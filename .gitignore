@@ -3,7 +3,6 @@
 /.kiro
 /*.yaml
 !/.ko.yaml
-*.exe
 
 # Test artifacts
 **/testdata/
@@ -11,3 +10,6 @@
 *.out
 coverage.html
 coverage.txt
+
+/build
+*.exe

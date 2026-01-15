@@ -15,9 +15,9 @@ builds:
     main: .
     env:
       - CGO_ENABLED=0
-    ldflags:
-      - -s
-      - -w
+    flags:
       - -trimpath
+    ldflags:
+      - -s -w
       - -extldflags '-static'
       - -X github.com/Mmx233/QMux/cmd.Version={{.Env.VERSION}}
