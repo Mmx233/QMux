@@ -32,4 +32,5 @@ jobs:
       - name: Build and Push
         env:
           KO_DOCKER_REPO: ${{ vars.DOCKERHUB_REPO }}
+          VERSION: ${{ github.ref_name }}
         run: ko build --sbom none --bare --tags latest,${{ github.ref_name }} .

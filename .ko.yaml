@@ -20,3 +20,4 @@ builds:
       - -w
       - -trimpath
       - -extldflags '-static'
+      - -X github.com/Mmx233/QMux/cmd.Version={{.Env.VERSION}}
