@@ -188,16 +188,16 @@ func (p *ConnectionPool) Remove(clientID string) {
 func (p *ConnectionPool) Select() (*ClientConn, error) {
 	// Fast path: use cached slice if available (lock-free read)
 	clientsPtr := p.cachedClients.Load()
-	var clients []*ClientConn
 	if clientsPtr != nil {
-		clients = *clientsPtr
+		clients := *clientsPtr
+		if len(clients) == 0 {
+			return nil, ErrNoClientsAvailable
+		}
+		return p.balancer.Select(clients)
 	}
 
-	if clients == nil {
-		// Rebuild cache lazily (rare path)
-		clients = p.rebuildClientSlice()
-	}
-
+	// Slow path: rebuild cache (rare)
+	clients := p.rebuildClientSlice()
 	if len(clients) == 0 {
 		return nil, ErrNoClientsAvailable
 	}
@@ -207,10 +207,11 @@ func (p *ConnectionPool) Select() (*ClientConn, error) {
 
 // rebuildClientSlice rebuilds the cached client slice from the map
 func (p *ConnectionPool) rebuildClientSlice() []*ClientConn {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	// Use write lock to prevent multiple goroutines from rebuilding simultaneously
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
-	// Double-check if another goroutine already rebuilt
+	// Double-check if another goroutine already rebuilt while we waited for the lock
 	clientsPtr := p.cachedClients.Load()
 	if clientsPtr != nil {
 		return *clientsPtr
