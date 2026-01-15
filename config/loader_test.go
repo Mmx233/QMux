@@ -135,13 +135,14 @@ func randomString(seed int) string {
 // LoadClientConfig Tests - Multi-Server Configuration Loading
 // ============================================================================
 
-// Test backward compatibility with single server configuration
+// Test single server configuration using servers array
 // Validates: Requirements 1.1
 func TestLoadClientConfig_SingleServer(t *testing.T) {
 	content := `client_id: test-client
 server:
-  address: "server.example.com:8443"
-  server_name: "server.example.com"
+  servers:
+    - address: "server.example.com:8443"
+      server_name: "server.example.com"
 local:
   host: "127.0.0.1"
   port: 8080
@@ -273,7 +274,9 @@ server:
 func TestLoadClientConfig_InvalidAddress(t *testing.T) {
 	content := `client_id: test-client
 server:
-  address: "invalid-no-port"
+  servers:
+    - address: "invalid-no-port"
+      server_name: "invalid"
 local:
   host: "127.0.0.1"
   port: 8080

@@ -26,7 +26,6 @@ func LoadConfig[T any](path string) (*T, error) {
 
 // LoadClientConfig reads a client YAML configuration file, validates it,
 // and applies deduplication for multi-server configurations.
-// It handles both single `address` and `servers` array configurations.
 func LoadClientConfig(path string) (*Client, error) {
 	logger := log.With().Str("com", "config-loader").Logger()
 

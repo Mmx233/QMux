@@ -26,33 +26,12 @@ type ServerEndpoint struct {
 }
 
 type ClientServer struct {
-	// Single server (backward compatible)
-	Address    string `yaml:"address"`     // server:port
-	ServerName string `yaml:"server_name"` // TLS server name for verification
-
-	// Multiple servers (new)
-	Servers []ServerEndpoint `yaml:"servers,omitempty"`
+	Servers []ServerEndpoint `yaml:"servers"`
 }
 
 // GetServers returns all configured server endpoints.
-// Returns single server as slice for backward compatibility.
 func (cs *ClientServer) GetServers() []ServerEndpoint {
-	// If explicit servers list is provided, use it
-	if len(cs.Servers) > 0 {
-		return cs.Servers
-	}
-
-	// Fall back to single server for backward compatibility
-	if cs.Address != "" {
-		return []ServerEndpoint{
-			{
-				Address:    cs.Address,
-				ServerName: cs.ServerName,
-			},
-		}
-	}
-
-	return nil
+	return cs.Servers
 }
 
 type LocalService struct {
@@ -181,9 +160,6 @@ func (cs *ClientServer) ValidateAndDeduplicate() (bool, error) {
 	deduplicated, hasDuplicates := cs.DeduplicateServers()
 	if hasDuplicates {
 		cs.Servers = deduplicated
-		// Clear single server fields if we're using the Servers list
-		cs.Address = ""
-		cs.ServerName = ""
 	}
 
 	// Then validate

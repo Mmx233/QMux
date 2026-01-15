@@ -161,26 +161,6 @@ func TestDuplicateDeduplication_Property(t *testing.T) {
 	})
 }
 
-// Unit test for backward compatibility with single server
-func TestGetServers_BackwardCompatibility(t *testing.T) {
-	// Test single server configuration (backward compatible)
-	cs := &ClientServer{
-		Address:    "server.example.com:8443",
-		ServerName: "server.example.com",
-	}
-
-	servers := cs.GetServers()
-	if len(servers) != 1 {
-		t.Fatalf("expected 1 server, got %d", len(servers))
-	}
-	if servers[0].Address != "server.example.com:8443" {
-		t.Errorf("expected address 'server.example.com:8443', got %q", servers[0].Address)
-	}
-	if servers[0].ServerName != "server.example.com" {
-		t.Errorf("expected server name 'server.example.com', got %q", servers[0].ServerName)
-	}
-}
-
 // Unit test for multi-server configuration
 func TestGetServers_MultiServer(t *testing.T) {
 	cs := &ClientServer{
@@ -196,31 +176,11 @@ func TestGetServers_MultiServer(t *testing.T) {
 	}
 }
 
-// Unit test: Servers field takes precedence over single server fields
-func TestGetServers_ServersPrecedence(t *testing.T) {
-	cs := &ClientServer{
-		Address:    "single.example.com:8443",
-		ServerName: "single.example.com",
-		Servers: []ServerEndpoint{
-			{Address: "multi1.example.com:8443", ServerName: "multi1.example.com"},
-			{Address: "multi2.example.com:8443", ServerName: "multi2.example.com"},
-		},
-	}
-
-	servers := cs.GetServers()
-	if len(servers) != 2 {
-		t.Fatalf("expected 2 servers (from Servers field), got %d", len(servers))
-	}
-	if servers[0].Address != "multi1.example.com:8443" {
-		t.Errorf("expected first server from Servers field, got %q", servers[0].Address)
-	}
-}
-
 // Unit test for empty configuration
 func TestGetServers_Empty(t *testing.T) {
 	cs := &ClientServer{}
 	servers := cs.GetServers()
-	if servers != nil {
-		t.Fatalf("expected nil for empty config, got %v", servers)
+	if len(servers) != 0 {
+		t.Fatalf("expected 0 for empty config, got %d", len(servers))
 	}
 }
