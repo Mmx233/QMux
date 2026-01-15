@@ -7,5 +7,5 @@ import (
 )
 
 type Auth interface {
-	VerifyConn(ctx context.Context, conn quic.Conn) (valid bool, err error)
+	VerifyConn(ctx context.Context, conn *quic.Conn) (valid bool, err error)
 }

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"github.com/Mmx233/QMux/cmd/generate"
 	"github.com/Mmx233/QMux/cmd/run"
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
@@ -25,4 +26,5 @@ func Execute() {
 
 func init() {
 	rootCmd.AddCommand(run.Cmd)
+	rootCmd.AddCommand(generate.Cmd)
 }

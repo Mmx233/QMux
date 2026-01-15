@@ -1,2 +1,12 @@
 /.idea
+/.claude
+/.kiro
 /*.yaml
+*.exe
+
+# Test artifacts
+**/testdata/
+*.test.exe
+*.out
+coverage.html
+coverage.txt
