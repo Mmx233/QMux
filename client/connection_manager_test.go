@@ -279,8 +279,9 @@ func TestConnectionManager_GetAllConnections_Empty(t *testing.T) {
 	cfg := &config.Client{
 		ClientID: "test-client",
 		Server: config.ClientServer{
-			Address:    "server.example.com:8443",
-			ServerName: "server",
+			Servers: []config.ServerEndpoint{
+				{Address: "server.example.com:8443", ServerName: "server"},
+			},
 		},
 	}
 
@@ -302,8 +303,9 @@ func TestConnectionManager_SessionCacheManager(t *testing.T) {
 	cfg := &config.Client{
 		ClientID: "test-client",
 		Server: config.ClientServer{
-			Address:    "server.example.com:8443",
-			ServerName: "server",
+			Servers: []config.ServerEndpoint{
+				{Address: "server.example.com:8443", ServerName: "server"},
+			},
 		},
 	}
 
@@ -325,8 +327,9 @@ func TestConnectionManager_Balancer(t *testing.T) {
 	cfg := &config.Client{
 		ClientID: "test-client",
 		Server: config.ClientServer{
-			Address:    "server.example.com:8443",
-			ServerName: "server",
+			Servers: []config.ServerEndpoint{
+				{Address: "server.example.com:8443", ServerName: "server"},
+			},
 		},
 	}
 
@@ -348,8 +351,9 @@ func TestConnectionManager_TotalCount(t *testing.T) {
 	cfg := &config.Client{
 		ClientID: "test-client",
 		Server: config.ClientServer{
-			Address:    "server.example.com:8443",
-			ServerName: "server",
+			Servers: []config.ServerEndpoint{
+				{Address: "server.example.com:8443", ServerName: "server"},
+			},
 		},
 	}
 
@@ -370,8 +374,9 @@ func TestConnectionManager_HealthyCount(t *testing.T) {
 	cfg := &config.Client{
 		ClientID: "test-client",
 		Server: config.ClientServer{
-			Address:    "server.example.com:8443",
-			ServerName: "server",
+			Servers: []config.ServerEndpoint{
+				{Address: "server.example.com:8443", ServerName: "server"},
+			},
 		},
 	}
 

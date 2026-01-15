@@ -136,8 +136,9 @@ func TestTCPReverseProxy_MTLS(t *testing.T) {
 	clientConfig := &config.Client{
 		ClientID: "test-client",
 		Server: config.ClientServer{
-			Address:    fmt.Sprintf("127.0.0.1:%d", quicPort),
-			ServerName: "localhost",
+			Servers: []config.ServerEndpoint{
+				{Address: fmt.Sprintf("127.0.0.1:%d", quicPort), ServerName: "localhost"},
+			},
 		},
 		Local: config.LocalService{
 			Host: "127.0.0.1",
@@ -293,8 +294,9 @@ func TestUDPReverseProxy_MTLS(t *testing.T) {
 	clientConfig := &config.Client{
 		ClientID: "test-client-udp",
 		Server: config.ClientServer{
-			Address:    fmt.Sprintf("127.0.0.1:%d", quicPort),
-			ServerName: "localhost",
+			Servers: []config.ServerEndpoint{
+				{Address: fmt.Sprintf("127.0.0.1:%d", quicPort), ServerName: "localhost"},
+			},
 		},
 		Local: config.LocalService{
 			Host: "127.0.0.1",
@@ -426,8 +428,9 @@ func TestConcurrentConnections_MTLS(t *testing.T) {
 	clientConfig := &config.Client{
 		ClientID: "test-client-concurrent",
 		Server: config.ClientServer{
-			Address:    fmt.Sprintf("127.0.0.1:%d", quicPort),
-			ServerName: "localhost",
+			Servers: []config.ServerEndpoint{
+				{Address: fmt.Sprintf("127.0.0.1:%d", quicPort), ServerName: "localhost"},
+			},
 		},
 		Local: config.LocalService{
 			Host: "127.0.0.1",
@@ -553,8 +556,9 @@ func TestClientReconnection_MTLS(t *testing.T) {
 	clientConfig := &config.Client{
 		ClientID: "test-client-reconnect",
 		Server: config.ClientServer{
-			Address:    fmt.Sprintf("127.0.0.1:%d", quicPort),
-			ServerName: "localhost",
+			Servers: []config.ServerEndpoint{
+				{Address: fmt.Sprintf("127.0.0.1:%d", quicPort), ServerName: "localhost"},
+			},
 		},
 		Local: config.LocalService{
 			Host: "127.0.0.1",
@@ -698,8 +702,9 @@ func BenchmarkClientAuth_MTLS(b *testing.B) {
 	clientConfig := &config.Client{
 		ClientID: "bench-client-auth",
 		Server: config.ClientServer{
-			Address:    fmt.Sprintf("127.0.0.1:%d", quicPort),
-			ServerName: "localhost",
+			Servers: []config.ServerEndpoint{
+				{Address: fmt.Sprintf("127.0.0.1:%d", quicPort), ServerName: "localhost"},
+			},
 		},
 		Local: config.LocalService{
 			Host: "127.0.0.1",
@@ -791,8 +796,9 @@ func BenchmarkTCPConnection_MTLS(b *testing.B) {
 	clientConfig := &config.Client{
 		ClientID: "bench-client-tcp",
 		Server: config.ClientServer{
-			Address:    fmt.Sprintf("127.0.0.1:%d", quicPort),
-			ServerName: "localhost",
+			Servers: []config.ServerEndpoint{
+				{Address: fmt.Sprintf("127.0.0.1:%d", quicPort), ServerName: "localhost"},
+			},
 		},
 		Local: config.LocalService{
 			Host: "127.0.0.1",
@@ -892,8 +898,9 @@ func BenchmarkUDPConnection_MTLS(b *testing.B) {
 	clientConfig := &config.Client{
 		ClientID: "bench-client-udp",
 		Server: config.ClientServer{
-			Address:    fmt.Sprintf("127.0.0.1:%d", quicPort),
-			ServerName: "localhost",
+			Servers: []config.ServerEndpoint{
+				{Address: fmt.Sprintf("127.0.0.1:%d", quicPort), ServerName: "localhost"},
+			},
 		},
 		Local: config.LocalService{
 			Host: "127.0.0.1",
@@ -992,8 +999,9 @@ func BenchmarkTCPThroughput_MTLS(b *testing.B) {
 	clientConfig := &config.Client{
 		ClientID: "bench-client-throughput",
 		Server: config.ClientServer{
-			Address:    fmt.Sprintf("127.0.0.1:%d", quicPort),
-			ServerName: "localhost",
+			Servers: []config.ServerEndpoint{
+				{Address: fmt.Sprintf("127.0.0.1:%d", quicPort), ServerName: "localhost"},
+			},
 		},
 		Local: config.LocalService{
 			Host: "127.0.0.1",
