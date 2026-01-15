@@ -9,9 +9,6 @@ on:
     types: [published]
   workflow_dispatch:
 
-env:
-  KO_DOCKER_REPO: ${{ vars.DOCKERHUB_REPO }}
-
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
@@ -28,10 +25,11 @@ jobs:
 
       - name: Login to Registry
         env:
-          registry: ${{ env.KO_DOCKER_REPO }}
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-        run: echo "$password" | ko login "$registry" -u "$username" --password-stdin
+        run: echo "$password" | ko login docker.io -u "$username" --password-stdin
 
       - name: Build and Push
-        run: ko build --sbom none --bare --tags latest,${{ github.ref_name }} ./cmd/search
+        env:
+          KO_DOCKER_REPO: ${{ vars.DOCKERHUB_REPO }}
+        run: ko build --sbom none --bare --tags latest,${{ github.ref_name }} .
