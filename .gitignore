@@ -2,6 +2,7 @@
 /.claude
 /.kiro
 /*.yaml
+!/.ko.yaml
 *.exe
 
 # Test artifacts
