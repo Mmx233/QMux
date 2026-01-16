@@ -11,9 +11,6 @@ import (
 // json is a drop-in replacement for encoding/json with better performance
 var json = jsoniter.ConfigCompatibleWithStandardLibrary
 
-// streamPool pools json-iterator streams for encoding
-var streamPool = jsoniter.NewStream(jsoniter.ConfigCompatibleWithStandardLibrary, nil, 256)
-
 // Wire format: [1 byte type][4 bytes length][payload]
 
 // WriteMessage writes a message to the writer using buffer pooling to reduce allocations.
