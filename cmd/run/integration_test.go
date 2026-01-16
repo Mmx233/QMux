@@ -107,10 +107,11 @@ func TestTCPReverseProxy_MTLS(t *testing.T) {
 			},
 		},
 		Auth: config.ServerAuth{
-			Method: "mtls",
+			Method:     "mtls",
+			CACertFile: filepath.Join(certDir, "ca.crt"),
 		},
 		TLS: config.ServerTLS{
-			CACertFile:     filepath.Join(certDir, "ca.crt"),
+
 			ServerCertFile: filepath.Join(certDir, "server.crt"),
 			ServerKeyFile:  filepath.Join(certDir, "server.key"),
 		},
@@ -145,7 +146,8 @@ func TestTCPReverseProxy_MTLS(t *testing.T) {
 			Port: localAddr.Port,
 		},
 		TLS: config.ClientTLS{
-			CACertFile:     filepath.Join(certDir, "ca.crt"),
+			CACertFile: filepath.Join(certDir, "ca.crt"),
+
 			ClientCertFile: filepath.Join(certDir, "client.crt"),
 			ClientKeyFile:  filepath.Join(certDir, "client.key"),
 		},
@@ -266,10 +268,11 @@ func TestUDPReverseProxy_MTLS(t *testing.T) {
 			},
 		},
 		Auth: config.ServerAuth{
-			Method: "mtls",
+			Method:     "mtls",
+			CACertFile: filepath.Join(certDir, "ca.crt"),
 		},
 		TLS: config.ServerTLS{
-			CACertFile:     filepath.Join(certDir, "ca.crt"),
+
 			ServerCertFile: filepath.Join(certDir, "server.crt"),
 			ServerKeyFile:  filepath.Join(certDir, "server.key"),
 		},
@@ -303,7 +306,8 @@ func TestUDPReverseProxy_MTLS(t *testing.T) {
 			Port: localAddr.Port,
 		},
 		TLS: config.ClientTLS{
-			CACertFile:     filepath.Join(certDir, "ca.crt"),
+			CACertFile: filepath.Join(certDir, "ca.crt"),
+
 			ClientCertFile: filepath.Join(certDir, "client.crt"),
 			ClientKeyFile:  filepath.Join(certDir, "client.key"),
 		},
@@ -410,10 +414,11 @@ func TestConcurrentConnections_MTLS(t *testing.T) {
 			},
 		},
 		Auth: config.ServerAuth{
-			Method: "mtls",
+			Method:     "mtls",
+			CACertFile: filepath.Join(certDir, "ca.crt"),
 		},
 		TLS: config.ServerTLS{
-			CACertFile:     filepath.Join(certDir, "ca.crt"),
+
 			ServerCertFile: filepath.Join(certDir, "server.crt"),
 			ServerKeyFile:  filepath.Join(certDir, "server.key"),
 		},
@@ -437,7 +442,8 @@ func TestConcurrentConnections_MTLS(t *testing.T) {
 			Port: localAddr.Port,
 		},
 		TLS: config.ClientTLS{
-			CACertFile:     filepath.Join(certDir, "ca.crt"),
+			CACertFile: filepath.Join(certDir, "ca.crt"),
+
 			ClientCertFile: filepath.Join(certDir, "client.crt"),
 			ClientKeyFile:  filepath.Join(certDir, "client.key"),
 		},
@@ -535,10 +541,11 @@ func TestClientReconnection_MTLS(t *testing.T) {
 			},
 		},
 		Auth: config.ServerAuth{
-			Method: "mtls",
+			Method:     "mtls",
+			CACertFile: filepath.Join(certDir, "ca.crt"),
 		},
 		TLS: config.ServerTLS{
-			CACertFile:     filepath.Join(certDir, "ca.crt"),
+
 			ServerCertFile: filepath.Join(certDir, "server.crt"),
 			ServerKeyFile:  filepath.Join(certDir, "server.key"),
 		},
@@ -565,7 +572,8 @@ func TestClientReconnection_MTLS(t *testing.T) {
 			Port: localAddr.Port,
 		},
 		TLS: config.ClientTLS{
-			CACertFile:     filepath.Join(certDir, "ca.crt"),
+			CACertFile: filepath.Join(certDir, "ca.crt"),
+
 			ClientCertFile: filepath.Join(certDir, "client.crt"),
 			ClientKeyFile:  filepath.Join(certDir, "client.key"),
 		},
@@ -684,10 +692,11 @@ func BenchmarkClientAuth_MTLS(b *testing.B) {
 			},
 		},
 		Auth: config.ServerAuth{
-			Method: "mtls",
+			Method:     "mtls",
+			CACertFile: filepath.Join(certDir, "ca.crt"),
 		},
 		TLS: config.ServerTLS{
-			CACertFile:     filepath.Join(certDir, "ca.crt"),
+
 			ServerCertFile: filepath.Join(certDir, "server.crt"),
 			ServerKeyFile:  filepath.Join(certDir, "server.key"),
 		},
@@ -711,7 +720,8 @@ func BenchmarkClientAuth_MTLS(b *testing.B) {
 			Port: localAddr.Port,
 		},
 		TLS: config.ClientTLS{
-			CACertFile:     filepath.Join(certDir, "ca.crt"),
+			CACertFile: filepath.Join(certDir, "ca.crt"),
+
 			ClientCertFile: filepath.Join(certDir, "client.crt"),
 			ClientKeyFile:  filepath.Join(certDir, "client.key"),
 		},
@@ -778,10 +788,11 @@ func BenchmarkTCPConnection_MTLS(b *testing.B) {
 			},
 		},
 		Auth: config.ServerAuth{
-			Method: "mtls",
+			Method:     "mtls",
+			CACertFile: filepath.Join(certDir, "ca.crt"),
 		},
 		TLS: config.ServerTLS{
-			CACertFile:     filepath.Join(certDir, "ca.crt"),
+
 			ServerCertFile: filepath.Join(certDir, "server.crt"),
 			ServerKeyFile:  filepath.Join(certDir, "server.key"),
 		},
@@ -805,7 +816,8 @@ func BenchmarkTCPConnection_MTLS(b *testing.B) {
 			Port: localAddr.Port,
 		},
 		TLS: config.ClientTLS{
-			CACertFile:     filepath.Join(certDir, "ca.crt"),
+			CACertFile: filepath.Join(certDir, "ca.crt"),
+
 			ClientCertFile: filepath.Join(certDir, "client.crt"),
 			ClientKeyFile:  filepath.Join(certDir, "client.key"),
 		},
@@ -880,10 +892,11 @@ func BenchmarkUDPConnection_MTLS(b *testing.B) {
 			},
 		},
 		Auth: config.ServerAuth{
-			Method: "mtls",
+			Method:     "mtls",
+			CACertFile: filepath.Join(certDir, "ca.crt"),
 		},
 		TLS: config.ServerTLS{
-			CACertFile:     filepath.Join(certDir, "ca.crt"),
+
 			ServerCertFile: filepath.Join(certDir, "server.crt"),
 			ServerKeyFile:  filepath.Join(certDir, "server.key"),
 		},
@@ -907,7 +920,8 @@ func BenchmarkUDPConnection_MTLS(b *testing.B) {
 			Port: localAddr.Port,
 		},
 		TLS: config.ClientTLS{
-			CACertFile:     filepath.Join(certDir, "ca.crt"),
+			CACertFile: filepath.Join(certDir, "ca.crt"),
+
 			ClientCertFile: filepath.Join(certDir, "client.crt"),
 			ClientKeyFile:  filepath.Join(certDir, "client.key"),
 		},
@@ -981,10 +995,11 @@ func BenchmarkTCPThroughput_MTLS(b *testing.B) {
 			},
 		},
 		Auth: config.ServerAuth{
-			Method: "mtls",
+			Method:     "mtls",
+			CACertFile: filepath.Join(certDir, "ca.crt"),
 		},
 		TLS: config.ServerTLS{
-			CACertFile:     filepath.Join(certDir, "ca.crt"),
+
 			ServerCertFile: filepath.Join(certDir, "server.crt"),
 			ServerKeyFile:  filepath.Join(certDir, "server.key"),
 		},
@@ -1008,7 +1023,8 @@ func BenchmarkTCPThroughput_MTLS(b *testing.B) {
 			Port: localAddr.Port,
 		},
 		TLS: config.ClientTLS{
-			CACertFile:     filepath.Join(certDir, "ca.crt"),
+			CACertFile: filepath.Join(certDir, "ca.crt"),
+
 			ClientCertFile: filepath.Join(certDir, "client.crt"),
 			ClientKeyFile:  filepath.Join(certDir, "client.key"),
 		},
@@ -1085,10 +1101,11 @@ func TestMultiServerConnection_MTLS(t *testing.T) {
 			},
 		},
 		Auth: config.ServerAuth{
-			Method: "mtls",
+			Method:     "mtls",
+			CACertFile: filepath.Join(certDir, "ca.crt"),
 		},
 		TLS: config.ServerTLS{
-			CACertFile:     filepath.Join(certDir, "ca.crt"),
+
 			ServerCertFile: filepath.Join(certDir, "server.crt"),
 			ServerKeyFile:  filepath.Join(certDir, "server.key"),
 		},
@@ -1108,10 +1125,11 @@ func TestMultiServerConnection_MTLS(t *testing.T) {
 			},
 		},
 		Auth: config.ServerAuth{
-			Method: "mtls",
+			Method:     "mtls",
+			CACertFile: filepath.Join(certDir, "ca.crt"),
 		},
 		TLS: config.ServerTLS{
-			CACertFile:     filepath.Join(certDir, "ca.crt"),
+
 			ServerCertFile: filepath.Join(certDir, "server.crt"),
 			ServerKeyFile:  filepath.Join(certDir, "server.key"),
 		},
@@ -1144,7 +1162,8 @@ func TestMultiServerConnection_MTLS(t *testing.T) {
 			Port: localAddr.Port,
 		},
 		TLS: config.ClientTLS{
-			CACertFile:     filepath.Join(certDir, "ca.crt"),
+			CACertFile: filepath.Join(certDir, "ca.crt"),
+
 			ClientCertFile: filepath.Join(certDir, "client.crt"),
 			ClientKeyFile:  filepath.Join(certDir, "client.key"),
 		},
@@ -1256,10 +1275,11 @@ func TestMultiServerFailover_MTLS(t *testing.T) {
 			},
 		},
 		Auth: config.ServerAuth{
-			Method: "mtls",
+			Method:     "mtls",
+			CACertFile: filepath.Join(certDir, "ca.crt"),
 		},
 		TLS: config.ServerTLS{
-			CACertFile:     filepath.Join(certDir, "ca.crt"),
+
 			ServerCertFile: filepath.Join(certDir, "server.crt"),
 			ServerKeyFile:  filepath.Join(certDir, "server.key"),
 		},
@@ -1279,10 +1299,11 @@ func TestMultiServerFailover_MTLS(t *testing.T) {
 			},
 		},
 		Auth: config.ServerAuth{
-			Method: "mtls",
+			Method:     "mtls",
+			CACertFile: filepath.Join(certDir, "ca.crt"),
 		},
 		TLS: config.ServerTLS{
-			CACertFile:     filepath.Join(certDir, "ca.crt"),
+
 			ServerCertFile: filepath.Join(certDir, "server.crt"),
 			ServerKeyFile:  filepath.Join(certDir, "server.key"),
 		},
@@ -1318,7 +1339,8 @@ func TestMultiServerFailover_MTLS(t *testing.T) {
 			Port: localAddr.Port,
 		},
 		TLS: config.ClientTLS{
-			CACertFile:     filepath.Join(certDir, "ca.crt"),
+			CACertFile: filepath.Join(certDir, "ca.crt"),
+
 			ClientCertFile: filepath.Join(certDir, "client.crt"),
 			ClientKeyFile:  filepath.Join(certDir, "client.key"),
 		},
@@ -1424,10 +1446,11 @@ func TestMultiServerLoadBalancing_MTLS(t *testing.T) {
 			},
 		},
 		Auth: config.ServerAuth{
-			Method: "mtls",
+			Method:     "mtls",
+			CACertFile: filepath.Join(certDir, "ca.crt"),
 		},
 		TLS: config.ServerTLS{
-			CACertFile:     filepath.Join(certDir, "ca.crt"),
+
 			ServerCertFile: filepath.Join(certDir, "server.crt"),
 			ServerKeyFile:  filepath.Join(certDir, "server.key"),
 		},
@@ -1445,10 +1468,11 @@ func TestMultiServerLoadBalancing_MTLS(t *testing.T) {
 			},
 		},
 		Auth: config.ServerAuth{
-			Method: "mtls",
+			Method:     "mtls",
+			CACertFile: filepath.Join(certDir, "ca.crt"),
 		},
 		TLS: config.ServerTLS{
-			CACertFile:     filepath.Join(certDir, "ca.crt"),
+
 			ServerCertFile: filepath.Join(certDir, "server.crt"),
 			ServerKeyFile:  filepath.Join(certDir, "server.key"),
 		},
@@ -1475,7 +1499,8 @@ func TestMultiServerLoadBalancing_MTLS(t *testing.T) {
 			Port: localAddr.Port,
 		},
 		TLS: config.ClientTLS{
-			CACertFile:     filepath.Join(certDir, "ca.crt"),
+			CACertFile: filepath.Join(certDir, "ca.crt"),
+
 			ClientCertFile: filepath.Join(certDir, "client.crt"),
 			ClientKeyFile:  filepath.Join(certDir, "client.key"),
 		},

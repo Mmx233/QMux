@@ -3,11 +3,14 @@ package config
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"os"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	"github.com/Mmx233/QMux/server/auth"
+	"github.com/Mmx233/QMux/server/auth/challenge"
+	"github.com/Mmx233/QMux/server/auth/mtls"
 )
 
 type Server struct {
@@ -28,12 +31,72 @@ type QuicListener struct {
 }
 
 type ServerAuth struct {
-	Method  string    `yaml:"method"` // "mtls", "token", etc.
-	Content yaml.Node `yaml:",inline"`
+	Method     string `yaml:"method"`       // "mtls", "token", etc.
+	CACertFile string `yaml:"ca_cert_file"` // Path to CA certificate file (for mTLS)
+	Token      string `yaml:"token"`        // Token for challenge-response auth
+
+	// Loaded certificate (not from YAML)
+	CACertPool *x509.CertPool `yaml:"-"`
+}
+
+// LoadCACertificate loads the CA certificate from file into the CACertPool
+func (a *ServerAuth) LoadCACertificate() error {
+	caCertPEM, err := os.ReadFile(a.CACertFile)
+	if err != nil {
+		return fmt.Errorf("read CA cert: %w", err)
+	}
+
+	a.CACertPool = x509.NewCertPool()
+	if !a.CACertPool.AppendCertsFromPEM(caCertPEM) {
+		return fmt.Errorf("failed to parse CA certificate")
+	}
+	return nil
+}
+
+// Validate validates the auth configuration based on the selected method.
+// It defaults to "mtls" when Method is empty.
+// For mTLS: requires non-empty CACertFile.
+// For token: requires non-empty token with minimum 16 bytes length.
+// Returns an error for unknown auth methods.
+func (a *ServerAuth) Validate() error {
+	switch a.Method {
+	case "", "mtls":
+		if a.CACertFile == "" {
+			return errors.New("ca_cert_file is required for mTLS authentication")
+		}
+		return nil
+	case "token":
+		if a.Token == "" {
+			return errors.New("token is required for token authentication")
+		}
+		if len(a.Token) < challenge.MinTokenSize {
+			return fmt.Errorf("token must be at least %d bytes", challenge.MinTokenSize)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown auth method: %s", a.Method)
+	}
+}
+
+// CreateAuthenticator creates and returns the appropriate authenticator based on the configured method.
+// For mTLS (or empty method): loads the CA certificate and creates an mTLS authenticator.
+// For token method: creates a challenge-response authenticator with the configured token.
+// Returns an error if authenticator creation fails.
+func (a *ServerAuth) CreateAuthenticator() (auth.Auth, error) {
+	switch a.Method {
+	case "", "mtls":
+		if err := a.LoadCACertificate(); err != nil {
+			return nil, fmt.Errorf("load CA certificate: %w", err)
+		}
+		return mtls.New(a.CACertPool), nil
+	case "token":
+		return challenge.New([]byte(a.Token))
+	default:
+		return nil, fmt.Errorf("unknown auth method: %s", a.Method)
+	}
 }
 
 type ServerTLS struct {
-	CACertFile     string `yaml:"ca_cert_file"`
 	ServerCertFile string `yaml:"server_cert_file"`
 	ServerKeyFile  string `yaml:"server_key_file"`
 
@@ -47,24 +110,12 @@ type ServerTLS struct {
 	// Higher values allow clients with older tickets to still resume sessions.
 	SessionTicketEncryptionKeyRotationOverlap uint8 `yaml:"session_ticket_encryption_key_rotation_overlap"`
 
-	// Loaded certificates (not from YAML)
-	CACertPool *x509.CertPool  `yaml:"-"`
+	// Loaded certificate (not from YAML)
 	ServerCert tls.Certificate `yaml:"-"`
 }
 
-// LoadCertificates loads TLS certificates from files
+// LoadCertificates loads server TLS certificate and key from files
 func (t *ServerTLS) LoadCertificates() error {
-	// Load CA certificate
-	caCertPEM, err := os.ReadFile(t.CACertFile)
-	if err != nil {
-		return fmt.Errorf("read CA cert: %w", err)
-	}
-
-	t.CACertPool = x509.NewCertPool()
-	if !t.CACertPool.AppendCertsFromPEM(caCertPEM) {
-		return fmt.Errorf("failed to parse CA certificate")
-	}
-
 	// Load server certificate and key
 	cert, err := tls.LoadX509KeyPair(t.ServerCertFile, t.ServerKeyFile)
 	if err != nil {

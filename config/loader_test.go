@@ -131,12 +131,6 @@ func randomString(seed int) string {
 	return string(result)
 }
 
-// ============================================================================
-// LoadClientConfig Tests - Multi-Server Configuration Loading
-// ============================================================================
-
-// Test single server configuration using servers array
-// Validates: Requirements 1.1
 func TestLoadClientConfig_SingleServer(t *testing.T) {
 	content := `client_id: test-client
 server:

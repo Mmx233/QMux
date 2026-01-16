@@ -10,7 +10,6 @@ import (
 	"github.com/Mmx233/QMux/config"
 	"github.com/Mmx233/QMux/protocol"
 	"github.com/Mmx233/QMux/server/auth"
-	"github.com/Mmx233/QMux/server/auth/mtls"
 	"github.com/Mmx233/QMux/server/pool"
 	"github.com/Mmx233/QMux/server/tls/stek"
 	"github.com/Mmx233/QMux/server/traffic"
@@ -37,15 +36,23 @@ func New(conf *config.Server) (*Server, error) {
 		return nil, fmt.Errorf("load certificates: %w", err)
 	}
 
-	// Create authenticator
-	var authenticator auth.Auth
-	if conf.Auth.Method == "mtls" {
-		authenticator = mtls.New(conf.TLS.CACertPool)
-		logger.Info().Msg("mTLS authentication enabled")
-	} else {
-		logger.Warn().Str("method", conf.Auth.Method).Msg("unknown auth method, using mTLS")
-		authenticator = mtls.New(conf.TLS.CACertPool)
+	// Validate auth config
+	if err := conf.Auth.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid auth config: %w", err)
 	}
+
+	// Create authenticator using factory
+	authenticator, err := conf.Auth.CreateAuthenticator()
+	if err != nil {
+		return nil, fmt.Errorf("create authenticator: %w", err)
+	}
+
+	// Log the auth method being used
+	method := conf.Auth.Method
+	if method == "" {
+		method = "mtls"
+	}
+	logger.Info().Str("method", method).Msg("authentication enabled")
 
 	// Create connection pools for each listener
 	pools := make(map[int]*pool.ConnectionPool)
@@ -150,11 +157,19 @@ func (s *Server) startListener(ctx context.Context, listenerConf config.QuicList
 			Msg("session ticket key rotation enabled")
 	}
 
-	// Configure TLS
+	// Configure TLS based on auth method
 	tlsConf := &tls.Config{
 		Certificates: []tls.Certificate{s.config.TLS.ServerCert},
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		ClientCAs:    s.config.TLS.CACertPool,
+	}
+
+	// For mTLS, require and verify client certificates
+	// For token auth, no client cert verification is needed
+	if s.config.Auth.Method == "" || s.config.Auth.Method == "mtls" {
+		tlsConf.ClientAuth = tls.RequireAndVerifyClientCert
+		tlsConf.ClientCAs = s.config.Auth.CACertPool
+	} else {
+		// Token-based auth doesn't require client certificates
+		tlsConf.ClientAuth = tls.NoClientCert
 	}
 
 	// Configure session ticket keys with automatic rotation

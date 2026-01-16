@@ -35,9 +35,11 @@ func TestServerConfigTemplateFields(t *testing.T) {
 
 	// Verify auth
 	assert.NotEmpty(t, cfg.Auth.Method, "auth method should not be empty")
+	if cfg.Auth.Method == "mtls" || cfg.Auth.Method == "" {
+		assert.NotEmpty(t, cfg.Auth.CACertFile, "auth.ca_cert_file should not be empty for mTLS auth")
+	}
 
 	// Verify TLS
-	assert.NotEmpty(t, cfg.TLS.CACertFile, "TLS CA cert file should not be empty")
 	assert.NotEmpty(t, cfg.TLS.ServerCertFile, "TLS server cert file should not be empty")
 	assert.NotEmpty(t, cfg.TLS.ServerKeyFile, "TLS server key file should not be empty")
 
