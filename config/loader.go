@@ -34,6 +34,9 @@ func LoadClientConfig(path string) (*Client, error) {
 		return nil, err
 	}
 
+	// Generate ClientID if not provided
+	cfg.EnsureClientID()
+
 	// Validate and deduplicate server configuration
 	hasDuplicates, err := cfg.Server.ValidateAndDeduplicate()
 	if err != nil {

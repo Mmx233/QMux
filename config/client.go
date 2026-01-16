@@ -8,6 +8,8 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type Client struct {
@@ -17,6 +19,14 @@ type Client struct {
 	Quic              Quic          `yaml:"quic"`
 	TLS               ClientTLS     `yaml:"tls"`
 	HeartbeatInterval time.Duration `yaml:"heartbeat_interval"` // Heartbeat interval, default 30s
+}
+
+// EnsureClientID generates a UUID for ClientID if it is empty.
+// This is useful for K8s deployments where multiple pods share the same ConfigMap.
+func (c *Client) EnsureClientID() {
+	if c.ClientID == "" {
+		c.ClientID = uuid.New().String()
+	}
 }
 
 // ServerEndpoint represents a single server endpoint
