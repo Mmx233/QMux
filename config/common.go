@@ -39,7 +39,7 @@ type Quic struct {
 
 func (q Quic) GetConfig() *quic.Config {
 	if q.MaxIdleTimeout == 0 {
-		q.MaxIdleTimeout = time.Minute * 5
+		q.MaxIdleTimeout = DefaultMaxIdleTimeout
 	}
 	return &quic.Config{
 		InitialStreamReceiveWindow:     q.InitialStreamReceiveWindow,

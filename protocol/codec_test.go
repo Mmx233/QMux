@@ -3,6 +3,8 @@ package protocol
 import (
 	"bytes"
 	"testing"
+
+	"github.com/Mmx233/QMux/config"
 )
 
 // Payload size constants for benchmarks
@@ -114,7 +116,7 @@ func BenchmarkDecodeMessage(b *testing.B) {
 		{"Register", MsgTypeRegister, RegisterMsg{
 			ClientID:     "client-12345",
 			Version:      ProtocolVersion,
-			Capabilities: DefaultCapabilities,
+			Capabilities: config.DefaultCapabilities,
 		}},
 		{"NewConn", MsgTypeNewConn, NewConnMsg{
 			ConnID:     12345,
@@ -166,7 +168,7 @@ func BenchmarkTypedMessages(b *testing.B) {
 
 		for i := 0; i < b.N; i++ {
 			buf.Reset()
-			if err := WriteRegister(&buf, "client-12345", ProtocolVersion, DefaultCapabilities); err != nil {
+			if err := WriteRegister(&buf, "client-12345", ProtocolVersion, config.DefaultCapabilities); err != nil {
 				b.Fatalf("WriteRegister failed: %v", err)
 			}
 		}

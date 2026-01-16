@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Mmx233/QMux/config"
 	"github.com/Mmx233/QMux/protocol"
 	"github.com/quic-go/quic-go"
 	"github.com/rs/zerolog"
@@ -212,7 +213,7 @@ func (sc *ServerConnection) Register(clientID string) error {
 		stream,
 		clientID,
 		protocol.ProtocolVersion,
-		protocol.DefaultCapabilities,
+		config.DefaultCapabilities,
 	)
 	if err != nil {
 		return fmt.Errorf("send registration: %w", err)

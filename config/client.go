@@ -8,8 +8,6 @@ import (
 	"os"
 	"strconv"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 type Client struct {
@@ -25,7 +23,16 @@ type Client struct {
 // This is useful for K8s deployments where multiple pods share the same ConfigMap.
 func (c *Client) EnsureClientID() {
 	if c.ClientID == "" {
-		c.ClientID = uuid.New().String()
+		c.ClientID = GenerateClientID()
+	}
+}
+
+// ApplyDefaults applies default values to zero-value fields.
+// It calls EnsureClientID() and sets HeartbeatInterval if not specified.
+func (c *Client) ApplyDefaults() {
+	c.EnsureClientID()
+	if c.HeartbeatInterval == 0 {
+		c.HeartbeatInterval = DefaultHeartbeatInterval
 	}
 }
 

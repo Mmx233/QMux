@@ -4,6 +4,7 @@ import (
 	stdjson "encoding/json"
 	"testing"
 
+	"github.com/Mmx233/QMux/config"
 	jsoniter "github.com/json-iterator/go"
 )
 
@@ -13,7 +14,7 @@ func BenchmarkJSONLibraryComparison(b *testing.B) {
 	registerMsg := RegisterMsg{
 		ClientID:     "client-12345",
 		Version:      ProtocolVersion,
-		Capabilities: DefaultCapabilities,
+		Capabilities: config.DefaultCapabilities,
 	}
 	newConnMsg := NewConnMsg{
 		ConnID:     12345,

@@ -29,6 +29,9 @@ type Client struct {
 
 // New creates a new client
 func New(conf *config.Client) (*Client, error) {
+	// Apply defaults to ensure all required fields have values
+	conf.ApplyDefaults()
+
 	logger := log.With().
 		Str("com", "client").
 		Str("client_id", conf.ClientID).

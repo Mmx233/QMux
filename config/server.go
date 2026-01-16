@@ -74,3 +74,14 @@ func (t *ServerTLS) LoadCertificates() error {
 
 	return nil
 }
+
+// ApplyDefaults applies default values to zero-value fields.
+// It sets HealthCheckInterval and HealthCheckTimeout if not specified.
+func (s *Server) ApplyDefaults() {
+	if s.HealthCheckInterval == 0 {
+		s.HealthCheckInterval = DefaultHealthCheckInterval
+	}
+	if s.HealthCheckTimeout == 0 {
+		s.HealthCheckTimeout = DefaultHealthCheckTimeout
+	}
+}

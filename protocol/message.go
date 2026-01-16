@@ -1,7 +1,5 @@
 package protocol
 
-import "time"
-
 // Message types
 const (
 	MsgTypeRegister    = 0x01 // Client registration
@@ -62,7 +60,3 @@ type Message struct {
 }
 
 const ProtocolVersion = "1.0"
-
-var DefaultCapabilities = []string{"tcp", "udp"}
-
-const DefaultHeartbeatInterval = 30 * time.Second
