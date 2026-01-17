@@ -13,7 +13,10 @@ import (
 
 // startTCP starts the TCP listener
 func (l *Listener) startTCP() error {
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", l.Port))
+	lc := net.ListenConfig{
+		Control: setSocketOptions,
+	}
+	listener, err := lc.Listen(l.ctx, "tcp", fmt.Sprintf(":%d", l.Port))
 	if err != nil {
 		return fmt.Errorf("listen TCP: %w", err)
 	}
