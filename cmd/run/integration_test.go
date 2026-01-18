@@ -32,7 +32,7 @@ func generateTestCertificates(t testing.TB) string {
 		t.Fatalf("failed to generate CA: %v", err)
 	}
 
-	serverKey, serverCert, err := certs.GenerateServerCert(caKey, caCert, 1)
+	serverKey, serverCert, err := certs.GenerateServerCert(caKey, caCert, 1, []string{"localhost"})
 	if err != nil {
 		t.Fatalf("failed to generate server cert: %v", err)
 	}
