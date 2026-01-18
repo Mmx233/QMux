@@ -7,7 +7,7 @@ import (
 )
 
 var (
-	configFile = tools.GetenvDefault(config.EnvPrefix+"CONFIG", "/etc/qmux/config.yaml")
+	configFile = tools.GetenvDefault(config.EnvPrefix+"CONFIG", "config.yaml")
 	Cmd        = &cobra.Command{
 		Use:   "run",
 		Short: "Run qmux server or client",
