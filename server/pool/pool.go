@@ -15,7 +15,7 @@ import (
 type ConnectionPool struct {
 	mu       sync.RWMutex
 	clients  map[string]*ClientConn // clientID -> connection
-	quicPort int                    // QUIC listen port this pool serves
+	quicAddr string                 // QUIC listen address this pool serves
 	balancer LoadBalancer           // Load balancing strategy
 	logger   zerolog.Logger
 
@@ -55,13 +55,13 @@ type ClientMetadata struct {
 }
 
 // New creates a new connection pool
-func New(quicPort int, balancer LoadBalancer, logger zerolog.Logger) *ConnectionPool {
+func New(quicAddr string, balancer LoadBalancer, logger zerolog.Logger) *ConnectionPool {
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &ConnectionPool{
 		clients:             make(map[string]*ClientConn),
-		quicPort:            quicPort,
+		quicAddr:            quicAddr,
 		balancer:            balancer,
-		logger:              logger.With().Int("quic_port", quicPort).Logger(),
+		logger:              logger.With().Str("quic_addr", quicAddr).Logger(),
 		healthCheckInterval: 10 * time.Second,
 		healthCheckTimeout:  30 * time.Second,
 		ctx:                 ctx,

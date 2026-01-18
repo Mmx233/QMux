@@ -24,11 +24,11 @@ type Server struct {
 }
 
 type QuicListener struct {
-	Listen      `yaml:",inline"`
+	QuicAddr    string `yaml:"quic_addr"`    // Address for QUIC control connections (e.g., "0.0.0.0:8443")
+	TrafficAddr string `yaml:"traffic_addr"` // Address for forwarded traffic (e.g., "0.0.0.0:8080")
+	Protocol    string `yaml:"protocol"`     // "tcp", "udp", or "both"
 	Quic        `yaml:",inline"`
-	TrafficPort int       `yaml:"traffic_port"` // 1:1 mapped traffic port for this listener
-	Protocol    string    `yaml:"protocol"`     // "tcp", "udp", or "both"
-	UDP         UDPConfig `yaml:"udp"`          // UDP-specific configuration
+	UDP         UDPConfig `yaml:"udp"` // UDP-specific configuration
 }
 
 type ServerAuth struct {

@@ -17,7 +17,7 @@ func newTestLogger() zerolog.Logger {
 
 // TestConnectionPool_AddRemove tests adding and removing clients
 func TestConnectionPool_AddRemove(t *testing.T) {
-	pool := New(8080, NewRoundRobinBalancer(), newTestLogger())
+	pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
 	defer pool.Stop()
 
 	client := &ClientConn{
@@ -50,7 +50,7 @@ func TestConnectionPool_AddRemove(t *testing.T) {
 
 // TestConnectionPool_Select tests client selection
 func TestConnectionPool_Select(t *testing.T) {
-	pool := New(8080, NewRoundRobinBalancer(), newTestLogger())
+	pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
 	defer pool.Stop()
 
 	// Try to select when no clients exist
@@ -79,7 +79,7 @@ func TestConnectionPool_Select(t *testing.T) {
 
 // TestConnectionPool_HealthCheck tests health checking mechanism
 func TestConnectionPool_HealthCheck(t *testing.T) {
-	pool := New(8080, NewRoundRobinBalancer(), newTestLogger())
+	pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
 	// Use shorter intervals for testing
 	pool.healthCheckInterval = 100 * time.Millisecond
 	pool.healthCheckTimeout = 300 * time.Millisecond
@@ -115,7 +115,7 @@ func TestConnectionPool_HealthCheck(t *testing.T) {
 
 // TestConnectionPool_HAFailover tests high availability failover
 func TestConnectionPool_HAFailover(t *testing.T) {
-	pool := New(8080, NewRoundRobinBalancer(), newTestLogger())
+	pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
 	defer pool.Stop()
 
 	// Add 3 healthy clients
@@ -163,7 +163,7 @@ func TestConnectionPool_HAFailover(t *testing.T) {
 
 // TestConnectionPool_MinimalDowntime tests that downtime is minimal during failover
 func TestConnectionPool_MinimalDowntime(t *testing.T) {
-	pool := New(8080, NewRoundRobinBalancer(), newTestLogger())
+	pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
 	defer pool.Stop()
 
 	// Add 2 clients
@@ -226,7 +226,7 @@ func TestConnectionPool_MinimalDowntime(t *testing.T) {
 
 // TestConnectionPool_ConcurrentOperations tests thread safety
 func TestConnectionPool_ConcurrentOperations(t *testing.T) {
-	pool := New(8080, NewRoundRobinBalancer(), newTestLogger())
+	pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
 	defer pool.Stop()
 
 	var wg sync.WaitGroup
@@ -273,7 +273,7 @@ func TestConnectionPool_ConcurrentOperations(t *testing.T) {
 
 // TestConnectionPool_AllClientsDown tests behavior when all clients go down
 func TestConnectionPool_AllClientsDown(t *testing.T) {
-	pool := New(8080, NewRoundRobinBalancer(), newTestLogger())
+	pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
 	defer pool.Stop()
 
 	// Add 2 healthy clients
@@ -311,7 +311,7 @@ func TestConnectionPool_AllClientsDown(t *testing.T) {
 
 // TestConnectionPool_RapidFailover tests rapid client failures
 func TestConnectionPool_RapidFailover(t *testing.T) {
-	pool := New(8080, NewRoundRobinBalancer(), newTestLogger())
+	pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
 	defer pool.Stop()
 
 	// Add 5 clients
@@ -352,7 +352,7 @@ func TestConnectionPool_RapidFailover(t *testing.T) {
 
 // BenchmarkConnectionPool_Select benchmarks client selection
 func BenchmarkConnectionPool_Select(b *testing.B) {
-	pool := New(8080, NewRoundRobinBalancer(), newTestLogger())
+	pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
 	defer pool.Stop()
 
 	// Add 10 clients
@@ -373,7 +373,7 @@ func BenchmarkConnectionPool_Select(b *testing.B) {
 
 // BenchmarkConnectionPool_Add benchmarks adding clients to pool
 func BenchmarkConnectionPool_Add(b *testing.B) {
-	pool := New(8080, NewRoundRobinBalancer(), newTestLogger())
+	pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
 	defer pool.Stop()
 
 	// Pre-create clients to avoid allocation in the loop
@@ -398,7 +398,7 @@ func BenchmarkConnectionPool_Add(b *testing.B) {
 // BenchmarkConnectionPool_Remove benchmarks removing clients from pool
 func BenchmarkConnectionPool_Remove(b *testing.B) {
 	// Pre-populate pool with clients
-	pool := New(8080, NewRoundRobinBalancer(), newTestLogger())
+	pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
 	defer pool.Stop()
 
 	clientIDs := make([]string, b.N)
@@ -426,7 +426,7 @@ func BenchmarkConnectionPool_Select_Sizes(b *testing.B) {
 
 	for _, size := range sizes {
 		b.Run(fmt.Sprintf("clients_%d", size), func(b *testing.B) {
-			pool := New(8080, NewRoundRobinBalancer(), newTestLogger())
+			pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
 			defer pool.Stop()
 
 			// Populate pool with clients
@@ -452,7 +452,7 @@ func BenchmarkConnectionPool_Select_Sizes(b *testing.B) {
 
 // BenchmarkConnectionPool_Get benchmarks client lookup by ID
 func BenchmarkConnectionPool_Get(b *testing.B) {
-	pool := New(8080, NewRoundRobinBalancer(), newTestLogger())
+	pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
 	defer pool.Stop()
 
 	// Populate pool with 100 clients
@@ -478,7 +478,7 @@ func BenchmarkConnectionPool_Get(b *testing.B) {
 
 // BenchmarkConnectionPool_Parallel benchmarks concurrent pool operations
 func BenchmarkConnectionPool_Parallel(b *testing.B) {
-	pool := New(8080, NewRoundRobinBalancer(), newTestLogger())
+	pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
 	defer pool.Stop()
 
 	// Populate pool with 100 clients
@@ -516,7 +516,7 @@ func BenchmarkConnectionPool_Parallel(b *testing.B) {
 // Validates: Requirements 2.3
 func TestCacheInvalidationCorrectness_Property(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		pool := New(8080, NewRoundRobinBalancer(), newTestLogger())
+		pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
 		defer pool.Stop()
 
 		// Generate initial client count (1-20)
@@ -613,7 +613,7 @@ func TestPoolSelectOverheadRatio_Property(t *testing.T) {
 		// Generate random pool size (50-200) - larger sizes for more stable measurements
 		poolSize := rapid.IntRange(50, 200).Draw(t, "poolSize")
 
-		pool := New(8080, NewRoundRobinBalancer(), newTestLogger())
+		pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
 		defer pool.Stop()
 
 		// Create clients
@@ -686,7 +686,7 @@ func TestConcurrentPoolThroughput_Property(t *testing.T) {
 		// Generate random pool size (20-100)
 		poolSize := rapid.IntRange(20, 100).Draw(t, "poolSize")
 
-		pool := New(8080, NewRoundRobinBalancer(), newTestLogger())
+		pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
 		defer pool.Stop()
 
 		// Populate pool with clients
@@ -774,7 +774,7 @@ func TestHealthUpdateEfficiency_Property(t *testing.T) {
 		largePoolSize := rapid.IntRange(500, 1000).Draw(t, "largePoolSize")
 
 		// Create small pool
-		smallPool := New(8080, NewRoundRobinBalancer(), newTestLogger())
+		smallPool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
 		defer smallPool.Stop()
 
 		for i := 0; i < smallPoolSize; i++ {
@@ -788,7 +788,7 @@ func TestHealthUpdateEfficiency_Property(t *testing.T) {
 		}
 
 		// Create large pool
-		largePool := New(8080, NewRoundRobinBalancer(), newTestLogger())
+		largePool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
 		defer largePool.Stop()
 
 		for i := 0; i < largePoolSize; i++ {

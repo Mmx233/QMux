@@ -122,7 +122,7 @@ func BenchmarkDecodeMessage(b *testing.B) {
 			ConnID:     12345,
 			Protocol:   "tcp",
 			SourceAddr: "192.168.1.100:54321",
-			DestPort:   8080,
+			DestAddr:   "0.0.0.0:8080",
 			Timestamp:  1234567890,
 		}},
 		{"Heartbeat", MsgTypeHeartbeat, HeartbeatMsg{
@@ -198,7 +198,7 @@ func BenchmarkTypedMessages(b *testing.B) {
 
 		for i := 0; i < b.N; i++ {
 			buf.Reset()
-			if err := WriteNewConn(&buf, 12345, "tcp", "192.168.1.100:54321", 8080, 1234567890); err != nil {
+			if err := WriteNewConn(&buf, 12345, "tcp", "192.168.1.100:54321", "0.0.0.0:8080", 1234567890); err != nil {
 				b.Fatalf("WriteNewConn failed: %v", err)
 			}
 		}

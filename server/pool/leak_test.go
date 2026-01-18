@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -27,7 +28,7 @@ func TestConnectionPool_Stop_NoGoroutineLeak(t *testing.T) {
 
 	// Create and stop multiple pools
 	for i := 0; i < 10; i++ {
-		pool := New(8443+i, balancer, logger)
+		pool := New(fmt.Sprintf("127.0.0.1:%d", 8443+i), balancer, logger)
 		// Give health check goroutine time to start
 		time.Sleep(10 * time.Millisecond)
 		pool.Stop()
@@ -47,7 +48,7 @@ func TestConnectionPool_RapidCreateStop_NoLeak(t *testing.T) {
 
 	// Rapid create/stop cycle
 	for i := 0; i < 50; i++ {
-		pool := New(8443, balancer, logger)
+		pool := New("127.0.0.1:8443", balancer, logger)
 		pool.Stop()
 	}
 
@@ -62,7 +63,7 @@ func TestConnectionPool_AddRemove_NoLeak(t *testing.T) {
 
 	logger := zerolog.Nop()
 	balancer := NewRoundRobinBalancer()
-	pool := New(8443, balancer, logger)
+	pool := New("127.0.0.1:8443", balancer, logger)
 	defer pool.Stop()
 
 	// Add and remove many clients
@@ -96,7 +97,7 @@ func TestConnectionPool_ConcurrentOperations_NoLeak(t *testing.T) {
 
 	logger := zerolog.Nop()
 	balancer := NewRoundRobinBalancer()
-	pool := New(8443, balancer, logger)
+	pool := New("127.0.0.1:8443", balancer, logger)
 	defer pool.Stop()
 
 	var wg sync.WaitGroup
@@ -157,7 +158,7 @@ func TestConnectionPool_HealthCheckLoop_NoLeak(t *testing.T) {
 	logger := zerolog.Nop()
 	balancer := NewRoundRobinBalancer()
 
-	pool := New(8443, balancer, logger)
+	pool := New("127.0.0.1:8443", balancer, logger)
 
 	// Set short health check interval
 	pool.SetHealthCheckInterval(10 * time.Millisecond)
@@ -190,7 +191,7 @@ func TestConnectionPool_MultipleStops_NoLeak(t *testing.T) {
 
 	logger := zerolog.Nop()
 	balancer := NewRoundRobinBalancer()
-	pool := New(8443, balancer, logger)
+	pool := New("127.0.0.1:8443", balancer, logger)
 
 	// Multiple stops should be safe
 	pool.Stop()
@@ -231,7 +232,7 @@ func TestConnectionPool_ClientHealthTransitions_NoLeak(t *testing.T) {
 
 	logger := zerolog.Nop()
 	balancer := NewRoundRobinBalancer()
-	pool := New(8443, balancer, logger)
+	pool := New("127.0.0.1:8443", balancer, logger)
 	defer pool.Stop()
 
 	// Add a client

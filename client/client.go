@@ -156,7 +156,7 @@ func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *Serv
 		Uint64("conn_id", msg.ConnID).
 		Str("protocol", msg.Protocol).
 		Str("source", msg.SourceAddr).
-		Uint16("dest_port", msg.DestPort).
+		Str("dest_addr", msg.DestAddr).
 		Str("server", sc.ServerAddr()).
 		Logger()
 

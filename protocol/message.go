@@ -37,7 +37,7 @@ type NewConnMsg struct {
 	ConnID     uint64 // Unique connection ID
 	Protocol   string // "tcp" or "udp"
 	SourceAddr string // Original client address (IP:port)
-	DestPort   uint16 // Target port on traffic listener
+	DestAddr   string // Target address on traffic listener (IP:port)
 	Timestamp  int64  // Connection timestamp
 }
 

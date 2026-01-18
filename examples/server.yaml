@@ -4,14 +4,11 @@
 # Listener configuration
 # Each listener defines a QUIC endpoint that accepts client connections
 listeners:
-  # IP address to bind to (use "0.0.0.0" for all interfaces)
-  - ip: "0.0.0.0"
+  # Address for QUIC control connections (IP:port format)
+  - quic_addr: "0.0.0.0:8443"
 
-    # Port for QUIC control connections
-    port: 8443
-
-    # Port for forwarded traffic (1:1 mapped to this listener)
-    traffic_port: 8080
+    # Address for forwarded traffic (IP:port format, 1:1 mapped to this listener)
+    traffic_addr: "0.0.0.0:8080"
 
     # Protocol to accept: "tcp", "udp", or "both"
     protocol: "both"

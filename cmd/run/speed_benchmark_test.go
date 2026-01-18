@@ -592,8 +592,8 @@ func setupTCPDiscardServerForTest(t *testing.T, certDir string) (net.Listener, i
 
 	serverConfig := &config.Server{
 		Listeners: []config.QuicListener{{
-			Listen:      config.Listen{IP: "127.0.0.1", Port: quicPort},
-			TrafficPort: trafficPort,
+			QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
+			TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
 			Protocol:    "tcp",
 			Quic:        quicConfig,
 		}},
@@ -666,8 +666,8 @@ func setupUDPDiscardServerForTest(t *testing.T, certDir string) (net.PacketConn,
 
 	serverConfig := &config.Server{
 		Listeners: []config.QuicListener{{
-			Listen:      config.Listen{IP: "127.0.0.1", Port: quicPort},
-			TrafficPort: trafficPort,
+			QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
+			TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
 			Protocol:    "udp",
 			Quic:        quicConfig,
 		}},
@@ -1114,8 +1114,8 @@ func setupTCPEchoServer(b *testing.B, certDir string) (net.Listener, int) {
 
 	serverConfig := &config.Server{
 		Listeners: []config.QuicListener{{
-			Listen:      config.Listen{IP: "127.0.0.1", Port: quicPort},
-			TrafficPort: trafficPort,
+			QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
+			TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
 			Protocol:    "tcp",
 			Quic:        quicConfig,
 		}},
@@ -1184,8 +1184,8 @@ func setupTCPEchoServerForTest(t *testing.T, certDir string) (net.Listener, int)
 
 	serverConfig := &config.Server{
 		Listeners: []config.QuicListener{{
-			Listen:      config.Listen{IP: "127.0.0.1", Port: quicPort},
-			TrafficPort: trafficPort,
+			QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
+			TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
 			Protocol:    "tcp",
 			Quic:        quicConfig,
 		}},
@@ -1254,8 +1254,8 @@ func setupUDPEchoServer(b *testing.B, certDir string) (net.PacketConn, int) {
 
 	serverConfig := &config.Server{
 		Listeners: []config.QuicListener{{
-			Listen:      config.Listen{IP: "127.0.0.1", Port: quicPort},
-			TrafficPort: trafficPort,
+			QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
+			TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
 			Protocol:    "udp",
 			Quic:        quicConfig,
 		}},
@@ -1324,8 +1324,8 @@ func setupUDPEchoServerForTest(t *testing.T, certDir string) (net.PacketConn, in
 
 	serverConfig := &config.Server{
 		Listeners: []config.QuicListener{{
-			Listen:      config.Listen{IP: "127.0.0.1", Port: quicPort},
-			TrafficPort: trafficPort,
+			QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
+			TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
 			Protocol:    "udp",
 			Quic:        quicConfig,
 		}},

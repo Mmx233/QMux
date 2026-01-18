@@ -49,7 +49,7 @@ type UDPHandler struct {
 
 	pool                *pool.ConnectionPool
 	packetConn          *net.UDPConn
-	port                int
+	addr                string
 	enableFragmentation bool
 	logger              zerolog.Logger
 	ctx                 context.Context
@@ -63,7 +63,7 @@ type UDPHandler struct {
 
 // startUDP starts the UDP listener with datagram support
 func (l *Listener) startUDP() error {
-	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", l.Port))
+	addr, err := net.ResolveUDPAddr("udp", l.Addr)
 	if err != nil {
 		return fmt.Errorf("resolve UDP addr: %w", err)
 	}
@@ -88,7 +88,7 @@ func (l *Listener) startUDP() error {
 	handler := &UDPHandler{
 		pool:                l.Pool,
 		packetConn:          conn,
-		port:                l.Port,
+		addr:                l.Addr,
 		enableFragmentation: l.EnableFragmentation,
 		logger:              l.logger,
 		ctx:                 ctx,

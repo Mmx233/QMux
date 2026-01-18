@@ -98,11 +98,8 @@ func TestTCPReverseProxy_MTLS(t *testing.T) {
 	serverConfig := &config.Server{
 		Listeners: []config.QuicListener{
 			{
-				Listen: config.Listen{
-					IP:   "127.0.0.1",
-					Port: quicPort,
-				},
-				TrafficPort: trafficPort,
+				QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
+				TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
 				Protocol:    "tcp",
 			},
 		},
@@ -259,11 +256,8 @@ func TestUDPReverseProxy_MTLS(t *testing.T) {
 	serverConfig := &config.Server{
 		Listeners: []config.QuicListener{
 			{
-				Listen: config.Listen{
-					IP:   "127.0.0.1",
-					Port: quicPort,
-				},
-				TrafficPort: trafficPort,
+				QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
+				TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
 				Protocol:    "udp",
 			},
 		},
@@ -405,11 +399,8 @@ func TestConcurrentConnections_MTLS(t *testing.T) {
 	serverConfig := &config.Server{
 		Listeners: []config.QuicListener{
 			{
-				Listen: config.Listen{
-					IP:   "127.0.0.1",
-					Port: quicPort,
-				},
-				TrafficPort: trafficPort,
+				QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
+				TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
 				Protocol:    "tcp",
 			},
 		},
@@ -532,11 +523,8 @@ func TestClientReconnection_MTLS(t *testing.T) {
 	serverConfig := &config.Server{
 		Listeners: []config.QuicListener{
 			{
-				Listen: config.Listen{
-					IP:   "127.0.0.1",
-					Port: quicPort,
-				},
-				TrafficPort: trafficPort,
+				QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
+				TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
 				Protocol:    "tcp",
 			},
 		},
@@ -683,11 +671,8 @@ func BenchmarkClientAuth_MTLS(b *testing.B) {
 	serverConfig := &config.Server{
 		Listeners: []config.QuicListener{
 			{
-				Listen: config.Listen{
-					IP:   "127.0.0.1",
-					Port: quicPort,
-				},
-				TrafficPort: trafficPort,
+				QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
+				TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
 				Protocol:    "tcp",
 			},
 		},
@@ -779,11 +764,8 @@ func BenchmarkTCPConnection_MTLS(b *testing.B) {
 	serverConfig := &config.Server{
 		Listeners: []config.QuicListener{
 			{
-				Listen: config.Listen{
-					IP:   "127.0.0.1",
-					Port: quicPort,
-				},
-				TrafficPort: trafficPort,
+				QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
+				TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
 				Protocol:    "tcp",
 			},
 		},
@@ -883,11 +865,8 @@ func BenchmarkUDPConnection_MTLS(b *testing.B) {
 	serverConfig := &config.Server{
 		Listeners: []config.QuicListener{
 			{
-				Listen: config.Listen{
-					IP:   "127.0.0.1",
-					Port: quicPort,
-				},
-				TrafficPort: trafficPort,
+				QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
+				TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
 				Protocol:    "udp",
 			},
 		},
@@ -986,11 +965,8 @@ func BenchmarkTCPThroughput_MTLS(b *testing.B) {
 	serverConfig := &config.Server{
 		Listeners: []config.QuicListener{
 			{
-				Listen: config.Listen{
-					IP:   "127.0.0.1",
-					Port: quicPort,
-				},
-				TrafficPort: trafficPort,
+				QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
+				TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
 				Protocol:    "tcp",
 			},
 		},
@@ -1092,11 +1068,8 @@ func TestMultiServerConnection_MTLS(t *testing.T) {
 	serverConfig1 := &config.Server{
 		Listeners: []config.QuicListener{
 			{
-				Listen: config.Listen{
-					IP:   "127.0.0.1",
-					Port: quicPort1,
-				},
-				TrafficPort: trafficPort1,
+				QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort1),
+				TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort1),
 				Protocol:    "tcp",
 			},
 		},
@@ -1116,11 +1089,8 @@ func TestMultiServerConnection_MTLS(t *testing.T) {
 	serverConfig2 := &config.Server{
 		Listeners: []config.QuicListener{
 			{
-				Listen: config.Listen{
-					IP:   "127.0.0.1",
-					Port: quicPort2,
-				},
-				TrafficPort: trafficPort2,
+				QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort2),
+				TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort2),
 				Protocol:    "tcp",
 			},
 		},
@@ -1266,11 +1236,8 @@ func TestMultiServerFailover_MTLS(t *testing.T) {
 	serverConfig1 := &config.Server{
 		Listeners: []config.QuicListener{
 			{
-				Listen: config.Listen{
-					IP:   "127.0.0.1",
-					Port: quicPort1,
-				},
-				TrafficPort: trafficPort1,
+				QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort1),
+				TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort1),
 				Protocol:    "tcp",
 			},
 		},
@@ -1290,11 +1257,8 @@ func TestMultiServerFailover_MTLS(t *testing.T) {
 	serverConfig2 := &config.Server{
 		Listeners: []config.QuicListener{
 			{
-				Listen: config.Listen{
-					IP:   "127.0.0.1",
-					Port: quicPort2,
-				},
-				TrafficPort: trafficPort2,
+				QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort2),
+				TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort2),
 				Protocol:    "tcp",
 			},
 		},
@@ -1437,11 +1401,8 @@ func TestMultiServerLoadBalancing_MTLS(t *testing.T) {
 	serverConfig1 := &config.Server{
 		Listeners: []config.QuicListener{
 			{
-				Listen: config.Listen{
-					IP:   "127.0.0.1",
-					Port: quicPort1,
-				},
-				TrafficPort: trafficPort1,
+				QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort1),
+				TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort1),
 				Protocol:    "tcp",
 			},
 		},
@@ -1459,11 +1420,8 @@ func TestMultiServerLoadBalancing_MTLS(t *testing.T) {
 	serverConfig2 := &config.Server{
 		Listeners: []config.QuicListener{
 			{
-				Listen: config.Listen{
-					IP:   "127.0.0.1",
-					Port: quicPort2,
-				},
-				TrafficPort: trafficPort2,
+				QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort2),
+				TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort2),
 				Protocol:    "tcp",
 			},
 		},

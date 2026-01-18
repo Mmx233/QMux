@@ -14,7 +14,7 @@ import (
 // Manager manages traffic listeners
 type Manager struct {
 	config    *config.Server
-	pools     map[int]*pool.ConnectionPool // quicPort -> pool
+	pools     map[string]*pool.ConnectionPool // quicAddr -> pool
 	listeners []*Listener
 	logger    zerolog.Logger
 	mu        sync.Mutex
@@ -22,7 +22,7 @@ type Manager struct {
 
 // Listener represents a traffic listener
 type Listener struct {
-	Port                int
+	Addr                string
 	Protocol            string // "tcp", "udp", or "both"
 	EnableFragmentation bool   // UDP fragmentation enabled
 	TCPListener         net.Listener
@@ -35,7 +35,7 @@ type Listener struct {
 }
 
 // NewManager creates a new traffic manager
-func NewManager(conf *config.Server, pools map[int]*pool.ConnectionPool, logger zerolog.Logger) *Manager {
+func NewManager(conf *config.Server, pools map[string]*pool.ConnectionPool, logger zerolog.Logger) *Manager {
 	return &Manager{
 		config:    conf,
 		pools:     pools,
@@ -49,24 +49,24 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Create 1:1 mapping between QUIC listeners and traffic ports
+	// Create 1:1 mapping between QUIC listeners and traffic addresses
 	for _, listenerConf := range m.config.Listeners {
-		poolInst := m.pools[listenerConf.Port]
+		poolInst := m.pools[listenerConf.QuicAddr]
 		if poolInst == nil {
 			m.logger.Warn().
-				Int("quic_port", listenerConf.Port).
+				Str("quic_addr", listenerConf.QuicAddr).
 				Msg("no connection pool found for QUIC listener, skipping")
 			continue
 		}
 
 		listener := &Listener{
-			Port:                listenerConf.TrafficPort,
+			Addr:                listenerConf.TrafficAddr,
 			Protocol:            listenerConf.Protocol,
 			EnableFragmentation: listenerConf.UDP.IsFragmentationEnabled(),
 			Pool:                poolInst,
 			logger: m.logger.With().
-				Int("traffic_port", listenerConf.TrafficPort).
-				Int("quic_port", listenerConf.Port).
+				Str("traffic_addr", listenerConf.TrafficAddr).
+				Str("quic_addr", listenerConf.QuicAddr).
 				Logger(),
 		}
 		listener.ctx, listener.cancel = context.WithCancel(ctx)
@@ -74,21 +74,21 @@ func (m *Manager) Start(ctx context.Context) error {
 		// Start TCP listener
 		if listenerConf.Protocol == "tcp" || listenerConf.Protocol == "both" {
 			if err := listener.startTCP(); err != nil {
-				return fmt.Errorf("start TCP listener on port %d: %w", listenerConf.TrafficPort, err)
+				return fmt.Errorf("start TCP listener on %s: %w", listenerConf.TrafficAddr, err)
 			}
 		}
 
 		// Start UDP listener
 		if listenerConf.Protocol == "udp" || listenerConf.Protocol == "both" {
 			if err := listener.startUDP(); err != nil {
-				return fmt.Errorf("start UDP listener on port %d: %w", listenerConf.TrafficPort, err)
+				return fmt.Errorf("start UDP listener on %s: %w", listenerConf.TrafficAddr, err)
 			}
 		}
 
 		m.listeners = append(m.listeners, listener)
 		m.logger.Info().
-			Int("quic_port", listenerConf.Port).
-			Int("traffic_port", listenerConf.TrafficPort).
+			Str("quic_addr", listenerConf.QuicAddr).
+			Str("traffic_addr", listenerConf.TrafficAddr).
 			Str("protocol", listenerConf.Protocol).
 			Msg("traffic listener started")
 	}

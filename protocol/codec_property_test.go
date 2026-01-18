@@ -74,14 +74,19 @@ func TestNewConnMsgDecodeAllocation_Property(t *testing.T) {
 				string(rune('0'+port/10000))+string(rune('0'+(port/1000)%10))+string(rune('0'+(port/100)%10))+
 				string(rune('0'+(port/10)%10))+string(rune('0'+port%10)),
 		).Draw(t, "sourceAddr")
-		destPort := uint16(rapid.IntRange(1, 65535).Draw(t, "destPort"))
+		destPort := rapid.IntRange(1, 65535).Draw(t, "destPort")
+		destAddr := rapid.Just(
+			"0.0.0.0:"+
+				string(rune('0'+destPort/10000))+string(rune('0'+(destPort/1000)%10))+string(rune('0'+(destPort/100)%10))+
+				string(rune('0'+(destPort/10)%10))+string(rune('0'+destPort%10)),
+		).Draw(t, "destAddr")
 		timestamp := rapid.Int64().Draw(t, "timestamp")
 
 		newConnMsg := NewConnMsg{
 			ConnID:     connID,
 			Protocol:   protocol,
 			SourceAddr: sourceAddr,
-			DestPort:   destPort,
+			DestAddr:   destAddr,
 			Timestamp:  timestamp,
 		}
 
@@ -97,11 +102,11 @@ func TestNewConnMsgDecodeAllocation_Property(t *testing.T) {
 			_ = DecodeMessage(newConnJSON, &msg)
 		})
 
-		// Property: NewConnMsg decode should produce ≤8 allocations (improved from 7 in std lib)
-		// Note: The design target was ≤4, but json-iterator achieves 8 which provides
-		// significant speed improvements (3x faster) despite similar allocation count.
-		if newConnAllocs > 8 {
-			t.Errorf("NewConnMsg decode: expected ≤8 allocations, got %.0f", newConnAllocs)
+		// Property: NewConnMsg decode should produce ≤9 allocations
+		// Note: Changed from ≤8 after DestPort (uint16) was replaced with DestAddr (string)
+		// which requires an additional allocation for the string.
+		if newConnAllocs > 9 {
+			t.Errorf("NewConnMsg decode: expected ≤9 allocations, got %.0f", newConnAllocs)
 		}
 	})
 }

@@ -21,7 +21,7 @@ import (
 // Server represents the QMux server
 type Server struct {
 	config         *config.Server
-	pools          map[int]*pool.ConnectionPool // quicPort -> pool
+	pools          map[string]*pool.ConnectionPool // quicAddr -> pool
 	trafficManager *traffic.Manager
 	authenticator  auth.Auth
 	logger         zerolog.Logger
@@ -55,10 +55,10 @@ func New(conf *config.Server) (*Server, error) {
 	logger.Info().Str("method", method).Msg("authentication enabled")
 
 	// Create connection pools for each listener
-	pools := make(map[int]*pool.ConnectionPool)
+	pools := make(map[string]*pool.ConnectionPool) // quicAddr -> pool
 	for _, listener := range conf.Listeners {
 		balancer := pool.NewRoundRobinBalancer()
-		p := pool.New(listener.Port, balancer, logger)
+		p := pool.New(listener.QuicAddr, balancer, logger)
 
 		// Configure health check intervals if specified
 		if conf.HealthCheckInterval > 0 {
@@ -68,9 +68,9 @@ func New(conf *config.Server) (*Server, error) {
 			p.SetHealthCheckTimeout(conf.HealthCheckTimeout)
 		}
 
-		pools[listener.Port] = p
+		pools[listener.QuicAddr] = p
 		logger.Info().
-			Int("port", listener.Port).
+			Str("quic_addr", listener.QuicAddr).
 			Str("balancer", balancer.Name()).
 			Msg("created connection pool")
 	}
@@ -101,7 +101,7 @@ func Start(ctx context.Context, conf *config.Server) error {
 	for _, listenerConf := range conf.Listeners {
 		go func(lc config.QuicListener) {
 			if err := srv.startListener(ctx, lc); err != nil {
-				errCh <- fmt.Errorf("listener on port %d: %w", lc.Port, err)
+				errCh <- fmt.Errorf("listener on %s: %w", lc.QuicAddr, err)
 			}
 		}(listenerConf)
 	}
@@ -118,18 +118,16 @@ func Start(ctx context.Context, conf *config.Server) error {
 
 // startListener starts a QUIC listener
 func (s *Server) startListener(ctx context.Context, listenerConf config.QuicListener) error {
-	logger := s.logger.With().Int("port", listenerConf.Port).Logger()
+	logger := s.logger.With().Str("quic_addr", listenerConf.QuicAddr).Logger()
 
-	ip, err := listenerConf.GetIP()
+	// Parse QUIC address
+	udpAddr, err := net.ResolveUDPAddr("udp", listenerConf.QuicAddr)
 	if err != nil {
-		return fmt.Errorf("get IP: %w", err)
+		return fmt.Errorf("resolve QUIC address: %w", err)
 	}
 
 	// Create UDP listener
-	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{
-		IP:   ip,
-		Port: listenerConf.Port,
-	})
+	udpConn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
 		return fmt.Errorf("listen UDP: %w", err)
 	}
@@ -203,9 +201,8 @@ func (s *Server) startListener(ctx context.Context, listenerConf config.QuicList
 	}
 
 	logger.Info().
-		Str("ip", ip.String()).
-		Int("quic_port", listenerConf.Port).
-		Int("traffic_port", listenerConf.TrafficPort).
+		Str("quic_addr", listenerConf.QuicAddr).
+		Str("traffic_addr", listenerConf.TrafficAddr).
 		Str("protocol", listenerConf.Protocol).
 		Msg("QUIC listener started")
 
@@ -220,15 +217,15 @@ func (s *Server) startListener(ctx context.Context, listenerConf config.QuicList
 			continue
 		}
 
-		go s.handleConnection(ctx, conn, listenerConf.Port)
+		go s.handleConnection(ctx, conn, listenerConf.QuicAddr)
 	}
 }
 
 // handleConnection handles a new QUIC connection
-func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn, quicPort int) {
+func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn, quicAddr string) {
 	logger := s.logger.With().
 		Str("remote", conn.RemoteAddr().String()).
-		Int("quic_port", quicPort).
+		Str("quic_addr", quicAddr).
 		Logger()
 
 	logger.Info().Msg("new connection")
@@ -280,7 +277,7 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn, quicPort
 	}
 
 	// Add to pool
-	poolInst := s.pools[quicPort]
+	poolInst := s.pools[quicAddr]
 	if err := poolInst.Add(regMsg.ClientID, clientConn); err != nil {
 		logger.Error().Err(err).Msg("add to pool failed")
 		protocol.WriteRegisterAck(controlStream, false, err.Error())
@@ -296,7 +293,7 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn, quicPort
 	}
 
 	// Start heartbeat handler
-	go s.handleHeartbeat(ctx, controlStream, regMsg.ClientID, quicPort)
+	go s.handleHeartbeat(ctx, controlStream, regMsg.ClientID, quicAddr)
 
 	// Wait for connection to close
 	<-conn.Context().Done()
@@ -307,13 +304,13 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn, quicPort
 }
 
 // handleHeartbeat handles heartbeat messages
-func (s *Server) handleHeartbeat(ctx context.Context, stream *quic.Stream, clientID string, quicPort int) {
+func (s *Server) handleHeartbeat(ctx context.Context, stream *quic.Stream, clientID string, quicAddr string) {
 	logger := s.logger.With().
 		Str("client_id", clientID).
-		Int("quic_port", quicPort).
+		Str("quic_addr", quicAddr).
 		Logger()
 
-	poolInst := s.pools[quicPort]
+	poolInst := s.pools[quicAddr]
 
 	for {
 		select {

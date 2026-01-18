@@ -120,12 +120,12 @@ func WriteHeartbeat(w io.Writer, timestamp int64) error {
 }
 
 // WriteNewConn writes a new connection message
-func WriteNewConn(w io.Writer, connID uint64, protocol, sourceAddr string, destPort uint16, timestamp int64) error {
+func WriteNewConn(w io.Writer, connID uint64, protocol, sourceAddr, destAddr string, timestamp int64) error {
 	msg := NewConnMsg{
 		ConnID:     connID,
 		Protocol:   protocol,
 		SourceAddr: sourceAddr,
-		DestPort:   destPort,
+		DestAddr:   destAddr,
 		Timestamp:  timestamp,
 	}
 	return WriteMessage(w, MsgTypeNewConn, msg)

@@ -16,7 +16,7 @@ func (l *Listener) startTCP() error {
 	lc := net.ListenConfig{
 		Control: setSocketOptions,
 	}
-	listener, err := lc.Listen(l.ctx, "tcp", fmt.Sprintf(":%d", l.Port))
+	listener, err := lc.Listen(l.ctx, "tcp", l.Addr)
 	if err != nil {
 		return fmt.Errorf("listen TCP: %w", err)
 	}
@@ -90,7 +90,7 @@ func (l *Listener) handleTCPConnection(conn net.Conn) {
 		connID,
 		"tcp",
 		conn.RemoteAddr().String(),
-		uint16(l.Port),
+		l.Addr,
 		time.Now().Unix(),
 	)
 	if err != nil {

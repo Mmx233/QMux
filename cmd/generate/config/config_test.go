@@ -28,9 +28,8 @@ func TestServerConfigTemplateFields(t *testing.T) {
 
 	// Verify listeners
 	assert.NotEmpty(t, cfg.Listeners, "listeners should not be empty")
-	assert.NotEmpty(t, cfg.Listeners[0].IP, "listener IP should not be empty")
-	assert.Greater(t, cfg.Listeners[0].Port, 0, "listener port should be greater than 0")
-	assert.Greater(t, cfg.Listeners[0].TrafficPort, 0, "traffic port should be greater than 0")
+	assert.NotEmpty(t, cfg.Listeners[0].QuicAddr, "listener quic_addr should not be empty")
+	assert.NotEmpty(t, cfg.Listeners[0].TrafficAddr, "traffic_addr should not be empty")
 	assert.NotEmpty(t, cfg.Listeners[0].Protocol, "protocol should not be empty")
 
 	// Verify auth

@@ -192,8 +192,8 @@ func runIperf3ThroughQMux(t *testing.T, certDir string, protocol string, threads
 
 	serverConfig := &config.Server{
 		Listeners: []config.QuicListener{{
-			Listen:      config.Listen{IP: "127.0.0.1", Port: quicPort},
-			TrafficPort: trafficPort,
+			QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
+			TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
 			Protocol:    qmuxProtocol,
 			Quic:        quicConfig,
 		}},
@@ -457,8 +457,8 @@ func runIperf3QMuxWithResult(t *testing.T, certDir string, protocol string, thre
 
 	serverConfig := &config.Server{
 		Listeners: []config.QuicListener{{
-			Listen:      config.Listen{IP: "127.0.0.1", Port: quicPort},
-			TrafficPort: trafficPort,
+			QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
+			TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
 			Protocol:    qmuxProtocol,
 			Quic:        quicConfig,
 		}},
@@ -561,8 +561,8 @@ func TestIperf3LiveOutput(t *testing.T) {
 
 	serverConfig := &config.Server{
 		Listeners: []config.QuicListener{{
-			Listen:      config.Listen{IP: "127.0.0.1", Port: quicPort},
-			TrafficPort: trafficPort,
+			QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
+			TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
 			Protocol:    "tcp",
 			Quic:        quicConfig,
 		}},
