@@ -26,8 +26,9 @@ type Server struct {
 type QuicListener struct {
 	Listen      `yaml:",inline"`
 	Quic        `yaml:",inline"`
-	TrafficPort int    `yaml:"traffic_port"` // 1:1 mapped traffic port for this listener
-	Protocol    string `yaml:"protocol"`     // "tcp", "udp", or "both"
+	TrafficPort int       `yaml:"traffic_port"` // 1:1 mapped traffic port for this listener
+	Protocol    string    `yaml:"protocol"`     // "tcp", "udp", or "both"
+	UDP         UDPConfig `yaml:"udp"`          // UDP-specific configuration
 }
 
 type ServerAuth struct {

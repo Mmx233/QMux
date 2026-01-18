@@ -18,13 +18,14 @@ import (
 
 // Client represents the QMux client
 type Client struct {
-	config     *config.Client
-	connMgr    *ConnectionManager
-	localConns sync.Map // connID -> net.Conn
-	logger     zerolog.Logger
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
+	config      *config.Client
+	connMgr     *ConnectionManager
+	udpHandlers sync.Map // serverAddr -> *UDPHandler
+	localConns  sync.Map // connID -> net.Conn
+	logger      zerolog.Logger
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
 }
 
 // New creates a new client
@@ -93,13 +94,25 @@ func (c *Client) Start(ctx context.Context) error {
 	return c.shutdown()
 }
 
-// startAcceptingStreams starts goroutines to accept streams from all connections
+// startAcceptingStreams starts goroutines to accept streams and datagrams from all connections
 func (c *Client) startAcceptingStreams(ctx context.Context) {
 	// Get all connections and start accepting streams from each
 	connections := c.connMgr.GetAllConnections()
 	for _, sc := range connections {
 		c.wg.Add(1)
 		go c.acceptStreamsFromConnection(ctx, sc)
+
+		// Start UDP datagram handler for this connection
+		if sc.Connection() != nil {
+			udpHandler := NewUDPHandler(
+				c.config.Local.Host,
+				c.config.Local.Port,
+				c.config.UDP.IsFragmentationEnabled(),
+				c.logger,
+			)
+			c.udpHandlers.Store(sc.ServerAddr(), udpHandler)
+			udpHandler.Start(ctx, *sc.Connection())
+		}
 	}
 }
 
@@ -159,28 +172,26 @@ func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *Serv
 	}
 	defer localConn.Close()
 
+	// Optimize TCP connection
+	if tc, ok := localConn.(*net.TCPConn); ok {
+		if err := tc.SetNoDelay(true); err != nil {
+			logger.Warn().Err(err).Msg("set TCP_NODELAY failed")
+		}
+		if err := tc.SetReadBuffer(512 * 1024); err != nil {
+			logger.Warn().Err(err).Msg("set read buffer failed")
+		}
+		if err := tc.SetWriteBuffer(512 * 1024); err != nil {
+			logger.Warn().Err(err).Msg("set write buffer failed")
+		}
+	}
+
 	c.localConns.Store(msg.ConnID, localConn)
 	defer c.localConns.Delete(msg.ConnID)
 
 	logger.Info().Str("local_addr", localAddr).Msg("connected to local service")
 
-	// Bidirectional proxy
-	errCh := make(chan error, 2)
-
-	// Local -> Server
-	go func() {
-		_, err := io.Copy(stream, localConn)
-		errCh <- err
-	}()
-
-	// Server -> Local
-	go func() {
-		_, err := io.Copy(localConn, stream)
-		errCh <- err
-	}()
-
-	// Wait for either direction to close
-	err = <-errCh
+	// Use optimized relay
+	err = protocol.Relay(localConn, stream)
 	if err != nil && !errors.Is(err, io.EOF) {
 		logger.Debug().Err(err).Msg("connection closed with error")
 	} else {
@@ -194,6 +205,14 @@ func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *Serv
 // shutdown gracefully shuts down the client
 func (c *Client) shutdown() error {
 	c.cancel()
+
+	// Stop all UDP handlers
+	c.udpHandlers.Range(func(key, value interface{}) bool {
+		if handler, ok := value.(*UDPHandler); ok {
+			handler.Stop()
+		}
+		return true
+	})
 
 	// Close all local connections
 	c.localConns.Range(func(key, value interface{}) bool {

@@ -16,6 +16,7 @@ type Client struct {
 	Local             LocalService  `yaml:"local"`
 	Quic              Quic          `yaml:"quic"`
 	TLS               ClientTLS     `yaml:"tls"`
+	UDP               UDPConfig     `yaml:"udp"`
 	HeartbeatInterval time.Duration `yaml:"heartbeat_interval"` // Heartbeat interval, default 30s
 }
 

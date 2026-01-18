@@ -42,6 +42,13 @@ func (l *Listener) acceptTCP() {
 			}
 		}
 
+		// Optimize TCP connection
+		if tc, ok := conn.(*net.TCPConn); ok {
+			_ = tc.SetNoDelay(true)
+			_ = tc.SetReadBuffer(512 * 1024)
+			_ = tc.SetWriteBuffer(512 * 1024)
+		}
+
 		go l.handleTCPConnection(conn)
 	}
 }
@@ -98,23 +105,8 @@ func (l *Listener) handleTCPConnection(conn net.Conn) {
 	client.TotalConns.Add(1)
 	defer client.ActiveConns.Add(-1)
 
-	// Bidirectional copy
-	errCh := make(chan error, 2)
-
-	// Client -> External
-	go func() {
-		_, err := io.Copy(conn, stream)
-		errCh <- err
-	}()
-
-	// External -> Client
-	go func() {
-		_, err := io.Copy(stream, conn)
-		errCh <- err
-	}()
-
-	// Wait for either direction to close
-	err = <-errCh
+	// Use optimized relay
+	err = protocol.Relay(conn, stream)
 	if err != nil && !errors.Is(err, io.EOF) {
 		logger.Debug().Err(err).Msg("connection closed with error")
 	} else {

@@ -22,11 +22,12 @@ type Manager struct {
 
 // Listener represents a traffic listener
 type Listener struct {
-	Port        int
-	Protocol    string // "tcp", "udp", or "both"
-	TCPListener net.Listener
-	UDPConn     net.PacketConn
-	Pool        *pool.ConnectionPool
+	Port                int
+	Protocol            string // "tcp", "udp", or "both"
+	EnableFragmentation bool   // UDP fragmentation enabled
+	TCPListener         net.Listener
+	UDPConn             net.PacketConn
+	Pool                *pool.ConnectionPool
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -59,9 +60,10 @@ func (m *Manager) Start(ctx context.Context) error {
 		}
 
 		listener := &Listener{
-			Port:     listenerConf.TrafficPort,
-			Protocol: listenerConf.Protocol,
-			Pool:     poolInst,
+			Port:                listenerConf.TrafficPort,
+			Protocol:            listenerConf.Protocol,
+			EnableFragmentation: listenerConf.UDP.IsFragmentationEnabled(),
+			Pool:                poolInst,
 			logger: m.logger.With().
 				Int("traffic_port", listenerConf.TrafficPort).
 				Int("quic_port", listenerConf.Port).
