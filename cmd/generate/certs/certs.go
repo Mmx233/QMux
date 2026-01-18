@@ -18,9 +18,10 @@ import (
 )
 
 var (
-	outputDir  string
-	validYears int
-	Cmd        = &cobra.Command{
+	outputDir   string
+	validYears  int
+	serverNames []string
+	Cmd         = &cobra.Command{
 		Use:   "certs",
 		Short: "Generate mTLS certificates (CA, server, client)",
 		RunE:  runGenerate,
@@ -30,6 +31,8 @@ var (
 func init() {
 	Cmd.Flags().StringVarP(&outputDir, "output", "o", "./certs", "output directory")
 	Cmd.Flags().IntVarP(&validYears, "years", "y", 10, "certificate validity in years")
+	Cmd.Flags().StringSliceVarP(&serverNames, "server-name", "s", nil, "server DNS names for the certificate (required, can be specified multiple times)")
+	Cmd.MarkFlagRequired("server-name")
 }
 
 func runGenerate(cmd *cobra.Command, args []string) error {
@@ -45,8 +48,8 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 	}
 
 	// 2. Generate server certificate
-	logger.Info().Msg("generating server certificate")
-	serverKey, serverCert, err := GenerateServerCert(caKey, caCert, validYears)
+	logger.Info().Strs("dns_names", serverNames).Msg("generating server certificate")
+	serverKey, serverCert, err := GenerateServerCert(caKey, caCert, validYears, serverNames)
 	if err != nil {
 		return fmt.Errorf("generate server cert: %w", err)
 	}
@@ -123,8 +126,8 @@ func GenerateCA(validYears int) (*rsa.PrivateKey, *x509.Certificate, error) {
 	return key, cert, nil
 }
 
-// GenerateServerCert generates a server certificate
-func GenerateServerCert(caKey *rsa.PrivateKey, caCert *x509.Certificate, validYears int) (*rsa.PrivateKey, *x509.Certificate, error) {
+// GenerateServerCert generates a server certificate with the specified DNS names
+func GenerateServerCert(caKey *rsa.PrivateKey, caCert *x509.Certificate, validYears int, dnsNames []string) (*rsa.PrivateKey, *x509.Certificate, error) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return nil, nil, fmt.Errorf("generate key: %w", err)
@@ -145,7 +148,7 @@ func GenerateServerCert(caKey *rsa.PrivateKey, caCert *x509.Certificate, validYe
 		NotAfter:    time.Now().AddDate(validYears, 0, 0),
 		KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:    []string{"localhost", "*.local", "qmux-server"},
+		DNSNames:    dnsNames,
 		IPAddresses: []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
 	}
 
