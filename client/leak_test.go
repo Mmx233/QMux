@@ -129,34 +129,6 @@ func TestSessionCacheManager_NoLeak(t *testing.T) {
 	}
 }
 
-// TestLoadBalancer_NoLeak verifies LoadBalancer operations don't leak goroutines.
-func TestLoadBalancer_NoLeak(t *testing.T) {
-	defer goleak.VerifyNone(t)
-
-	lb := NewLoadBalancer()
-
-	logger := zerolog.Nop()
-	cache := tls.NewLRUClientSessionCache(0)
-
-	// Create connections
-	conns := make([]*ServerConnection, 10)
-	for i := 0; i < 10; i++ {
-		conns[i] = NewServerConnection("server.example.com:8443", "server.example.com", cache, logger)
-		conns[i].MarkHealthy()
-	}
-
-	// Update balancer multiple times
-	for i := 0; i < 100; i++ {
-		lb.UpdateConnections(conns)
-		lb.Select()
-	}
-
-	// Clean up connections
-	for _, conn := range conns {
-		conn.Close()
-	}
-}
-
 // TestConcurrentConnectionOperations_NoLeak tests concurrent operations
 // on connections to ensure thread-safe cleanup.
 func TestConcurrentConnectionOperations_NoLeak(t *testing.T) {

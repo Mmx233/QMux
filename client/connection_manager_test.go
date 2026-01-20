@@ -102,7 +102,6 @@ func TestGracefulShutdownCompleteness_Property(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		logger := zerolog.Nop()
 		sessionCacheManager := NewSessionCacheManager()
-		balancer := NewLoadBalancer()
 
 		// Generate N connections (1-5)
 		n := rapid.IntRange(1, 5).Draw(t, "connectionCount")
@@ -118,8 +117,6 @@ func TestGracefulShutdownCompleteness_Property(t *testing.T) {
 				connections[i].MarkHealthy()
 			}
 		}
-
-		balancer.UpdateConnections(connections)
 
 		// Close all connections (simulating Stop behavior)
 		for _, conn := range connections {
@@ -317,30 +314,6 @@ func TestConnectionManager_SessionCacheManager(t *testing.T) {
 	scm := cm.SessionCacheManager()
 	if scm == nil {
 		t.Error("SessionCacheManager should not be nil")
-	}
-}
-
-// Unit test: Balancer returns the load balancer
-func TestConnectionManager_Balancer(t *testing.T) {
-	logger := zerolog.Nop()
-
-	cfg := &config.Client{
-		ClientID: "test-client",
-		Server: config.ClientServer{
-			Servers: []config.ServerEndpoint{
-				{Address: "server.example.com:8443", ServerName: "server"},
-			},
-		},
-	}
-
-	cm, err := NewConnectionManager(cfg, logger)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	lb := cm.Balancer()
-	if lb == nil {
-		t.Error("Balancer should not be nil")
 	}
 }
 

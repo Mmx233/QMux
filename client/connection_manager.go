@@ -20,13 +20,11 @@ const (
 )
 
 // ConnectionManager manages connections to multiple servers.
-// It orchestrates ServerConnection instances, handles lifecycle management,
-// and provides load balancing across healthy connections.
+// It orchestrates ServerConnection instances and handles lifecycle management.
 type ConnectionManager struct {
 	config        *config.Client
 	connections   sync.Map // map[string]*ServerConnection (key: server address)
 	sessionCaches *SessionCacheManager
-	balancer      *LoadBalancer
 	logger        zerolog.Logger
 
 	// TLS and QUIC configuration
@@ -59,7 +57,6 @@ func NewConnectionManager(cfg *config.Client, logger zerolog.Logger) (*Connectio
 	cm := &ConnectionManager{
 		config:        cfg,
 		sessionCaches: NewSessionCacheManager(),
-		balancer:      NewLoadBalancer(),
 		logger:        logger.With().Str("component", "connection_manager").Logger(),
 		ctx:           ctx,
 		cancel:        cancel,
@@ -162,10 +159,6 @@ func (cm *ConnectionManager) Start(ctx context.Context) error {
 
 	// Wait for all connection attempts to complete
 	wg.Wait()
-
-	// Update load balancer with all connections (including unhealthy ones)
-	allConns := cm.GetAllConnections()
-	cm.balancer.UpdateConnections(allConns)
 
 	// Log summary
 	cm.logger.Info().
@@ -324,9 +317,8 @@ func (cm *ConnectionManager) reconnectionLoop(serverAddr string) {
 			continue
 		}
 
-		// Success - update connection map and balancer
+		// Success - update connection map
 		cm.connections.Store(serverAddr, sc)
-		cm.balancer.UpdateConnections(cm.GetAllConnections())
 
 		cm.logger.Info().
 			Str("server", serverAddr).
@@ -382,11 +374,6 @@ func (cm *ConnectionManager) Stop() error {
 	return nil
 }
 
-// GetHealthyConnection returns a healthy connection using load balancing.
-func (cm *ConnectionManager) GetHealthyConnection() (*ServerConnection, error) {
-	return cm.balancer.Select()
-}
-
 // GetAllConnections returns all server connections.
 func (cm *ConnectionManager) GetAllConnections() []*ServerConnection {
 	var conns []*ServerConnection
@@ -407,7 +394,14 @@ func (cm *ConnectionManager) GetConnection(serverAddr string) *ServerConnection 
 
 // HealthyCount returns the number of healthy connections.
 func (cm *ConnectionManager) HealthyCount() int {
-	return cm.balancer.HealthyCount()
+	count := 0
+	cm.connections.Range(func(_, value interface{}) bool {
+		if sc := value.(*ServerConnection); sc.IsHealthy() {
+			count++
+		}
+		return true
+	})
+	return count
 }
 
 // TotalCount returns the total number of connections.
@@ -424,9 +418,4 @@ func (cm *ConnectionManager) TotalCount() int {
 // This is useful for testing session cache persistence.
 func (cm *ConnectionManager) SessionCacheManager() *SessionCacheManager {
 	return cm.sessionCaches
-}
-
-// Balancer returns the load balancer.
-func (cm *ConnectionManager) Balancer() *LoadBalancer {
-	return cm.balancer
 }

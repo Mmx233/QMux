@@ -241,12 +241,6 @@ func (c *Client) Stop() error {
 	return c.shutdown()
 }
 
-// GetHealthyConnection returns a healthy server connection using load balancing.
-// This can be used for outgoing stream selection.
-func (c *Client) GetHealthyConnection() (*ServerConnection, error) {
-	return c.connMgr.GetHealthyConnection()
-}
-
 // HealthyConnectionCount returns the number of healthy server connections.
 func (c *Client) HealthyConnectionCount() int {
 	return c.connMgr.HealthyCount()
