@@ -72,9 +72,15 @@ type UDPConfig struct {
 	// Default: true
 	EnableBufferPooling *bool `yaml:"enable_buffer_pooling"`
 
-	// ReadBufferSize is the size of the UDP read buffer.
-	// Default: 65535
+	// ReadBufferSize is the size of the UDP read buffer in bytes.
+	// This should be large enough to receive any UDP packet.
+	// Default: 65535 (maximum UDP packet size)
 	ReadBufferSize int `yaml:"read_buffer_size"`
+
+	// DatagramBufferSize is the size of QUIC datagram buffers in bytes.
+	// This is typically set to the QUIC max datagram size.
+	// Default: 1200
+	DatagramBufferSize int `yaml:"datagram_buffer_size"`
 }
 
 // IsFragmentationEnabled returns whether UDP fragmentation is enabled.
@@ -105,7 +111,21 @@ func (u *UDPConfig) IsBufferPoolingEnabled() bool {
 // GetReadBufferSize returns the configured read buffer size or default
 func (u *UDPConfig) GetReadBufferSize() int {
 	if u.ReadBufferSize <= 0 {
-		return 65535
+		return DefaultReadBufferSize
 	}
 	return u.ReadBufferSize
+}
+
+// GetDatagramBufferSize returns the configured datagram buffer size or default
+func (u *UDPConfig) GetDatagramBufferSize() int {
+	if u.DatagramBufferSize <= 0 {
+		return DefaultDatagramBufferSize
+	}
+	return u.DatagramBufferSize
+}
+
+// GetFragmentBufferSize returns the fragment buffer size calculated from datagram size.
+// Fragment buffer = datagram size - 9 bytes (fragment header)
+func (u *UDPConfig) GetFragmentBufferSize() int {
+	return u.GetDatagramBufferSize() - 9
 }

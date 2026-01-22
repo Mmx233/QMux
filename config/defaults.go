@@ -19,6 +19,12 @@ const (
 
 	// DefaultHealthCheckTimeout is the time without heartbeat before marking unhealthy
 	DefaultHealthCheckTimeout = 30 * time.Second
+
+	// DefaultReadBufferSize is the default size for UDP read buffers (max UDP packet size)
+	DefaultReadBufferSize = 65535
+
+	// DefaultDatagramBufferSize is the default size for QUIC datagram buffers
+	DefaultDatagramBufferSize = 1200
 )
 
 // DefaultCapabilities lists the default supported protocols

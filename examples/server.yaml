@@ -41,6 +41,22 @@ listeners:
     # Allow 0-RTT connections (reduces latency but has security implications)
     # allow0rtt: false
 
+    # UDP settings (optional - defaults are used if not specified)
+    # Enable automatic fragmentation of large UDP packets
+    # enable_fragmentation: true
+
+    # Number of shards for the fragment assembler (higher = less lock contention)
+    # fragment_assembler_shards: 16
+
+    # Enable buffer pooling for UDP operations
+    # enable_buffer_pooling: true
+
+    # Size of the UDP read buffer in bytes (max UDP packet size)
+    # read_buffer_size: 65535
+
+    # Size of QUIC datagram buffers in bytes
+    # datagram_buffer_size: 1200
+
 # Authentication configuration
 auth:
   # Authentication method: "mtls" (mutual TLS) or "token"

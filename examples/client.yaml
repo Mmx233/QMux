@@ -9,8 +9,9 @@ client_id: ""
 # Configure one or more QMux servers to connect to
 server:
   servers:
-    - # Server address in host:port format
-      address: "localhost:8443"
+    # Server address in host:port format
+    - address: "localhost:8443"
+
       # TLS server name for certificate verification
       server_name: "qmux-server"
 
@@ -18,6 +19,7 @@ server:
 local:
   # Host address of the local service
   host: "127.0.0.1"
+
   # Port of the local service
   port: 8080
 
@@ -25,29 +27,56 @@ local:
 quic:
   # Initial stream receive window size in bytes
   # initialstreamreceivewindow: 524288
+
   # Maximum stream receive window size in bytes
   # maxstreamreceivewindow: 6291456
+
   # Initial connection receive window size in bytes
   # initialconnectionreceivewindow: 1048576
+
   # Maximum connection receive window size in bytes
   # maxconnectionreceivewindow: 15728640
+
   # Maximum number of incoming streams
   # maxincomingstreams: 100
+
   # Keep-alive period for the connection
   # keepaliveperiod: 30s
+
   # Timeout for the handshake to complete
   # handshakeidletimeout: 10s
+
   # Maximum idle timeout before connection is closed
   # maxidletimeout: 5m
+
   # Allow 0-RTT connections (reduces latency but has security implications)
   # allow0rtt: false
+
+# UDP settings (optional - defaults are used if not specified)
+udp:
+  # Enable automatic fragmentation of large UDP packets
+  # enable_fragmentation: true
+
+  # Number of shards for the fragment assembler (higher = less lock contention)
+  # fragment_assembler_shards: 16
+
+  # Enable buffer pooling for UDP operations
+  # enable_buffer_pooling: true
+
+  # Size of the UDP read buffer in bytes (max UDP packet size)
+  # read_buffer_size: 65535
+
+  # Size of QUIC datagram buffers in bytes
+  # datagram_buffer_size: 1200
 
 # TLS configuration
 tls:
   # Path to CA certificate file (for server verification)
   ca_cert_file: "./certs/ca.crt"
+
   # Path to client certificate file
   client_cert_file: "./certs/client.crt"
+
   # Path to client private key file
   client_key_file: "./certs/client.key"
 

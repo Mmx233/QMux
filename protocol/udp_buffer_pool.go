@@ -2,53 +2,91 @@ package protocol
 
 import "sync"
 
-// UDP buffer size constants for different operation types
+// Default UDP buffer size constants
 const (
-	// DatagramBufferSize is the size for QUIC datagram buffers
-	DatagramBufferSize = MaxDatagramSize // 1200 bytes
+	// DefaultDatagramBufferSize is the default size for QUIC datagram buffers
+	DefaultDatagramBufferSize = MaxDatagramSize // 1200 bytes
 
-	// ReadBufferSize is the size for UDP read buffers
-	ReadBufferSize = 65535
+	// DefaultReadBufferSize is the default size for UDP read buffers
+	DefaultReadBufferSize = 65535
 
-	// FragmentBufferSize is the default size for fragment storage
-	FragmentBufferSize = MaxFragPayload // ~1191 bytes
+	// DefaultFragmentBufferSize is the default size for fragment storage
+	// Calculated as: DatagramSize - FragmentHeaderSize (9 bytes)
+	DefaultFragmentBufferSize = DefaultDatagramBufferSize - UDPFragHeaderSize
+)
+
+// Current buffer sizes (can be configured via InitBufferPool)
+var (
+	DatagramBufferSize = DefaultDatagramBufferSize
+	ReadBufferSize     = DefaultReadBufferSize
+	FragmentBufferSize = DefaultFragmentBufferSize
 )
 
 // UDPBufferPool provides pooled buffers for UDP operations.
 // It maintains three tiers of buffer pools optimized for different use cases:
-// - Datagram pool: 1200-byte buffers for QUIC datagram operations
-// - Read pool: 65535-byte buffers for UDP socket read operations
-// - Fragment pool: ~1191-byte buffers for fragment storage
+// - Datagram pool: buffers for QUIC datagram operations
+// - Read pool: buffers for UDP socket read operations
+// - Fragment pool: buffers for fragment storage
 type UDPBufferPool struct {
-	datagramPool sync.Pool // 1200 byte buffers
-	readPool     sync.Pool // 65535 byte buffers
-	fragmentPool sync.Pool // ~1191 byte buffers
+	datagramPool sync.Pool
+	readPool     sync.Pool
+	fragmentPool sync.Pool
 }
 
 // udpPool is the global UDP buffer pool instance
-var udpPool = &UDPBufferPool{
-	datagramPool: sync.Pool{
-		New: func() interface{} {
-			buf := make([]byte, DatagramBufferSize)
-			return &buf
+var udpPool *UDPBufferPool
+
+func init() {
+	// Initialize with default sizes
+	initPool(DefaultDatagramBufferSize, DefaultReadBufferSize, DefaultFragmentBufferSize)
+}
+
+// initPool initializes the buffer pool with specified sizes
+func initPool(datagramSize, readSize, fragmentSize int) {
+	DatagramBufferSize = datagramSize
+	ReadBufferSize = readSize
+	FragmentBufferSize = fragmentSize
+
+	udpPool = &UDPBufferPool{
+		datagramPool: sync.Pool{
+			New: func() interface{} {
+				buf := make([]byte, DatagramBufferSize)
+				return &buf
+			},
 		},
-	},
-	readPool: sync.Pool{
-		New: func() interface{} {
-			buf := make([]byte, ReadBufferSize)
-			return &buf
+		readPool: sync.Pool{
+			New: func() interface{} {
+				buf := make([]byte, ReadBufferSize)
+				return &buf
+			},
 		},
-	},
-	fragmentPool: sync.Pool{
-		New: func() interface{} {
-			buf := make([]byte, FragmentBufferSize)
-			return &buf
+		fragmentPool: sync.Pool{
+			New: func() interface{} {
+				buf := make([]byte, FragmentBufferSize)
+				return &buf
+			},
 		},
-	},
+	}
+}
+
+// InitBufferPool initializes the buffer pool with custom sizes.
+// This should be called once at startup before any buffer operations.
+// If any size is <= 0, the default value will be used.
+func InitBufferPool(datagramSize, readSize, fragmentSize int) {
+	if datagramSize <= 0 {
+		datagramSize = DefaultDatagramBufferSize
+	}
+	if readSize <= 0 {
+		readSize = DefaultReadBufferSize
+	}
+	if fragmentSize <= 0 {
+		fragmentSize = DefaultFragmentBufferSize
+	}
+	initPool(datagramSize, readSize, fragmentSize)
 }
 
 // GetDatagramBuffer returns a buffer for datagram operations.
-// The returned buffer has a length of exactly DatagramBufferSize (1200 bytes).
+// The returned buffer has a length of exactly DatagramBufferSize.
 // Callers must call PutDatagramBuffer when done to return the buffer to the pool.
 func GetDatagramBuffer() *[]byte {
 	return udpPool.datagramPool.Get().(*[]byte)
@@ -64,7 +102,7 @@ func PutDatagramBuffer(buf *[]byte) {
 }
 
 // GetReadBuffer returns a buffer for UDP read operations.
-// The returned buffer has a length of exactly ReadBufferSize (65535 bytes).
+// The returned buffer has a length of exactly ReadBufferSize.
 // Callers must call PutReadBuffer when done to return the buffer to the pool.
 func GetReadBuffer() *[]byte {
 	return udpPool.readPool.Get().(*[]byte)
@@ -80,7 +118,7 @@ func PutReadBuffer(buf *[]byte) {
 }
 
 // GetFragmentBuffer returns a buffer for fragment storage.
-// The returned buffer has a length of exactly FragmentBufferSize (~1191 bytes).
+// The returned buffer has a length of exactly FragmentBufferSize.
 // Callers must call PutFragmentBuffer when done to return the buffer to the pool.
 func GetFragmentBuffer() *[]byte {
 	return udpPool.fragmentPool.Get().(*[]byte)
