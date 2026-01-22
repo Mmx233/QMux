@@ -18,6 +18,9 @@ type Server struct {
 	Auth      ServerAuth     `yaml:"auth"`
 	TLS       ServerTLS      `yaml:"tls"`
 
+	// Load balancer algorithm: "least-connections" (default) or "round-robin"
+	LoadBalancer string `yaml:"load_balancer"`
+
 	// Health check configuration
 	HealthCheckInterval time.Duration `yaml:"health_check_interval"` // How often to check client health, default 10s
 	HealthCheckTimeout  time.Duration `yaml:"health_check_timeout"`  // Time without heartbeat before marking unhealthy, default 30s
@@ -135,5 +138,8 @@ func (s *Server) ApplyDefaults() {
 	}
 	if s.HealthCheckTimeout == 0 {
 		s.HealthCheckTimeout = DefaultHealthCheckTimeout
+	}
+	if s.LoadBalancer == "" {
+		s.LoadBalancer = DefaultLoadBalancer
 	}
 }

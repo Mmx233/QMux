@@ -25,6 +25,9 @@ const (
 
 	// DefaultDatagramBufferSize is the default size for QUIC datagram buffers
 	DefaultDatagramBufferSize = 1200
+
+	// DefaultLoadBalancer is the default load balancing algorithm
+	DefaultLoadBalancer = "least-connections"
 )
 
 // DefaultCapabilities lists the default supported protocols

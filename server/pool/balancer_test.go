@@ -252,6 +252,150 @@ func TestLeastConnectionsBalancer_SkipUnhealthy(t *testing.T) {
 	}
 }
 
+// TestLeastConnectionsBalancer_AllUnhealthy tests error when all clients are unhealthy
+func TestLeastConnectionsBalancer_AllUnhealthy(t *testing.T) {
+	balancer := NewLeastConnectionsBalancer()
+
+	clients := []*ClientConn{
+		{ID: "client1"},
+		{ID: "client2"},
+	}
+
+	// Mark all clients as unhealthy
+	for _, c := range clients {
+		c.healthy.Store(false)
+	}
+
+	_, err := balancer.Select(clients)
+	if !errors.Is(err, ErrNoHealthyClients) {
+		t.Errorf("expected ErrNoHealthyClients, got %v", err)
+	}
+}
+
+// TestLeastConnectionsBalancer_NoClients tests error when no clients exist
+func TestLeastConnectionsBalancer_NoClients(t *testing.T) {
+	balancer := NewLeastConnectionsBalancer()
+
+	_, err := balancer.Select([]*ClientConn{})
+	if !errors.Is(err, ErrNoClientsAvailable) {
+		t.Errorf("expected ErrNoClientsAvailable, got %v", err)
+	}
+}
+
+// TestLeastConnectionsBalancer_Concurrent tests thread-safety
+func TestLeastConnectionsBalancer_Concurrent(t *testing.T) {
+	balancer := NewLeastConnectionsBalancer()
+
+	clients := []*ClientConn{
+		{ID: "client1"},
+		{ID: "client2"},
+		{ID: "client3"},
+	}
+	for i, c := range clients {
+		c.healthy.Store(true)
+		c.ActiveConns.Store(int64(i * 10))
+	}
+
+	// Run 100 goroutines selecting simultaneously
+	var wg sync.WaitGroup
+	errCh := make(chan error, 100)
+
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				_, err := balancer.Select(clients)
+				if err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	// Check for any errors
+	for err := range errCh {
+		t.Errorf("concurrent selection error: %v", err)
+	}
+}
+
+// TestLeastConnectionsBalancer_DynamicHealth tests handling of clients becoming unhealthy
+func TestLeastConnectionsBalancer_DynamicHealth(t *testing.T) {
+	balancer := NewLeastConnectionsBalancer()
+
+	clients := []*ClientConn{
+		{ID: "client1"},
+		{ID: "client2"},
+		{ID: "client3"},
+	}
+	for i, c := range clients {
+		c.healthy.Store(true)
+		c.ActiveConns.Store(int64((i + 1) * 10)) // 10, 20, 30
+	}
+
+	// Initially client1 should be selected (least connections)
+	selected, err := balancer.Select(clients)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if selected.ID != "client1" {
+		t.Errorf("expected client1, got %s", selected.ID)
+	}
+
+	// Mark client1 as unhealthy mid-test
+	clients[0].healthy.Store(false)
+
+	// Now client2 should be selected (least connections among healthy)
+	selected, err = balancer.Select(clients)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if selected.ID != "client2" {
+		t.Errorf("expected client2 after client1 became unhealthy, got %s", selected.ID)
+	}
+}
+
+// TestLeastConnectionsBalancer_EqualConnections tests selection when multiple clients have same connection count
+func TestLeastConnectionsBalancer_EqualConnections(t *testing.T) {
+	balancer := NewLeastConnectionsBalancer()
+
+	clients := []*ClientConn{
+		{ID: "client1"},
+		{ID: "client2"},
+		{ID: "client3"},
+	}
+	for _, c := range clients {
+		c.healthy.Store(true)
+		c.ActiveConns.Store(5) // All have same connection count
+	}
+
+	// Should select one of them without error (deterministic: first one with min)
+	selected, err := balancer.Select(clients)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Should consistently select the first client when all have equal connections
+	if selected.ID != "client1" {
+		t.Errorf("expected client1 (first with min connections), got %s", selected.ID)
+	}
+
+	// Verify consistency across multiple calls
+	for i := 0; i < 10; i++ {
+		s, err := balancer.Select(clients)
+		if err != nil {
+			t.Fatalf("unexpected error on iteration %d: %v", i, err)
+		}
+		if s.ID != "client1" {
+			t.Errorf("iteration %d: expected consistent selection of client1, got %s", i, s.ID)
+		}
+	}
+}
+
 // BenchmarkRoundRobinBalancer benchmarks round-robin selection
 func BenchmarkRoundRobinBalancer(b *testing.B) {
 	balancer := NewRoundRobinBalancer()

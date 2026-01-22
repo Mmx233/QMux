@@ -85,6 +85,11 @@ tls:
   # Recommended: 2-3 for smooth rotation
   # session_ticket_encryption_key_rotation_overlap: 2
 
+# Load balancer algorithm: "least-connections" (default) or "round-robin"
+# least-connections: selects the client with fewest active connections
+# round-robin: distributes requests evenly across all clients
+load_balancer: "least-connections"
+
 # Health check settings
 # How often to check client health
 health_check_interval: 10s

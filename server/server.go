@@ -57,7 +57,13 @@ func New(conf *config.Server) (*Server, error) {
 	// Create connection pools for each listener
 	pools := make(map[string]*pool.ConnectionPool) // quicAddr -> pool
 	for _, listener := range conf.Listeners {
-		balancer := pool.NewRoundRobinBalancer()
+		var balancer pool.LoadBalancer
+		switch conf.LoadBalancer {
+		case "round-robin":
+			balancer = pool.NewRoundRobinBalancer()
+		default:
+			balancer = pool.NewLeastConnectionsBalancer()
+		}
 		p := pool.New(listener.QuicAddr, balancer, logger)
 
 		// Configure health check intervals if specified
