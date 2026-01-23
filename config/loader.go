@@ -24,6 +24,19 @@ func LoadConfig[T any](path string) (*T, error) {
 	return &cfg, nil
 }
 
+// LoadServerConfig reads a server YAML configuration file and applies defaults.
+func LoadServerConfig(path string) (*Server, error) {
+	cfg, err := LoadConfig[Server](path)
+	if err != nil {
+		return nil, err
+	}
+
+	// Apply default values
+	cfg.ApplyDefaults()
+
+	return cfg, nil
+}
+
 // LoadClientConfig reads a client YAML configuration file, validates it,
 // and applies deduplication for multi-server configurations.
 func LoadClientConfig(path string) (*Client, error) {

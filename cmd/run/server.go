@@ -27,7 +27,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	// Load configuration
 	logger.Info().Str("config", configFile).Msg("loading configuration")
-	cfg, err := config.LoadConfig[config.Server](configFile)
+	cfg, err := config.LoadServerConfig(configFile)
 	if err != nil {
 		return err
 	}
