@@ -30,11 +30,18 @@ type RotateManager struct {
 }
 
 // NewRotateManager creates a new RotateManager with the specified rotation interval and key overlap.
-// The overlap parameter determines how many keys to maintain (current + old keys).
+// The overlap parameter determines how many OLD keys to retain after rotation.
+// Total keys = 1 (current) + overlap (old keys).
+//
+// Example with overlap=2:
+//   - Initial: [key0] (1 key)
+//   - After 1st rotation: [key1, key0] (2 keys)
+//   - After 2nd rotation: [key2, key1, key0] (3 keys = 1 current + 2 old)
+//   - After 3rd rotation: [key3, key2, key1] (3 keys, key0 dropped)
 //
 // Example:
 //
-//	manager, err := stek.NewRotateManager(24*time.Hour, 3)
+//	manager, err := stek.NewRotateManager(24*time.Hour, 2)
 //	if err != nil {
 //	    return err
 //	}
@@ -44,9 +51,6 @@ func NewRotateManager(interval time.Duration, overlap uint8) (*RotateManager, er
 	if interval <= 0 {
 		return nil, fmt.Errorf("rotation interval must be positive, got %v", interval)
 	}
-	if overlap < 1 {
-		return nil, fmt.Errorf("overlap must be at least 1, got %d", overlap)
-	}
 
 	m := &RotateManager{
 		Keys:     &atomic.Pointer[[][32]byte]{},
@@ -55,19 +59,16 @@ func NewRotateManager(interval time.Duration, overlap uint8) (*RotateManager, er
 		logger:   log.With().Str("com", "stek").Logger(),
 	}
 
-	// Generate initial key set
-	initialKeys := make([][32]byte, overlap)
-	for i := range initialKeys {
-		key, err := m.generateKey()
-		if err != nil {
-			return nil, fmt.Errorf("failed to generate initial key %d: %w", i, err)
-		}
-		initialKeys[i] = key
+	// Generate initial key
+	key, err := m.generateKey()
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate initial key: %w", err)
 	}
+	initialKeys := [][32]byte{key}
 	m.Keys.Store(&initialKeys)
 
 	m.logger.Info().
-		Int("initial_keys", len(initialKeys)).
+		Int("initial_keys", 1).
 		Uint8("overlap", overlap).
 		Msg("initialized session ticket encryption keys")
 
@@ -84,7 +85,8 @@ func (m *RotateManager) generateKey() ([32]byte, error) {
 	return key, nil
 }
 
-// rotate performs a key rotation by generating a new key and maintaining the overlap.
+// rotate performs a key rotation by generating a new key and retaining up to 'overlap' old keys.
+// Total keys after rotation = 1 (new) + min(current_count, overlap) old keys.
 func (m *RotateManager) rotate() error {
 	// Generate new key
 	newKey, err := m.generateKey()
@@ -95,18 +97,16 @@ func (m *RotateManager) rotate() error {
 	// Load current keys
 	currentKeys := m.Keys.Load()
 
-	// Calculate new slice size (capped at overlap)
-	newSize := len(*currentKeys) + 1
-	if newSize > int(m.overlap) {
-		newSize = int(m.overlap)
+	// Calculate how many old keys to keep (up to overlap)
+	oldKeysToKeep := len(*currentKeys)
+	if oldKeysToKeep > int(m.overlap) {
+		oldKeysToKeep = int(m.overlap)
 	}
 
-	// Create new slice with new key first
-	newKeys := make([][32]byte, newSize)
+	// Create new slice: new key + old keys
+	newKeys := make([][32]byte, 1+oldKeysToKeep)
 	newKeys[0] = newKey
-
-	// Copy old keys (up to overlap-1)
-	copy(newKeys[1:], *currentKeys)
+	copy(newKeys[1:], (*currentKeys)[:oldKeysToKeep])
 
 	// Store atomically
 	m.Keys.Store(&newKeys)
