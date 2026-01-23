@@ -11,13 +11,14 @@ import (
 )
 
 type Client struct {
-	ClientID          string        `yaml:"client_id"`
-	Server            ClientServer  `yaml:"server"`
-	Local             LocalService  `yaml:"local"`
-	Quic              Quic          `yaml:"quic"`
-	TLS               ClientTLS     `yaml:"tls"`
-	UDP               UDPConfig     `yaml:"udp"`
-	HeartbeatInterval time.Duration `yaml:"heartbeat_interval"` // Heartbeat interval, default 30s
+	ClientID            string        `yaml:"client_id"`
+	Server              ClientServer  `yaml:"server"`
+	Local               LocalService  `yaml:"local"`
+	Quic                Quic          `yaml:"quic"`
+	TLS                 ClientTLS     `yaml:"tls"`
+	UDP                 UDPConfig     `yaml:"udp"`
+	HeartbeatInterval   time.Duration `yaml:"heartbeat_interval"`    // Heartbeat interval, default 30s
+	HeartbeatAckTimeout time.Duration `yaml:"heartbeat_ack_timeout"` // Timeout waiting for heartbeat ACK, default 10s
 }
 
 // EnsureClientID generates a UUID for ClientID if it is empty.
@@ -34,6 +35,9 @@ func (c *Client) ApplyDefaults() {
 	c.EnsureClientID()
 	if c.HeartbeatInterval == 0 {
 		c.HeartbeatInterval = DefaultHeartbeatInterval
+	}
+	if c.HeartbeatAckTimeout == 0 {
+		c.HeartbeatAckTimeout = DefaultHeartbeatAckTimeout
 	}
 }
 

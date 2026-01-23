@@ -236,22 +236,63 @@ func (sc *ServerConnection) Register(clientID string) error {
 	return nil
 }
 
-// SendHeartbeat sends a heartbeat message on the control stream.
+// SendHeartbeat sends a heartbeat message on the control stream and waits for ACK.
+// The ackTimeout specifies how long to wait for the server's acknowledgment.
 // On success, the connection is marked healthy. On failure, it's marked unhealthy.
-func (sc *ServerConnection) SendHeartbeat() error {
+func (sc *ServerConnection) SendHeartbeat(ackTimeout time.Duration) error {
 	if sc.controlStream == nil {
 		return fmt.Errorf("no control stream")
 	}
 
-	err := protocol.WriteHeartbeat(sc.controlStream, time.Now().Unix())
+	timestamp := time.Now().Unix()
+	err := protocol.WriteHeartbeat(sc.controlStream, timestamp)
 	if err != nil {
 		sc.MarkUnhealthy()
-		sc.logger.Error().Err(err).Msg("heartbeat failed")
+		sc.logger.Error().Err(err).Msg("heartbeat send failed")
 		return fmt.Errorf("send heartbeat: %w", err)
 	}
 
+	// Set read deadline for ACK
+	if err := (*sc.controlStream).SetReadDeadline(time.Now().Add(ackTimeout)); err != nil {
+		sc.MarkUnhealthy()
+		sc.logger.Error().Err(err).Msg("set read deadline failed")
+		return fmt.Errorf("set read deadline: %w", err)
+	}
+	defer func() {
+		_ = (*sc.controlStream).SetReadDeadline(time.Time{}) // Clear deadline after
+	}()
+
+	// Wait for ACK
+	msgType, payload, err := protocol.ReadMessage(sc.controlStream)
+	if err != nil {
+		sc.MarkUnhealthy()
+		sc.logger.Error().Err(err).Msg("heartbeat ack read failed")
+		return fmt.Errorf("read heartbeat ack: %w", err)
+	}
+
+	if msgType != protocol.MsgTypeHeartbeatAck {
+		sc.MarkUnhealthy()
+		sc.logger.Error().Uint8("msg_type", msgType).Msg("unexpected message type, expected heartbeat ack")
+		return fmt.Errorf("unexpected message type: 0x%02x", msgType)
+	}
+
+	// Verify timestamp matches
+	var ackMsg protocol.HeartbeatAckMsg
+	if err := protocol.DecodeMessage(payload, &ackMsg); err != nil {
+		sc.MarkUnhealthy()
+		sc.logger.Error().Err(err).Msg("decode heartbeat ack failed")
+		return fmt.Errorf("decode heartbeat ack: %w", err)
+	}
+
+	if ackMsg.Timestamp != timestamp {
+		sc.logger.Warn().
+			Int64("sent", timestamp).
+			Int64("received", ackMsg.Timestamp).
+			Msg("heartbeat ack timestamp mismatch")
+	}
+
 	sc.MarkHealthy()
-	sc.logger.Debug().Msg("heartbeat sent")
+	sc.logger.Debug().Msg("heartbeat ack received")
 	return nil
 }
 

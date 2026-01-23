@@ -181,6 +181,7 @@ func (cm *ConnectionManager) heartbeatLoop(sc *ServerConnection) {
 	defer cm.wg.Done()
 
 	interval := cm.config.HeartbeatInterval
+	ackTimeout := cm.config.HeartbeatAckTimeout
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -190,7 +191,7 @@ func (cm *ConnectionManager) heartbeatLoop(sc *ServerConnection) {
 		case <-cm.ctx.Done():
 			return
 		case <-ticker.C:
-			if err := sc.SendHeartbeat(); err != nil {
+			if err := sc.SendHeartbeat(ackTimeout); err != nil {
 				cm.logger.Error().
 					Str("server", sc.ServerAddr()).
 					Err(err).

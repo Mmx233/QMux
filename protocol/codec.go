@@ -119,6 +119,14 @@ func WriteHeartbeat(w io.Writer, timestamp int64) error {
 	return WriteMessage(w, MsgTypeHeartbeat, msg)
 }
 
+// WriteHeartbeatAck writes a heartbeat acknowledgment message
+func WriteHeartbeatAck(w io.Writer, timestamp int64) error {
+	msg := HeartbeatAckMsg{
+		Timestamp: timestamp,
+	}
+	return WriteMessage(w, MsgTypeHeartbeatAck, msg)
+}
+
 // WriteNewConn writes a new connection message
 func WriteNewConn(w io.Writer, connID uint64, protocol, sourceAddr, destAddr string, timestamp int64) error {
 	msg := NewConnMsg{

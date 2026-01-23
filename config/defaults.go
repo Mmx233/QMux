@@ -11,6 +11,9 @@ const (
 	// DefaultHeartbeatInterval is the default interval between heartbeat messages
 	DefaultHeartbeatInterval = 30 * time.Second
 
+	// DefaultHeartbeatAckTimeout is the default timeout waiting for heartbeat ACK
+	DefaultHeartbeatAckTimeout = 10 * time.Second
+
 	// DefaultMaxIdleTimeout is the default QUIC connection idle timeout
 	DefaultMaxIdleTimeout = 5 * time.Minute
 

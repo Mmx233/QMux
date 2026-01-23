@@ -2,12 +2,13 @@ package protocol
 
 // Message types
 const (
-	MsgTypeRegister    = 0x01 // Client registration
-	MsgTypeRegisterAck = 0x02 // Server acknowledgment
-	MsgTypeHeartbeat   = 0x03 // Keepalive
-	MsgTypeNewConn     = 0x04 // New connection metadata
-	MsgTypeConnClose   = 0x06 // Connection closed
-	MsgTypeError       = 0xFF // Error message
+	MsgTypeRegister     = 0x01 // Client registration
+	MsgTypeRegisterAck  = 0x02 // Server acknowledgment
+	MsgTypeHeartbeat    = 0x03 // Keepalive
+	MsgTypeNewConn      = 0x04 // New connection metadata
+	MsgTypeConnClose    = 0x06 // Connection closed
+	MsgTypeHeartbeatAck = 0x07 // Heartbeat acknowledgment
+	MsgTypeError        = 0xFF // Error message
 )
 
 // Note: MsgTypeConnData (0x05) is not used in current design.
@@ -30,6 +31,11 @@ type RegisterAckMsg struct {
 // HeartbeatMsg is sent periodically to keep connection alive
 type HeartbeatMsg struct {
 	Timestamp int64 // Unix timestamp
+}
+
+// HeartbeatAckMsg is sent by server to acknowledge heartbeat
+type HeartbeatAckMsg struct {
+	Timestamp int64 // Echo back the timestamp from HeartbeatMsg
 }
 
 // NewConnMsg is sent by server to client when new connection arrives
