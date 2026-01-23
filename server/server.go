@@ -326,7 +326,7 @@ func (s *Server) handleHeartbeat(ctx context.Context, stream *quic.Stream, clien
 		}
 
 		// Read message with timeout
-		msgType, payload, err := protocol.ReadMessage(stream)
+		msgType, _, err := protocol.ReadMessage(stream)
 		if err != nil {
 			logger.Debug().Err(err).Msg("read heartbeat failed")
 			return
@@ -335,20 +335,6 @@ func (s *Server) handleHeartbeat(ctx context.Context, stream *quic.Stream, clien
 		if msgType == protocol.MsgTypeHeartbeat {
 			poolInst.UpdateLastSeen(clientID)
 			logger.Debug().Msg("heartbeat received")
-
-			// Decode heartbeat to get timestamp
-			var hbMsg protocol.HeartbeatMsg
-			if err := protocol.DecodeMessage(payload, &hbMsg); err != nil {
-				logger.Warn().Err(err).Msg("decode heartbeat failed")
-				continue
-			}
-
-			// Send ACK with same timestamp
-			if err := protocol.WriteHeartbeatAck(stream, hbMsg.Timestamp); err != nil {
-				logger.Warn().Err(err).Msg("send heartbeat ack failed")
-				return
-			}
-			logger.Debug().Msg("heartbeat ack sent")
 		}
 	}
 }

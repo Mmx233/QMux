@@ -83,7 +83,3 @@ tls:
 # Heartbeat interval
 # How often to send heartbeat messages to the server
 heartbeat_interval: 30s
-
-# Heartbeat ACK timeout
-# How long to wait for server's heartbeat acknowledgment before triggering reconnection
-# heartbeat_ack_timeout: 10s
