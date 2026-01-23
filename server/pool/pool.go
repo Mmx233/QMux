@@ -23,11 +23,8 @@ type ConnectionPool struct {
 	// Using atomic.Pointer for lock-free reads on the hot path
 	cachedClients atomic.Pointer[[]*ClientConn]
 
-	// Health check
-	healthCheckInterval time.Duration
-	healthCheckTimeout  time.Duration
-	ctx                 context.Context
-	cancel              context.CancelFunc
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // ClientConn represents a connected client
@@ -58,18 +55,13 @@ type ClientMetadata struct {
 func New(quicAddr string, balancer LoadBalancer, logger zerolog.Logger) *ConnectionPool {
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &ConnectionPool{
-		clients:             make(map[string]*ClientConn),
-		quicAddr:            quicAddr,
-		balancer:            balancer,
-		logger:              logger.With().Str("quic_addr", quicAddr).Logger(),
-		healthCheckInterval: 10 * time.Second,
-		healthCheckTimeout:  30 * time.Second,
-		ctx:                 ctx,
-		cancel:              cancel,
+		clients:  make(map[string]*ClientConn),
+		quicAddr: quicAddr,
+		balancer: balancer,
+		logger:   logger.With().Str("quic_addr", quicAddr).Logger(),
+		ctx:      ctx,
+		cancel:   cancel,
 	}
-
-	// Start health check goroutine
-	go p.healthCheckLoop()
 
 	return p
 }
@@ -77,67 +69,6 @@ func New(quicAddr string, balancer LoadBalancer, logger zerolog.Logger) *Connect
 // Stop stops the connection pool
 func (p *ConnectionPool) Stop() {
 	p.cancel()
-}
-
-// SetHealthCheckInterval sets the health check interval
-func (p *ConnectionPool) SetHealthCheckInterval(interval time.Duration) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.healthCheckInterval = interval
-}
-
-// SetHealthCheckTimeout sets the health check timeout
-func (p *ConnectionPool) SetHealthCheckTimeout(timeout time.Duration) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.healthCheckTimeout = timeout
-}
-
-// healthCheckLoop periodically checks client health
-func (p *ConnectionPool) healthCheckLoop() {
-	ticker := time.NewTicker(p.healthCheckInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-p.ctx.Done():
-			return
-		case <-ticker.C:
-			p.performHealthChecks()
-		}
-	}
-}
-
-// performHealthChecks checks all clients and marks stale ones as unhealthy
-func (p *ConnectionPool) performHealthChecks() {
-	p.mu.RLock()
-	clients := make([]*ClientConn, 0, len(p.clients))
-	for _, conn := range p.clients {
-		clients = append(clients, conn)
-	}
-	p.mu.RUnlock()
-
-	now := time.Now()
-	for _, conn := range clients {
-		// Check if client hasn't sent heartbeat in timeout period
-		if now.Sub(conn.LastSeen) > p.healthCheckTimeout {
-			if conn.healthy.Load() {
-				p.logger.Warn().
-					Str("client_id", conn.ID).
-					Dur("last_seen", now.Sub(conn.LastSeen)).
-					Msg("client marked unhealthy due to missed heartbeats")
-				conn.healthy.Store(false)
-			}
-		} else {
-			// Client is responsive, ensure it's marked healthy
-			if !conn.healthy.Load() {
-				p.logger.Info().
-					Str("client_id", conn.ID).
-					Msg("client recovered and marked healthy")
-				conn.healthy.Store(true)
-			}
-		}
-	}
 }
 
 // Add registers a new client connection

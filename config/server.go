@@ -21,9 +21,9 @@ type Server struct {
 	// Load balancer algorithm: "least-connections" (default) or "round-robin"
 	LoadBalancer string `yaml:"load_balancer"`
 
-	// Health check configuration
-	HealthCheckInterval time.Duration `yaml:"health_check_interval"` // How often to check client health, default 10s
-	HealthCheckTimeout  time.Duration `yaml:"health_check_timeout"`  // Time without heartbeat before marking unhealthy, default 30s
+	// Heartbeat configuration
+	HeartbeatInterval time.Duration `yaml:"heartbeat_interval"` // Interval between server heartbeats to clients, default 10s
+	HealthTimeout     time.Duration `yaml:"health_timeout"`     // Time without heartbeat before marking unhealthy, default 30s
 }
 
 type QuicListener struct {
@@ -131,13 +131,13 @@ func (t *ServerTLS) LoadCertificates() error {
 }
 
 // ApplyDefaults applies default values to zero-value fields.
-// It sets HealthCheckInterval and HealthCheckTimeout if not specified.
+// It sets HeartbeatInterval and HealthTimeout if not specified.
 func (s *Server) ApplyDefaults() {
-	if s.HealthCheckInterval == 0 {
-		s.HealthCheckInterval = DefaultHealthCheckInterval
+	if s.HeartbeatInterval == 0 {
+		s.HeartbeatInterval = DefaultServerHeartbeatInterval
 	}
-	if s.HealthCheckTimeout == 0 {
-		s.HealthCheckTimeout = DefaultHealthCheckTimeout
+	if s.HealthTimeout == 0 {
+		s.HealthTimeout = DefaultServerHealthTimeout
 	}
 	if s.LoadBalancer == "" {
 		s.LoadBalancer = DefaultLoadBalancer

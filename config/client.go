@@ -18,6 +18,7 @@ type Client struct {
 	TLS               ClientTLS     `yaml:"tls"`
 	UDP               UDPConfig     `yaml:"udp"`
 	HeartbeatInterval time.Duration `yaml:"heartbeat_interval"` // Heartbeat interval, default 30s
+	HealthTimeout     time.Duration `yaml:"health_timeout"`     // Health timeout for received heartbeats, default 90s
 }
 
 // EnsureClientID generates a UUID for ClientID if it is empty.
@@ -29,12 +30,24 @@ func (c *Client) EnsureClientID() {
 }
 
 // ApplyDefaults applies default values to zero-value fields.
-// It calls EnsureClientID() and sets HeartbeatInterval if not specified.
+// It calls EnsureClientID() and sets HeartbeatInterval and HealthTimeout if not specified.
 func (c *Client) ApplyDefaults() {
 	c.EnsureClientID()
 	if c.HeartbeatInterval == 0 {
 		c.HeartbeatInterval = DefaultHeartbeatInterval
 	}
+	if c.HealthTimeout == 0 {
+		c.HealthTimeout = DefaultHealthTimeout
+	}
+}
+
+// Validate validates the client configuration.
+// It checks that HealthTimeout is greater than HeartbeatInterval.
+func (c *Client) Validate() error {
+	if c.HealthTimeout <= c.HeartbeatInterval {
+		return fmt.Errorf("health_timeout (%v) must be greater than heartbeat_interval (%v)", c.HealthTimeout, c.HeartbeatInterval)
+	}
+	return nil
 }
 
 // ServerEndpoint represents a single server endpoint

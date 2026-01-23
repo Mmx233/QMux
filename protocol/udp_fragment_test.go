@@ -1389,7 +1389,6 @@ func BenchmarkShardedFragmentAssembler_AddFragment(b *testing.B) {
 
 // BenchmarkShardedFragmentAssembler_Reassemble benchmarks the sharded assembler's
 // reassembly performance, comparable to BenchmarkFragmentAssembler_Reassemble.
-// Requirements: 7.2, 7.4
 func BenchmarkShardedFragmentAssembler_Reassemble(b *testing.B) {
 	data := make([]byte, 5000)
 	var fragID uint16
@@ -1408,7 +1407,6 @@ func BenchmarkShardedFragmentAssembler_Reassemble(b *testing.B) {
 // BenchmarkShardedFragmentAssembler_Concurrent benchmarks the sharded assembler's
 // performance under concurrent access from multiple goroutines.
 // This measures the effectiveness of sharded locking in reducing contention.
-// Requirements: 7.2, 7.4
 func BenchmarkShardedFragmentAssembler_Concurrent(b *testing.B) {
 	// Prepare multiple fragment sets with different fragment IDs
 	// to distribute across shards
@@ -1460,7 +1458,6 @@ func BenchmarkShardedFragmentAssembler_Concurrent(b *testing.B) {
 
 // BenchmarkFragmentAssembler_Concurrent benchmarks the original assembler's
 // performance under concurrent access for comparison with the sharded version.
-// Requirements: 7.2, 7.4
 func BenchmarkFragmentAssembler_Concurrent(b *testing.B) {
 	// Prepare multiple fragment sets with different fragment IDs
 	const numFragmentSets = 16
@@ -1516,7 +1513,6 @@ func BenchmarkFragmentAssembler_Concurrent(b *testing.B) {
 // BenchmarkAtomicCounter_Concurrent benchmarks the atomic.Uint32 counter
 // performance under concurrent access from multiple goroutines.
 // This simulates the fragment ID counter usage pattern in FragmentUDPPooled.
-// Requirements: 7.4
 func BenchmarkAtomicCounter_Concurrent(b *testing.B) {
 	var counter atomic.Uint32
 
@@ -1531,7 +1527,6 @@ func BenchmarkAtomicCounter_Concurrent(b *testing.B) {
 // BenchmarkMutexCounter_Concurrent benchmarks a mutex-protected counter
 // for comparison with the atomic counter. This represents the old approach
 // using sync.Mutex for fragment ID counter protection.
-// Requirements: 7.4
 func BenchmarkMutexCounter_Concurrent(b *testing.B) {
 	var mu sync.Mutex
 	var counter uint32
@@ -1549,7 +1544,6 @@ func BenchmarkMutexCounter_Concurrent(b *testing.B) {
 // BenchmarkAtomicCounter_FragmentIDPattern benchmarks the atomic counter
 // in a pattern that more closely matches the actual FragmentUDPPooled usage:
 // increment counter and use the value for fragment ID generation.
-// Requirements: 7.4
 func BenchmarkAtomicCounter_FragmentIDPattern(b *testing.B) {
 	var counter atomic.Uint32
 	data := make([]byte, 3000) // Large enough to require fragmentation
@@ -1567,7 +1561,6 @@ func BenchmarkAtomicCounter_FragmentIDPattern(b *testing.B) {
 // BenchmarkMutexCounter_FragmentIDPattern benchmarks a mutex-protected counter
 // in a pattern that matches the old FragmentUDP usage with mutex protection.
 // This provides a direct comparison for the atomic counter optimization.
-// Requirements: 7.4
 func BenchmarkMutexCounter_FragmentIDPattern(b *testing.B) {
 	var mu sync.Mutex
 	var fragID uint16

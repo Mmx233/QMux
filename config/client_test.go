@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"pgregory.net/rapid"
 )
@@ -183,4 +184,39 @@ func TestGetServers_Empty(t *testing.T) {
 	if len(servers) != 0 {
 		t.Fatalf("expected 0 for empty config, got %d", len(servers))
 	}
+}
+
+// Feature: bidirectional-heartbeat, Property 16: Configuration Validation
+// Validates: Requirements 8.5
+// For any valid configuration, the healthTimeout should be greater than the heartbeatInterval.
+func TestConfigurationValidation_Property(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		// Generate random heartbeat interval (1-60 seconds)
+		heartbeatIntervalSec := rapid.IntRange(1, 60).Draw(t, "heartbeatIntervalSec")
+		heartbeatInterval := time.Duration(heartbeatIntervalSec) * time.Second
+
+		// Generate random health timeout (1-120 seconds)
+		healthTimeoutSec := rapid.IntRange(1, 120).Draw(t, "healthTimeoutSec")
+		healthTimeout := time.Duration(healthTimeoutSec) * time.Second
+
+		client := &Client{
+			HeartbeatInterval: heartbeatInterval,
+			HealthTimeout:     healthTimeout,
+		}
+
+		err := client.Validate()
+
+		// Property: validation should pass if and only if healthTimeout > heartbeatInterval
+		if healthTimeout > heartbeatInterval {
+			if err != nil {
+				t.Fatalf("expected validation success when healthTimeout (%v) > heartbeatInterval (%v), got error: %v",
+					healthTimeout, heartbeatInterval, err)
+			}
+		} else {
+			if err == nil {
+				t.Fatalf("expected validation error when healthTimeout (%v) <= heartbeatInterval (%v), got nil",
+					healthTimeout, heartbeatInterval)
+			}
+		}
+	})
 }

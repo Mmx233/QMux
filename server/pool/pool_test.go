@@ -77,42 +77,6 @@ func TestConnectionPool_Select(t *testing.T) {
 	}
 }
 
-// TestConnectionPool_HealthCheck tests health checking mechanism
-func TestConnectionPool_HealthCheck(t *testing.T) {
-	pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
-	// Use shorter intervals for testing
-	pool.healthCheckInterval = 100 * time.Millisecond
-	pool.healthCheckTimeout = 300 * time.Millisecond
-	defer pool.Stop()
-
-	// Add client with old LastSeen
-	client := &ClientConn{
-		ID:       "test-client",
-		LastSeen: time.Now().Add(-5 * time.Minute), // Old timestamp
-	}
-	client.healthy.Store(true)
-	pool.Add("test-client", client)
-
-	// Wait for health check to run
-	time.Sleep(250 * time.Millisecond)
-
-	// Client should be marked unhealthy due to old LastSeen
-	if client.healthy.Load() {
-		t.Error("expected client to be marked unhealthy")
-	}
-
-	// Update LastSeen to recent time
-	pool.UpdateLastSeen("test-client")
-
-	// Wait for health check to run again
-	time.Sleep(150 * time.Millisecond)
-
-	// Client should be marked healthy again (LastSeen is < 300ms old)
-	if !client.healthy.Load() {
-		t.Errorf("expected client to be marked healthy after recent heartbeat, last_seen: %v", client.LastSeen)
-	}
-}
-
 // TestConnectionPool_HAFailover tests high availability failover
 func TestConnectionPool_HAFailover(t *testing.T) {
 	pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
@@ -852,6 +816,266 @@ func TestHealthUpdateEfficiency_Property(t *testing.T) {
 		if ratio > poolSizeRatio*0.5 {
 			t.Errorf("Health update time scales with pool size (not O(1)): small=%v, large=%v, ratio=%.2f, poolSizeRatio=%.2f",
 				avgSmallTime, avgLargeTime, ratio, poolSizeRatio)
+		}
+	})
+}
+
+// Feature: bidirectional-heartbeat
+// TestConnectionPool_SelectExcludesUnhealthy verifies that pool.Select() never returns
+// unhealthy clients, ensuring the load balancer respects the healthy flag.
+// Validates: Requirements 6.5
+func TestConnectionPool_SelectExcludesUnhealthy(t *testing.T) {
+	pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
+	defer pool.Stop()
+
+	// Add 3 clients
+	clients := []*ClientConn{
+		{ID: "client1", LastSeen: time.Now()},
+		{ID: "client2", LastSeen: time.Now()},
+		{ID: "client3", LastSeen: time.Now()},
+	}
+
+	// Mark all as healthy initially
+	for _, c := range clients {
+		c.healthy.Store(true)
+		pool.Add(c.ID, c)
+	}
+
+	// Mark client2 as unhealthy (simulating heartbeat timeout)
+	pool.MarkUnhealthy("client2")
+
+	// Perform many selections and verify client2 is never selected
+	selections := make(map[string]int)
+	for i := 0; i < 100; i++ {
+		selected, err := pool.Select()
+		if err != nil {
+			t.Fatalf("Select failed: %v", err)
+		}
+		selections[selected.ID]++
+
+		// Property: unhealthy client should never be selected
+		if selected.ID == "client2" {
+			t.Errorf("Select returned unhealthy client2 on iteration %d", i)
+		}
+	}
+
+	// Verify client2 was never selected
+	if selections["client2"] != 0 {
+		t.Errorf("unhealthy client2 was selected %d times, expected 0", selections["client2"])
+	}
+
+	// Verify healthy clients were selected
+	if selections["client1"] == 0 {
+		t.Error("healthy client1 was never selected")
+	}
+	if selections["client3"] == 0 {
+		t.Error("healthy client3 was never selected")
+	}
+}
+
+// TestConnectionPool_SelectAllUnhealthy verifies that pool.Select() returns
+// ErrNoHealthyClients when all clients are unhealthy.
+// Validates: Requirements 6.5
+func TestConnectionPool_SelectAllUnhealthy(t *testing.T) {
+	pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
+	defer pool.Stop()
+
+	// Add 3 clients
+	for i := 0; i < 3; i++ {
+		client := &ClientConn{
+			ID:       fmt.Sprintf("client%d", i),
+			LastSeen: time.Now(),
+		}
+		client.healthy.Store(true)
+		pool.Add(client.ID, client)
+	}
+
+	// Mark all clients as unhealthy (simulating heartbeat timeout for all)
+	pool.MarkUnhealthy("client0")
+	pool.MarkUnhealthy("client1")
+	pool.MarkUnhealthy("client2")
+
+	// Select should return ErrNoHealthyClients
+	_, err := pool.Select()
+	if !errors.Is(err, ErrNoHealthyClients) {
+		t.Errorf("expected ErrNoHealthyClients when all clients unhealthy, got %v", err)
+	}
+}
+
+// Feature: bidirectional-heartbeat, Property 14: Unhealthy Excluded from Load Balancer
+// *For any* load balancer selection operation, clients marked as unhealthy should never
+// be returned as the selected client.
+// **Validates: Requirements 6.5**
+func TestUnhealthyExcludedFromLoadBalancer_Property(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
+		defer pool.Stop()
+
+		// Generate random number of clients (2-20)
+		clientCount := rapid.IntRange(2, 20).Draw(t, "clientCount")
+
+		// Generate random number of unhealthy clients (1 to clientCount-1)
+		// Ensure at least one healthy client remains
+		unhealthyCount := rapid.IntRange(1, clientCount-1).Draw(t, "unhealthyCount")
+
+		// Create clients
+		clientIDs := make([]string, clientCount)
+		unhealthyIDs := make(map[string]bool)
+
+		for i := 0; i < clientCount; i++ {
+			clientIDs[i] = fmt.Sprintf("client-%d", i)
+			client := &ClientConn{
+				ID:       clientIDs[i],
+				LastSeen: time.Now(),
+			}
+			client.healthy.Store(true)
+			pool.Add(clientIDs[i], client)
+		}
+
+		// Mark some clients as unhealthy
+		for i := 0; i < unhealthyCount; i++ {
+			pool.MarkUnhealthy(clientIDs[i])
+			unhealthyIDs[clientIDs[i]] = true
+		}
+
+		// Generate number of selections to perform (10-100)
+		selectionCount := rapid.IntRange(10, 100).Draw(t, "selectionCount")
+
+		// Perform selections and verify no unhealthy client is ever selected
+		for i := 0; i < selectionCount; i++ {
+			selected, err := pool.Select()
+			if err != nil {
+				t.Fatalf("Select failed unexpectedly: %v", err)
+			}
+
+			// Property: selected client should never be unhealthy
+			if unhealthyIDs[selected.ID] {
+				t.Errorf("iteration %d: Select returned unhealthy client %s", i, selected.ID)
+			}
+
+			// Property: selected client's healthy flag should be true
+			if !selected.healthy.Load() {
+				t.Errorf("iteration %d: Select returned client %s with healthy=false", i, selected.ID)
+			}
+		}
+	})
+}
+
+// Feature: bidirectional-heartbeat, Property 14: Unhealthy Excluded from Load Balancer - Dynamic Health
+// Tests that clients becoming unhealthy during selection are properly excluded.
+// **Validates: Requirements 6.5**
+func TestUnhealthyExcludedFromLoadBalancer_DynamicHealth_Property(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
+		defer pool.Stop()
+
+		// Generate random number of clients (3-10)
+		clientCount := rapid.IntRange(3, 10).Draw(t, "clientCount")
+
+		// Create all healthy clients
+		clientIDs := make([]string, clientCount)
+		for i := 0; i < clientCount; i++ {
+			clientIDs[i] = fmt.Sprintf("client-%d", i)
+			client := &ClientConn{
+				ID:       clientIDs[i],
+				LastSeen: time.Now(),
+			}
+			client.healthy.Store(true)
+			pool.Add(clientIDs[i], client)
+		}
+
+		// Track which clients are currently unhealthy
+		unhealthyIDs := make(map[string]bool)
+
+		// Perform selections with dynamic health changes
+		for i := 0; i < 50; i++ {
+			// Randomly mark a client unhealthy or healthy
+			if i%5 == 0 && len(unhealthyIDs) < clientCount-1 {
+				// Mark a healthy client as unhealthy (keep at least one healthy)
+				idx := rapid.IntRange(0, clientCount-1).Draw(t, fmt.Sprintf("unhealthyIdx%d", i))
+				if !unhealthyIDs[clientIDs[idx]] {
+					pool.MarkUnhealthy(clientIDs[idx])
+					unhealthyIDs[clientIDs[idx]] = true
+				}
+			} else if i%7 == 0 && len(unhealthyIDs) > 0 {
+				// Mark an unhealthy client as healthy
+				for id := range unhealthyIDs {
+					pool.MarkHealthy(id)
+					delete(unhealthyIDs, id)
+					break
+				}
+			}
+
+			// Perform selection
+			selected, err := pool.Select()
+			if err != nil {
+				// This can happen if all clients become unhealthy
+				if len(unhealthyIDs) == clientCount {
+					continue
+				}
+				t.Fatalf("Select failed unexpectedly: %v", err)
+			}
+
+			// Property: selected client should never be in the unhealthy set
+			if unhealthyIDs[selected.ID] {
+				t.Errorf("iteration %d: Select returned unhealthy client %s", i, selected.ID)
+			}
+		}
+	})
+}
+
+// Feature: bidirectional-heartbeat, Property 14: Unhealthy Excluded from Load Balancer - LeastConnections
+// Tests that the LeastConnectionsBalancer also excludes unhealthy clients.
+// **Validates: Requirements 6.5**
+func TestUnhealthyExcludedFromLoadBalancer_LeastConnections_Property(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		pool := New("127.0.0.1:8080", NewLeastConnectionsBalancer(), newTestLogger())
+		defer pool.Stop()
+
+		// Generate random number of clients (2-15)
+		clientCount := rapid.IntRange(2, 15).Draw(t, "clientCount")
+
+		// Generate random number of unhealthy clients (1 to clientCount-1)
+		unhealthyCount := rapid.IntRange(1, clientCount-1).Draw(t, "unhealthyCount")
+
+		// Create clients with varying connection counts
+		clientIDs := make([]string, clientCount)
+		unhealthyIDs := make(map[string]bool)
+
+		for i := 0; i < clientCount; i++ {
+			clientIDs[i] = fmt.Sprintf("client-%d", i)
+			client := &ClientConn{
+				ID:       clientIDs[i],
+				LastSeen: time.Now(),
+			}
+			client.healthy.Store(true)
+			// Set varying connection counts - unhealthy clients might have lowest connections
+			client.ActiveConns.Store(int64(i * 10))
+			pool.Add(clientIDs[i], client)
+		}
+
+		// Mark the first N clients as unhealthy (these have lowest connection counts)
+		// This tests that even clients with lowest connections are excluded if unhealthy
+		for i := 0; i < unhealthyCount; i++ {
+			pool.MarkUnhealthy(clientIDs[i])
+			unhealthyIDs[clientIDs[i]] = true
+		}
+
+		// Generate number of selections to perform (10-50)
+		selectionCount := rapid.IntRange(10, 50).Draw(t, "selectionCount")
+
+		// Perform selections and verify no unhealthy client is ever selected
+		for i := 0; i < selectionCount; i++ {
+			selected, err := pool.Select()
+			if err != nil {
+				t.Fatalf("Select failed unexpectedly: %v", err)
+			}
+
+			// Property: selected client should never be unhealthy
+			// Even though unhealthy clients have lower connection counts
+			if unhealthyIDs[selected.ID] {
+				t.Errorf("iteration %d: LeastConnections selected unhealthy client %s", i, selected.ID)
+			}
 		}
 	})
 }

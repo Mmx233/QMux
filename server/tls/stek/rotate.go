@@ -145,7 +145,6 @@ func (m *RotateManager) run(ctx context.Context) {
 		case <-ctx.Done():
 			m.logger.Info().Msg("stopping session ticket key rotation (context cancelled)")
 			m.ticker.Stop()
-			close(m.stopCh)
 			return
 		case <-m.stopCh:
 			m.logger.Info().Msg("stopping session ticket key rotation")

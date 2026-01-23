@@ -34,20 +34,20 @@ func TestZeroValueDefaultsApplication_Property(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		// Test Server.ApplyDefaults() with zero values
 		server := &Server{
-			HealthCheckInterval: 0,
-			HealthCheckTimeout:  0,
+			HeartbeatInterval: 0,
+			HealthTimeout:     0,
 		}
 
 		server.ApplyDefaults()
 
-		// Property: HealthCheckInterval should equal DefaultHealthCheckInterval
-		if server.HealthCheckInterval != DefaultHealthCheckInterval {
-			t.Fatalf("expected HealthCheckInterval=%v, got %v", DefaultHealthCheckInterval, server.HealthCheckInterval)
+		// Property: HeartbeatInterval should equal DefaultServerHeartbeatInterval
+		if server.HeartbeatInterval != DefaultServerHeartbeatInterval {
+			t.Fatalf("expected HeartbeatInterval=%v, got %v", DefaultServerHeartbeatInterval, server.HeartbeatInterval)
 		}
 
-		// Property: HealthCheckTimeout should equal DefaultHealthCheckTimeout
-		if server.HealthCheckTimeout != DefaultHealthCheckTimeout {
-			t.Fatalf("expected HealthCheckTimeout=%v, got %v", DefaultHealthCheckTimeout, server.HealthCheckTimeout)
+		// Property: HealthTimeout should equal DefaultServerHealthTimeout
+		if server.HealthTimeout != DefaultServerHealthTimeout {
+			t.Fatalf("expected HealthTimeout=%v, got %v", DefaultServerHealthTimeout, server.HealthTimeout)
 		}
 	})
 
@@ -105,24 +105,24 @@ func TestNonZeroValuePreservation_Property(t *testing.T) {
 
 	// Test Server.ApplyDefaults() preserves non-zero values
 	rapid.Check(t, func(t *rapid.T) {
-		originalHealthCheckInterval := nonZeroDurationGen.Draw(t, "originalHealthCheckInterval")
-		originalHealthCheckTimeout := nonZeroDurationGen.Draw(t, "originalHealthCheckTimeout")
+		originalHeartbeatInterval := nonZeroDurationGen.Draw(t, "originalHeartbeatInterval")
+		originalHealthTimeout := nonZeroDurationGen.Draw(t, "originalHealthTimeout")
 
 		server := &Server{
-			HealthCheckInterval: originalHealthCheckInterval,
-			HealthCheckTimeout:  originalHealthCheckTimeout,
+			HeartbeatInterval: originalHeartbeatInterval,
+			HealthTimeout:     originalHealthTimeout,
 		}
 
 		server.ApplyDefaults()
 
-		// Property: HealthCheckInterval should be preserved
-		if server.HealthCheckInterval != originalHealthCheckInterval {
-			t.Fatalf("expected HealthCheckInterval=%v to be preserved, got %v", originalHealthCheckInterval, server.HealthCheckInterval)
+		// Property: HeartbeatInterval should be preserved
+		if server.HeartbeatInterval != originalHeartbeatInterval {
+			t.Fatalf("expected HeartbeatInterval=%v to be preserved, got %v", originalHeartbeatInterval, server.HeartbeatInterval)
 		}
 
-		// Property: HealthCheckTimeout should be preserved
-		if server.HealthCheckTimeout != originalHealthCheckTimeout {
-			t.Fatalf("expected HealthCheckTimeout=%v to be preserved, got %v", originalHealthCheckTimeout, server.HealthCheckTimeout)
+		// Property: HealthTimeout should be preserved
+		if server.HealthTimeout != originalHealthTimeout {
+			t.Fatalf("expected HealthTimeout=%v to be preserved, got %v", originalHealthTimeout, server.HealthTimeout)
 		}
 	})
 

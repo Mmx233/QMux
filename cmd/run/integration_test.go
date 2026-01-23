@@ -112,8 +112,8 @@ func TestTCPReverseProxy_MTLS(t *testing.T) {
 			ServerCertFile: filepath.Join(certDir, "server.crt"),
 			ServerKeyFile:  filepath.Join(certDir, "server.key"),
 		},
-		HealthCheckInterval: 1 * time.Second,
-		HealthCheckTimeout:  3 * time.Second,
+		HeartbeatInterval: 1 * time.Second,
+		HealthTimeout:     3 * time.Second,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -270,8 +270,8 @@ func TestUDPReverseProxy_MTLS(t *testing.T) {
 			ServerCertFile: filepath.Join(certDir, "server.crt"),
 			ServerKeyFile:  filepath.Join(certDir, "server.key"),
 		},
-		HealthCheckInterval: 1 * time.Second,
-		HealthCheckTimeout:  3 * time.Second,
+		HeartbeatInterval: 1 * time.Second,
+		HealthTimeout:     3 * time.Second,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -537,8 +537,8 @@ func TestClientReconnection_MTLS(t *testing.T) {
 			ServerCertFile: filepath.Join(certDir, "server.crt"),
 			ServerKeyFile:  filepath.Join(certDir, "server.key"),
 		},
-		HealthCheckInterval: 500 * time.Millisecond,
-		HealthCheckTimeout:  1 * time.Second,
+		HeartbeatInterval: 500 * time.Millisecond,
+		HealthTimeout:     1 * time.Second,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1082,8 +1082,8 @@ func TestMultiServerConnection_MTLS(t *testing.T) {
 			ServerCertFile: filepath.Join(certDir, "server.crt"),
 			ServerKeyFile:  filepath.Join(certDir, "server.key"),
 		},
-		HealthCheckInterval: 1 * time.Second,
-		HealthCheckTimeout:  3 * time.Second,
+		HeartbeatInterval: 1 * time.Second,
+		HealthTimeout:     3 * time.Second,
 	}
 
 	serverConfig2 := &config.Server{
@@ -1103,8 +1103,8 @@ func TestMultiServerConnection_MTLS(t *testing.T) {
 			ServerCertFile: filepath.Join(certDir, "server.crt"),
 			ServerKeyFile:  filepath.Join(certDir, "server.key"),
 		},
-		HealthCheckInterval: 1 * time.Second,
-		HealthCheckTimeout:  3 * time.Second,
+		HeartbeatInterval: 1 * time.Second,
+		HealthTimeout:     3 * time.Second,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1250,8 +1250,8 @@ func TestMultiServerFailover_MTLS(t *testing.T) {
 			ServerCertFile: filepath.Join(certDir, "server.crt"),
 			ServerKeyFile:  filepath.Join(certDir, "server.key"),
 		},
-		HealthCheckInterval: 500 * time.Millisecond,
-		HealthCheckTimeout:  1 * time.Second,
+		HeartbeatInterval: 500 * time.Millisecond,
+		HealthTimeout:     1 * time.Second,
 	}
 
 	serverConfig2 := &config.Server{
@@ -1271,8 +1271,8 @@ func TestMultiServerFailover_MTLS(t *testing.T) {
 			ServerCertFile: filepath.Join(certDir, "server.crt"),
 			ServerKeyFile:  filepath.Join(certDir, "server.key"),
 		},
-		HealthCheckInterval: 500 * time.Millisecond,
-		HealthCheckTimeout:  1 * time.Second,
+		HeartbeatInterval: 500 * time.Millisecond,
+		HealthTimeout:     1 * time.Second,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)

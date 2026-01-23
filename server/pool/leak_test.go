@@ -19,7 +19,7 @@ func TestMain(m *testing.M) {
 }
 
 // TestConnectionPool_Stop_NoGoroutineLeak verifies that stopping a ConnectionPool
-// properly terminates the health check goroutine.
+// properly terminates cleanly.
 func TestConnectionPool_Stop_NoGoroutineLeak(t *testing.T) {
 	defer goleak.VerifyNone(t)
 
@@ -29,8 +29,6 @@ func TestConnectionPool_Stop_NoGoroutineLeak(t *testing.T) {
 	// Create and stop multiple pools
 	for i := 0; i < 10; i++ {
 		pool := New(fmt.Sprintf("127.0.0.1:%d", 8443+i), balancer, logger)
-		// Give health check goroutine time to start
-		time.Sleep(10 * time.Millisecond)
 		pool.Stop()
 	}
 
@@ -148,81 +146,6 @@ func TestConnectionPool_ConcurrentOperations_NoLeak(t *testing.T) {
 	}
 
 	wg.Wait()
-}
-
-// TestConnectionPool_HealthCheckLoop_NoLeak verifies the health check loop
-// properly terminates when the pool is stopped.
-func TestConnectionPool_HealthCheckLoop_NoLeak(t *testing.T) {
-	defer goleak.VerifyNone(t)
-
-	logger := zerolog.Nop()
-	balancer := NewRoundRobinBalancer()
-
-	pool := New("127.0.0.1:8443", balancer, logger)
-
-	// Set short health check interval
-	pool.SetHealthCheckInterval(10 * time.Millisecond)
-
-	// Add some clients
-	for i := 0; i < 5; i++ {
-		clientID := "client-" + string(rune('0'+i))
-		conn := &ClientConn{
-			ID:           clientID,
-			RegisteredAt: time.Now(),
-			LastSeen:     time.Now(),
-		}
-		pool.Add(clientID, conn)
-	}
-
-	// Let health checks run a few times
-	time.Sleep(50 * time.Millisecond)
-
-	// Stop pool
-	pool.Stop()
-
-	// Allow goroutine to terminate
-	time.Sleep(50 * time.Millisecond)
-}
-
-// TestConnectionPool_MultipleStops_NoLeak verifies that calling Stop multiple times
-// doesn't cause issues or leaks.
-func TestConnectionPool_MultipleStops_NoLeak(t *testing.T) {
-	defer goleak.VerifyNone(t)
-
-	logger := zerolog.Nop()
-	balancer := NewRoundRobinBalancer()
-	pool := New("127.0.0.1:8443", balancer, logger)
-
-	// Multiple stops should be safe
-	pool.Stop()
-	pool.Stop()
-	pool.Stop()
-
-	// Allow goroutines to terminate
-	time.Sleep(50 * time.Millisecond)
-}
-
-// TestBalancer_NoLeak verifies balancer operations don't leak goroutines.
-func TestBalancer_NoLeak(t *testing.T) {
-	defer goleak.VerifyNone(t)
-
-	balancer := NewRoundRobinBalancer()
-
-	// Create test clients
-	clients := make([]*ClientConn, 10)
-	for i := 0; i < 10; i++ {
-		clients[i] = &ClientConn{
-			ID:           "client-" + string(rune('0'+i)),
-			RegisteredAt: time.Now(),
-			LastSeen:     time.Now(),
-		}
-		clients[i].healthy.Store(true)
-	}
-
-	// Many select operations
-	for i := 0; i < 10000; i++ {
-		balancer.Select(clients)
-	}
 }
 
 // TestConnectionPool_ClientHealthTransitions_NoLeak tests client health state

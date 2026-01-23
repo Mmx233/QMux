@@ -39,6 +39,10 @@ func (s ConnectionState) String() string {
 	}
 }
 
+// ReconnectionCallback is a function type for signaling that reconnection is needed.
+// It receives the server address that needs reconnection.
+type ReconnectionCallback func(serverAddr string)
+
 // ServerConnection represents a connection to a single server instance.
 // Each ServerConnection maintains its own TLS session cache to ensure
 // session tickets are isolated between different servers.
@@ -53,6 +57,15 @@ type ServerConnection struct {
 	// Health tracking
 	healthy       atomic.Bool
 	lastHeartbeat atomic.Int64
+
+	// Bidirectional heartbeat tracking - tracks when heartbeats are received from server
+	lastReceivedFromServer atomic.Int64
+
+	// Health check configuration
+	healthTimeout time.Duration
+
+	// Reconnection callback - called when health check detects timeout
+	reconnectCallback ReconnectionCallback
 
 	// Connection state
 	state atomic.Int32
@@ -190,6 +203,199 @@ func (sc *ServerConnection) CheckHealth(timeout time.Duration) bool {
 	return sc.IsHealthy()
 }
 
+// --- Bidirectional Heartbeat Methods ---
+
+// LastReceivedFromServer returns the timestamp of when the last heartbeat was received from the server.
+// Returns zero time if no heartbeat has been received yet.
+func (sc *ServerConnection) LastReceivedFromServer() time.Time {
+	ns := sc.lastReceivedFromServer.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
+}
+
+// UpdateLastReceivedFromServer updates the timestamp of when a heartbeat was received from the server.
+// This method is thread-safe using atomic operations.
+func (sc *ServerConnection) UpdateLastReceivedFromServer() {
+	sc.lastReceivedFromServer.Store(time.Now().UnixNano())
+	sc.logger.Debug().Msg("received heartbeat from server")
+}
+
+// SetHealthConfig configures the health check parameters for the connection.
+// healthTimeout is the maximum duration allowed between received heartbeats before marking unhealthy.
+func (sc *ServerConnection) SetHealthConfig(healthTimeout time.Duration) {
+	sc.healthTimeout = healthTimeout
+}
+
+// SetReconnectCallback sets the callback function to be called when reconnection is needed.
+// This is called when the health check detects a timeout.
+func (sc *ServerConnection) SetReconnectCallback(callback ReconnectionCallback) {
+	sc.reconnectCallback = callback
+}
+
+// CheckReceivedHealth checks if the connection is healthy based on received heartbeats.
+// Returns true if a heartbeat has been received within the configured healthTimeout.
+// Returns false if no heartbeat has been received or if the timeout has been exceeded.
+func (sc *ServerConnection) CheckReceivedHealth() bool {
+	lastReceived := sc.LastReceivedFromServer()
+	if lastReceived.IsZero() {
+		return false
+	}
+	return time.Since(lastReceived) <= sc.healthTimeout
+}
+
+// heartbeatLoop handles bidirectional heartbeat messages in a single goroutine.
+// It sends heartbeats to the server at the configured interval,
+// receives heartbeats from the server updating lastReceivedFromServer timestamp,
+// and checks for heartbeat timeout to detect unhealthy connection.
+// This is similar to the server-side handleHeartbeat implementation.
+func (sc *ServerConnection) heartbeatLoop(sendInterval time.Duration) {
+	sc.logger.Debug().
+		Dur("send_interval", sendInterval).
+		Dur("health_timeout", sc.healthTimeout).
+		Msg("starting heartbeat loop")
+
+	// Create a ticker for sending heartbeats
+	sendTicker := time.NewTicker(sendInterval)
+	defer sendTicker.Stop()
+
+	// Create a ticker for checking heartbeat timeout
+	// Check at half the timeout interval for responsive detection
+	timeoutCheckInterval := sc.healthTimeout / 2
+	if timeoutCheckInterval < 100*time.Millisecond {
+		timeoutCheckInterval = 100 * time.Millisecond
+	}
+	timeoutTicker := time.NewTicker(timeoutCheckInterval)
+	defer timeoutTicker.Stop()
+
+	// Channel to receive messages from the read goroutine
+	type readResult struct {
+		msgType byte
+		payload []byte
+		err     error
+	}
+	readCh := make(chan readResult, 1)
+
+	// Start a goroutine to read messages
+	go func() {
+		for {
+			if sc.controlStream == nil {
+				return
+			}
+			msgType, payload, err := protocol.ReadMessage(sc.controlStream)
+			select {
+			case readCh <- readResult{msgType: msgType, payload: payload, err: err}:
+			case <-sc.ctx.Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-sc.ctx.Done():
+			sc.logger.Debug().Msg("heartbeat loop stopped: context cancelled")
+			return
+
+		case <-sendTicker.C:
+			// Send heartbeat to server
+			if err := sc.SendHeartbeat(); err != nil {
+				sc.logger.Debug().Err(err).Msg("heartbeat send failed, exiting loop")
+				return
+			}
+
+		case <-timeoutTicker.C:
+			// Check if heartbeat was received within timeout period
+			lastReceived := sc.LastReceivedFromServer()
+			if lastReceived.IsZero() {
+				// No heartbeat received yet, skip check
+				continue
+			}
+
+			timeSinceLastReceived := time.Since(lastReceived)
+			if timeSinceLastReceived > sc.healthTimeout {
+				sc.logger.Warn().
+					Dur("time_since_last_received", timeSinceLastReceived).
+					Dur("timeout", sc.healthTimeout).
+					Msg("server heartbeat timeout")
+
+				// Mark connection as unhealthy
+				sc.MarkUnhealthy()
+
+				// Trigger reconnection if callback is set
+				if sc.reconnectCallback != nil {
+					sc.logger.Info().Msg("triggering reconnection due to health timeout")
+					sc.reconnectCallback(sc.serverAddr)
+				}
+				return
+			}
+
+		case result := <-readCh:
+			if result.err != nil {
+				sc.logger.Debug().Err(result.err).Msg("read from control stream failed")
+				// Mark unhealthy and trigger reconnection on read error
+				sc.MarkUnhealthy()
+				if sc.reconnectCallback != nil {
+					sc.reconnectCallback(sc.serverAddr)
+				}
+				return
+			}
+
+			if result.msgType == protocol.MsgTypeHeartbeat {
+				// Update last received timestamp
+				sc.UpdateLastReceivedFromServer()
+				sc.logger.Debug().Msg("heartbeat received from server")
+			} else {
+				// Route non-heartbeat messages to handler
+				if nonHeartbeatHandler != nil {
+					if err := nonHeartbeatHandler(result.msgType, result.payload); err != nil {
+						sc.logger.Warn().
+							Uint8("msg_type", result.msgType).
+							Err(err).
+							Msg("error handling non-heartbeat message")
+					}
+				} else {
+					sc.logger.Debug().
+						Uint8("msg_type", result.msgType).
+						Msg("received non-heartbeat message (no handler set)")
+				}
+			}
+		}
+	}
+}
+
+// NonHeartbeatHandler is a function type for handling non-heartbeat messages received on the control stream.
+// It receives the message type and payload, and returns an error if handling fails.
+type NonHeartbeatHandler func(msgType byte, payload []byte) error
+
+// nonHeartbeatHandler is the handler for non-heartbeat messages.
+// If nil, non-heartbeat messages are logged and ignored.
+var nonHeartbeatHandler NonHeartbeatHandler
+
+// SetNonHeartbeatHandler sets the handler for non-heartbeat messages received on the control stream.
+// This allows routing of non-heartbeat messages to appropriate handlers without blocking heartbeat processing.
+func (sc *ServerConnection) SetNonHeartbeatHandler(handler NonHeartbeatHandler) {
+	nonHeartbeatHandler = handler
+}
+
+// StartHeartbeatLoops starts the unified heartbeat loop for this connection.
+// The loop handles sending heartbeats, receiving heartbeats, and health checking
+// all in a single goroutine (similar to server-side implementation).
+//
+// All operations use the same connection context for coordinated shutdown.
+func (sc *ServerConnection) StartHeartbeatLoops(heartbeatInterval time.Duration) {
+	sc.logger.Debug().
+		Dur("heartbeat_interval", heartbeatInterval).
+		Dur("health_timeout", sc.healthTimeout).
+		Msg("starting heartbeat loop")
+
+	go sc.heartbeatLoop(heartbeatInterval)
+}
+
 // --- Connection Lifecycle Methods ---
 
 // Register sends a registration message to the server and waits for acknowledgment.
@@ -237,16 +443,38 @@ func (sc *ServerConnection) Register(clientID string) error {
 }
 
 // SendHeartbeat sends a heartbeat message on the control stream.
-// On success, the connection is marked healthy. On failure, it's marked unhealthy.
+// This is a non-blocking operation that does not wait for any response.
+// On success, the connection is marked healthy. On failure, it's marked unhealthy
+// and reconnection is triggered if a callback is set.
 func (sc *ServerConnection) SendHeartbeat() error {
 	if sc.controlStream == nil {
+		// No control stream is a failure condition - mark unhealthy (Requirement 1.3)
+		sc.MarkUnhealthy()
+		sc.logger.Error().Msg("heartbeat send failed: no control stream")
+
+		// Trigger reconnection if callback is set (Requirement 1.3)
+		if sc.reconnectCallback != nil {
+			sc.logger.Info().Msg("triggering reconnection due to missing control stream")
+			sc.reconnectCallback(sc.serverAddr)
+		}
+
 		return fmt.Errorf("no control stream")
 	}
 
+	// Non-blocking write - does not wait for any response (Requirement 1.2)
+	// The heartbeat message contains a Unix timestamp (Requirement 1.4)
 	err := protocol.WriteHeartbeat(sc.controlStream, time.Now().Unix())
 	if err != nil {
+		// Mark connection as unhealthy on write error (Requirement 1.3)
 		sc.MarkUnhealthy()
-		sc.logger.Error().Err(err).Msg("heartbeat failed")
+		sc.logger.Error().Err(err).Msg("heartbeat send failed")
+
+		// Trigger reconnection if callback is set (Requirement 1.3)
+		if sc.reconnectCallback != nil {
+			sc.logger.Info().Msg("triggering reconnection due to heartbeat write error")
+			sc.reconnectCallback(sc.serverAddr)
+		}
+
 		return fmt.Errorf("send heartbeat: %w", err)
 	}
 
@@ -298,21 +526,23 @@ func (sc *ServerConnection) Close() error {
 
 // ServerConnectionInfo provides connection status information for monitoring.
 type ServerConnectionInfo struct {
-	Address       string
-	ServerName    string
-	State         ConnectionState
-	Healthy       bool
-	LastHeartbeat time.Time
-	ConnectedAt   time.Time
+	Address                string
+	ServerName             string
+	State                  ConnectionState
+	Healthy                bool
+	LastHeartbeat          time.Time
+	LastReceivedFromServer time.Time
+	ConnectedAt            time.Time
 }
 
 // Info returns current connection status information.
 func (sc *ServerConnection) Info() ServerConnectionInfo {
 	return ServerConnectionInfo{
-		Address:       sc.serverAddr,
-		ServerName:    sc.serverName,
-		State:         sc.State(),
-		Healthy:       sc.IsHealthy(),
-		LastHeartbeat: sc.LastHeartbeat(),
+		Address:                sc.serverAddr,
+		ServerName:             sc.serverName,
+		State:                  sc.State(),
+		Healthy:                sc.IsHealthy(),
+		LastHeartbeat:          sc.LastHeartbeat(),
+		LastReceivedFromServer: sc.LastReceivedFromServer(),
 	}
 }

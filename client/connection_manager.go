@@ -169,39 +169,28 @@ func (cm *ConnectionManager) Start(ctx context.Context) error {
 
 	// Start heartbeat goroutines for connected servers
 	for _, sc := range connectedServers {
-		cm.wg.Add(1)
-		go cm.heartbeatLoop(sc)
+		// Setup and start all heartbeat loops using the new unified method
+		cm.setupServerConnection(sc)
 	}
 
 	return nil
 }
 
-// heartbeatLoop sends periodic heartbeats on a server connection.
-func (cm *ConnectionManager) heartbeatLoop(sc *ServerConnection) {
-	defer cm.wg.Done()
+// setupServerConnection configures a ServerConnection with health check and reconnection callback,
+// then starts all heartbeat loops.
+// This should be called after successful registration.
+func (cm *ConnectionManager) setupServerConnection(sc *ServerConnection) {
+	// Configure health check with the client's health timeout
+	sc.SetHealthConfig(cm.config.HealthTimeout)
 
-	interval := cm.config.HeartbeatInterval
+	// Set reconnection callback to trigger reconnection when health check fails
+	sc.SetReconnectCallback(func(serverAddr string) {
+		cm.startReconnection(serverAddr)
+	})
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-cm.ctx.Done():
-			return
-		case <-ticker.C:
-			if err := sc.SendHeartbeat(); err != nil {
-				cm.logger.Error().
-					Str("server", sc.ServerAddr()).
-					Err(err).
-					Msg("heartbeat failed, starting reconnection")
-
-				// Start reconnection
-				cm.startReconnection(sc.ServerAddr())
-				return
-			}
-		}
-	}
+	// Start all heartbeat loops (send, receive, health check) using the unified method
+	// All loops use the same context for coordinated shutdown
+	sc.StartHeartbeatLoops(cm.config.HeartbeatInterval)
 }
 
 // CalculateBackoff calculates the backoff duration for a given attempt number.
@@ -325,9 +314,8 @@ func (cm *ConnectionManager) reconnectionLoop(serverAddr string) {
 			Int("attempts", attempt+1).
 			Msg("reconnection successful")
 
-		// Start heartbeat loop for reconnected server
-		cm.wg.Add(1)
-		go cm.heartbeatLoop(sc)
+		// Setup and start all heartbeat loops for reconnected server
+		cm.setupServerConnection(sc)
 
 		return
 	}

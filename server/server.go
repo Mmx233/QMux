@@ -29,6 +29,9 @@ type Server struct {
 
 // New creates a new server
 func New(conf *config.Server) (*Server, error) {
+	// Apply defaults to ensure all required fields have values
+	conf.ApplyDefaults()
+
 	logger := log.With().Str("com", "server").Logger()
 
 	// Load TLS certificates
@@ -65,14 +68,6 @@ func New(conf *config.Server) (*Server, error) {
 			balancer = pool.NewLeastConnectionsBalancer()
 		}
 		p := pool.New(listener.QuicAddr, balancer, logger)
-
-		// Configure health check intervals if specified
-		if conf.HealthCheckInterval > 0 {
-			p.SetHealthCheckInterval(conf.HealthCheckInterval)
-		}
-		if conf.HealthCheckTimeout > 0 {
-			p.SetHealthCheckTimeout(conf.HealthCheckTimeout)
-		}
 
 		pools[listener.QuicAddr] = p
 		logger.Info().
@@ -299,7 +294,7 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn, quicAddr
 	}
 
 	// Start heartbeat handler
-	go s.handleHeartbeat(ctx, controlStream, regMsg.ClientID, quicAddr)
+	go s.handleHeartbeat(ctx, controlStream, regMsg.ClientID, quicAddr, conn)
 
 	// Wait for connection to close
 	<-conn.Context().Done()
@@ -309,8 +304,11 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn, quicAddr
 	logger.Info().Msg("client disconnected")
 }
 
-// handleHeartbeat handles heartbeat messages
-func (s *Server) handleHeartbeat(ctx context.Context, stream *quic.Stream, clientID string, quicAddr string) {
+// handleHeartbeat handles bidirectional heartbeat messages.
+// It sends heartbeats to the client at the configured interval,
+// receives heartbeats from the client updating LastSeen timestamp,
+// and checks for heartbeat timeout to detect unhealthy clients.
+func (s *Server) handleHeartbeat(ctx context.Context, stream *quic.Stream, clientID string, quicAddr string, conn *quic.Conn) {
 	logger := s.logger.With().
 		Str("client_id", clientID).
 		Str("quic_addr", quicAddr).
@@ -318,23 +316,93 @@ func (s *Server) handleHeartbeat(ctx context.Context, stream *quic.Stream, clien
 
 	poolInst := s.pools[quicAddr]
 
+	// Create a ticker for sending heartbeats
+	sendTicker := time.NewTicker(s.config.HeartbeatInterval)
+	defer sendTicker.Stop()
+
+	// Create a ticker for checking heartbeat timeout
+	// Check at half the timeout interval for responsive detection
+	timeoutCheckInterval := s.config.HealthTimeout / 2
+	if timeoutCheckInterval < time.Second {
+		timeoutCheckInterval = time.Second
+	}
+	timeoutTicker := time.NewTicker(timeoutCheckInterval)
+	defer timeoutTicker.Stop()
+
+	// Channel to receive messages from the read goroutine
+	type readResult struct {
+		msgType byte
+		err     error
+	}
+	readCh := make(chan readResult, 1)
+
+	// Start a goroutine to read messages
+	go func() {
+		for {
+			msgType, _, err := protocol.ReadMessage(stream)
+			select {
+			case readCh <- readResult{msgType: msgType, err: err}:
+			case <-ctx.Done():
+				return
+			case <-conn.Context().Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		default:
-		}
 
-		// Read message with timeout
-		msgType, _, err := protocol.ReadMessage(stream)
-		if err != nil {
-			logger.Debug().Err(err).Msg("read heartbeat failed")
+		case <-conn.Context().Done():
+			// QUIC connection closed
 			return
-		}
 
-		if msgType == protocol.MsgTypeHeartbeat {
-			poolInst.UpdateLastSeen(clientID)
-			logger.Debug().Msg("heartbeat received")
+		case <-sendTicker.C:
+			// Send heartbeat to client
+			if err := protocol.WriteHeartbeat(stream, time.Now().Unix()); err != nil {
+				logger.Debug().Err(err).Msg("failed to send heartbeat to client")
+				poolInst.MarkUnhealthy(clientID)
+				return
+			}
+			logger.Debug().Msg("heartbeat sent to client")
+
+		case <-timeoutTicker.C:
+			// Check if heartbeat was received within timeout period
+			clientConn, exists := poolInst.Get(clientID)
+			if !exists {
+				// Client was removed from pool
+				return
+			}
+
+			timeSinceLastSeen := time.Since(clientConn.LastSeen)
+			if timeSinceLastSeen > s.config.HealthTimeout {
+				logger.Warn().
+					Dur("time_since_last_seen", timeSinceLastSeen).
+					Dur("timeout", s.config.HealthTimeout).
+					Msg("client heartbeat timeout, closing connection")
+
+				// Mark unhealthy, close connection, and remove from pool
+				poolInst.MarkUnhealthy(clientID)
+				conn.CloseWithError(1, "heartbeat timeout")
+				poolInst.Remove(clientID)
+				return
+			}
+
+		case result := <-readCh:
+			if result.err != nil {
+				logger.Debug().Err(result.err).Msg("read heartbeat failed")
+				return
+			}
+
+			if result.msgType == protocol.MsgTypeHeartbeat {
+				poolInst.UpdateLastSeen(clientID)
+				logger.Debug().Msg("heartbeat received from client")
+			}
 		}
 	}
 }
