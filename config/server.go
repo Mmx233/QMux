@@ -134,10 +134,10 @@ func (t *ServerTLS) LoadCertificates() error {
 // It sets HeartbeatInterval and HealthTimeout if not specified.
 func (s *Server) ApplyDefaults() {
 	if s.HeartbeatInterval == 0 {
-		s.HeartbeatInterval = DefaultServerHeartbeatInterval
+		s.HeartbeatInterval = DefaultHeartbeatInterval
 	}
 	if s.HealthTimeout == 0 {
-		s.HealthTimeout = DefaultServerHealthTimeout
+		s.HealthTimeout = DefaultHealthTimeout
 	}
 	if s.LoadBalancer == "" {
 		s.LoadBalancer = DefaultLoadBalancer

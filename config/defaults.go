@@ -8,22 +8,17 @@ import (
 
 // Default timeout and interval values
 const (
-	// DefaultHeartbeatInterval is the default interval between heartbeat messages (client)
-	DefaultHeartbeatInterval = 30 * time.Second
+	// DefaultHeartbeatInterval is the default interval between heartbeat messages
+	// Used by both client and server
+	DefaultHeartbeatInterval = 10 * time.Second
 
 	// DefaultHealthTimeout is the default timeout for determining connection health
-	// based on received heartbeats (client-side). Must be greater than HeartbeatInterval.
-	DefaultHealthTimeout = 90 * time.Second
+	// based on received heartbeats. Must be greater than HeartbeatInterval.
+	// Used by both client and server
+	DefaultHealthTimeout = 30 * time.Second
 
 	// DefaultMaxIdleTimeout is the default QUIC connection idle timeout
 	DefaultMaxIdleTimeout = 5 * time.Minute
-
-	// DefaultServerHeartbeatInterval is the interval between server heartbeats to clients
-	DefaultServerHeartbeatInterval = 10 * time.Second
-
-	// DefaultServerHealthTimeout is the time without heartbeat before marking client unhealthy (server-side)
-	// Must be greater than client's heartbeat interval
-	DefaultServerHealthTimeout = 30 * time.Second
 
 	// DefaultReadBufferSize is the default size for UDP read buffers (max UDP packet size)
 	DefaultReadBufferSize = 65535

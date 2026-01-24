@@ -43,10 +43,10 @@ func TestServerConfigTemplateFields(t *testing.T) {
 	assert.NotEmpty(t, cfg.TLS.ServerKeyFile, "TLS server key file should not be empty")
 
 	// Verify defaults match config/defaults.go
-	assert.Equal(t, config.DefaultServerHeartbeatInterval, cfg.HeartbeatInterval,
-		"heartbeat_interval should match DefaultServerHeartbeatInterval")
-	assert.Equal(t, config.DefaultServerHealthTimeout, cfg.HealthTimeout,
-		"health_timeout should match DefaultServerHealthTimeout")
+	assert.Equal(t, config.DefaultHeartbeatInterval, cfg.HeartbeatInterval,
+		"heartbeat_interval should match DefaultHeartbeatInterval")
+	assert.Equal(t, config.DefaultHealthTimeout, cfg.HealthTimeout,
+		"health_timeout should match DefaultHealthTimeout")
 }
 
 // TestClientConfigTemplateFields verifies that the embedded client.yaml template:

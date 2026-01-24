@@ -82,8 +82,8 @@ tls:
 
 # Heartbeat configuration
 # How often to send heartbeat messages to the server
-heartbeat_interval: 30s
+heartbeat_interval: 10s
 
 # Maximum time without receiving a heartbeat from server before marking unhealthy
 # Must be greater than heartbeat_interval to allow for network delays
-health_timeout: 90s
+health_timeout: 30s

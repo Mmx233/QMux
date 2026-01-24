@@ -40,14 +40,14 @@ func TestZeroValueDefaultsApplication_Property(t *testing.T) {
 
 		server.ApplyDefaults()
 
-		// Property: HeartbeatInterval should equal DefaultServerHeartbeatInterval
-		if server.HeartbeatInterval != DefaultServerHeartbeatInterval {
-			t.Fatalf("expected HeartbeatInterval=%v, got %v", DefaultServerHeartbeatInterval, server.HeartbeatInterval)
+		// Property: HeartbeatInterval should equal DefaultHeartbeatInterval
+		if server.HeartbeatInterval != DefaultHeartbeatInterval {
+			t.Fatalf("expected HeartbeatInterval=%v, got %v", DefaultHeartbeatInterval, server.HeartbeatInterval)
 		}
 
-		// Property: HealthTimeout should equal DefaultServerHealthTimeout
-		if server.HealthTimeout != DefaultServerHealthTimeout {
-			t.Fatalf("expected HealthTimeout=%v, got %v", DefaultServerHealthTimeout, server.HealthTimeout)
+		// Property: HealthTimeout should equal DefaultHealthTimeout
+		if server.HealthTimeout != DefaultHealthTimeout {
+			t.Fatalf("expected HealthTimeout=%v, got %v", DefaultHealthTimeout, server.HealthTimeout)
 		}
 	})
 
