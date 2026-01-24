@@ -9,6 +9,114 @@ A high-availability L4 (transport layer) NAT traversal tool built on the QUIC pr
 
 QMux operates at Layer 4 of the OSI model, enabling secure TCP/UDP tunneling through NAT/firewalls by establishing QUIC connections between clients and servers. It works at the transport layer, forwarding raw TCP streams without inspecting application-layer protocols. It supports multi-server configurations with automatic load balancing, mTLS authentication, and 0-RTT session resumption for fast reconnections.
 
+# Get Started
+
+## Installation
+
+### From Binary
+
+Download the latest release from [GitHub Releases](https://github.com/Mmx233/QMux/releases).
+
+### From Source
+
+```bash
+go install github.com/Mmx233/QMux@latest
+```
+
+### Docker
+
+```bash
+docker pull mmx233/qmux
+```
+
+## Quick Start
+
+### 1. Generate Certificates
+
+QMux uses mTLS for authentication by default. Generate the required certificates for testing:
+
+```bash
+qmux generate certs -s your-server-domain.com
+```
+
+The `-s` flag specifies the server DNS name for the certificate (required). You can specify multiple names:
+
+```bash
+qmux generate certs -s example.com -s qmux.example.com
+```
+
+Certificates are valid for 10 years by default. Use `-y` to customize:
+
+```bash
+qmux generate certs -s example.com -y 5  # 5 years validity
+```
+
+This creates in pwd:
+- `certs/ca.crt` - CA certificate
+- `certs/server.crt` / `certs/server.key` - Server certificate
+- `certs/client.crt` / `certs/client.key` - Client certificate
+
+### 2. Generate Configuration Files
+
+```bash
+# Generate server config
+qmux generate config server -o server.yaml
+
+# Generate client config
+qmux generate config client -o client.yaml
+```
+
+### 3. Configure Example Server
+
+Edit `server.yaml`:
+
+```yaml
+listeners:
+  - quic_addr: "0.0.0.0:8443"    # QUIC control port
+    traffic_addr: "0.0.0.0:8080" # Traffic forwarding port
+    protocol: "both"              # tcp, udp, or both
+
+auth:
+  method: "mtls"
+  ca_cert_file: "./certs/ca.crt"
+
+tls:
+  server_cert_file: "./certs/server.crt"
+  server_key_file: "./certs/server.key"
+```
+
+### 4. Configure Example Client
+
+Edit `client.yaml`:
+
+```yaml
+server:
+  servers:
+    - address: "your-server-ip:8443"
+      server_name: "qmux-server"
+
+local:
+  host: "127.0.0.1"
+  port: 3000  # Your local service port
+
+tls:
+  ca_cert_file: "./certs/ca.crt"
+  client_cert_file: "./certs/client.crt"
+  client_key_file: "./certs/client.key"
+```
+
+### 5. Run
+
+```bash
+# Start server (on public server)
+qmux run server -c server.yaml
+
+# Start client (on machine behind NAT)
+qmux run client -c client.yaml
+```
+
+Now external traffic to `your-server-ip:8080` will be forwarded to your local service on port 3000.
+
 # Performance
 
 ## Test Environment
