@@ -391,7 +391,7 @@ func TestServerHealthDetermination_Property(t *testing.T) {
 		// The server uses `>` for timeout check, so healthy means `<=`
 		expectedHealthy := timeSinceLastSeen < healthCheckTimeout
 
-		// Simulate the health determination logic (same as in handleHeartbeat)
+		// Simulate the health determination logic (same as in handleControlStream)
 		// Note: time.Since(lastSeen) will be slightly larger than timeSinceLastSeen due to time elapsed
 		actualHealthy := time.Since(lastSeen) <= healthCheckTimeout
 
@@ -485,7 +485,7 @@ func TestUnhealthyTriggersRemoval_Property(t *testing.T) {
 		// Simulate LastSeen being beyond timeout
 		lastSeen := time.Now().Add(-healthCheckTimeout - 10*time.Millisecond)
 
-		// Simulate the timeout detection and removal logic from handleHeartbeat
+		// Simulate the timeout detection and removal logic from handleControlStream
 		timeSinceLastSeen := time.Since(lastSeen)
 		if timeSinceLastSeen > healthCheckTimeout {
 			// Mark unhealthy
@@ -578,7 +578,7 @@ func TestUnhealthyTriggersRemovalSequence_Property(t *testing.T) {
 			sequence = append(sequence, op)
 		}
 
-		// Simulate the timeout handling sequence from handleHeartbeat
+		// Simulate the timeout handling sequence from handleControlStream
 		// This mirrors the actual code:
 		// poolInst.MarkUnhealthy(clientID)
 		// conn.CloseWithError(1, "heartbeat timeout")

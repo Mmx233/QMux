@@ -249,7 +249,6 @@ func (sc *ServerConnection) CheckReceivedHealth() bool {
 // It sends heartbeats to the server at the configured interval,
 // receives heartbeats from the server updating lastReceivedFromServer timestamp,
 // and checks for heartbeat timeout to detect unhealthy connection.
-// This is similar to the server-side handleHeartbeat implementation.
 func (sc *ServerConnection) heartbeatLoop(sendInterval time.Duration) {
 	sc.logger.Debug().
 		Dur("send_interval", sendInterval).
@@ -260,15 +259,6 @@ func (sc *ServerConnection) heartbeatLoop(sendInterval time.Duration) {
 	sendTicker := time.NewTicker(sendInterval)
 	defer sendTicker.Stop()
 
-	// Create a ticker for checking heartbeat timeout
-	// Check at half the timeout interval for responsive detection
-	timeoutCheckInterval := sc.healthTimeout / 2
-	if timeoutCheckInterval < 100*time.Millisecond {
-		timeoutCheckInterval = 100 * time.Millisecond
-	}
-	timeoutTicker := time.NewTicker(timeoutCheckInterval)
-	defer timeoutTicker.Stop()
-
 	// Channel to receive messages from the read goroutine
 	type readResult struct {
 		msgType byte
@@ -278,23 +268,24 @@ func (sc *ServerConnection) heartbeatLoop(sendInterval time.Duration) {
 	readCh := make(chan readResult, 1)
 
 	// Start a goroutine to read messages
-	go func() {
+	go func(ctx context.Context, stream *quic.Stream, readCh chan readResult) {
 		for {
-			if sc.controlStream == nil {
+			if stream == nil {
 				return
 			}
-			msgType, payload, err := protocol.ReadMessage(sc.controlStream)
+			msgType, payload, err := protocol.ReadMessage(stream)
 			select {
 			case readCh <- readResult{msgType: msgType, payload: payload, err: err}:
-			case <-sc.ctx.Done():
+			case <-ctx.Done():
 				return
 			}
 			if err != nil {
 				return
 			}
 		}
-	}()
+	}(sc.ctx, sc.controlStream, readCh)
 
+	heartbeatDeadline := time.After(sc.healthTimeout)
 	for {
 		select {
 		case <-sc.ctx.Done():
@@ -305,32 +296,6 @@ func (sc *ServerConnection) heartbeatLoop(sendInterval time.Duration) {
 			// Send heartbeat to server
 			if err := sc.SendHeartbeat(); err != nil {
 				sc.logger.Debug().Err(err).Msg("heartbeat send failed, exiting loop")
-				return
-			}
-
-		case <-timeoutTicker.C:
-			// Check if heartbeat was received within timeout period
-			lastReceived := sc.LastReceivedFromServer()
-			if lastReceived.IsZero() {
-				// No heartbeat received yet, skip check
-				continue
-			}
-
-			timeSinceLastReceived := time.Since(lastReceived)
-			if timeSinceLastReceived > sc.healthTimeout {
-				sc.logger.Warn().
-					Dur("time_since_last_received", timeSinceLastReceived).
-					Dur("timeout", sc.healthTimeout).
-					Msg("server heartbeat timeout")
-
-				// Mark connection as unhealthy
-				sc.MarkUnhealthy()
-
-				// Trigger reconnection if callback is set
-				if sc.reconnectCallback != nil {
-					sc.logger.Info().Msg("triggering reconnection due to health timeout")
-					sc.reconnectCallback(sc.serverAddr)
-				}
 				return
 			}
 
@@ -346,9 +311,10 @@ func (sc *ServerConnection) heartbeatLoop(sendInterval time.Duration) {
 			}
 
 			if result.msgType == protocol.MsgTypeHeartbeat {
-				// Update last received timestamp
+				// Update last received timestamp and reset deadline
 				sc.UpdateLastReceivedFromServer()
 				sc.logger.Debug().Msg("heartbeat received from server")
+				heartbeatDeadline = time.After(sc.healthTimeout)
 			} else {
 				// Route non-heartbeat messages to handler
 				if nonHeartbeatHandler != nil {
@@ -364,6 +330,24 @@ func (sc *ServerConnection) heartbeatLoop(sendInterval time.Duration) {
 						Msg("received non-heartbeat message (no handler set)")
 				}
 			}
+
+		case <-heartbeatDeadline:
+			lastReceived := sc.LastReceivedFromServer()
+			timeSinceLastReceived := time.Since(lastReceived)
+			sc.logger.Warn().
+				Dur("time_since_last_received", timeSinceLastReceived).
+				Dur("timeout", sc.healthTimeout).
+				Msg("server heartbeat timeout")
+
+			// Mark connection as unhealthy
+			sc.MarkUnhealthy()
+
+			// Trigger reconnection if callback is set
+			if sc.reconnectCallback != nil {
+				sc.logger.Info().Msg("triggering reconnection due to health timeout")
+				sc.reconnectCallback(sc.serverAddr)
+			}
+			return
 		}
 	}
 }
