@@ -218,6 +218,7 @@ func (p *ConnectionPool) MarkUnhealthy(clientID string) {
 
 	if conn, exists := p.clients[clientID]; exists {
 		conn.healthy.Store(false)
+		p.cachedClients.Store(nil)
 		p.logger.Warn().Str("client_id", clientID).Msg("client marked unhealthy")
 	}
 }
@@ -229,6 +230,7 @@ func (p *ConnectionPool) MarkHealthy(clientID string) {
 
 	if conn, exists := p.clients[clientID]; exists {
 		conn.healthy.Store(true)
+		p.cachedClients.Store(nil)
 		p.logger.Info().Str("client_id", clientID).Msg("client marked healthy")
 	}
 }
