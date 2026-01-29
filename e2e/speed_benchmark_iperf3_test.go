@@ -1,4 +1,4 @@
-package run
+package e2e
 
 import (
 	"bufio"
