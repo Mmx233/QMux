@@ -95,6 +95,7 @@ func (l *Listener) handleTCPConnection(conn net.Conn) {
 	)
 	if err != nil {
 		logger.Error().Err(err).Msg("send NewConn message failed")
+		l.Pool.MarkUnhealthy(client.ID)
 		return
 	}
 
