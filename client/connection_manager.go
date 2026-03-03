@@ -39,6 +39,10 @@ type ConnectionManager struct {
 	// Reconnection tracking
 	reconnectMu  sync.Mutex
 	reconnecting map[string]bool
+
+	// NewConns delivers newly established ServerConnections (initial + reconnected)
+	// to the Client layer for stream acceptance and UDP handler setup.
+	NewConns chan *ServerConnection
 }
 
 // NewConnectionManager creates a new ConnectionManager instance.
@@ -61,6 +65,7 @@ func NewConnectionManager(cfg *config.Client, logger zerolog.Logger) (*Connectio
 		ctx:           ctx,
 		cancel:        cancel,
 		reconnecting:  make(map[string]bool),
+		NewConns:      make(chan *ServerConnection, 16),
 	}
 
 	return cm, nil
@@ -169,8 +174,9 @@ func (cm *ConnectionManager) Start(ctx context.Context) error {
 
 	// Start heartbeat goroutines for connected servers
 	for _, sc := range connectedServers {
-		// Setup and start all heartbeat loops using the new unified method
 		cm.setupServerConnection(sc)
+		// Notify client of the new connection
+		cm.NewConns <- sc
 	}
 
 	return nil
@@ -316,6 +322,12 @@ func (cm *ConnectionManager) reconnectionLoop(serverAddr string) {
 
 		// Setup and start all heartbeat loops for reconnected server
 		cm.setupServerConnection(sc)
+
+		// Notify client of the new connection
+		select {
+		case cm.NewConns <- sc:
+		case <-cm.ctx.Done():
+		}
 
 		return
 	}

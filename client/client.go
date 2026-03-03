@@ -74,13 +74,14 @@ func (c *Client) Start(ctx context.Context) error {
 		Str("local", fmt.Sprintf("%s:%d", c.config.Local.Host, c.config.Local.Port)).
 		Msg("starting client")
 
+	// Listen for new connections (initial + reconnected) from the connection manager
+	c.wg.Add(1)
+	go c.handleNewConnections(ctx)
+
 	// Start connection manager (handles connecting to all servers)
 	if err := c.connMgr.Start(ctx); err != nil {
 		return fmt.Errorf("start connection manager: %w", err)
 	}
-
-	// Accept streams from all server connections
-	c.startAcceptingStreams(ctx)
 
 	c.logger.Info().
 		Int("healthy", c.connMgr.HealthyCount()).
@@ -94,24 +95,32 @@ func (c *Client) Start(ctx context.Context) error {
 	return c.shutdown()
 }
 
-// startAcceptingStreams starts goroutines to accept streams and datagrams from all connections
-func (c *Client) startAcceptingStreams(ctx context.Context) {
-	// Get all connections and start accepting streams from each
-	connections := c.connMgr.GetAllConnections()
-	for _, sc := range connections {
-		c.wg.Add(1)
-		go c.acceptStreamsFromConnection(ctx, sc)
+// handleNewConnections listens on the connection manager's NewConns channel
+// and starts stream acceptance and UDP handler for each new connection.
+func (c *Client) handleNewConnections(ctx context.Context) {
+	defer c.wg.Done()
 
-		// Start UDP datagram handler for this connection
-		if sc.Connection() != nil {
-			udpHandler := NewUDPHandler(
-				c.config.Local.Host,
-				c.config.Local.Port,
-				c.config.UDP.IsFragmentationEnabled(),
-				c.logger,
-			)
-			c.udpHandlers.Store(sc.ServerAddr(), udpHandler)
-			udpHandler.Start(ctx, *sc.Connection())
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case sc, ok := <-c.connMgr.NewConns:
+			if !ok {
+				return
+			}
+			c.wg.Add(1)
+			go c.acceptStreamsFromConnection(ctx, sc)
+
+			if sc.Connection() != nil {
+				udpHandler := NewUDPHandler(
+					c.config.Local.Host,
+					c.config.Local.Port,
+					c.config.UDP.IsFragmentationEnabled(),
+					c.logger,
+				)
+				c.udpHandlers.Store(sc.ServerAddr(), udpHandler)
+				udpHandler.Start(ctx, *sc.Connection())
+			}
 		}
 	}
 }
