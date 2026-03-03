@@ -19,20 +19,20 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// TestAbruptDisconnect_MTLS tests server behavior when a client disconnects abruptly
+// TestClientAbruptDisconnect_MTLS tests server behavior when a client disconnects abruptly
 // without proper handshake, with heartbeat disabled, under different load balancing algorithms
-func TestAbruptDisconnect_MTLS(t *testing.T) {
+func TestClientAbruptDisconnect_MTLS(t *testing.T) {
 	t.Run("least-connections", func(t *testing.T) {
-		testAbruptDisconnect(t, "least-connections")
+		testClientAbruptDisconnect(t, "least-connections")
 	})
 
 	t.Run("round-robin", func(t *testing.T) {
-		testAbruptDisconnect(t, "round-robin")
+		testClientAbruptDisconnect(t, "round-robin")
 	})
 }
 
-// testAbruptDisconnect is the core test function for abrupt disconnect scenarios
-func testAbruptDisconnect(t *testing.T, loadBalancer string) {
+// testClientAbruptDisconnect is the core test function for abrupt disconnect scenarios
+func testClientAbruptDisconnect(t *testing.T, loadBalancer string) {
 	certDir := generateTestCertificates(t)
 	defer os.RemoveAll(certDir)
 
@@ -252,4 +252,245 @@ func testConnection(t *testing.T, trafficPort int) bool {
 	}
 
 	return true
+}
+
+// TestServerRestartReconnect_MTLS tests that clients automatically reconnect
+// after the server is stopped and restarted, and can successfully handle
+// requests through the traffic port after reconnection.
+func TestServerRestartReconnect_MTLS(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Generate mTLS certificates for the test
+	certDir := generateTestCertificates(t)
+	defer os.RemoveAll(certDir)
+
+	// Start local TCP echo server on a random port
+	localListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start local echo server: %v", err)
+	}
+	defer localListener.Close()
+
+	localAddr := localListener.Addr().(*net.TCPAddr)
+	t.Logf("Local echo server listening on %s", localAddr)
+
+	// Echo server goroutine: echo back all received data
+	go func() {
+		for {
+			conn, err := localListener.Accept()
+			if err != nil {
+				return
+			}
+			go io.Copy(conn, conn)
+		}
+	}()
+
+	// Get free ports for QMux server
+	quicPort := getFreePort(t)
+	trafficPort := getFreePort(t)
+	t.Logf("Allocated QUIC port %d, traffic port %d", quicPort, trafficPort)
+
+	// Configure QMux server with short heartbeat and health timeout
+	serverConfig := &config.Server{
+		Listeners: []config.QuicListener{
+			{
+				QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
+				TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
+				Protocol:    "tcp",
+			},
+		},
+		Auth: config.ServerAuth{
+			Method:     "mtls",
+			CACertFile: filepath.Join(certDir, "ca.crt"),
+		},
+		TLS: config.ServerTLS{
+			ServerCertFile: filepath.Join(certDir, "server.crt"),
+			ServerKeyFile:  filepath.Join(certDir, "server.key"),
+		},
+		HeartbeatInterval: 1 * time.Second,
+		HealthTimeout:     3 * time.Second,
+	}
+
+	// Start QMux server with a cancellable context
+	serverCtx, serverCancel := context.WithCancel(ctx)
+	defer serverCancel()
+	go func() {
+		if err := server.Start(serverCtx, serverConfig); err != nil && !errors.Is(err, context.Canceled) {
+			t.Logf("server error: %v", err)
+		}
+	}()
+	time.Sleep(500 * time.Millisecond)
+	t.Logf("QMux server started on QUIC port %d, traffic port %d", quicPort, trafficPort)
+
+	// Create and start client-1 in-process
+	client1Config := &config.Client{
+		ClientID: "client-1",
+		Server: config.ClientServer{
+			Servers: []config.ServerEndpoint{
+				{Address: fmt.Sprintf("127.0.0.1:%d", quicPort), ServerName: "localhost"},
+			},
+		},
+		Local: config.LocalService{
+			Host: "127.0.0.1",
+			Port: localAddr.Port,
+		},
+		TLS: config.ClientTLS{
+			CACertFile:     filepath.Join(certDir, "ca.crt"),
+			ClientCertFile: filepath.Join(certDir, "client.crt"),
+			ClientKeyFile:  filepath.Join(certDir, "client.key"),
+		},
+		HeartbeatInterval: 1 * time.Second,
+		HealthTimeout:     3 * time.Second,
+	}
+
+	c1, err := client.New(client1Config)
+	if err != nil {
+		t.Fatalf("failed to create client-1: %v", err)
+	}
+
+	client1Ctx, client1Cancel := context.WithCancel(ctx)
+	defer client1Cancel()
+	go func() {
+		if err := c1.Start(client1Ctx); err != nil && !errors.Is(err, context.Canceled) {
+			t.Logf("client-1 error: %v", err)
+		}
+	}()
+	time.Sleep(1 * time.Second)
+
+	// Create and start client-2 in-process
+	client2Config := &config.Client{
+		ClientID: "client-2",
+		Server: config.ClientServer{
+			Servers: []config.ServerEndpoint{
+				{Address: fmt.Sprintf("127.0.0.1:%d", quicPort), ServerName: "localhost"},
+			},
+		},
+		Local: config.LocalService{
+			Host: "127.0.0.1",
+			Port: localAddr.Port,
+		},
+		TLS: config.ClientTLS{
+			CACertFile:     filepath.Join(certDir, "ca.crt"),
+			ClientCertFile: filepath.Join(certDir, "client.crt"),
+			ClientKeyFile:  filepath.Join(certDir, "client.key"),
+		},
+		HeartbeatInterval: 1 * time.Second,
+		HealthTimeout:     3 * time.Second,
+	}
+
+	c2, err := client.New(client2Config)
+	if err != nil {
+		t.Fatalf("failed to create client-2: %v", err)
+	}
+
+	client2Ctx, client2Cancel := context.WithCancel(ctx)
+	defer client2Cancel()
+	go func() {
+		if err := c2.Start(client2Ctx); err != nil && !errors.Is(err, context.Canceled) {
+			t.Logf("client-2 error: %v", err)
+		}
+	}()
+	time.Sleep(1 * time.Second)
+
+	// Verify both clients have healthy connections
+	c1Healthy := c1.HealthyConnectionCount()
+	c1Total := c1.TotalConnectionCount()
+	t.Logf("Client-1: %d healthy, %d total connections", c1Healthy, c1Total)
+	if c1Healthy != 1 {
+		t.Fatalf("client-1 should have 1 healthy connection, got %d healthy, %d total", c1Healthy, c1Total)
+	}
+
+	c2Healthy := c2.HealthyConnectionCount()
+	c2Total := c2.TotalConnectionCount()
+	t.Logf("Client-2: %d healthy, %d total connections", c2Healthy, c2Total)
+	if c2Healthy != 1 {
+		t.Fatalf("client-2 should have 1 healthy connection, got %d healthy, %d total", c2Healthy, c2Total)
+	}
+
+	t.Log("Both clients connected and healthy")
+
+	// Verify initial end-to-end connection via traffic port
+	if !testConnection(t, trafficPort) {
+		t.Fatalf("initial connection verification failed: traffic port %d is not working", trafficPort)
+	}
+	t.Log("Initial connection verification passed")
+	// Stop the QMux server by cancelling its context
+	t.Log("Stopping QMux server...")
+	serverCancel()
+
+	// Wait for both clients to detect the disconnect (healthy drops to 0)
+	t.Log("Waiting for clients to detect server shutdown...")
+	disconnectTicker := time.NewTicker(200 * time.Millisecond)
+	defer disconnectTicker.Stop()
+	disconnectTimeout := time.After(15 * time.Second)
+	for {
+		select {
+		case <-disconnectTimeout:
+			t.Fatalf("timed out waiting for clients to detect disconnect: client-1 healthy=%d, client-2 healthy=%d",
+				c1.HealthyConnectionCount(), c2.HealthyConnectionCount())
+		case <-disconnectTicker.C:
+			if c1.HealthyConnectionCount() == 0 && c2.HealthyConnectionCount() == 0 {
+				goto disconnected
+			}
+		}
+	}
+disconnected:
+	t.Log("Both clients detected server shutdown")
+
+	// Use a new traffic port for the restarted server since the old traffic
+	// manager's TCP listener is not closed by server.Start on context cancel.
+	trafficPort2 := getFreePort(t)
+	serverConfig.Listeners[0].TrafficAddr = fmt.Sprintf("127.0.0.1:%d", trafficPort2)
+	t.Logf("Allocated new traffic port %d for server restart", trafficPort2)
+
+	// Restart the QMux server with a new cancellable context
+	serverCtx2, serverCancel2 := context.WithCancel(ctx)
+	defer serverCancel2()
+	serverErrCh := make(chan error, 1)
+	go func() {
+		serverErrCh <- server.Start(serverCtx2, serverConfig)
+	}()
+	// Give the server a moment to start, then verify it didn't fail immediately
+	time.Sleep(500 * time.Millisecond)
+	select {
+	case err := <-serverErrCh:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("server failed to restart: %v", err)
+		}
+	default:
+		// Server is running
+	}
+	t.Logf("QMux server restarted on QUIC port %d, traffic port %d", quicPort, trafficPort2)
+
+	// Wait for both clients to reconnect
+	t.Log("Waiting for both clients to reconnect...")
+	reconnectTicker := time.NewTicker(500 * time.Millisecond)
+	defer reconnectTicker.Stop()
+	reconnectTimeout := time.After(30 * time.Second)
+	for {
+		select {
+		case <-reconnectTimeout:
+			t.Fatalf("timed out waiting for clients to reconnect: client-1 healthy=%d total=%d, client-2 healthy=%d total=%d",
+				c1.HealthyConnectionCount(), c1.TotalConnectionCount(),
+				c2.HealthyConnectionCount(), c2.TotalConnectionCount())
+		case <-reconnectTicker.C:
+			if c1.HealthyConnectionCount() >= 1 && c2.HealthyConnectionCount() >= 1 {
+				goto reconnected
+			}
+		}
+	}
+reconnected:
+	t.Logf("Both clients reconnected: client-1 healthy=%d total=%d, client-2 healthy=%d total=%d",
+		c1.HealthyConnectionCount(), c1.TotalConnectionCount(),
+		c2.HealthyConnectionCount(), c2.TotalConnectionCount())
+
+	// Verify end-to-end connection works after reconnection using the new traffic port
+	if !testConnection(t, trafficPort2) {
+		t.Fatalf("post-reconnection connection verification failed: traffic port %d is not working; client-1 healthy=%d total=%d, client-2 healthy=%d total=%d",
+			trafficPort2,
+			c1.HealthyConnectionCount(), c1.TotalConnectionCount(),
+			c2.HealthyConnectionCount(), c2.TotalConnectionCount())
+	}
+	t.Log("Post-reconnection connection verification passed")
 }
