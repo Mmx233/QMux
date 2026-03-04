@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,7 +20,7 @@ jobs:
         with:
           repository: "Mmx233/GoReleaseCli"
           latest: true
-          fileName: 'release_linux_amd64.tar.gz'
+          fileName: 'release_linux_arm64.tar.gz'
           extract: true
           out-file-path: './build/'
 
