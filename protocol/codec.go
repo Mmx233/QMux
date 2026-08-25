@@ -103,10 +103,12 @@ func WriteRegister(w io.Writer, clientID, version string, capabilities []string)
 }
 
 // WriteRegisterAck writes a registration acknowledgment
-func WriteRegisterAck(w io.Writer, success bool, message string) error {
+func WriteRegisterAck(w io.Writer, success bool, message, serverVersion string, selectedCapabilities []string) error {
 	msg := RegisterAckMsg{
-		Success: success,
-		Message: message,
+		Success:              success,
+		Message:              message,
+		ServerVersion:        serverVersion,
+		SelectedCapabilities: selectedCapabilities,
 	}
 	return WriteMessage(w, MsgTypeRegisterAck, msg)
 }

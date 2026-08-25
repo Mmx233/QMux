@@ -81,7 +81,7 @@ func TestPooledFragmentLifecycle_SmallPackets_Property(t *testing.T) {
 		sessionID := rapid.Uint32().Draw(t, "sessionID")
 
 		// Generate small data that won't require fragmentation
-		// MaxUDPPayload = MaxDatagramSize - UDPHeaderSize = 1200 - 4 = 1196
+		// MaxUDPPayload = MaxDatagramSize - UDPHeaderSize = 1200 - 5 = 1195
 		dataLen := rapid.IntRange(1, MaxUDPPayload).Draw(t, "dataLen")
 		data := make([]byte, dataLen)
 		for i := range data {
@@ -127,7 +127,7 @@ func TestPooledFragmentLifecycle_LargePackets_Property(t *testing.T) {
 		sessionID := rapid.Uint32().Draw(t, "sessionID")
 
 		// Generate large data that requires fragmentation
-		// MaxUDPPayload = 1196, so anything larger needs fragmentation
+		// MaxUDPPayload = 1195, so anything larger needs fragmentation
 		// Limit to reasonable size to avoid too many fragments (max 255)
 		// MaxFragPayload = 1191, so max data = 255 * 1191 = ~303KB
 		// We'll test up to 50KB for reasonable test times
@@ -268,7 +268,7 @@ func TestFragmentReassemblyRoundTrip_Property(t *testing.T) {
 		// Generate random session ID
 		sessionID := rapid.Uint32().Draw(t, "sessionID")
 
-		// Generate data that requires fragmentation (> MaxUDPPayload = 1196 bytes)
+		// Generate data that requires fragmentation (> MaxUDPPayload = 1195 bytes)
 		// Limit to reasonable size to avoid too many fragments (max 255)
 		// MaxFragPayload = 1191, so max data = 255 * 1191 = ~303KB
 		// We'll test up to 50KB for reasonable test times
@@ -513,7 +513,7 @@ func TestFragmentReassemblyRoundTrip_MinFragmentation_Property(t *testing.T) {
 		defer ReleaseDatagramResults(results)
 
 		// Property: Should produce exactly 2 fragments
-		// Note: MaxUDPPayload = 1196, MaxFragPayload = 1191
+		// Note: MaxUDPPayload = 1195, MaxFragPayload = 1191
 		// For 1197 bytes: ceil(1197/1191) = 2 fragments
 		expectedFragments := (dataLen + MaxFragPayload - 1) / MaxFragPayload
 		if len(results) != expectedFragments {
@@ -805,7 +805,7 @@ func TestConcurrentFragmentCorrectness_Property(t *testing.T) {
 			// Generate unique session ID for each packet
 			sessionID := rapid.Uint32().Draw(t, "sessionID")
 
-			// Generate data that requires fragmentation (> MaxUDPPayload = 1196 bytes)
+			// Generate data that requires fragmentation (> MaxUDPPayload = 1195 bytes)
 			// Keep size reasonable to avoid too many fragments
 			dataLen := rapid.IntRange(MaxUDPPayload+1, 10*1024).Draw(t, "dataLen")
 			data := make([]byte, dataLen)
@@ -1335,7 +1335,7 @@ func TestAtomicCounterThreadSafety_Property(t *testing.T) {
 		// Generate random session ID
 		sessionID := rapid.Uint32().Draw(t, "sessionID")
 
-		// Generate data that requires fragmentation (> MaxUDPPayload = 1196 bytes)
+		// Generate data that requires fragmentation (> MaxUDPPayload = 1195 bytes)
 		// This ensures FragmentUDPPooled will use the atomic counter
 		dataLen := rapid.IntRange(MaxUDPPayload+1, 5*1024).Draw(t, "dataLen")
 		data := make([]byte, dataLen)

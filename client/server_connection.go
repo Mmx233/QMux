@@ -415,14 +415,19 @@ func (sc *ServerConnection) Register(clientID string) error {
 		return fmt.Errorf("read registration ack: %w", err)
 	}
 
-	if !ackMsg.Success {
-		return fmt.Errorf("registration failed: %s", ackMsg.Message)
+	if err := sc.acceptRegisterAck(ackMsg); err != nil {
+		return err
 	}
 
-	// Mark as healthy after successful registration
-	sc.MarkHealthy()
-
 	sc.logger.Info().Str("message", ackMsg.Message).Msg("registered with server")
+	return nil
+}
+
+func (sc *ServerConnection) acceptRegisterAck(ack protocol.RegisterAckMsg) error {
+	if err := protocol.ValidateRegisterAck(ack); err != nil {
+		return err
+	}
+	sc.MarkHealthy()
 	return nil
 }
 

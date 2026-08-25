@@ -1,4 +1,6 @@
 /.idea
+/.vscode
+/.codex
 /.claude
 /.kiro
 /*.yaml

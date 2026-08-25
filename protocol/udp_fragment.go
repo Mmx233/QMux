@@ -8,11 +8,17 @@ import (
 	"time"
 )
 
-// UDP fragment header format:
-// [4 bytes session ID][2 bytes fragment ID][1 byte flags][1 byte fragment index][1 byte total fragments][payload]
-// Flags: 0x01 = more fragments follow
+// UDP wire v2 datagram formats:
+//
+//   - normal:   [0x20][4 bytes session ID][payload]
+//   - fragment: [0x21][4 bytes session ID][2 bytes fragment ID][1 byte fragment index][1 byte total fragments][payload]
+//
+// All multi-byte integers use big-endian byte order.
 const (
-	UDPHeaderSize     = 4                                   // Session ID only (for unfragmented packets)
+	UDPDatagramTypeNormal   = 0x20
+	UDPDatagramTypeFragment = 0x21
+
+	UDPHeaderSize     = 5                                   // Type and session ID
 	UDPFragHeaderSize = 9                                   // Full fragment header
 	MaxDatagramSize   = 1200                                // Safe QUIC datagram payload size
 	MaxUDPPayload     = MaxDatagramSize - UDPHeaderSize     // Max payload for unfragmented
@@ -23,18 +29,48 @@ const (
 	DefaultShardCount = 16
 )
 
-const (
-	FlagMoreFragments = 0x01
-	FlagFragmented    = 0x80 // Indicates this is a fragmented packet
-)
-
 var (
 	ErrPacketTooLarge        = errors.New("packet too large to fragment")
 	ErrSessionIDMismatch     = errors.New("session ID mismatch")
 	ErrInvalidFragIndex      = errors.New("invalid fragment index")
 	ErrDatagramTooShort      = errors.New("datagram too short")
+	ErrDatagramTooLarge      = errors.New("datagram exceeds maximum size")
+	ErrUnknownDatagramType   = errors.New("unknown UDP datagram type")
+	ErrInvalidFragTotal      = errors.New("invalid fragment total")
+	ErrEmptyFragmentPayload  = errors.New("empty fragment payload")
+	ErrFragmentAssemblerNil  = errors.New("fragment assembler is required")
 	ErrFragmentationDisabled = errors.New("fragmentation disabled, packet too large")
 )
+
+// UDPDatagram is a validated UDP wire v2 datagram.
+// Payload aliases the input passed to DecodeUDPDatagram.
+type UDPDatagram struct {
+	Type          byte
+	SessionID     uint32
+	IsFragmented  bool
+	FragmentID    uint16
+	FragmentIndex uint8
+	FragmentTotal uint8
+	Payload       []byte
+}
+
+// UDPFragmentAssembler is implemented by the regular and sharded fragment assemblers.
+type UDPFragmentAssembler interface {
+	AddFragment(sessionID uint32, fragID uint16, index, total uint8, payload []byte) ([]byte, error)
+}
+
+func writeUDPHeader(dst []byte, sessionID uint32) {
+	dst[0] = UDPDatagramTypeNormal
+	binary.BigEndian.PutUint32(dst[1:UDPHeaderSize], sessionID)
+}
+
+func writeUDPFragmentHeader(dst []byte, sessionID uint32, fragID uint16, index, total uint8) {
+	dst[0] = UDPDatagramTypeFragment
+	binary.BigEndian.PutUint32(dst[1:5], sessionID)
+	binary.BigEndian.PutUint16(dst[5:7], fragID)
+	dst[7] = index
+	dst[8] = total
+}
 
 // DatagramResult holds a datagram and its buffer for later release.
 // Data is a slice of the buffer containing the actual datagram content.
@@ -61,17 +97,17 @@ func ReleaseDatagramResults(results []DatagramResult) {
 // to return the buffers to the pool.
 //
 // For unfragmented packets (data <= MaxUDPPayload), returns a single DatagramResult
-// with a simple 4-byte header containing only the session ID.
+// with a 5-byte header containing the datagram type and session ID.
 //
 // For fragmented packets, returns multiple DatagramResults with 9-byte headers
-// containing session ID, fragment ID, flags, fragment index, and total fragments.
+// containing type, session ID, fragment ID, fragment index, and total fragments.
 func FragmentUDPPooled(sessionID uint32, data []byte, fragIDCounter *atomic.Uint32, enableFragmentation bool) ([]DatagramResult, error) {
 	if len(data) <= MaxUDPPayload {
 		// No fragmentation needed - use pooled buffer
 		bufPtr := GetDatagramBuffer()
 		buf := *bufPtr
 
-		binary.BigEndian.PutUint32(buf[:4], sessionID)
+		writeUDPHeader(buf, sessionID)
 		copy(buf[UDPHeaderSize:], data)
 
 		return []DatagramResult{{
@@ -94,26 +130,14 @@ func FragmentUDPPooled(sessionID uint32, data []byte, fragIDCounter *atomic.Uint
 	results := make([]DatagramResult, numFragments)
 	offset := 0
 
-	for i := 0; i < numFragments; i++ {
-		end := offset + MaxFragPayload
-		if end > len(data) {
-			end = len(data)
-		}
+	for i := range numFragments {
+		end := min(offset+MaxFragPayload, len(data))
 		payloadLen := end - offset
 
 		bufPtr := GetDatagramBuffer()
 		buf := *bufPtr
 
-		binary.BigEndian.PutUint32(buf[:4], sessionID)
-		binary.BigEndian.PutUint16(buf[4:6], fragID)
-
-		flags := byte(FlagFragmented)
-		if i < numFragments-1 {
-			flags |= FlagMoreFragments
-		}
-		buf[6] = flags
-		buf[7] = byte(i)
-		buf[8] = byte(numFragments)
+		writeUDPFragmentHeader(buf, sessionID, fragID, byte(i), byte(numFragments))
 		copy(buf[UDPFragHeaderSize:], data[offset:end])
 
 		results[i] = DatagramResult{
@@ -357,7 +381,7 @@ func FragmentUDP(sessionID uint32, data []byte, fragIDCounter *uint16, enableFra
 	if len(data) <= MaxUDPPayload {
 		// No fragmentation needed - use simple header
 		dgram := make([]byte, UDPHeaderSize+len(data))
-		binary.BigEndian.PutUint32(dgram[:4], sessionID)
+		writeUDPHeader(dgram, sessionID)
 		copy(dgram[UDPHeaderSize:], data)
 		return [][]byte{dgram}, nil
 	}
@@ -378,25 +402,13 @@ func FragmentUDP(sessionID uint32, data []byte, fragIDCounter *uint16, enableFra
 	result := make([][]byte, numFragments)
 	offset := 0
 
-	for i := 0; i < numFragments; i++ {
-		end := offset + MaxFragPayload
-		if end > len(data) {
-			end = len(data)
-		}
+	for i := range numFragments {
+		end := min(offset+MaxFragPayload, len(data))
 		payload := data[offset:end]
 		offset = end
 
 		dgram := make([]byte, UDPFragHeaderSize+len(payload))
-		binary.BigEndian.PutUint32(dgram[:4], sessionID)
-		binary.BigEndian.PutUint16(dgram[4:6], fragID)
-
-		flags := byte(FlagFragmented)
-		if i < numFragments-1 {
-			flags |= FlagMoreFragments
-		}
-		dgram[6] = flags
-		dgram[7] = byte(i)
-		dgram[8] = byte(numFragments)
+		writeUDPFragmentHeader(dgram, sessionID, fragID, byte(i), byte(numFragments))
 		copy(dgram[UDPFragHeaderSize:], payload)
 
 		result[i] = dgram
@@ -405,29 +417,90 @@ func FragmentUDP(sessionID uint32, data []byte, fragIDCounter *uint16, enableFra
 	return result, nil
 }
 
-// ParseUDPDatagram parses a UDP datagram header
-// Returns sessionID, isFragmented, fragID, fragIndex, fragTotal, payload
-func ParseUDPDatagram(dgram []byte) (uint32, bool, uint16, uint8, uint8, []byte, error) {
+// DecodeUDPDatagram strictly parses and validates a UDP wire v2 datagram.
+// Legacy datagrams and unknown wire versions or packet types are rejected.
+func DecodeUDPDatagram(dgram []byte) (UDPDatagram, error) {
 	if len(dgram) < UDPHeaderSize {
-		return 0, false, 0, 0, 0, nil, ErrDatagramTooShort
+		return UDPDatagram{}, ErrDatagramTooShort
+	}
+	if len(dgram) > MaxDatagramSize {
+		return UDPDatagram{}, ErrDatagramTooLarge
 	}
 
-	sessionID := binary.BigEndian.Uint32(dgram[:4])
+	switch dgram[0] {
+	case UDPDatagramTypeNormal:
+		return UDPDatagram{
+			Type:      UDPDatagramTypeNormal,
+			SessionID: binary.BigEndian.Uint32(dgram[1:5]),
+			Payload:   dgram[UDPHeaderSize:],
+		}, nil
 
-	// Check if this is a fragmented packet by looking at the flags byte position
-	// For fragmented packets, we have at least 9 bytes header
-	if len(dgram) >= UDPFragHeaderSize {
-		flags := dgram[6]
-		if flags&FlagFragmented != 0 {
-			fragID := binary.BigEndian.Uint16(dgram[4:6])
-			fragIndex := dgram[7]
-			fragTotal := dgram[8]
-			payload := dgram[UDPFragHeaderSize:]
-			return sessionID, true, fragID, fragIndex, fragTotal, payload, nil
+	case UDPDatagramTypeFragment:
+		if len(dgram) < UDPFragHeaderSize {
+			return UDPDatagram{}, ErrDatagramTooShort
 		}
+		if len(dgram) == UDPFragHeaderSize {
+			return UDPDatagram{}, ErrEmptyFragmentPayload
+		}
+
+		total := dgram[8]
+		if total < 2 {
+			return UDPDatagram{}, ErrInvalidFragTotal
+		}
+		index := dgram[7]
+		if index >= total {
+			return UDPDatagram{}, ErrInvalidFragIndex
+		}
+
+		return UDPDatagram{
+			Type:          UDPDatagramTypeFragment,
+			SessionID:     binary.BigEndian.Uint32(dgram[1:5]),
+			IsFragmented:  true,
+			FragmentID:    binary.BigEndian.Uint16(dgram[5:7]),
+			FragmentIndex: index,
+			FragmentTotal: total,
+			Payload:       dgram[UDPFragHeaderSize:],
+		}, nil
+
+	default:
+		return UDPDatagram{}, ErrUnknownDatagramType
+	}
+}
+
+// ParseUDPDatagram is the compatibility adapter for the original tuple API.
+// New code should use DecodeUDPDatagram so fields cannot be confused at call sites.
+func ParseUDPDatagram(dgram []byte) (uint32, bool, uint16, uint8, uint8, []byte, error) {
+	parsed, err := DecodeUDPDatagram(dgram)
+	if err != nil {
+		return 0, false, 0, 0, 0, nil, err
+	}
+	return parsed.SessionID, parsed.IsFragmented, parsed.FragmentID, parsed.FragmentIndex, parsed.FragmentTotal, parsed.Payload, nil
+}
+
+// DecodeAndAssembleUDPDatagram validates a UDP wire v2 datagram and, when needed,
+// adds it to assembler. complete distinguishes an incomplete fragmented packet
+// from a valid normal datagram with an empty payload.
+func DecodeAndAssembleUDPDatagram(dgram []byte, assembler UDPFragmentAssembler) (sessionID uint32, payload []byte, complete bool, err error) {
+	parsed, err := DecodeUDPDatagram(dgram)
+	if err != nil {
+		return 0, nil, false, err
+	}
+	if !parsed.IsFragmented {
+		return parsed.SessionID, parsed.Payload, true, nil
+	}
+	if assembler == nil {
+		return 0, nil, false, ErrFragmentAssemblerNil
 	}
 
-	// Unfragmented packet
-	payload := dgram[UDPHeaderSize:]
-	return sessionID, false, 0, 0, 0, payload, nil
+	payload, err = assembler.AddFragment(
+		parsed.SessionID,
+		parsed.FragmentID,
+		parsed.FragmentIndex,
+		parsed.FragmentTotal,
+		parsed.Payload,
+	)
+	if err != nil {
+		return 0, nil, false, err
+	}
+	return parsed.SessionID, payload, payload != nil, nil
 }

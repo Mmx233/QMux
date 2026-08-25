@@ -74,11 +74,17 @@ func (l *Listener) startUDP() error {
 	}
 
 	// Increase UDP buffer sizes
-	if err := conn.SetReadBuffer(4 * 1024 * 1024); err != nil {
-		l.logger.Warn().Err(err).Msg("set UDP read buffer failed")
+	bufferSetters := []struct {
+		name string
+		set  func(int) error
+	}{
+		{name: "read", set: conn.SetReadBuffer},
+		{name: "write", set: conn.SetWriteBuffer},
 	}
-	if err := conn.SetWriteBuffer(4 * 1024 * 1024); err != nil {
-		l.logger.Warn().Err(err).Msg("set UDP write buffer failed")
+	for _, setter := range bufferSetters {
+		if err := setter.set(4 * 1024 * 1024); err != nil {
+			l.logger.Warn().Err(err).Msg("set UDP " + setter.name + " buffer failed")
+		}
 	}
 
 	l.UDPConn = conn
@@ -243,24 +249,14 @@ func (h *UDPHandler) receiveDatagrams(quicConn *quic.Conn) {
 			}
 		}
 
-		// Parse datagram
-		sessionID, isFragmented, fragID, fragIndex, fragTotal, payload, err := protocol.ParseUDPDatagram(dgram)
+		// Validate and, if needed, reassemble the datagram.
+		sessionID, payload, complete, err := protocol.DecodeAndAssembleUDPDatagram(dgram, h.fragmentAssembler)
 		if err != nil {
-			h.logger.Debug().Err(err).Msg("parse datagram failed")
+			h.logger.Debug().Err(err).Msg("process datagram failed")
 			continue
 		}
-
-		// Handle fragmented packets
-		if isFragmented {
-			payload, err = h.fragmentAssembler.AddFragment(sessionID, fragID, fragIndex, fragTotal, payload)
-			if err != nil {
-				h.logger.Debug().Err(err).Msg("add fragment failed")
-				continue
-			}
-			if payload == nil {
-				// More fragments needed
-				continue
-			}
+		if !complete {
+			continue
 		}
 
 		// Find session by ID

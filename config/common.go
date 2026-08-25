@@ -58,7 +58,7 @@ func (q Quic) GetConfig() *quic.Config {
 // UDPConfig contains UDP-specific configuration
 type UDPConfig struct {
 	// EnableFragmentation enables automatic fragmentation of large UDP packets.
-	// When enabled, packets larger than ~1196 bytes will be split into multiple
+	// When enabled, packets larger than 1195 bytes will be split into multiple
 	// QUIC datagrams and reassembled on the other side.
 	// Default: true
 	EnableFragmentation *bool `yaml:"enable_fragmentation"`

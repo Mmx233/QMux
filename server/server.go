@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"slices"
 	"time"
 
 	"github.com/Mmx233/QMux/config"
@@ -260,6 +261,15 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn, quicAddr
 		Str("version", regMsg.Version).
 		Logger()
 
+	// Reject incompatible peers before constructing or publishing a pool entry.
+	if err := protocol.ValidateRegistration(regMsg.Version, regMsg.Capabilities); err != nil {
+		logger.Warn().Err(err).Msg("registration negotiation failed")
+		_ = protocol.WriteRegisterAck(controlStream, false, err.Error(), protocol.ProtocolVersion, nil)
+		_ = conn.CloseWithError(1, "incompatible protocol")
+		return
+	}
+	selectedCapabilities := protocol.SelectCapabilities(regMsg.Capabilities, config.DefaultCapabilities)
+
 	logger.Info().
 		Strs("capabilities", regMsg.Capabilities).
 		Msg("client registered")
@@ -273,7 +283,7 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn, quicAddr
 		LastSeen:      time.Now(),
 		Metadata: pool.ClientMetadata{
 			Version:      regMsg.Version,
-			Capabilities: regMsg.Capabilities,
+			Capabilities: slices.Clone(selectedCapabilities),
 		},
 	}
 
@@ -281,13 +291,13 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn, quicAddr
 	poolInst := s.pools[quicAddr]
 	if err := poolInst.Add(regMsg.ClientID, clientConn); err != nil {
 		logger.Error().Err(err).Msg("add to pool failed")
-		_ = protocol.WriteRegisterAck(controlStream, false, err.Error())
+		_ = protocol.WriteRegisterAck(controlStream, false, err.Error(), protocol.ProtocolVersion, nil)
 		_ = conn.CloseWithError(1, "pool error")
 		return
 	}
 
 	// Send acknowledgment
-	if err := protocol.WriteRegisterAck(controlStream, true, "registered"); err != nil {
+	if err := protocol.WriteRegisterAck(controlStream, true, "registered", protocol.ProtocolVersion, selectedCapabilities); err != nil {
 		logger.Error().Err(err).Msg("send ack failed")
 		poolInst.Remove(regMsg.ClientID)
 		return

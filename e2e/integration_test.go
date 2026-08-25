@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -323,10 +324,12 @@ func TestUDPReverseProxy_MTLS(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 
 	// Test UDP through tunnel
-	testData := []string{
-		"UDP Test 1",
-		"UDP Test 2",
-		strings.Repeat("U", 512),
+	testData := [][]byte{
+		[]byte("UDP Test 1"),
+		[]byte("UDP Test 2"),
+		[]byte(strings.Repeat("U", 512)),
+		{0x01, 0x02, 0x80, 0x00, 0x02, 0x03},
+		bytes.Repeat([]byte{0x00, 0xff, 0x80, 0x21}, 512),
 	}
 
 	for i, data := range testData {
@@ -340,7 +343,7 @@ func TestUDPReverseProxy_MTLS(t *testing.T) {
 			conn.SetDeadline(time.Now().Add(5 * time.Second))
 
 			// Send data
-			_, err = conn.Write([]byte(data))
+			_, err = conn.Write(data)
 			if err != nil {
 				t.Fatalf("failed to write UDP: %v", err)
 			}
@@ -352,8 +355,8 @@ func TestUDPReverseProxy_MTLS(t *testing.T) {
 				t.Fatalf("failed to read UDP: %v", err)
 			}
 
-			if string(buf[:n]) != data {
-				t.Fatalf("UDP data mismatch: got %q, expected %q", string(buf[:n]), data)
+			if !bytes.Equal(buf[:n], data) {
+				t.Fatalf("UDP data mismatch: got % x, expected % x", buf[:n], data)
 			}
 		})
 	}

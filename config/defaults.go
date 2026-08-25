@@ -31,7 +31,7 @@ const (
 )
 
 // DefaultCapabilities lists the default supported protocols
-var DefaultCapabilities = []string{"tcp", "udp"}
+var DefaultCapabilities = []string{"tcp", "udp", "udp-wire-v2"}
 
 // GenerateClientID generates a new UUID for use as a client identifier.
 // This is useful for K8s deployments where multiple pods share the same ConfigMap.

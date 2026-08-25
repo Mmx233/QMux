@@ -1,5 +1,10 @@
 package protocol
 
+import (
+	"fmt"
+	"slices"
+)
+
 // Message types
 const (
 	MsgTypeRegister    = 0x01 // Client registration
@@ -23,8 +28,10 @@ type RegisterMsg struct {
 
 // RegisterAckMsg is sent by server to acknowledge registration
 type RegisterAckMsg struct {
-	Success bool   // Registration success
-	Message string // Optional message
+	Success              bool     // Registration success
+	Message              string   // Optional message
+	ServerVersion        string   // Protocol version selected by the server
+	SelectedCapabilities []string // Capabilities selected for this connection
 }
 
 // HeartbeatMsg is sent periodically to keep connection alive
@@ -59,4 +66,51 @@ type Message struct {
 	Payload interface{}
 }
 
-const ProtocolVersion = "1.0"
+const (
+	ProtocolVersion     = "2.0"
+	CapabilityUDPWireV2 = "udp-wire-v2"
+)
+
+// HasCapability reports whether capabilities contains capability.
+func HasCapability(capabilities []string, capability string) bool {
+	return slices.Contains(capabilities, capability)
+}
+
+// ValidateRegistration rejects peers that cannot safely exchange UDP wire v2 datagrams.
+func ValidateRegistration(version string, capabilities []string) error {
+	if version != ProtocolVersion {
+		return fmt.Errorf("incompatible protocol version: got %q, require %q", version, ProtocolVersion)
+	}
+	if !HasCapability(capabilities, CapabilityUDPWireV2) {
+		return fmt.Errorf("required capability %q is missing", CapabilityUDPWireV2)
+	}
+	return nil
+}
+
+// SelectCapabilities returns the requested capabilities supported by this peer.
+// It preserves request order while removing duplicates.
+func SelectCapabilities(requested, supported []string) []string {
+	selected := make([]string, 0, len(requested))
+	seen := make(map[string]struct{}, len(requested))
+	for _, capability := range requested {
+		if _, duplicate := seen[capability]; duplicate {
+			continue
+		}
+		if HasCapability(supported, capability) {
+			selected = append(selected, capability)
+			seen[capability] = struct{}{}
+		}
+	}
+	return selected
+}
+
+// ValidateRegisterAck verifies the server side of protocol negotiation.
+func ValidateRegisterAck(ack RegisterAckMsg) error {
+	if !ack.Success {
+		return fmt.Errorf("registration failed: %s", ack.Message)
+	}
+	if err := ValidateRegistration(ack.ServerVersion, ack.SelectedCapabilities); err != nil {
+		return fmt.Errorf("invalid registration acknowledgment: %w", err)
+	}
+	return nil
+}

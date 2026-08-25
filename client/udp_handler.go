@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -17,8 +18,15 @@ const (
 	// Session timeout for inactive UDP sessions
 	udpSessionTimeout = 5 * time.Minute
 	// Cleanup interval for expired sessions
-	udpCleanupInterval = 30 * time.Second
+	udpCleanupInterval  = 30 * time.Second
+	udpSocketBufferSize = 4 * 1024 * 1024
 )
+
+func setUDPSocketBuffer(logger zerolog.Logger, name string, setter func(int) error) {
+	if err := setter(udpSocketBufferSize); err != nil {
+		logger.Warn().Err(err).Msg("set UDP " + name + " buffer failed")
+	}
+}
 
 // UDPSession represents a client-side UDP session
 type UDPSession struct {
@@ -79,7 +87,7 @@ func (h *UDPHandler) Stop() {
 	h.cancel()
 
 	// Close all local connections
-	h.sessions.Range(func(key, value interface{}) bool {
+	h.sessions.Range(func(key, value any) bool {
 		session := value.(*UDPSession)
 		session.localConn.Close()
 		return true
@@ -102,24 +110,14 @@ func (h *UDPHandler) receiveDatagrams(ctx context.Context, quicConn *quic.Conn) 
 			}
 		}
 
-		// Parse datagram
-		sessionID, isFragmented, fragID, fragIndex, fragTotal, payload, err := protocol.ParseUDPDatagram(dgram)
+		// Validate and, if needed, reassemble the datagram.
+		sessionID, payload, complete, err := protocol.DecodeAndAssembleUDPDatagram(dgram, h.fragmentAssembler)
 		if err != nil {
-			h.logger.Debug().Err(err).Msg("parse datagram failed")
+			h.logger.Debug().Err(err).Msg("process datagram failed")
 			continue
 		}
-
-		// Handle fragmented packets
-		if isFragmented {
-			payload, err = h.fragmentAssembler.AddFragment(sessionID, fragID, fragIndex, fragTotal, payload)
-			if err != nil {
-				h.logger.Debug().Err(err).Msg("add fragment failed")
-				continue
-			}
-			if payload == nil {
-				// More fragments needed
-				continue
-			}
+		if !complete {
+			continue
 		}
 
 		// Get or create session
@@ -159,12 +157,8 @@ func (h *UDPHandler) getOrCreateSession(sessionID uint32, quicConn *quic.Conn) (
 	}
 
 	// Increase UDP buffer sizes to handle large packets
-	if err := localConn.SetReadBuffer(4 * 1024 * 1024); err != nil {
-		h.logger.Warn().Err(err).Msg("set UDP read buffer failed")
-	}
-	if err := localConn.SetWriteBuffer(4 * 1024 * 1024); err != nil {
-		h.logger.Warn().Err(err).Msg("set UDP write buffer failed")
-	}
+	setUDPSocketBuffer(h.logger, "read", localConn.SetReadBuffer)
+	setUDPSocketBuffer(h.logger, "write", localConn.SetWriteBuffer)
 
 	session := &UDPSession{
 		id:        sessionID,
@@ -204,7 +198,8 @@ func (h *UDPHandler) readLocalResponses(session *UDPSession) {
 				protocol.PutReadBuffer(bufPtr)
 				return
 			default:
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				var netErr net.Error
+				if errors.As(err, &netErr) && netErr.Timeout() {
 					// Timeout - check if session is still active
 					if session.isExpired(udpSessionTimeout) {
 						protocol.PutReadBuffer(bufPtr)
@@ -268,7 +263,7 @@ func (h *UDPHandler) cleanupLoop() {
 		case <-h.ctx.Done():
 			return
 		case <-ticker.C:
-			h.sessions.Range(func(key, value interface{}) bool {
+			h.sessions.Range(func(key, value any) bool {
 				session := value.(*UDPSession)
 				if session.isExpired(udpSessionTimeout) {
 					h.logger.Debug().Uint32("session_id", session.id).Msg("cleaning up expired UDP session")
