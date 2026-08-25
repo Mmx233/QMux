@@ -33,6 +33,7 @@ var (
 	ErrPacketTooLarge        = errors.New("packet too large to fragment")
 	ErrSessionIDMismatch     = errors.New("session ID mismatch")
 	ErrInvalidFragIndex      = errors.New("invalid fragment index")
+	ErrFragmentTotalMismatch = errors.New("fragment total mismatch")
 	ErrDatagramTooShort      = errors.New("datagram too short")
 	ErrDatagramTooLarge      = errors.New("datagram exceeds maximum size")
 	ErrUnknownDatagramType   = errors.New("unknown UDP datagram type")
@@ -165,6 +166,90 @@ type fragmentGroup struct {
 	createdAt time.Time
 }
 
+func validateFragmentInput(index, total uint8) error {
+	if total < 2 {
+		return ErrInvalidFragTotal
+	}
+	if index >= total {
+		return ErrInvalidFragIndex
+	}
+	return nil
+}
+
+func validateFragmentGroup(group *fragmentGroup, sessionID uint32, index, total uint8) error {
+	if group.sessionID != sessionID {
+		return ErrSessionIDMismatch
+	}
+	if group.total != total {
+		return ErrFragmentTotalMismatch
+	}
+	if int(index) >= len(group.data) {
+		return ErrInvalidFragIndex
+	}
+	return nil
+}
+
+// loadOrCreateFragmentGroup requires the caller to hold the lock protecting groups.
+func loadOrCreateFragmentGroup(groups map[uint16]*fragmentGroup, sessionID uint32, fragID uint16, index, total uint8) (*fragmentGroup, error) {
+	group, exists := groups[fragID]
+	if !exists {
+		group = &fragmentGroup{
+			sessionID: sessionID,
+			total:     total,
+			data:      make([][]byte, total),
+			createdAt: time.Now(),
+		}
+		groups[fragID] = group
+		return group, nil
+	}
+
+	if err := validateFragmentGroup(group, sessionID, index, total); err != nil {
+		if errors.Is(err, ErrFragmentTotalMismatch) {
+			releaseFragmentGroup(group)
+			delete(groups, fragID)
+		}
+		return nil, err
+	}
+	return group, nil
+}
+
+func joinFragmentGroup(group *fragmentGroup) []byte {
+	totalSize := 0
+	for _, fragment := range group.data {
+		totalSize += len(fragment)
+	}
+
+	result := make([]byte, 0, totalSize)
+	for _, fragment := range group.data {
+		result = append(result, fragment...)
+	}
+	return result
+}
+
+func releaseFragmentGroup(group *fragmentGroup) {
+	for i, bufPtr := range group.buffers {
+		PutFragmentBuffer(bufPtr)
+		group.buffers[i] = nil
+	}
+	group.buffers = nil
+
+	for i := range group.data {
+		group.data[i] = nil
+	}
+	group.data = nil
+	group.received = 0
+}
+
+// cleanupExpiredFragmentGroups requires the caller to hold the lock protecting groups.
+func cleanupExpiredFragmentGroups(groups map[uint16]*fragmentGroup, now time.Time) {
+	for id, group := range groups {
+		if now.Sub(group.createdAt) > FragmentTimeout {
+			releaseFragmentGroup(group)
+			delete(groups, id)
+		}
+	}
+}
+
 // NewFragmentAssembler creates a new fragment assembler
 func NewFragmentAssembler() *FragmentAssembler {
 	fa := &FragmentAssembler{
@@ -181,12 +266,7 @@ func (fa *FragmentAssembler) cleanupLoop() {
 
 	for range ticker.C {
 		fa.mu.Lock()
-		now := time.Now()
-		for id, group := range fa.fragments {
-			if now.Sub(group.createdAt) > FragmentTimeout {
-				delete(fa.fragments, id)
-			}
-		}
+		cleanupExpiredFragmentGroups(fa.fragments, time.Now())
 		fa.mu.Unlock()
 	}
 }
@@ -194,26 +274,16 @@ func (fa *FragmentAssembler) cleanupLoop() {
 // AddFragment adds a fragment and returns the complete packet if all fragments received
 // Returns (nil, nil) if more fragments are needed
 func (fa *FragmentAssembler) AddFragment(sessionID uint32, fragID uint16, index, total uint8, payload []byte) ([]byte, error) {
-	if index >= total {
-		return nil, ErrInvalidFragIndex
+	if err := validateFragmentInput(index, total); err != nil {
+		return nil, err
 	}
 
 	fa.mu.Lock()
 	defer fa.mu.Unlock()
 
-	group, exists := fa.fragments[fragID]
-	if !exists {
-		group = &fragmentGroup{
-			sessionID: sessionID,
-			total:     total,
-			data:      make([][]byte, total),
-			createdAt: time.Now(),
-		}
-		fa.fragments[fragID] = group
-	}
-
-	if group.sessionID != sessionID {
-		return nil, ErrSessionIDMismatch
+	group, err := loadOrCreateFragmentGroup(fa.fragments, sessionID, fragID, index, total)
+	if err != nil {
+		return nil, err
 	}
 
 	if group.data[index] == nil {
@@ -224,17 +294,9 @@ func (fa *FragmentAssembler) AddFragment(sessionID uint32, fragID uint16, index,
 
 	if group.received == group.total {
 		// All fragments received, reassemble
+		result := joinFragmentGroup(group)
 		delete(fa.fragments, fragID)
-
-		totalSize := 0
-		for _, frag := range group.data {
-			totalSize += len(frag)
-		}
-
-		result := make([]byte, 0, totalSize)
-		for _, frag := range group.data {
-			result = append(result, frag...)
-		}
+		releaseFragmentGroup(group)
 		return result, nil
 	}
 
@@ -287,15 +349,7 @@ func (sfa *ShardedFragmentAssembler) cleanupLoop() {
 		for i := range sfa.shards {
 			shard := &sfa.shards[i]
 			shard.mu.Lock()
-			for id, group := range shard.fragments {
-				if now.Sub(group.createdAt) > FragmentTimeout {
-					// Return buffers to pool before deleting
-					for _, bufPtr := range group.buffers {
-						PutFragmentBuffer(bufPtr)
-					}
-					delete(shard.fragments, id)
-				}
-			}
+			cleanupExpiredFragmentGroups(shard.fragments, now)
 			shard.mu.Unlock()
 		}
 	}
@@ -306,27 +360,17 @@ func (sfa *ShardedFragmentAssembler) cleanupLoop() {
 // Uses pooled buffers for fragment storage and tracks them for cleanup.
 // Returns (nil, nil) if more fragments are needed.
 func (sfa *ShardedFragmentAssembler) AddFragment(sessionID uint32, fragID uint16, index, total uint8, payload []byte) ([]byte, error) {
-	if index >= total {
-		return nil, ErrInvalidFragIndex
+	if err := validateFragmentInput(index, total); err != nil {
+		return nil, err
 	}
 
 	shard := sfa.getShard(fragID)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
-	group, exists := shard.fragments[fragID]
-	if !exists {
-		group = &fragmentGroup{
-			sessionID: sessionID,
-			total:     total,
-			data:      make([][]byte, total),
-			createdAt: time.Now(),
-		}
-		shard.fragments[fragID] = group
-	}
-
-	if group.sessionID != sessionID {
-		return nil, ErrSessionIDMismatch
+	group, err := loadOrCreateFragmentGroup(shard.fragments, sessionID, fragID, index, total)
+	if err != nil {
+		return nil, err
 	}
 
 	if group.data[index] == nil {
@@ -351,22 +395,9 @@ func (sfa *ShardedFragmentAssembler) AddFragment(sessionID uint32, fragID uint16
 
 	if group.received == group.total {
 		// All fragments received, reassemble
+		result := joinFragmentGroup(group)
 		delete(shard.fragments, fragID)
-
-		totalSize := 0
-		for _, frag := range group.data {
-			totalSize += len(frag)
-		}
-
-		result := make([]byte, 0, totalSize)
-		for _, frag := range group.data {
-			result = append(result, frag...)
-		}
-
-		// Return fragment buffers to pool
-		for _, bufPtr := range group.buffers {
-			PutFragmentBuffer(bufPtr)
-		}
+		releaseFragmentGroup(group)
 
 		return result, nil
 	}

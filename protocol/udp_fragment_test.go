@@ -2,6 +2,8 @@ package protocol
 
 import (
 	"bytes"
+	"errors"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -147,6 +149,47 @@ func TestFragmentUDP_SmallPacket(t *testing.T) {
 	}
 }
 
+func assertFragmentsReassemble(t *testing.T, datagrams [][]byte, expected []byte) {
+	t.Helper()
+
+	assembler := NewFragmentAssembler()
+	var result []byte
+
+	for i, datagram := range datagrams {
+		sessionID, isFragmented, fragID, fragIndex, fragTotal, payload, err := ParseUDPDatagram(datagram)
+		if err != nil {
+			t.Fatalf("parse error on fragment %d: %v", i, err)
+		}
+		if sessionID != 12345 {
+			t.Errorf("fragment %d: expected session ID 12345, got %d", i, sessionID)
+		}
+		if !isFragmented {
+			t.Errorf("fragment %d: expected fragmented flag", i)
+		}
+		if int(fragTotal) != len(datagrams) {
+			t.Errorf("fragment %d: expected total %d, got %d", i, len(datagrams), fragTotal)
+		}
+		if int(fragIndex) != i {
+			t.Errorf("fragment %d: expected index %d, got %d", i, i, fragIndex)
+		}
+
+		result, err = assembler.AddFragment(sessionID, fragID, fragIndex, fragTotal, payload)
+		if err != nil {
+			t.Fatalf("add fragment error: %v", err)
+		}
+		if i < len(datagrams)-1 && result != nil {
+			t.Errorf("fragment %d: expected nil result (more fragments needed)", i)
+		}
+	}
+
+	if result == nil {
+		t.Fatal("expected complete result after all fragments")
+	}
+	if !bytes.Equal(result, expected) {
+		t.Errorf("reassembled data mismatch: expected %d bytes, got %d bytes", len(expected), len(result))
+	}
+}
+
 func TestFragmentUDP_LargePacket(t *testing.T) {
 	// Large packet should be fragmented
 	data := make([]byte, 3000)
@@ -164,49 +207,7 @@ func TestFragmentUDP_LargePacket(t *testing.T) {
 		t.Fatalf("expected multiple datagrams, got %d", len(datagrams))
 	}
 
-	// Verify all fragments
-	assembler := NewFragmentAssembler()
-	var result []byte
-
-	for i, dgram := range datagrams {
-		sessionID, isFragmented, fID, fIndex, fTotal, payload, err := ParseUDPDatagram(dgram)
-		if err != nil {
-			t.Fatalf("parse error on fragment %d: %v", i, err)
-		}
-
-		if sessionID != 12345 {
-			t.Errorf("fragment %d: expected session ID 12345, got %d", i, sessionID)
-		}
-
-		if !isFragmented {
-			t.Errorf("fragment %d: expected fragmented flag", i)
-		}
-
-		if int(fTotal) != len(datagrams) {
-			t.Errorf("fragment %d: expected total %d, got %d", i, len(datagrams), fTotal)
-		}
-
-		if int(fIndex) != i {
-			t.Errorf("fragment %d: expected index %d, got %d", i, i, fIndex)
-		}
-
-		result, err = assembler.AddFragment(sessionID, fID, fIndex, fTotal, payload)
-		if err != nil {
-			t.Fatalf("add fragment error: %v", err)
-		}
-
-		if i < len(datagrams)-1 && result != nil {
-			t.Errorf("fragment %d: expected nil result (more fragments needed)", i)
-		}
-	}
-
-	if result == nil {
-		t.Fatal("expected complete result after all fragments")
-	}
-
-	if !bytes.Equal(result, data) {
-		t.Errorf("reassembled data mismatch: expected %d bytes, got %d bytes", len(data), len(result))
-	}
+	assertFragmentsReassemble(t, datagrams, data)
 }
 
 func TestFragmentUDP_DisabledFragmentation(t *testing.T) {
@@ -215,7 +216,7 @@ func TestFragmentUDP_DisabledFragmentation(t *testing.T) {
 
 	var fragID uint16
 	_, err := FragmentUDP(12345, data, &fragID, false)
-	if err != ErrFragmentationDisabled {
+	if !errors.Is(err, ErrFragmentationDisabled) {
 		t.Errorf("expected ErrFragmentationDisabled, got %v", err)
 	}
 }
@@ -292,8 +293,8 @@ func TestFragmentAssembler_OutOfOrder(t *testing.T) {
 	assembler := NewFragmentAssembler()
 	var result []byte
 
-	for i := len(datagrams) - 1; i >= 0; i-- {
-		_, _, fID, fIndex, fTotal, payload, _ := ParseUDPDatagram(datagrams[i])
+	for _, datagram := range slices.Backward(datagrams) {
+		_, _, fID, fIndex, fTotal, payload, _ := ParseUDPDatagram(datagram)
 		var err error
 		result, err = assembler.AddFragment(12345, fID, fIndex, fTotal, payload)
 		if err != nil {
@@ -307,6 +308,23 @@ func TestFragmentAssembler_OutOfOrder(t *testing.T) {
 
 	if !bytes.Equal(result, data) {
 		t.Error("reassembled data mismatch")
+	}
+}
+
+func assertDuplicateFragmentIgnored(
+	t *testing.T,
+	add func(sessionID uint32, fragID uint16, index, total uint8, payload []byte) ([]byte, error),
+	sessionID uint32,
+	fragID uint16,
+	index, total uint8,
+	payload []byte,
+) {
+	t.Helper()
+	if result, err := add(sessionID, fragID, index, total, payload); err != nil || result != nil {
+		t.Fatalf("add first fragment: result=%q, err=%v", result, err)
+	}
+	if result, err := add(sessionID, fragID, index, total, payload); err != nil || result != nil {
+		t.Fatalf("add duplicate fragment: result=%q, err=%v", result, err)
 	}
 }
 
@@ -324,8 +342,7 @@ func TestFragmentAssembler_DuplicateFragment(t *testing.T) {
 
 	// Add first fragment twice
 	_, _, fID, fIndex, fTotal, payload, _ := ParseUDPDatagram(datagrams[0])
-	assembler.AddFragment(12345, fID, fIndex, fTotal, payload)
-	assembler.AddFragment(12345, fID, fIndex, fTotal, payload) // duplicate
+	assertDuplicateFragmentIgnored(t, assembler.AddFragment, 12345, fID, fIndex, fTotal, payload)
 
 	// Add remaining fragments
 	var result []byte
@@ -379,12 +396,14 @@ func TestFragmentAssembler_SessionIDMismatch(t *testing.T) {
 
 	// Add first fragment with correct session ID
 	_, _, fID, fIndex, fTotal, payload, _ := ParseUDPDatagram(datagrams[0])
-	assembler.AddFragment(12345, fID, fIndex, fTotal, payload)
+	if result, err := assembler.AddFragment(12345, fID, fIndex, fTotal, payload); err != nil || result != nil {
+		t.Fatalf("add initial fragment: result=%q, err=%v", result, err)
+	}
 
 	// Try to add second fragment with wrong session ID
 	_, _, fID, fIndex, fTotal, payload, _ = ParseUDPDatagram(datagrams[1])
 	_, err := assembler.AddFragment(99999, fID, fIndex, fTotal, payload)
-	if err != ErrSessionIDMismatch {
+	if !errors.Is(err, ErrSessionIDMismatch) {
 		t.Errorf("expected ErrSessionIDMismatch, got %v", err)
 	}
 }
@@ -394,7 +413,7 @@ func TestFragmentAssembler_InvalidFragmentIndex(t *testing.T) {
 
 	// Try to add fragment with index >= total
 	_, err := assembler.AddFragment(12345, 1, 5, 3, []byte("test"))
-	if err != ErrInvalidFragIndex {
+	if !errors.Is(err, ErrInvalidFragIndex) {
 		t.Errorf("expected ErrInvalidFragIndex, got %v", err)
 	}
 }
@@ -405,8 +424,12 @@ func TestFragmentAssembler_Timeout(t *testing.T) {
 	assembler := NewFragmentAssembler()
 
 	// Add partial fragments
-	assembler.AddFragment(12345, 1, 0, 3, []byte("part1"))
-	assembler.AddFragment(12345, 1, 1, 3, []byte("part2"))
+	if result, err := assembler.AddFragment(12345, 1, 0, 3, []byte("part1")); err != nil || result != nil {
+		t.Fatalf("add first partial fragment: result=%q, err=%v", result, err)
+	}
+	if result, err := assembler.AddFragment(12345, 1, 1, 3, []byte("part2")); err != nil || result != nil {
+		t.Fatalf("add second partial fragment: result=%q, err=%v", result, err)
+	}
 	// Missing fragment 2
 
 	// Verify fragments are stored
@@ -419,7 +442,7 @@ func TestFragmentAssembler_Timeout(t *testing.T) {
 
 func TestParseUDPDatagram_TooShort(t *testing.T) {
 	_, _, _, _, _, _, err := ParseUDPDatagram([]byte{1, 2, 3})
-	if err != ErrDatagramTooShort {
+	if !errors.Is(err, ErrDatagramTooShort) {
 		t.Errorf("expected ErrDatagramTooShort, got %v", err)
 	}
 }
@@ -429,12 +452,16 @@ func TestFragmentIDCounter(t *testing.T) {
 	data := make([]byte, 3000)
 
 	var fragID uint16 = 0
-	FragmentUDP(12345, data, &fragID, true)
+	if _, err := FragmentUDP(12345, data, &fragID, true); err != nil {
+		t.Fatalf("first fragmentation: %v", err)
+	}
 	if fragID != 1 {
 		t.Errorf("expected fragID 1, got %d", fragID)
 	}
 
-	FragmentUDP(12345, data, &fragID, true)
+	if _, err := FragmentUDP(12345, data, &fragID, true); err != nil {
+		t.Fatalf("second fragmentation: %v", err)
+	}
 	if fragID != 2 {
 		t.Errorf("expected fragID 2, got %d", fragID)
 	}
@@ -448,7 +475,7 @@ func TestFragmentUDP_VeryLargePacket(t *testing.T) {
 
 	var fragID uint16
 	_, err := FragmentUDP(12345, data, &fragID, true)
-	if err != ErrPacketTooLarge {
+	if !errors.Is(err, ErrPacketTooLarge) {
 		t.Errorf("expected ErrPacketTooLarge, got %v", err)
 	}
 }
@@ -459,7 +486,7 @@ func BenchmarkFragmentUDP_SmallPacket(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		FragmentUDP(12345, data, &fragID, true)
+		_, _ = FragmentUDP(12345, data, &fragID, true)
 	}
 }
 
@@ -469,7 +496,7 @@ func BenchmarkFragmentUDP_LargePacket(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		FragmentUDP(12345, data, &fragID, true)
+		_, _ = FragmentUDP(12345, data, &fragID, true)
 	}
 }
 
@@ -483,54 +510,66 @@ func BenchmarkFragmentAssembler_Reassemble(b *testing.B) {
 		assembler := NewFragmentAssembler()
 		for _, dgram := range datagrams {
 			_, _, fID, fIndex, fTotal, payload, _ := ParseUDPDatagram(dgram)
-			assembler.AddFragment(12345, fID, fIndex, fTotal, payload)
+			_, _ = assembler.AddFragment(12345, fID, fIndex, fTotal, payload)
 		}
 	}
 }
 
-// TestFragmentAssembler_CleanupExpired tests that expired fragments are cleaned up
-func TestFragmentAssembler_CleanupExpired(t *testing.T) {
-	// Create assembler with short timeout for testing
-	fa := &FragmentAssembler{
-		fragments: make(map[uint16]*fragmentGroup),
-	}
-
-	// Add a fragment group with old timestamp
-	fa.fragments[1] = &fragmentGroup{
-		sessionID: 12345,
-		total:     3,
-		data:      make([][]byte, 3),
-		createdAt: time.Now().Add(-10 * time.Second), // Old timestamp
-	}
-
-	// Add a fragment group with recent timestamp
-	fa.fragments[2] = &fragmentGroup{
-		sessionID: 12345,
-		total:     3,
-		data:      make([][]byte, 3),
-		createdAt: time.Now(),
-	}
-
-	// Manually run cleanup logic
-	fa.mu.Lock()
+func TestCleanupExpiredFragmentGroups(t *testing.T) {
 	now := time.Now()
-	for id, group := range fa.fragments {
-		if now.Sub(group.createdAt) > FragmentTimeout {
-			delete(fa.fragments, id)
-		}
-	}
-	fa.mu.Unlock()
+	regular := &FragmentAssembler{fragments: make(map[uint16]*fragmentGroup)}
+	sharded := &fragmentShard{fragments: make(map[uint16]*fragmentGroup)}
 
-	// Verify old group was cleaned up
-	fa.mu.Lock()
-	defer fa.mu.Unlock()
-
-	if _, exists := fa.fragments[1]; exists {
-		t.Error("expected old fragment group to be cleaned up")
+	tests := []struct {
+		name   string
+		lock   sync.Locker
+		groups map[uint16]*fragmentGroup
+		pooled bool
+	}{
+		{name: "regular", lock: &regular.mu, groups: regular.fragments},
+		{name: "sharded pooled", lock: &sharded.mu, groups: sharded.fragments, pooled: true},
 	}
 
-	if _, exists := fa.fragments[2]; !exists {
-		t.Error("expected recent fragment group to still exist")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			expired := &fragmentGroup{
+				sessionID: 12345,
+				total:     2,
+				received:  1,
+				data:      make([][]byte, 2),
+				createdAt: now.Add(-FragmentTimeout - time.Second),
+			}
+			if tt.pooled {
+				bufPtr := GetFragmentBuffer()
+				copy((*bufPtr)[:4], "part")
+				expired.data[0] = (*bufPtr)[:4]
+				expired.buffers = []*[]byte{bufPtr}
+			} else {
+				expired.data[0] = []byte("part")
+			}
+
+			recent := &fragmentGroup{
+				sessionID: 12345,
+				total:     2,
+				received:  1,
+				data:      [][]byte{[]byte("recent"), nil},
+				createdAt: now,
+			}
+			tt.groups[1] = expired
+			tt.groups[2] = recent
+
+			tt.lock.Lock()
+			cleanupExpiredFragmentGroups(tt.groups, now)
+			tt.lock.Unlock()
+
+			if _, exists := tt.groups[1]; exists {
+				t.Error("expected expired fragment group to be deleted")
+			}
+			if got := tt.groups[2]; got != recent {
+				t.Fatal("expected recent fragment group to remain unchanged")
+			}
+			assertFragmentGroupReleased(t, expired)
+		})
 	}
 }
 
@@ -598,56 +637,15 @@ func TestFragmentUDPPooled_LargePacket(t *testing.T) {
 		t.Fatalf("expected multiple results, got %d", len(results))
 	}
 
-	// Verify all buffers are non-nil (pooled)
+	// Verify all buffers are non-nil (pooled) and collect their datagram views.
+	datagrams := make([][]byte, len(results))
 	for i, r := range results {
 		if r.Buffer == nil {
 			t.Errorf("result %d: expected Buffer to be non-nil", i)
 		}
+		datagrams[i] = r.Data
 	}
-
-	// Verify all fragments and reassemble
-	assembler := NewFragmentAssembler()
-	var result []byte
-
-	for i, r := range results {
-		sessionID, isFragmented, fID, fIndex, fTotal, payload, err := ParseUDPDatagram(r.Data)
-		if err != nil {
-			t.Fatalf("parse error on fragment %d: %v", i, err)
-		}
-
-		if sessionID != 12345 {
-			t.Errorf("fragment %d: expected session ID 12345, got %d", i, sessionID)
-		}
-
-		if !isFragmented {
-			t.Errorf("fragment %d: expected fragmented flag", i)
-		}
-
-		if int(fTotal) != len(results) {
-			t.Errorf("fragment %d: expected total %d, got %d", i, len(results), fTotal)
-		}
-
-		if int(fIndex) != i {
-			t.Errorf("fragment %d: expected index %d, got %d", i, i, fIndex)
-		}
-
-		result, err = assembler.AddFragment(sessionID, fID, fIndex, fTotal, payload)
-		if err != nil {
-			t.Fatalf("add fragment error: %v", err)
-		}
-
-		if i < len(results)-1 && result != nil {
-			t.Errorf("fragment %d: expected nil result (more fragments needed)", i)
-		}
-	}
-
-	if result == nil {
-		t.Fatal("expected complete result after all fragments")
-	}
-
-	if !bytes.Equal(result, data) {
-		t.Errorf("reassembled data mismatch: expected %d bytes, got %d bytes", len(data), len(result))
-	}
+	assertFragmentsReassemble(t, datagrams, data)
 }
 
 func TestFragmentUDPPooled_DisabledFragmentation(t *testing.T) {
@@ -656,7 +654,7 @@ func TestFragmentUDPPooled_DisabledFragmentation(t *testing.T) {
 
 	var fragIDCounter atomic.Uint32
 	_, err := FragmentUDPPooled(12345, data, &fragIDCounter, false)
-	if err != ErrFragmentationDisabled {
+	if !errors.Is(err, ErrFragmentationDisabled) {
 		t.Errorf("expected ErrFragmentationDisabled, got %v", err)
 	}
 }
@@ -727,7 +725,7 @@ func TestFragmentUDPPooled_VeryLargePacket(t *testing.T) {
 
 	var fragIDCounter atomic.Uint32
 	_, err := FragmentUDPPooled(12345, data, &fragIDCounter, true)
-	if err != ErrPacketTooLarge {
+	if !errors.Is(err, ErrPacketTooLarge) {
 		t.Errorf("expected ErrPacketTooLarge, got %v", err)
 	}
 }
@@ -770,7 +768,7 @@ func TestFragmentUDPPooled_AtomicCounterIncrement(t *testing.T) {
 
 func TestFragmentUDPPooled_EmptyData(t *testing.T) {
 	// Test with empty data
-	data := []byte{}
+	var data []byte
 
 	var fragIDCounter atomic.Uint32
 	results, err := FragmentUDPPooled(12345, data, &fragIDCounter, true)
@@ -924,7 +922,7 @@ func TestNewShardedFragmentAssembler_ShardsInitialized(t *testing.T) {
 	// Test that all shards have initialized fragment maps
 	sfa := NewShardedFragmentAssembler(8)
 
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		if sfa.shards[i].fragments == nil {
 			t.Errorf("shard %d: expected fragments map to be initialized", i)
 		}
@@ -982,7 +980,7 @@ func TestShardedFragmentAssembler_GetShard_AllShardsAccessible(t *testing.T) {
 	accessedShards := make(map[*fragmentShard]bool)
 
 	// Access shards using fragment IDs 0 through shardCount-1
-	for i := 0; i < shardCount; i++ {
+	for i := range shardCount {
 		shard := sfa.getShard(uint16(i))
 		accessedShards[shard] = true
 	}
@@ -1070,8 +1068,8 @@ func TestShardedFragmentAssembler_AddFragment_OutOfOrder(t *testing.T) {
 	var result []byte
 
 	// Receive in reverse order
-	for i := len(results) - 1; i >= 0; i-- {
-		_, _, fID, fIndex, fTotal, payload, _ := ParseUDPDatagram(results[i].Data)
+	for _, datagram := range slices.Backward(results) {
+		_, _, fID, fIndex, fTotal, payload, _ := ParseUDPDatagram(datagram.Data)
 		result, err = sfa.AddFragment(12345, fID, fIndex, fTotal, payload)
 		if err != nil {
 			t.Fatalf("add fragment error: %v", err)
@@ -1105,8 +1103,7 @@ func TestShardedFragmentAssembler_AddFragment_DuplicateFragment(t *testing.T) {
 
 	// Add first fragment twice
 	_, _, fID, fIndex, fTotal, payload, _ := ParseUDPDatagram(results[0].Data)
-	sfa.AddFragment(12345, fID, fIndex, fTotal, payload)
-	sfa.AddFragment(12345, fID, fIndex, fTotal, payload) // duplicate
+	assertDuplicateFragmentIgnored(t, sfa.AddFragment, 12345, fID, fIndex, fTotal, payload)
 
 	// Add remaining fragments
 	var result []byte
@@ -1139,12 +1136,14 @@ func TestShardedFragmentAssembler_AddFragment_SessionIDMismatch(t *testing.T) {
 
 	// Add first fragment with correct session ID
 	_, _, fID, fIndex, fTotal, payload, _ := ParseUDPDatagram(results[0].Data)
-	sfa.AddFragment(12345, fID, fIndex, fTotal, payload)
+	if result, err := sfa.AddFragment(12345, fID, fIndex, fTotal, payload); err != nil || result != nil {
+		t.Fatalf("add initial fragment: result=%q, err=%v", result, err)
+	}
 
 	// Try to add second fragment with wrong session ID
 	_, _, fID, fIndex, fTotal, payload, _ = ParseUDPDatagram(results[1].Data)
 	_, err = sfa.AddFragment(99999, fID, fIndex, fTotal, payload)
-	if err != ErrSessionIDMismatch {
+	if !errors.Is(err, ErrSessionIDMismatch) {
 		t.Errorf("expected ErrSessionIDMismatch, got %v", err)
 	}
 }
@@ -1154,7 +1153,7 @@ func TestShardedFragmentAssembler_AddFragment_InvalidFragmentIndex(t *testing.T)
 
 	// Try to add fragment with index >= total
 	_, err := sfa.AddFragment(12345, 1, 5, 3, []byte("test"))
-	if err != ErrInvalidFragIndex {
+	if !errors.Is(err, ErrInvalidFragIndex) {
 		t.Errorf("expected ErrInvalidFragIndex, got %v", err)
 	}
 }
@@ -1314,22 +1313,17 @@ func TestShardedFragmentAssembler_AddFragment_ShardIsolation(t *testing.T) {
 	}
 }
 
-func TestShardedFragmentAssembler_AddFragment_SingleFragment(t *testing.T) {
-	// Test with a single fragment (total = 1)
+func TestShardedFragmentAssembler_AddFragment_RejectsSingleFragment(t *testing.T) {
+	// Fragmented datagrams require at least two fragments.
 	sfa := NewShardedFragmentAssembler(16)
 
 	payload := []byte("single fragment data")
 	result, err := sfa.AddFragment(12345, 1, 0, 1, payload)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if !errors.Is(err, ErrInvalidFragTotal) {
+		t.Fatalf("expected ErrInvalidFragTotal, got %v", err)
 	}
-
-	if result == nil {
-		t.Fatal("expected complete result for single fragment")
-	}
-
-	if !bytes.Equal(result, payload) {
-		t.Errorf("expected result %v, got %v", payload, result)
+	if result != nil {
+		t.Fatalf("expected nil result, got %q", result)
 	}
 }
 
@@ -1343,16 +1337,34 @@ func TestShardedFragmentAssembler_AddFragment_LargePayload(t *testing.T) {
 		largePayload[i] = byte(i % 256)
 	}
 
-	result, err := sfa.AddFragment(12345, 1, 0, 1, largePayload)
+	result, err := sfa.AddFragment(12345, 1, 0, 2, largePayload)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-
-	if result == nil {
-		t.Fatal("expected complete result")
+	if result != nil {
+		t.Fatalf("expected incomplete result, got %d bytes", len(result))
 	}
 
-	if !bytes.Equal(result, largePayload) {
+	shard := sfa.getShard(1)
+	shard.mu.Lock()
+	group := shard.fragments[1]
+	if group == nil {
+		shard.mu.Unlock()
+		t.Fatal("expected fragment group")
+	}
+	if len(group.buffers) != 0 {
+		shard.mu.Unlock()
+		t.Fatalf("large fragment should be directly allocated, got %d pooled buffers", len(group.buffers))
+	}
+	shard.mu.Unlock()
+
+	tail := []byte("tail")
+	result, err = sfa.AddFragment(12345, 1, 1, 2, tail)
+	if err != nil {
+		t.Fatalf("unexpected completion error: %v", err)
+	}
+	expected := append(append([]byte(nil), largePayload...), tail...)
+	if !bytes.Equal(result, expected) {
 		t.Error("reassembled data mismatch for large payload")
 	}
 }
@@ -1382,7 +1394,7 @@ func BenchmarkShardedFragmentAssembler_AddFragment(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		sfa := NewShardedFragmentAssembler(16)
 		for _, f := range frags {
-			sfa.AddFragment(f.sessionID, f.fragID, f.index, f.total, f.payload)
+			_, _ = sfa.AddFragment(f.sessionID, f.fragID, f.index, f.total, f.payload)
 		}
 	}
 }
@@ -1399,57 +1411,68 @@ func BenchmarkShardedFragmentAssembler_Reassemble(b *testing.B) {
 		sfa := NewShardedFragmentAssembler(16)
 		for _, dgram := range datagrams {
 			_, _, fID, fIndex, fTotal, payload, _ := ParseUDPDatagram(dgram)
-			sfa.AddFragment(12345, fID, fIndex, fTotal, payload)
+			_, _ = sfa.AddFragment(12345, fID, fIndex, fTotal, payload)
 		}
 	}
 }
 
-// BenchmarkShardedFragmentAssembler_Concurrent benchmarks the sharded assembler's
-// performance under concurrent access from multiple goroutines.
-// This measures the effectiveness of sharded locking in reducing contention.
-func BenchmarkShardedFragmentAssembler_Concurrent(b *testing.B) {
-	// Prepare multiple fragment sets with different fragment IDs
-	// to distribute across shards
-	const numFragmentSets = 16
-	type parsedFrag struct {
-		sessionID uint32
-		fragID    uint16
-		index     uint8
-		total     uint8
-		payload   []byte
-	}
+const concurrentBenchmarkFragmentSetCount = 16
 
-	fragmentSets := make([][]parsedFrag, numFragmentSets)
-	for setIdx := 0; setIdx < numFragmentSets; setIdx++ {
+type concurrentBenchmarkFragment struct {
+	sessionID uint32
+	fragID    uint16
+	index     uint8
+	total     uint8
+	payload   []byte
+}
+
+func makeConcurrentBenchmarkFragmentSets(tb testing.TB) [][]concurrentBenchmarkFragment {
+	tb.Helper()
+	fragmentSets := make([][]concurrentBenchmarkFragment, concurrentBenchmarkFragmentSetCount)
+	for setIdx := range concurrentBenchmarkFragmentSetCount {
 		data := make([]byte, 5000)
 		for i := range data {
 			data[i] = byte((i + setIdx) % 256)
 		}
 
 		var fragIDCounter atomic.Uint32
-		fragIDCounter.Store(uint32(setIdx * 1000)) // Different starting IDs for each set
-		results, _ := FragmentUDPPooled(uint32(12345+setIdx), data, &fragIDCounter, true)
-
-		frags := make([]parsedFrag, len(results))
-		for i, r := range results {
-			sessionID, _, fID, fIndex, fTotal, payload, _ := ParseUDPDatagram(r.Data)
-			// Make a copy of payload since we'll release the results
-			payloadCopy := make([]byte, len(payload))
-			copy(payloadCopy, payload)
-			frags[i] = parsedFrag{sessionID, fID, fIndex, fTotal, payloadCopy}
+		fragIDCounter.Store(uint32(setIdx * 1000))
+		results, err := FragmentUDPPooled(uint32(12345+setIdx), data, &fragIDCounter, true)
+		if err != nil {
+			tb.Fatalf("fragment benchmark set %d: %v", setIdx, err)
 		}
-		fragmentSets[setIdx] = frags
-		ReleaseDatagramResults(results)
+
+		func() {
+			defer ReleaseDatagramResults(results)
+			fragments := make([]concurrentBenchmarkFragment, len(results))
+			for i, result := range results {
+				sessionID, _, fragID, fragIndex, fragTotal, payload, err := ParseUDPDatagram(result.Data)
+				if err != nil {
+					tb.Fatalf("parse benchmark set %d fragment %d: %v", setIdx, i, err)
+				}
+				payloadCopy := append([]byte(nil), payload...)
+				fragments[i] = concurrentBenchmarkFragment{sessionID, fragID, fragIndex, fragTotal, payloadCopy}
+			}
+			fragmentSets[setIdx] = fragments
+		}()
 	}
+	return fragmentSets
+}
+
+// BenchmarkShardedFragmentAssembler_Concurrent benchmarks the sharded assembler's
+// performance under concurrent access from multiple goroutines.
+// This measures the effectiveness of sharded locking in reducing contention.
+func BenchmarkShardedFragmentAssembler_Concurrent(b *testing.B) {
+	fragmentSets := makeConcurrentBenchmarkFragmentSets(b)
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		sfa := NewShardedFragmentAssembler(16)
 		setIdx := 0
 		for pb.Next() {
-			frags := fragmentSets[setIdx%numFragmentSets]
+			frags := fragmentSets[setIdx%concurrentBenchmarkFragmentSetCount]
 			for _, f := range frags {
-				sfa.AddFragment(f.sessionID, f.fragID, f.index, f.total, f.payload)
+				_, _ = sfa.AddFragment(f.sessionID, f.fragID, f.index, f.total, f.payload)
 			}
 			setIdx++
 		}
@@ -1459,47 +1482,16 @@ func BenchmarkShardedFragmentAssembler_Concurrent(b *testing.B) {
 // BenchmarkFragmentAssembler_Concurrent benchmarks the original assembler's
 // performance under concurrent access for comparison with the sharded version.
 func BenchmarkFragmentAssembler_Concurrent(b *testing.B) {
-	// Prepare multiple fragment sets with different fragment IDs
-	const numFragmentSets = 16
-	type parsedFrag struct {
-		sessionID uint32
-		fragID    uint16
-		index     uint8
-		total     uint8
-		payload   []byte
-	}
-
-	fragmentSets := make([][]parsedFrag, numFragmentSets)
-	for setIdx := 0; setIdx < numFragmentSets; setIdx++ {
-		data := make([]byte, 5000)
-		for i := range data {
-			data[i] = byte((i + setIdx) % 256)
-		}
-
-		var fragIDCounter atomic.Uint32
-		fragIDCounter.Store(uint32(setIdx * 1000)) // Different starting IDs for each set
-		results, _ := FragmentUDPPooled(uint32(12345+setIdx), data, &fragIDCounter, true)
-
-		frags := make([]parsedFrag, len(results))
-		for i, r := range results {
-			sessionID, _, fID, fIndex, fTotal, payload, _ := ParseUDPDatagram(r.Data)
-			// Make a copy of payload since we'll release the results
-			payloadCopy := make([]byte, len(payload))
-			copy(payloadCopy, payload)
-			frags[i] = parsedFrag{sessionID, fID, fIndex, fTotal, payloadCopy}
-		}
-		fragmentSets[setIdx] = frags
-		ReleaseDatagramResults(results)
-	}
+	fragmentSets := makeConcurrentBenchmarkFragmentSets(b)
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		assembler := NewFragmentAssembler()
 		setIdx := 0
 		for pb.Next() {
-			frags := fragmentSets[setIdx%numFragmentSets]
+			frags := fragmentSets[setIdx%concurrentBenchmarkFragmentSetCount]
 			for _, f := range frags {
-				assembler.AddFragment(f.sessionID, f.fragID, f.index, f.total, f.payload)
+				_, _ = assembler.AddFragment(f.sessionID, f.fragID, f.index, f.total, f.payload)
 			}
 			setIdx++
 		}
