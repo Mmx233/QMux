@@ -59,6 +59,9 @@ func LoadClientConfig(path string) (*Client, error) {
 	if hasDuplicates {
 		logger.Warn().Msg("duplicate server addresses detected and removed from configuration")
 	}
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("client configuration validation failed: %w", err)
+	}
 
 	servers := cfg.Server.GetServers()
 	logger.Info().Int("server_count", len(servers)).Msg("loaded server configuration")

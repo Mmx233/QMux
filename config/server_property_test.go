@@ -3,7 +3,7 @@ package config
 import (
 	"testing"
 
-	"github.com/Mmx233/QMux/server/auth/challenge"
+	sharedtoken "github.com/Mmx233/QMux/auth/token"
 	"pgregory.net/rapid"
 )
 
@@ -46,7 +46,7 @@ func TestProperty_TokenValidation_ValidToken(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		// Generate token with length >= MinTokenSize (16 bytes)
 		// Use a range from MinTokenSize to a reasonable max (256 bytes)
-		tokenLength := rapid.IntRange(challenge.MinTokenSize, 256).Draw(t, "token_length")
+		tokenLength := rapid.IntRange(sharedtoken.MinSecretSize, 256).Draw(t, "token_length")
 
 		// Generate random bytes for the token
 		tokenBytes := make([]byte, tokenLength)
@@ -64,7 +64,7 @@ func TestProperty_TokenValidation_ValidToken(t *testing.T) {
 		err := auth.Validate()
 		if err != nil {
 			t.Fatalf("expected validation to pass for token with length %d (>= %d), got: %v",
-				len(token), challenge.MinTokenSize, err)
+				len(token), sharedtoken.MinSecretSize, err)
 		}
 	})
 }
@@ -75,7 +75,7 @@ func TestProperty_TokenValidation_ShortToken(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		// Generate token with length < MinTokenSize (16 bytes)
 		// Range from 1 to MinTokenSize-1 (1 to 15 bytes)
-		tokenLength := rapid.IntRange(1, challenge.MinTokenSize-1).Draw(t, "token_length")
+		tokenLength := rapid.IntRange(1, sharedtoken.MinSecretSize-1).Draw(t, "token_length")
 
 		// Generate random bytes for the token
 		tokenBytes := make([]byte, tokenLength)
@@ -93,7 +93,7 @@ func TestProperty_TokenValidation_ShortToken(t *testing.T) {
 		err := auth.Validate()
 		if err == nil {
 			t.Fatalf("expected validation to fail for token with length %d (< %d), but it passed",
-				len(token), challenge.MinTokenSize)
+				len(token), sharedtoken.MinSecretSize)
 		}
 
 		// Verify the error message mentions the minimum length requirement

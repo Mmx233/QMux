@@ -39,9 +39,9 @@ func New(conf *config.Client) (*Client, error) {
 		Str("client_id", conf.ClientID).
 		Logger()
 
-	// Load TLS certificates
-	if err := conf.TLS.LoadCertificates(); err != nil {
-		return nil, fmt.Errorf("load certificates: %w", err)
+	// Load the credentials required by the selected authentication mode.
+	if err := conf.LoadCredentials(); err != nil {
+		return nil, fmt.Errorf("load credentials: %w", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

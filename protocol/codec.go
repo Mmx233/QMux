@@ -11,6 +11,13 @@ import (
 // json is a drop-in replacement for encoding/json with better performance
 var json = jsoniter.ConfigCompatibleWithStandardLibrary
 
+const (
+	// MaxPayloadSize is the generic protocol message payload limit.
+	MaxPayloadSize = 10 * 1024 * 1024
+	// MaxRegistrationPayloadSize is the stricter limit for registration traffic.
+	MaxRegistrationPayloadSize = 4 * 1024
+)
+
 // Wire format: [1 byte type][4 bytes length][payload]
 
 // WriteMessage writes a message to the writer using buffer pooling to reduce allocations.
@@ -44,6 +51,12 @@ func WriteMessage(w io.Writer, msgType byte, payload any) error {
 // ReadMessage reads a message from the reader with optimized allocations.
 // Uses a fixed header buffer to avoid allocations for header reading.
 func ReadMessage(r io.Reader) (msgType byte, payload []byte, err error) {
+	return ReadMessageLimited(r, MaxPayloadSize)
+}
+
+// ReadMessageLimited reads a message while enforcing maxPayloadSize before
+// allocating the payload buffer.
+func ReadMessageLimited(r io.Reader, maxPayloadSize uint32) (msgType byte, payload []byte, err error) {
 	// Use a fixed-size header buffer to avoid allocations
 	var header [5]byte
 
@@ -57,8 +70,8 @@ func ReadMessage(r io.Reader) (msgType byte, payload []byte, err error) {
 	length := binary.BigEndian.Uint32(header[1:])
 
 	// Validate length (prevent excessive memory allocation)
-	if length > 10*1024*1024 { // 10MB max
-		return 0, nil, fmt.Errorf("payload too large: %d bytes", length)
+	if length > maxPayloadSize {
+		return 0, nil, fmt.Errorf("payload too large: %d bytes (maximum %d)", length, maxPayloadSize)
 	}
 
 	// Read payload - allocation is necessary here as we return the slice
@@ -80,7 +93,13 @@ func DecodeMessage(payload []byte, msg any) error {
 
 // ReadTypedMessage reads and decodes a message in one call
 func ReadTypedMessage(r io.Reader, expectedType byte, msg any) error {
-	msgType, payload, err := ReadMessage(r)
+	return ReadTypedMessageLimited(r, expectedType, msg, MaxPayloadSize)
+}
+
+// ReadTypedMessageLimited reads and decodes a message while enforcing a
+// caller-provided payload limit.
+func ReadTypedMessageLimited(r io.Reader, expectedType byte, msg any, maxPayloadSize uint32) error {
+	msgType, payload, err := ReadMessageLimited(r, maxPayloadSize)
 	if err != nil {
 		return err
 	}
@@ -94,21 +113,35 @@ func ReadTypedMessage(r io.Reader, expectedType byte, msg any) error {
 
 // WriteRegister writes a registration message
 func WriteRegister(w io.Writer, clientID, version string, capabilities []string) error {
+	return WriteRegisterWithAuth(w, clientID, version, capabilities, nil)
+}
+
+// WriteRegisterWithAuth writes a registration message with an optional
+// authentication proof.
+func WriteRegisterWithAuth(w io.Writer, clientID, version string, capabilities []string, auth *RegisterAuth) error {
 	msg := RegisterMsg{
 		ClientID:     clientID,
 		Version:      version,
 		Capabilities: capabilities,
+		Auth:         auth,
 	}
 	return WriteMessage(w, MsgTypeRegister, msg)
 }
 
 // WriteRegisterAck writes a registration acknowledgment
 func WriteRegisterAck(w io.Writer, success bool, message, serverVersion string, selectedCapabilities []string) error {
+	return WriteRegisterAckWithAuth(w, success, message, serverVersion, selectedCapabilities, "")
+}
+
+// WriteRegisterAckWithAuth writes a registration acknowledgment that echoes
+// the server-selected authentication scheme.
+func WriteRegisterAckWithAuth(w io.Writer, success bool, message, serverVersion string, selectedCapabilities []string, selectedAuthScheme string) error {
 	msg := RegisterAckMsg{
 		Success:              success,
 		Message:              message,
 		ServerVersion:        serverVersion,
 		SelectedCapabilities: selectedCapabilities,
+		SelectedAuthScheme:   selectedAuthScheme,
 	}
 	return WriteMessage(w, MsgTypeRegisterAck, msg)
 }

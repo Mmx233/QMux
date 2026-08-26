@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Mmx233/QMux/server/auth/challenge"
 	"github.com/Mmx233/QMux/server/auth/mtls"
+	"github.com/Mmx233/QMux/server/auth/tokenauth"
 	"gopkg.in/yaml.v3"
 )
 
@@ -609,10 +609,10 @@ func TestServerAuth_CreateAuthenticator_TokenMethod(t *testing.T) {
 		t.Fatal("expected authenticator to be non-nil")
 	}
 
-	// Verify it's a challenge authenticator by type assertion
-	_, ok := authenticator.(*challenge.ChallengeAuth)
+	// Verify it's an exporter-bound token authenticator by type assertion.
+	_, ok := authenticator.(*tokenauth.TokenAuth)
 	if !ok {
-		t.Errorf("expected authenticator to be *challenge.ChallengeAuth, got %T", authenticator)
+		t.Errorf("expected authenticator to be *tokenauth.TokenAuth, got %T", authenticator)
 	}
 }
 
@@ -694,7 +694,7 @@ func TestServerAuth_CreateAuthenticator_TableDriven(t *testing.T) {
 		auth             ServerAuth
 		expectError      bool
 		errorMsg         string
-		expectedAuthType string // "mtls" or "challenge"
+		expectedAuthType string // "mtls" or "token"
 	}{
 		{
 			name: "mtls with valid CA cert",
@@ -721,7 +721,7 @@ func TestServerAuth_CreateAuthenticator_TableDriven(t *testing.T) {
 				Token:  "this-is-a-valid-token-16bytes",
 			},
 			expectError:      false,
-			expectedAuthType: "challenge",
+			expectedAuthType: "token",
 		},
 		{
 			name: "mtls with nonexistent CA cert file",
@@ -779,9 +779,9 @@ func TestServerAuth_CreateAuthenticator_TableDriven(t *testing.T) {
 					if _, ok := authenticator.(*mtls.MTLSAuth); !ok {
 						t.Errorf("expected *mtls.MTLSAuth, got %T", authenticator)
 					}
-				case "challenge":
-					if _, ok := authenticator.(*challenge.ChallengeAuth); !ok {
-						t.Errorf("expected *challenge.ChallengeAuth, got %T", authenticator)
+				case "token":
+					if _, ok := authenticator.(*tokenauth.TokenAuth); !ok {
+						t.Errorf("expected *tokenauth.TokenAuth, got %T", authenticator)
 					}
 				}
 			}

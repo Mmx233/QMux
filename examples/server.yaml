@@ -38,7 +38,8 @@ listeners:
     # Maximum idle timeout before connection is closed
     # maxidletimeout: 5m
 
-    # Allow 0-RTT connections (reduces latency but has security implications)
+    # Reserved QUIC 0-RTT setting. QMux does not currently accept authentication,
+    # registration, or tunnel side effects as early application data.
     # allow0rtt: false
 
     # UDP settings (optional - defaults are used if not specified)
@@ -65,8 +66,10 @@ auth:
   # Path to CA certificate file (for client verification in mTLS mode)
   ca_cert_file: "./certs/ca.crt"
 
-  # Token for challenge-response authentication (required when method is "token")
-  # token: "my-secret-token-at-least-16-bytes"
+  # Shared secret for TLS-exporter-bound token authentication.
+  # Generate at least 256 random bits, for example with: openssl rand -base64 32
+  # The token is never sent over the wire.
+  # token: "replace-with-the-generated-secret"
 
 # TLS configuration
 tls:

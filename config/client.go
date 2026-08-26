@@ -3,11 +3,14 @@ package config
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"strconv"
 	"time"
+
+	sharedtoken "github.com/Mmx233/QMux/auth/token"
 )
 
 type Client struct {
@@ -16,6 +19,7 @@ type Client struct {
 	Local             LocalService  `yaml:"local"`
 	Quic              Quic          `yaml:"quic"`
 	TLS               ClientTLS     `yaml:"tls"`
+	Auth              ClientAuth    `yaml:"auth"`
 	UDP               UDPConfig     `yaml:"udp"`
 	HeartbeatInterval time.Duration `yaml:"heartbeat_interval"` // Heartbeat interval, default 30s
 	HealthTimeout     time.Duration `yaml:"health_timeout"`     // Health timeout for received heartbeats, default 90s
@@ -33,6 +37,7 @@ func (c *Client) EnsureClientID() {
 // It calls EnsureClientID() and sets HeartbeatInterval and HealthTimeout if not specified.
 func (c *Client) ApplyDefaults() {
 	c.EnsureClientID()
+	c.Auth.ApplyDefaults()
 	if c.HeartbeatInterval == 0 {
 		c.HeartbeatInterval = DefaultHeartbeatInterval
 	}
@@ -47,7 +52,61 @@ func (c *Client) Validate() error {
 	if c.HealthTimeout <= c.HeartbeatInterval {
 		return fmt.Errorf("health_timeout (%v) must be greater than heartbeat_interval (%v)", c.HealthTimeout, c.HeartbeatInterval)
 	}
+	if err := c.Auth.Validate(); err != nil {
+		return fmt.Errorf("auth: %w", err)
+	}
+	if err := c.TLS.Validate(c.Auth.Method); err != nil {
+		return fmt.Errorf("tls: %w", err)
+	}
 	return nil
+}
+
+const (
+	ClientAuthMethodMTLS  = "mtls"
+	ClientAuthMethodToken = "token"
+)
+
+// ClientAuth selects client authentication and carries its token when needed.
+type ClientAuth struct {
+	Method string `yaml:"method"`
+	Token  string `yaml:"token"`
+}
+
+// ApplyDefaults selects mTLS when no client authentication method is set.
+func (a *ClientAuth) ApplyDefaults() {
+	if a.Method == "" {
+		a.Method = ClientAuthMethodMTLS
+	}
+}
+
+// Validate validates the selected client authentication method.
+func (a *ClientAuth) Validate() error {
+	switch a.Method {
+	case "", ClientAuthMethodMTLS:
+		return nil
+	case ClientAuthMethodToken:
+		if len(a.Token) < sharedtoken.MinSecretSize {
+			return fmt.Errorf("token must be at least %d bytes", sharedtoken.MinSecretSize)
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown auth method: %s", a.Method)
+	}
+}
+
+// LoadCredentials validates and loads the credentials required by the selected
+// client authentication method.
+func (c *Client) LoadCredentials() error {
+	if err := c.Auth.Validate(); err != nil {
+		return fmt.Errorf("auth: %w", err)
+	}
+	if err := c.TLS.Validate(c.Auth.Method); err != nil {
+		return fmt.Errorf("tls: %w", err)
+	}
+	if c.Auth.Method == ClientAuthMethodToken {
+		return c.TLS.LoadCACertificate()
+	}
+	return c.TLS.LoadCertificates()
 }
 
 // ServerEndpoint represents a single server endpoint
@@ -80,9 +139,24 @@ type ClientTLS struct {
 	ClientCert tls.Certificate `yaml:"-"`
 }
 
-// LoadCertificates loads TLS certificates from files
-func (t *ClientTLS) LoadCertificates() error {
-	// Load CA certificate
+// Validate checks the certificate paths required by the selected auth method.
+func (t *ClientTLS) Validate(authMethod string) error {
+	if t.CACertFile == "" {
+		return errors.New("ca_cert_file is required")
+	}
+	if authMethod == "" || authMethod == ClientAuthMethodMTLS {
+		if t.ClientCertFile == "" {
+			return errors.New("client_cert_file is required for mTLS authentication")
+		}
+		if t.ClientKeyFile == "" {
+			return errors.New("client_key_file is required for mTLS authentication")
+		}
+	}
+	return nil
+}
+
+// LoadCACertificate loads the server CA certificate from disk.
+func (t *ClientTLS) LoadCACertificate() error {
 	caCertPEM, err := os.ReadFile(t.CACertFile)
 	if err != nil {
 		return fmt.Errorf("read CA cert: %w", err)
@@ -92,15 +166,25 @@ func (t *ClientTLS) LoadCertificates() error {
 	if !t.CACertPool.AppendCertsFromPEM(caCertPEM) {
 		return fmt.Errorf("failed to parse CA certificate")
 	}
+	return nil
+}
 
-	// Load client certificate and key
+// LoadClientKeyPair loads the client certificate and private key from disk.
+func (t *ClientTLS) LoadClientKeyPair() error {
 	cert, err := tls.LoadX509KeyPair(t.ClientCertFile, t.ClientKeyFile)
 	if err != nil {
 		return fmt.Errorf("load client cert/key: %w", err)
 	}
 	t.ClientCert = cert
-
 	return nil
+}
+
+// LoadCertificates loads TLS certificates from files
+func (t *ClientTLS) LoadCertificates() error {
+	if err := t.LoadCACertificate(); err != nil {
+		return err
+	}
+	return t.LoadClientKeyPair()
 }
 
 const (

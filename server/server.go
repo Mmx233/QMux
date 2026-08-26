@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/Mmx233/QMux/config"
@@ -19,14 +21,33 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+const (
+	registrationTimeout         = 10 * time.Second
+	maxPendingRegistrations     = 128
+	registrationErrorCode       = quic.ApplicationErrorCode(1)
+	registrationStreamErrorCode = quic.StreamErrorCode(1)
+	registrationFailureReason   = "registration failed"
+)
+
 // Server represents the QMux server
 type Server struct {
-	config         *config.Server
-	pools          map[string]*pool.ConnectionPool // quicAddr -> pool
-	trafficManager *traffic.Manager
-	authenticator  auth.Auth
-	logger         zerolog.Logger
+	config               *config.Server
+	pools                map[string]*pool.ConnectionPool // quicAddr -> pool
+	trafficManager       *traffic.Manager
+	authenticator        auth.Auth
+	registrationTimeout  time.Duration
+	writeRegistrationAck registrationAckWriter
+	logger               zerolog.Logger
 }
+
+type registrationAckWriter func(
+	io.Writer,
+	bool,
+	string,
+	string,
+	[]string,
+	string,
+) error
 
 // New creates a new server
 func New(conf *config.Server) (*Server, error) {
@@ -78,10 +99,12 @@ func New(conf *config.Server) (*Server, error) {
 	}
 
 	return &Server{
-		config:        conf,
-		pools:         pools,
-		authenticator: authenticator,
-		logger:        logger,
+		config:               conf,
+		pools:                pools,
+		authenticator:        authenticator,
+		registrationTimeout:  registrationTimeout,
+		writeRegistrationAck: protocol.WriteRegisterAckWithAuth,
+		logger:               logger,
 	}, nil
 }
 
@@ -207,6 +230,7 @@ func (s *Server) startListener(ctx context.Context, listenerConf config.QuicList
 		Str("traffic_addr", listenerConf.TrafficAddr).
 		Str("protocol", listenerConf.Protocol).
 		Msg("QUIC listener started")
+	pendingRegistrations := make(chan struct{}, maxPendingRegistrations)
 
 	// Accept connections
 	for {
@@ -219,12 +243,48 @@ func (s *Server) startListener(ctx context.Context, listenerConf config.QuicList
 			continue
 		}
 
-		go s.handleConnection(ctx, conn, listenerConf.QuicAddr)
+		permit, ok := acquirePendingRegistration(pendingRegistrations)
+		if !ok {
+			logger.Warn().Str("remote", conn.RemoteAddr().String()).Msg("pending registration limit reached")
+			_ = conn.CloseWithError(registrationErrorCode, registrationFailureReason)
+			continue
+		}
+
+		go func() {
+			s.handleConnection(ctx, conn, listenerConf.QuicAddr, permit)
+		}()
 	}
 }
 
+type registrationPermit struct {
+	slots chan struct{}
+	once  sync.Once
+}
+
+func acquirePendingRegistration(slots chan struct{}) (*registrationPermit, bool) {
+	select {
+	case slots <- struct{}{}:
+		return &registrationPermit{slots: slots}, true
+	default:
+		return nil, false
+	}
+}
+
+func (p *registrationPermit) Release() {
+	if p == nil {
+		return
+	}
+	p.once.Do(func() { <-p.slots })
+}
+
 // handleConnection handles a new QUIC connection
-func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn, quicAddr string) {
+func (s *Server) handleConnection(
+	ctx context.Context,
+	conn *quic.Conn,
+	quicAddr string,
+	registrationPermit *registrationPermit,
+) {
+	defer registrationPermit.Release()
 	logger := s.logger.With().
 		Str("remote", conn.RemoteAddr().String()).
 		Str("quic_addr", quicAddr).
@@ -232,27 +292,89 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn, quicAddr
 
 	logger.Info().Msg("new connection")
 
-	// Authenticate connection
-	valid, err := s.authenticator.VerifyConn(ctx, conn)
-	if err != nil || !valid {
-		logger.Error().Err(err).Msg("authentication failed")
-		_ = conn.CloseWithError(1, "authentication failed")
+	timeout := s.registrationTimeout
+	if timeout <= 0 {
+		timeout = registrationTimeout
+	}
+	registrationCtx, cancelRegistration := context.WithTimeout(ctx, timeout)
+	defer cancelRegistration()
+	registrationDeadline, _ := registrationCtx.Deadline()
+	registrationSucceeded := false
+	defer func() {
+		if !registrationSucceeded {
+			_ = conn.CloseWithError(registrationErrorCode, registrationFailureReason)
+		}
+	}()
+
+	// A completed handshake is the freshness boundary for exporter-bound auth.
+	select {
+	case <-conn.HandshakeComplete():
+	case <-registrationCtx.Done():
+		logger.Error().Err(context.Cause(registrationCtx)).Msg("TLS handshake did not complete during registration")
+		return
+	case <-conn.Context().Done():
+		logger.Error().Err(context.Cause(conn.Context())).Msg("connection closed before TLS handshake completed")
 		return
 	}
 
 	// Accept control stream (first stream from client)
-	controlStream, err := conn.AcceptStream(ctx)
+	controlStream, err := conn.AcceptStream(registrationCtx)
 	if err != nil {
 		logger.Error().Err(err).Msg("accept control stream failed")
-		_ = conn.CloseWithError(1, "control stream error")
+		return
+	}
+	if err := controlStream.SetDeadline(registrationDeadline); err != nil {
+		logger.Error().Err(err).Msg("set registration stream deadline failed")
 		return
 	}
 
+	// Stream deadlines bound stalls; cancellation also interrupts the stream
+	// immediately instead of waiting for the remaining timeout.
+	stopCancellationWatch := make(chan struct{})
+	cancellationWatchStopped := make(chan struct{})
+	go func() {
+		defer close(cancellationWatchStopped)
+		select {
+		case <-ctx.Done():
+			controlStream.CancelRead(registrationStreamErrorCode)
+			controlStream.CancelWrite(registrationStreamErrorCode)
+		case <-stopCancellationWatch:
+		}
+	}()
+	var stopWatchOnce sync.Once
+	stopWatch := func() {
+		stopWatchOnce.Do(func() {
+			close(stopCancellationWatch)
+			<-cancellationWatchStopped
+		})
+	}
+	defer stopWatch()
+
 	// Read registration message
 	var regMsg protocol.RegisterMsg
-	if err := protocol.ReadTypedMessage(controlStream, protocol.MsgTypeRegister, &regMsg); err != nil {
+	if err := protocol.ReadTypedMessageLimited(
+		controlStream,
+		protocol.MsgTypeRegister,
+		&regMsg,
+		protocol.MaxRegistrationPayloadSize,
+	); err != nil {
 		logger.Error().Err(err).Msg("read registration failed")
-		_ = conn.CloseWithError(1, "registration error")
+		return
+	}
+
+	// The authenticator was selected by server configuration. Registration
+	// fields can never select or switch the server's authentication policy.
+	authRegistration := auth.Registration{
+		ClientID:     regMsg.ClientID,
+		Version:      regMsg.Version,
+		Capabilities: regMsg.Capabilities,
+	}
+	if regMsg.Auth != nil {
+		authRegistration.Scheme = regMsg.Auth.Scheme
+		authRegistration.Proof = regMsg.Auth.Proof
+	}
+	if err := s.authenticator.Verify(conn.ConnectionState().TLS, authRegistration); err != nil {
+		logger.Error().Err(err).Msg("authentication failed")
 		return
 	}
 
@@ -264,8 +386,7 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn, quicAddr
 	// Reject incompatible peers before constructing or publishing a pool entry.
 	if err := protocol.ValidateRegistration(regMsg.Version, regMsg.Capabilities); err != nil {
 		logger.Warn().Err(err).Msg("registration negotiation failed")
-		_ = protocol.WriteRegisterAck(controlStream, false, err.Error(), protocol.ProtocolVersion, nil)
-		_ = conn.CloseWithError(1, "incompatible protocol")
+		_ = s.writeRegisterAck(controlStream, false, err.Error(), protocol.ProtocolVersion, nil, "")
 		return
 	}
 	selectedCapabilities := protocol.SelectCapabilities(regMsg.Capabilities, config.DefaultCapabilities)
@@ -287,12 +408,31 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn, quicAddr
 		},
 	}
 
-	// Add to pool
+	// Reserve the client ID without publishing it to traffic selection. The
+	// connection becomes visible only after the success Ack is on the wire.
 	poolInst := s.pools[quicAddr]
-	if err := poolInst.Add(clientConn); err != nil {
-		logger.Error().Err(err).Msg("add to pool failed")
-		_ = protocol.WriteRegisterAck(controlStream, false, err.Error(), protocol.ProtocolVersion, nil)
-		_ = conn.CloseWithError(1, "pool error")
+	reservation, err := poolInst.Reserve(clientConn)
+	if err != nil {
+		logger.Error().Err(err).Msg("reserve pool entry failed")
+		_ = s.writeRegisterAck(controlStream, false, "registration unavailable", protocol.ProtocolVersion, nil, "")
+		return
+	}
+	defer poolInst.Abort(reservation)
+
+	selectedAuthScheme := s.authenticator.SelectedScheme()
+	if err := s.writeRegisterAck(
+		controlStream,
+		true,
+		"registered",
+		protocol.ProtocolVersion,
+		selectedCapabilities,
+		selectedAuthScheme,
+	); err != nil {
+		logger.Error().Err(err).Msg("send ack failed")
+		return
+	}
+	if err := poolInst.Commit(reservation); err != nil {
+		logger.Error().Err(err).Msg("commit pool entry failed")
 		return
 	}
 	defer func() {
@@ -303,13 +443,31 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn, quicAddr
 		}
 	}()
 
-	// Send acknowledgment
-	if err := protocol.WriteRegisterAck(controlStream, true, "registered", protocol.ProtocolVersion, selectedCapabilities); err != nil {
-		logger.Error().Err(err).Msg("send ack failed")
+	// Stop registration cancellation before clearing the transaction deadline.
+	stopWatch()
+	cancelRegistration()
+	if err := controlStream.SetDeadline(time.Time{}); err != nil {
+		logger.Error().Err(err).Msg("clear registration stream deadline failed")
 		return
 	}
+	registrationSucceeded = true
+	registrationPermit.Release()
 
 	s.handleControlStream(ctx, poolInst, clientConn, quicAddr)
+}
+
+func (s *Server) writeRegisterAck(
+	w io.Writer,
+	success bool,
+	message, serverVersion string,
+	selectedCapabilities []string,
+	selectedAuthScheme string,
+) error {
+	writer := s.writeRegistrationAck
+	if writer == nil {
+		writer = protocol.WriteRegisterAckWithAuth
+	}
+	return writer(w, success, message, serverVersion, selectedCapabilities, selectedAuthScheme)
 }
 
 // handleControlStream handles bidirectional heartbeat messages on the control stream.

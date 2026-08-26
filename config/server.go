@@ -8,9 +8,10 @@ import (
 	"os"
 	"time"
 
+	sharedtoken "github.com/Mmx233/QMux/auth/token"
 	"github.com/Mmx233/QMux/server/auth"
-	"github.com/Mmx233/QMux/server/auth/challenge"
 	"github.com/Mmx233/QMux/server/auth/mtls"
+	"github.com/Mmx233/QMux/server/auth/tokenauth"
 )
 
 type Server struct {
@@ -37,7 +38,7 @@ type QuicListener struct {
 type ServerAuth struct {
 	Method     string `yaml:"method"`       // "mtls", "token", etc.
 	CACertFile string `yaml:"ca_cert_file"` // Path to CA certificate file (for mTLS)
-	Token      string `yaml:"token"`        // Token for challenge-response auth
+	Token      string `yaml:"token"`        // Secret for exporter-bound token auth
 
 	// Loaded certificate (not from YAML)
 	CACertPool *x509.CertPool `yaml:"-"`
@@ -73,8 +74,8 @@ func (a *ServerAuth) Validate() error {
 		if a.Token == "" {
 			return errors.New("token is required for token authentication")
 		}
-		if len(a.Token) < challenge.MinTokenSize {
-			return fmt.Errorf("token must be at least %d bytes", challenge.MinTokenSize)
+		if len(a.Token) < sharedtoken.MinSecretSize {
+			return fmt.Errorf("token must be at least %d bytes", sharedtoken.MinSecretSize)
 		}
 		return nil
 	default:
@@ -84,7 +85,7 @@ func (a *ServerAuth) Validate() error {
 
 // CreateAuthenticator creates and returns the appropriate authenticator based on the configured method.
 // For mTLS (or empty method): loads the CA certificate and creates an mTLS authenticator.
-// For token method: creates a challenge-response authenticator with the configured token.
+// For token method: creates an exporter-bound registration authenticator.
 // Returns an error if authenticator creation fails.
 func (a *ServerAuth) CreateAuthenticator() (auth.Auth, error) {
 	switch a.Method {
@@ -94,7 +95,7 @@ func (a *ServerAuth) CreateAuthenticator() (auth.Auth, error) {
 		}
 		return mtls.New(a.CACertPool), nil
 	case "token":
-		return challenge.New([]byte(a.Token))
+		return tokenauth.New([]byte(a.Token))
 	default:
 		return nil, fmt.Errorf("unknown auth method: %s", a.Method)
 	}

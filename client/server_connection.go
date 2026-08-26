@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	sharedtoken "github.com/Mmx233/QMux/auth/token"
 	"github.com/Mmx233/QMux/config"
 	"github.com/Mmx233/QMux/protocol"
 	"github.com/quic-go/quic-go"
@@ -422,16 +423,53 @@ func (sc *ServerConnection) StartHeartbeatLoops(heartbeatInterval time.Duration)
 
 // --- Connection Lifecycle Methods ---
 
-// Register sends a registration message to the server and waits for acknowledgment.
+// Register sends an mTLS registration message to the server and waits for acknowledgment.
+// It is retained as the source-compatible wrapper for callers using the default
+// authentication mode.
+func (sc *ServerConnection) Register(ctx context.Context, clientID string) error {
+	return sc.RegisterWithAuth(ctx, clientID, config.ClientAuth{Method: config.ClientAuthMethodMTLS})
+}
+
+// RegisterWithAuth sends a registration message to the server and waits for acknowledgment.
 // The context governs opening the stream, writing the registration, and reading and
 // validating the acknowledgment. A Background context has no registration deadline;
 // ConnectionManager supplies its internal 30-second per-attempt deadline.
 // Success installs the provisional control stream; ConnectionManager owns health,
 // publication, and heartbeat startup.
 // This should be called after Connect succeeds.
-func (sc *ServerConnection) Register(ctx context.Context, clientID string) error {
+func (sc *ServerConnection) RegisterWithAuth(ctx context.Context, clientID string, auth config.ClientAuth) error {
 	if sc.conn == nil {
 		return fmt.Errorf("not connected")
+	}
+	auth.ApplyDefaults()
+	if err := auth.Validate(); err != nil {
+		return fmt.Errorf("invalid client authentication: %w", err)
+	}
+	if err := sc.waitForHandshake(ctx); err != nil {
+		return err
+	}
+
+	capabilities := config.DefaultCapabilities
+	expectedAuthScheme := ""
+	var registerAuth *protocol.RegisterAuth
+	if auth.Method == config.ClientAuthMethodToken {
+		expectedAuthScheme = sharedtoken.Scheme
+		proof, err := sharedtoken.Compute(
+			[]byte(auth.Token),
+			sharedtoken.Transcript{
+				ClientID:     clientID,
+				Version:      protocol.ProtocolVersion,
+				Capabilities: capabilities,
+			},
+			sc.conn.ConnectionState().TLS,
+		)
+		if err != nil {
+			return fmt.Errorf("compute token authentication proof: %w", err)
+		}
+		registerAuth = &protocol.RegisterAuth{
+			Scheme: sharedtoken.Scheme,
+			Proof:  proof,
+		}
 	}
 
 	sc.logger.Info().Str("client_id", clientID).Msg("registering with server")
@@ -479,11 +517,12 @@ func (sc *ServerConnection) Register(ctx context.Context, clientID string) error
 	}()
 
 	// Send registration message
-	err = protocol.WriteRegister(
+	err = protocol.WriteRegisterWithAuth(
 		stream,
 		clientID,
 		protocol.ProtocolVersion,
-		config.DefaultCapabilities,
+		capabilities,
+		registerAuth,
 	)
 	if err != nil {
 		return registrationIOError(ctx, "send registration", err)
@@ -491,11 +530,16 @@ func (sc *ServerConnection) Register(ctx context.Context, clientID string) error
 
 	// Read acknowledgment
 	var ackMsg protocol.RegisterAckMsg
-	if err := protocol.ReadTypedMessage(stream, protocol.MsgTypeRegisterAck, &ackMsg); err != nil {
+	if err := protocol.ReadTypedMessageLimited(
+		stream,
+		protocol.MsgTypeRegisterAck,
+		&ackMsg,
+		protocol.MaxRegistrationPayloadSize,
+	); err != nil {
 		return registrationIOError(ctx, "read registration ack", err)
 	}
 
-	if err := sc.acceptRegisterAck(ackMsg); err != nil {
+	if err := sc.acceptRegisterAckWithAuth(ackMsg, expectedAuthScheme); err != nil {
 		return err
 	}
 	if !stopAndWait() {
@@ -518,6 +562,17 @@ func (sc *ServerConnection) Register(ctx context.Context, clientID string) error
 	return nil
 }
 
+func (sc *ServerConnection) waitForHandshake(ctx context.Context) error {
+	select {
+	case <-sc.conn.HandshakeComplete():
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("wait for TLS handshake: %w", ctx.Err())
+	case <-sc.conn.Context().Done():
+		return fmt.Errorf("wait for TLS handshake: connection closed: %w", context.Cause(sc.conn.Context()))
+	}
+}
+
 func registrationIOError(ctx context.Context, operation string, err error) error {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return fmt.Errorf("%s: %w: %w", operation, ctxErr, err)
@@ -530,6 +585,10 @@ func registrationIOError(ctx context.Context, operation string, err error) error
 
 func (sc *ServerConnection) acceptRegisterAck(ack protocol.RegisterAckMsg) error {
 	return protocol.ValidateRegisterAck(ack)
+}
+
+func (sc *ServerConnection) acceptRegisterAckWithAuth(ack protocol.RegisterAckMsg, expectedAuthScheme string) error {
+	return protocol.ValidateRegisterAckWithAuth(ack, expectedAuthScheme)
 }
 
 // SendHeartbeat sends a heartbeat message on the control stream.

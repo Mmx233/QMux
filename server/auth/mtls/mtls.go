@@ -1,12 +1,11 @@
 package mtls
 
 import (
-	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 
 	"github.com/Mmx233/QMux/server/auth"
-	"github.com/quic-go/quic-go"
 )
 
 // MTLSAuth implements mTLS authentication
@@ -18,31 +17,28 @@ type MTLSAuth struct {
 
 // New creates a new mTLS authenticator
 func New(caCertPool *x509.CertPool) auth.Auth {
-	return &MTLSAuth{
-		caCertPool: caCertPool,
-	}
+	return &MTLSAuth{caCertPool: caCertPool}
 }
 
-// VerifyConn verifies a QUIC connection using mTLS
-func (m *MTLSAuth) VerifyConn(_ context.Context, conn *quic.Conn) (bool, error) {
-	// Get TLS connection state
-	tlsState := conn.ConnectionState().TLS
-
-	// Check if client certificate was provided
-	if len(tlsState.PeerCertificates) == 0 {
-		return false, fmt.Errorf("no client certificate provided")
+// Verify preserves the existing application-level mTLS verification after the
+// transport handshake has completed.
+func (m *MTLSAuth) Verify(state tls.ConnectionState, _ auth.Registration) error {
+	if !state.HandshakeComplete {
+		return fmt.Errorf("TLS handshake is incomplete")
 	}
-
-	// Verify certificate chain
+	if len(state.PeerCertificates) == 0 {
+		return fmt.Errorf("no client certificate provided")
+	}
 	opts := x509.VerifyOptions{
 		Roots:     m.caCertPool,
 		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	}
-
-	_, err := tlsState.PeerCertificates[0].Verify(opts)
-	if err != nil {
-		return false, fmt.Errorf("certificate verification failed: %w", err)
+	if _, err := state.PeerCertificates[0].Verify(opts); err != nil {
+		return fmt.Errorf("certificate verification failed: %w", err)
 	}
+	return nil
+}
 
-	return true, nil
+func (m *MTLSAuth) SelectedScheme() string {
+	return ""
 }

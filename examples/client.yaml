@@ -49,7 +49,8 @@ quic:
   # Maximum idle timeout before connection is closed
   # maxidletimeout: 5m
 
-  # Allow 0-RTT connections (reduces latency but has security implications)
+  # Reserved QUIC 0-RTT setting. QMux does not currently send authentication,
+  # registration, or tunnel side effects as early application data.
   # allow0rtt: false
 
 # UDP settings (optional - defaults are used if not specified)
@@ -69,15 +70,24 @@ udp:
   # Size of QUIC datagram buffers in bytes
   # datagram_buffer_size: 1200
 
+# Authentication configuration
+auth:
+  # Authentication method: "mtls" (default) or "token"
+  method: "mtls"
+
+  # Shared secret for token authentication. Generate at least 256 random bits,
+  # for example with: openssl rand -base64 32
+  # The token is never sent over the wire; it authenticates a TLS-exporter-bound proof.
+  # token: "replace-with-the-generated-secret"
+
 # TLS configuration
 tls:
   # Path to CA certificate file (for server verification)
   ca_cert_file: "./certs/ca.crt"
 
-  # Path to client certificate file
+  # Paths to the client certificate and key (required for mTLS only;
+  # omit both in token mode)
   client_cert_file: "./certs/client.crt"
-
-  # Path to client private key file
   client_key_file: "./certs/client.key"
 
 # Heartbeat configuration

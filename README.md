@@ -7,7 +7,7 @@
 
 A high-availability L4 (transport layer) NAT traversal tool built on the QUIC protocol.
 
-QMux operates at Layer 4 of the OSI model, enabling secure TCP/UDP tunneling through NAT/firewalls by establishing QUIC connections between clients and servers. It works at the transport layer, forwarding raw TCP streams without inspecting application-layer protocols. It supports multi-server configurations with automatic load balancing, mTLS authentication, and 0-RTT session resumption for fast reconnections.
+QMux operates at Layer 4 of the OSI model, enabling secure TCP/UDP tunneling through NAT/firewalls by establishing QUIC connections between clients and servers. It works at the transport layer, forwarding raw TCP streams without inspecting application-layer protocols. It supports multi-server configurations with automatic load balancing, mTLS or token authentication, and TLS session resumption for fast reconnections.
 
 # Get Started
 
@@ -99,6 +99,9 @@ local:
   host: "127.0.0.1"
   port: 3000  # Your local service port
 
+auth:
+  method: "mtls"
+
 tls:
   ca_cert_file: "./certs/ca.crt"
   client_cert_file: "./certs/client.crt"
@@ -116,6 +119,37 @@ qmux run client -c client.yaml
 ```
 
 Now external traffic to `your-server-ip:8080` will be forwarded to your local service on port 3000.
+
+## Authentication
+
+QMux uses mTLS by default. In this mode the server and client verify one another with certificates, as shown in the quick-start configuration above.
+
+Token authentication is available when distributing a client certificate is undesirable. Generate a machine-random secret with at least 256 bits of entropy, for example with `openssl rand -base64 32`, and configure the same value on both sides:
+
+```yaml
+# server.yaml
+auth:
+  method: "token"
+  token: "replace-with-the-generated-secret"
+
+tls:
+  server_cert_file: "./certs/server.crt"
+  server_key_file: "./certs/server.key"
+```
+
+```yaml
+# client.yaml
+auth:
+  method: "token"
+  token: "replace-with-the-generated-secret"
+
+tls:
+  ca_cert_file: "./certs/ca.crt"
+```
+
+The token itself is never sent over the wire. After the TLS 1.3 handshake completes, the client sends an HMAC-SHA512 registration proof bound to that connection through the TLS exporter. The client still validates the server certificate using `ca_cert_file`, while token mode neither requires nor sends a client certificate. A proof captured from one connection cannot authenticate another connection, including a resumed TLS session.
+
+QMux does not currently send authentication, registration, or tunnel side effects as QUIC 0-RTT application data. The `allow0rtt` setting remains disabled by default and does not enable early QMux application messages; replay-safe application-level 0-RTT semantics are not implemented yet.
 
 # Performance
 

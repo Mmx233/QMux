@@ -144,6 +144,12 @@ func newLifecyclePeerWithNextProtos(t *testing.T, nextProtos []string) *lifecycl
 	serverTLS, clientTLS := lifecycleTLSConfigs(t)
 	serverTLS.NextProtos = nextProtos
 	clientTLS.NextProtos = nextProtos
+	return newLifecyclePeerWithTLS(t, serverTLS, clientTLS)
+}
+
+func newLifecyclePeerWithTLS(t *testing.T, serverTLS, clientTLS *tls.Config) *lifecyclePeer {
+	t.Helper()
+
 	listener, err := quic.ListenAddr("127.0.0.1:0", serverTLS, &quic.Config{
 		HandshakeIdleTimeout: 10 * time.Second,
 		MaxIdleTimeout:       30 * time.Second,

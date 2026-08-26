@@ -85,15 +85,21 @@ func NewConnectionManager(cfg *config.Client, logger zerolog.Logger) (*Connectio
 // It uses goroutines for each server and waits for all connection attempts.
 // Partial failures are handled - the manager continues with successful connections.
 func (cm *ConnectionManager) Start(ctx context.Context) error {
-	// Load TLS certificates
-	if err := cm.config.TLS.LoadCertificates(); err != nil {
-		return fmt.Errorf("load certificates: %w", err)
+	if err := cm.config.Validate(); err != nil {
+		return fmt.Errorf("invalid client configuration: %w", err)
+	}
+
+	// Load the credentials required by the selected authentication mode.
+	if err := cm.config.LoadCredentials(); err != nil {
+		return fmt.Errorf("load credentials: %w", err)
 	}
 
 	// Create base TLS config
 	cm.baseTLSConfig = &tls.Config{
-		Certificates: []tls.Certificate{cm.config.TLS.ClientCert},
-		RootCAs:      cm.config.TLS.CACertPool,
+		RootCAs: cm.config.TLS.CACertPool,
+	}
+	if cm.config.Auth.Method != config.ClientAuthMethodToken {
+		cm.baseTLSConfig.Certificates = []tls.Certificate{cm.config.TLS.ClientCert}
 	}
 
 	// Get QUIC config
@@ -176,7 +182,7 @@ func (cm *ConnectionManager) connectAndRegister(ctx context.Context, endpoint co
 		_ = sc.Close()
 		return nil, err
 	}
-	if err := sc.Register(attemptCtx, cm.config.ClientID); err != nil {
+	if err := sc.RegisterWithAuth(attemptCtx, cm.config.ClientID, cm.config.Auth); err != nil {
 		_ = sc.Close()
 		return nil, err
 	}

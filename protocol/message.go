@@ -21,9 +21,16 @@ const (
 
 // RegisterMsg is sent by client to register with server
 type RegisterMsg struct {
-	ClientID     string   // Unique client identifier
-	Version      string   // Protocol version
-	Capabilities []string // Supported features (e.g., "tcp", "udp")
+	ClientID     string        // Unique client identifier
+	Version      string        // Protocol version
+	Capabilities []string      // Supported features (e.g., "tcp", "udp")
+	Auth         *RegisterAuth `json:",omitempty"` // Optional application-layer authentication proof
+}
+
+// RegisterAuth carries the authentication scheme and connection-bound proof.
+type RegisterAuth struct {
+	Scheme string
+	Proof  []byte
 }
 
 // RegisterAckMsg is sent by server to acknowledge registration
@@ -32,6 +39,7 @@ type RegisterAckMsg struct {
 	Message              string   // Optional message
 	ServerVersion        string   // Protocol version selected by the server
 	SelectedCapabilities []string // Capabilities selected for this connection
+	SelectedAuthScheme   string   `json:",omitempty"` // Authentication scheme selected by the server
 }
 
 // HeartbeatMsg is sent periodically to keep connection alive
@@ -113,6 +121,18 @@ func ValidateRegisterAck(ack RegisterAckMsg) error {
 	}
 	if err := ValidateRegistration(ack.ServerVersion, ack.SelectedCapabilities); err != nil {
 		return fmt.Errorf("invalid registration acknowledgment: %w", err)
+	}
+	return nil
+}
+
+// ValidateRegisterAckWithAuth verifies protocol negotiation and requires the
+// server to echo the exact expected authentication scheme.
+func ValidateRegisterAckWithAuth(ack RegisterAckMsg, expectedAuthScheme string) error {
+	if err := ValidateRegisterAck(ack); err != nil {
+		return err
+	}
+	if ack.SelectedAuthScheme != expectedAuthScheme {
+		return fmt.Errorf("invalid registration acknowledgment: selected auth scheme got %q, require %q", ack.SelectedAuthScheme, expectedAuthScheme)
 	}
 	return nil
 }

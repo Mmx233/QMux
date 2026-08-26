@@ -202,6 +202,11 @@ func TestConfigurationValidation_Property(t *testing.T) {
 		client := &Client{
 			HeartbeatInterval: heartbeatInterval,
 			HealthTimeout:     healthTimeout,
+			TLS: ClientTLS{
+				CACertFile:     "ca.pem",
+				ClientCertFile: "client.pem",
+				ClientKeyFile:  "client-key.pem",
+			},
 		}
 
 		err := client.Validate()

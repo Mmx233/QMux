@@ -13,11 +13,12 @@ import (
 
 // ConnectionPool manages client connections for a QUIC listener
 type ConnectionPool struct {
-	mu       sync.RWMutex
-	clients  map[string]*ClientConn // clientID -> connection
-	quicAddr string                 // QUIC listen address this pool serves
-	balancer LoadBalancer           // Load balancing strategy
-	logger   zerolog.Logger
+	mu           sync.RWMutex
+	clients      map[string]*ClientConn // clientID -> selectable connection
+	reservations map[string]*Reservation
+	quicAddr     string       // QUIC listen address this pool serves
+	balancer     LoadBalancer // Load balancing strategy
+	logger       zerolog.Logger
 
 	// Cached client slice to avoid allocation on Select
 	// Using atomic.Pointer for lock-free reads on the hot path
@@ -28,7 +29,8 @@ type ConnectionPool struct {
 }
 
 // ClientConn represents one connection generation for a client ID.
-// A pointer may be added to a pool only once, and ID must not change after Add succeeds.
+// A pointer may be added to a pool only once. ID must not change while a
+// reservation is pending or after Add/Commit succeeds.
 type ClientConn struct {
 	ID            string
 	Conn          *quic.Conn
@@ -48,6 +50,22 @@ type ClientConn struct {
 	added atomic.Bool
 }
 
+// Reservation holds an unpublished client generation while registration is
+// acknowledged. A reservation belongs to exactly one pool and client pointer.
+type Reservation struct {
+	pool *ConnectionPool
+	conn *ClientConn
+	id   string
+
+	state atomic.Uint32
+}
+
+const (
+	reservationPending uint32 = iota
+	reservationCommitted
+	reservationAborted
+)
+
 // ClientMetadata contains client information
 type ClientMetadata struct {
 	Version      string
@@ -59,12 +77,13 @@ type ClientMetadata struct {
 func New(quicAddr string, balancer LoadBalancer, logger zerolog.Logger) *ConnectionPool {
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &ConnectionPool{
-		clients:  make(map[string]*ClientConn),
-		quicAddr: quicAddr,
-		balancer: balancer,
-		logger:   logger.With().Str("quic_addr", quicAddr).Logger(),
-		ctx:      ctx,
-		cancel:   cancel,
+		clients:      make(map[string]*ClientConn),
+		reservations: make(map[string]*Reservation),
+		quicAddr:     quicAddr,
+		balancer:     balancer,
+		logger:       logger.With().Str("quic_addr", quicAddr).Logger(),
+		ctx:          ctx,
+		cancel:       cancel,
 	}
 
 	return p
@@ -84,37 +103,104 @@ func (p *ConnectionPool) Stop() {
 // selection. Validation and duplicate-ID failures do not consume an otherwise
 // unused pointer, so callers may correct it and retry.
 func (p *ConnectionPool) Add(conn *ClientConn) error {
+	reservation, err := p.Reserve(conn)
+	if err != nil {
+		return err
+	}
+	if err := p.Commit(reservation); err != nil {
+		p.Abort(reservation)
+		return err
+	}
+	return nil
+}
+
+// Reserve atomically claims conn.ID without making conn selectable. Current
+// and pending registrations share the same ID namespace. A successful
+// reservation does not consume conn as a generation until Commit succeeds.
+func (p *ConnectionPool) Reserve(conn *ClientConn) (*Reservation, error) {
 	if conn == nil {
-		return fmt.Errorf("client connection is nil")
+		return nil, fmt.Errorf("client connection is nil")
 	}
 	if conn.ID == "" {
-		return fmt.Errorf("client ID is empty")
+		return nil, fmt.Errorf("client ID is empty")
 	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if _, exists := p.clients[conn.ID]; exists {
-		return fmt.Errorf("client %s already exists in pool", conn.ID)
+		return nil, fmt.Errorf("client %s already exists in pool", conn.ID)
 	}
-	if !conn.added.CompareAndSwap(false, true) {
-		return fmt.Errorf("client connection %s was already added to a pool", conn.ID)
+	if _, exists := p.reservations[conn.ID]; exists {
+		return nil, fmt.Errorf("client %s already has a pending registration", conn.ID)
+	}
+	if conn.added.Load() {
+		return nil, fmt.Errorf("client connection %s was already added to a pool", conn.ID)
 	}
 
-	conn.healthy.Store(true)
-	p.clients[conn.ID] = conn
+	reservation := &Reservation{pool: p, conn: conn, id: conn.ID}
+	p.reservations[conn.ID] = reservation
+	return reservation, nil
+}
+
+// Commit publishes the exact generation held by reservation. It consumes the
+// ClientConn generation token only after verifying that the reservation is
+// still current and that its ID wasn't mutated.
+func (p *ConnectionPool) Commit(reservation *Reservation) error {
+	if reservation == nil || reservation.pool != p {
+		return fmt.Errorf("invalid pool reservation")
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if reservation.state.Load() != reservationPending || p.reservations[reservation.id] != reservation {
+		return fmt.Errorf("client reservation is no longer pending")
+	}
+	if reservation.conn == nil || reservation.conn.ID != reservation.id {
+		return fmt.Errorf("reserved client ID changed before commit")
+	}
+	if _, exists := p.clients[reservation.id]; exists {
+		return fmt.Errorf("client %s already exists in pool", reservation.id)
+	}
+	if !reservation.conn.added.CompareAndSwap(false, true) {
+		return fmt.Errorf("client connection %s was already added to a pool", reservation.id)
+	}
+
+	reservation.conn.healthy.Store(true)
+	p.clients[reservation.id] = reservation.conn
+	delete(p.reservations, reservation.id)
+	reservation.state.Store(reservationCommitted)
 
 	// Invalidate cache by setting to nil
 	p.cachedClients.Store(nil)
 
 	p.logger.Info().
-		Str("client_id", conn.ID).
-		Time("registered_at", conn.RegisteredAt).
-		Str("version", conn.Metadata.Version).
-		Strs("capabilities", conn.Metadata.Capabilities).
+		Str("client_id", reservation.conn.ID).
+		Time("registered_at", reservation.conn.RegisteredAt).
+		Str("version", reservation.conn.Metadata.Version).
+		Strs("capabilities", reservation.conn.Metadata.Capabilities).
 		Msg("client added to pool")
 
 	return nil
+}
+
+// Abort removes reservation only if it is still the exact pending claim.
+// Repeated or stale aborts are harmless.
+func (p *ConnectionPool) Abort(reservation *Reservation) bool {
+	if reservation == nil || reservation.pool != p {
+		return false
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if reservation.state.Load() != reservationPending || p.reservations[reservation.id] != reservation {
+		return false
+	}
+	delete(p.reservations, reservation.id)
+	reservation.state.Store(reservationAborted)
+	return true
 }
 
 // Remove removes the expected client generation from the pool.

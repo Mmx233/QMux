@@ -141,6 +141,10 @@ server:
 local:
   host: "127.0.0.1"
   port: 8080
+tls:
+  ca_cert_file: "ca.pem"
+  client_cert_file: "client.pem"
+  client_key_file: "client-key.pem"
 `
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.yaml")
@@ -163,6 +167,9 @@ local:
 	if servers[0].ServerName != "server.example.com" {
 		t.Errorf("expected server name 'server.example.com', got %q", servers[0].ServerName)
 	}
+	if cfg.Auth.Method != ClientAuthMethodMTLS {
+		t.Errorf("default auth method = %q, want %q", cfg.Auth.Method, ClientAuthMethodMTLS)
+	}
 }
 
 // Test multi-server configuration loading
@@ -180,6 +187,10 @@ server:
 local:
   host: "127.0.0.1"
   port: 8080
+tls:
+  ca_cert_file: "ca.pem"
+  client_cert_file: "client.pem"
+  client_key_file: "client-key.pem"
 `
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.yaml")
@@ -306,6 +317,10 @@ server:
 local:
   host: "127.0.0.1"
   port: 8080
+tls:
+  ca_cert_file: "ca.pem"
+  client_cert_file: "client.pem"
+  client_key_file: "client-key.pem"
 `
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.yaml")
