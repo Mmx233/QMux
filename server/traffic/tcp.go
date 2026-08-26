@@ -78,7 +78,9 @@ func (l *Listener) handleTCPConnection(conn net.Conn) {
 	stream, err := client.Conn.OpenStreamSync(l.ctx)
 	if err != nil {
 		logger.Error().Err(err).Msg("open stream failed")
-		l.Pool.MarkUnhealthy(client.ID)
+		if !l.Pool.MarkUnhealthy(client) {
+			logger.Debug().Msg("ignored stale client stream-open failure")
+		}
 		return
 	}
 	defer func() { _ = stream.Close() }()
@@ -95,7 +97,9 @@ func (l *Listener) handleTCPConnection(conn net.Conn) {
 	)
 	if err != nil {
 		logger.Error().Err(err).Msg("send NewConn message failed")
-		l.Pool.MarkUnhealthy(client.ID)
+		if !l.Pool.MarkUnhealthy(client) {
+			logger.Debug().Msg("ignored stale client NewConn write failure")
+		}
 		return
 	}
 

@@ -27,7 +27,8 @@ type ConnectionPool struct {
 	cancel context.CancelFunc
 }
 
-// ClientConn represents a connected client
+// ClientConn represents one connection generation for a client ID.
+// A pointer may be added to a pool only once, and ID must not change after Add succeeds.
 type ClientConn struct {
 	ID            string
 	Conn          *quic.Conn
@@ -42,6 +43,9 @@ type ClientConn struct {
 
 	// Health
 	healthy atomic.Bool
+
+	// Registration tracks whether this pointer has been consumed as a generation.
+	added atomic.Bool
 }
 
 // ClientMetadata contains client information
@@ -71,23 +75,41 @@ func (p *ConnectionPool) Stop() {
 	p.cancel()
 }
 
-// Add registers a new client connection
-func (p *ConnectionPool) Add(clientID string, conn *ClientConn) error {
+// Add registers a new client connection.
+//
+// conn must be non-nil and have a non-empty ID. After Add succeeds, conn is a
+// single-use generation token and its ID must remain immutable. A duplicate ID
+// is rejected while it has a current registration; pointers already used by any
+// pool are also rejected. On success, conn is healthy and eligible for
+// selection. Validation and duplicate-ID failures do not consume an otherwise
+// unused pointer, so callers may correct it and retry.
+func (p *ConnectionPool) Add(conn *ClientConn) error {
+	if conn == nil {
+		return fmt.Errorf("client connection is nil")
+	}
+	if conn.ID == "" {
+		return fmt.Errorf("client ID is empty")
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if _, exists := p.clients[clientID]; exists {
-		return fmt.Errorf("client %s already exists in pool", clientID)
+	if _, exists := p.clients[conn.ID]; exists {
+		return fmt.Errorf("client %s already exists in pool", conn.ID)
+	}
+	if !conn.added.CompareAndSwap(false, true) {
+		return fmt.Errorf("client connection %s was already added to a pool", conn.ID)
 	}
 
 	conn.healthy.Store(true)
-	p.clients[clientID] = conn
+	p.clients[conn.ID] = conn
 
 	// Invalidate cache by setting to nil
 	p.cachedClients.Store(nil)
 
 	p.logger.Info().
-		Str("client_id", clientID).
+		Str("client_id", conn.ID).
+		Time("registered_at", conn.RegisteredAt).
 		Str("version", conn.Metadata.Version).
 		Strs("capabilities", conn.Metadata.Capabilities).
 		Msg("client added to pool")
@@ -95,24 +117,28 @@ func (p *ConnectionPool) Add(clientID string, conn *ClientConn) error {
 	return nil
 }
 
-// Remove removes a client from the pool
-func (p *ConnectionPool) Remove(clientID string) {
+// Remove removes the expected client generation from the pool.
+// It reports whether expected was still current and the removal was applied.
+func (p *ConnectionPool) Remove(expected *ClientConn) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if conn, exists := p.clients[clientID]; exists {
-		conn.healthy.Store(false)
-		delete(p.clients, clientID)
-
-		// Invalidate cache by setting to nil
-		p.cachedClients.Store(nil)
-
-		p.logger.Info().
-			Str("client_id", clientID).
-			Int64("active_conns", conn.ActiveConns.Load()).
-			Uint64("total_conns", conn.TotalConns.Load()).
-			Msg("client removed from pool")
+	if !p.isCurrentLocked(expected) {
+		return false
 	}
+
+	expected.healthy.Store(false)
+	delete(p.clients, expected.ID)
+	p.cachedClients.Store(nil)
+
+	p.logger.Info().
+		Str("client_id", expected.ID).
+		Time("registered_at", expected.RegisteredAt).
+		Int64("active_conns", expected.ActiveConns.Load()).
+		Uint64("total_conns", expected.TotalConns.Load()).
+		Msg("client removed from pool")
+
+	return true
 }
 
 // Select chooses a client using the load balancer
@@ -201,38 +227,61 @@ func (p *ConnectionPool) HealthyCount() int {
 	return count
 }
 
-// UpdateLastSeen updates the last seen timestamp for a client
-func (p *ConnectionPool) UpdateLastSeen(clientID string) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+// UpdateLastSeen updates the last seen timestamp for the expected client generation.
+// It reports whether expected was still current and the update was applied.
+func (p *ConnectionPool) UpdateLastSeen(expected *ClientConn) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
-	if conn, exists := p.clients[clientID]; exists {
-		conn.LastSeen = time.Now()
+	if !p.isCurrentLocked(expected) {
+		return false
 	}
+	expected.LastSeen = time.Now()
+	return true
 }
 
-// MarkUnhealthy marks a client as unhealthy
-func (p *ConnectionPool) MarkUnhealthy(clientID string) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+// MarkUnhealthy marks the expected client generation as unhealthy.
+// It reports whether expected was still current and the update was applied.
+func (p *ConnectionPool) MarkUnhealthy(expected *ClientConn) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
-	if conn, exists := p.clients[clientID]; exists {
-		conn.healthy.Store(false)
-		p.cachedClients.Store(nil)
-		p.logger.Warn().Str("client_id", clientID).Msg("client marked unhealthy")
+	if !p.isCurrentLocked(expected) {
+		return false
 	}
+	expected.healthy.Store(false)
+	p.cachedClients.Store(nil)
+	p.logger.Warn().
+		Str("client_id", expected.ID).
+		Time("registered_at", expected.RegisteredAt).
+		Msg("client marked unhealthy")
+	return true
 }
 
-// MarkHealthy marks a client as healthy
-func (p *ConnectionPool) MarkHealthy(clientID string) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+// MarkHealthy marks the expected client generation as healthy.
+// It reports whether expected was still current and the update was applied.
+func (p *ConnectionPool) MarkHealthy(expected *ClientConn) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
-	if conn, exists := p.clients[clientID]; exists {
-		conn.healthy.Store(true)
-		p.cachedClients.Store(nil)
-		p.logger.Info().Str("client_id", clientID).Msg("client marked healthy")
+	if !p.isCurrentLocked(expected) {
+		return false
 	}
+	expected.healthy.Store(true)
+	p.cachedClients.Store(nil)
+	p.logger.Info().
+		Str("client_id", expected.ID).
+		Time("registered_at", expected.RegisteredAt).
+		Msg("client marked healthy")
+	return true
+}
+
+func (p *ConnectionPool) isCurrentLocked(expected *ClientConn) bool {
+	if expected == nil || expected.ID == "" {
+		return false
+	}
+	current, exists := p.clients[expected.ID]
+	return exists && current == expected
 }
 
 // Errors

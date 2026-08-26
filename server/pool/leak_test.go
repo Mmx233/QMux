@@ -3,6 +3,7 @@ package pool
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -64,6 +65,8 @@ func TestConnectionPool_AddRemove_NoLeak(t *testing.T) {
 	pool := New("127.0.0.1:8443", balancer, logger)
 	defer pool.Stop()
 
+	clients := make(map[string]*ClientConn)
+
 	// Add and remove many clients
 	for i := range 100 {
 		clientID := fmt.Sprintf("client-%c", '0'+i%10)
@@ -74,17 +77,19 @@ func TestConnectionPool_AddRemove_NoLeak(t *testing.T) {
 		}
 
 		// Remove first if exists (to allow re-add)
-		pool.Remove(clientID)
+		pool.Remove(clients[clientID])
 
-		if err := pool.Add(clientID, conn); err != nil {
+		if err := pool.Add(conn); err != nil {
 			t.Logf("add client %s: %v (expected for duplicates)", clientID, err)
+		} else {
+			clients[clientID] = conn
 		}
 	}
 
 	// Remove all
 	for i := range 10 {
 		clientID := fmt.Sprintf("client-%c", '0'+i)
-		pool.Remove(clientID)
+		pool.Remove(clients[clientID])
 	}
 }
 
@@ -101,6 +106,7 @@ func TestConnectionPool_ConcurrentOperations_NoLeak(t *testing.T) {
 	var wg sync.WaitGroup
 	numGoroutines := 10
 	opsPerGoroutine := 50
+	clients := make([]atomic.Pointer[ClientConn], numGoroutines)
 
 	// Concurrent adds
 	for i := range numGoroutines {
@@ -113,8 +119,10 @@ func TestConnectionPool_ConcurrentOperations_NoLeak(t *testing.T) {
 					RegisteredAt: time.Now(),
 					LastSeen:     time.Now(),
 				}
-				pool.Remove(clientID)
-				_ = pool.Add(clientID, conn)
+				pool.Remove(clients[id].Load())
+				if pool.Add(conn) == nil {
+					clients[id].Store(conn)
+				}
 			}
 		})
 	}
@@ -132,11 +140,11 @@ func TestConnectionPool_ConcurrentOperations_NoLeak(t *testing.T) {
 	for i := range numGoroutines {
 		wg.Go(func() {
 			id := i
-			clientID := "client-" + string(rune('A'+id))
 			for range opsPerGoroutine {
-				pool.MarkHealthy(clientID)
-				pool.MarkUnhealthy(clientID)
-				pool.UpdateLastSeen(clientID)
+				conn := clients[id].Load()
+				pool.MarkHealthy(conn)
+				pool.MarkUnhealthy(conn)
+				pool.UpdateLastSeen(conn)
 			}
 		})
 	}
@@ -160,13 +168,13 @@ func TestConnectionPool_ClientHealthTransitions_NoLeak(t *testing.T) {
 		RegisteredAt: time.Now(),
 		LastSeen:     time.Now(),
 	}
-	_ = pool.Add("test-client", conn)
+	_ = pool.Add(conn)
 
 	// Rapid health transitions
 	for range 1000 {
-		pool.MarkHealthy("test-client")
-		pool.MarkUnhealthy("test-client")
+		pool.MarkHealthy(conn)
+		pool.MarkUnhealthy(conn)
 	}
 
-	pool.Remove("test-client")
+	pool.Remove(conn)
 }

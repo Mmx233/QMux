@@ -289,41 +289,47 @@ func (s *Server) handleConnection(ctx context.Context, conn *quic.Conn, quicAddr
 
 	// Add to pool
 	poolInst := s.pools[quicAddr]
-	if err := poolInst.Add(regMsg.ClientID, clientConn); err != nil {
+	if err := poolInst.Add(clientConn); err != nil {
 		logger.Error().Err(err).Msg("add to pool failed")
 		_ = protocol.WriteRegisterAck(controlStream, false, err.Error(), protocol.ProtocolVersion, nil)
 		_ = conn.CloseWithError(1, "pool error")
 		return
 	}
+	defer func() {
+		if !poolInst.Remove(clientConn) {
+			logger.Warn().
+				Time("registered_at", clientConn.RegisteredAt).
+				Msg("client generation was not current during deferred cleanup")
+		}
+	}()
 
 	// Send acknowledgment
 	if err := protocol.WriteRegisterAck(controlStream, true, "registered", protocol.ProtocolVersion, selectedCapabilities); err != nil {
 		logger.Error().Err(err).Msg("send ack failed")
-		poolInst.Remove(regMsg.ClientID)
 		return
 	}
 
-	s.handleControlStream(ctx, controlStream, regMsg.ClientID, quicAddr, conn)
-
-	// Remove from pool
-	poolInst.Remove(regMsg.ClientID)
-	logger.Info().Msg("client disconnected")
+	s.handleControlStream(ctx, poolInst, clientConn, quicAddr)
 }
 
 // handleControlStream handles bidirectional heartbeat messages on the control stream.
 // It sends heartbeats to the client at the configured interval,
 // receives heartbeats from the client updating LastSeen timestamp,
 // and checks for heartbeat timeout to detect unhealthy clients.
-func (s *Server) handleControlStream(ctx context.Context, stream *quic.Stream, clientID string, quicAddr string, conn *quic.Conn) {
+func (s *Server) handleControlStream(
+	ctx context.Context,
+	poolInst *pool.ConnectionPool,
+	clientConn *pool.ClientConn,
+	quicAddr string,
+) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	logger := s.logger.With().
-		Str("client_id", clientID).
+		Str("client_id", clientConn.ID).
+		Time("registered_at", clientConn.RegisteredAt).
 		Str("quic_addr", quicAddr).
 		Logger()
-
-	poolInst := s.pools[quicAddr]
 
 	// Create a ticker for sending heartbeats
 	heartBeatTicker := time.NewTicker(s.config.HeartbeatInterval)
@@ -351,7 +357,7 @@ func (s *Server) handleControlStream(ctx context.Context, stream *quic.Stream, c
 				return
 			}
 		}
-	}(ctx, stream, readCh, conn)
+	}(ctx, clientConn.ControlStream, readCh, clientConn.Conn)
 
 	heartbeatDeadline := time.After(s.config.HealthTimeout)
 	for {
@@ -359,15 +365,17 @@ func (s *Server) handleControlStream(ctx context.Context, stream *quic.Stream, c
 		case <-ctx.Done():
 			return
 
-		case <-conn.Context().Done():
+		case <-clientConn.Conn.Context().Done():
 			// QUIC connection closed
 			return
 
 		case <-heartBeatTicker.C:
 			// Send heartbeat to client
-			if err := protocol.WriteHeartbeat(stream, time.Now().Unix()); err != nil {
+			if err := protocol.WriteHeartbeat(clientConn.ControlStream, time.Now().Unix()); err != nil {
 				logger.Debug().Err(err).Msg("failed to send heartbeat to client")
-				poolInst.MarkUnhealthy(clientID)
+				if !poolInst.MarkUnhealthy(clientConn) {
+					logger.Debug().Msg("ignored stale heartbeat write failure")
+				}
 				return
 			}
 			logger.Debug().Msg("heartbeat sent to client")
@@ -379,28 +387,25 @@ func (s *Server) handleControlStream(ctx context.Context, stream *quic.Stream, c
 			}
 
 			if result.msgType == protocol.MsgTypeHeartbeat {
-				poolInst.UpdateLastSeen(clientID)
+				if !poolInst.UpdateLastSeen(clientConn) {
+					logger.Debug().Msg("ignored heartbeat from stale client generation")
+					return
+				}
 				logger.Debug().Msg("heartbeat received from client")
 				heartbeatDeadline = time.After(s.config.HealthTimeout)
 			}
 
 		case <-heartbeatDeadline:
-			clientConn, exists := poolInst.Get(clientID)
-			if !exists {
-				// Client was removed from pool
-				return
-			}
-
 			timeSinceLastSeen := time.Since(clientConn.LastSeen)
 			logger.Warn().
 				Dur("time_since_last_seen", timeSinceLastSeen).
 				Dur("timeout", s.config.HealthTimeout).
 				Msg("client heartbeat timeout, closing connection")
 
-			// Mark unhealthy, close connection, and remove from pool
-			poolInst.MarkUnhealthy(clientID)
-			_ = conn.CloseWithError(1, "heartbeat timeout")
-			poolInst.Remove(clientID)
+			if !poolInst.MarkUnhealthy(clientConn) {
+				logger.Debug().Msg("ignored timeout for stale client generation")
+			}
+			_ = clientConn.Conn.CloseWithError(1, "heartbeat timeout")
 			return
 		}
 	}
