@@ -14,9 +14,10 @@ import (
 
 // Default backoff configuration
 const (
-	InitialBackoff = 5 * time.Second
-	MaxBackoff     = 60 * time.Second
-	BackoffFactor  = 2
+	InitialBackoff                  = 5 * time.Second
+	MaxBackoff                      = 60 * time.Second
+	BackoffFactor                   = 2
+	defaultConnectionAttemptTimeout = 30 * time.Second
 )
 
 // ConnectionManager manages connections to multiple servers.
@@ -35,6 +36,14 @@ type ConnectionManager struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	// Publication is the commit point for a registered connection. Stop closes
+	// this gate before canceling attempts so a late acknowledgment cannot commit.
+	publishMu sync.Mutex
+	closed    bool
+
+	// Internal test seam; the production default remains fixed and is not config.
+	attemptTimeout time.Duration
 
 	// Reconnection tracking
 	reconnectMu  sync.Mutex
@@ -59,13 +68,14 @@ func NewConnectionManager(cfg *config.Client, logger zerolog.Logger) (*Connectio
 	ctx, cancel := context.WithCancel(context.Background())
 
 	cm := &ConnectionManager{
-		config:        cfg,
-		sessionCaches: NewSessionCacheManager(),
-		logger:        logger.With().Str("component", "connection_manager").Logger(),
-		ctx:           ctx,
-		cancel:        cancel,
-		reconnecting:  make(map[string]bool),
-		NewConns:      make(chan *ServerConnection, 16),
+		config:         cfg,
+		sessionCaches:  NewSessionCacheManager(),
+		logger:         logger.With().Str("component", "connection_manager").Logger(),
+		ctx:            ctx,
+		cancel:         cancel,
+		attemptTimeout: defaultConnectionAttemptTimeout,
+		reconnecting:   make(map[string]bool),
+		NewConns:       make(chan *ServerConnection, 16),
 	}
 
 	return cm, nil
@@ -93,108 +103,141 @@ func (cm *ConnectionManager) Start(ctx context.Context) error {
 	cm.logger.Info().Int("server_count", len(servers)).Msg("starting connections to servers")
 
 	// Create connections concurrently
-	var wg sync.WaitGroup
+	var initialWG sync.WaitGroup
 	var mu sync.Mutex
-	var connectedServers []*ServerConnection
+	connectedServers := 0
 	var connectionErrors []error
 
 	for _, server := range servers {
-		wg.Go(func() {
+		cm.publishMu.Lock()
+		if cm.closed {
+			cm.publishMu.Unlock()
+			continue
+		}
+		initialWG.Add(1)
+		cm.wg.Go(func() {
+			defer initialWG.Done()
 			endpoint := server
-			// Get or create session cache for this server
-			sessionCache := cm.sessionCaches.GetOrCreate(endpoint.Address)
-
-			// Create server connection
-			sc := NewServerConnection(
-				endpoint.Address,
-				endpoint.ServerName,
-				sessionCache,
-				cm.logger,
-			)
-
-			// Store connection in map
-			cm.connections.Store(endpoint.Address, sc)
-
-			// Attempt to connect
-			connectCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			defer cancel()
-
-			if err := sc.Connect(connectCtx, cm.baseTLSConfig, cm.quicConfig); err != nil {
+			sc, err := cm.connectAndRegister(ctx, endpoint)
+			if err != nil {
 				cm.logger.Error().
 					Str("server", endpoint.Address).
 					Err(err).
-					Msg("failed to connect to server")
+					Msg("failed to connect and register with server")
 
 				mu.Lock()
 				connectionErrors = append(connectionErrors, fmt.Errorf("server %s: %w", endpoint.Address, err))
 				mu.Unlock()
 
-				// Start reconnection goroutine for failed connection
-				cm.startReconnection(endpoint.Address)
+				cm.startReconnection(ctx, endpoint.Address)
 				return
 			}
 
-			// Register with server
-			if err := sc.Register(cm.config.ClientID); err != nil {
-				cm.logger.Error().
-					Str("server", endpoint.Address).
-					Err(err).
-					Msg("failed to register with server")
-
-				mu.Lock()
-				connectionErrors = append(connectionErrors, fmt.Errorf("server %s registration: %w", endpoint.Address, err))
-				mu.Unlock()
-
+			if !cm.publishServerConnection(ctx, sc) {
 				_ = sc.Close()
-				cm.startReconnection(endpoint.Address)
 				return
 			}
 
 			mu.Lock()
-			connectedServers = append(connectedServers, sc)
+			connectedServers++
 			mu.Unlock()
 
 			cm.logger.Info().
 				Str("server", endpoint.Address).
 				Msg("successfully connected and registered")
 		})
+		cm.publishMu.Unlock()
 	}
 
 	// Wait for all connection attempts to complete
-	wg.Wait()
+	initialWG.Wait()
 
 	// Log summary
 	cm.logger.Info().
-		Int("connected", len(connectedServers)).
+		Int("connected", connectedServers).
 		Int("failed", len(connectionErrors)).
 		Int("total", len(servers)).
 		Msg("connection startup complete")
 
-	// Start heartbeat goroutines for connected servers
-	for _, sc := range connectedServers {
-		cm.setupServerConnection(sc)
-		// Notify client of the new connection
-		cm.NewConns <- sc
-	}
-
 	return nil
 }
 
-// setupServerConnection configures a ServerConnection with health check and reconnection callback,
-// then starts all heartbeat loops.
-// This should be called after successful registration.
-func (cm *ConnectionManager) setupServerConnection(sc *ServerConnection) {
-	// Configure health check with the client's health timeout
+func (cm *ConnectionManager) connectAndRegister(ctx context.Context, endpoint config.ServerEndpoint) (*ServerConnection, error) {
+	attemptCtx, cancel := cm.newAttemptContext(ctx)
+	defer cancel()
+
+	sc := NewServerConnection(
+		endpoint.Address,
+		endpoint.ServerName,
+		cm.sessionCaches.GetOrCreate(endpoint.Address),
+		cm.logger,
+	)
+	if err := sc.Connect(attemptCtx, cm.baseTLSConfig, cm.quicConfig); err != nil {
+		_ = sc.Close()
+		return nil, err
+	}
+	if err := sc.Register(attemptCtx, cm.config.ClientID); err != nil {
+		_ = sc.Close()
+		return nil, err
+	}
+	return sc, nil
+}
+
+func (cm *ConnectionManager) newAttemptContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	attemptCtx, cancelAttempt := context.WithTimeout(ctx, cm.attemptTimeout)
+	stopManagerCancellation := context.AfterFunc(cm.ctx, cancelAttempt)
+	if cm.ctx.Err() != nil {
+		cancelAttempt()
+	}
+	return attemptCtx, func() {
+		stopManagerCancellation()
+		cancelAttempt()
+	}
+}
+
+// publishServerConnection is the formal commit point for a registered connection.
+func (cm *ConnectionManager) publishServerConnection(ctx context.Context, sc *ServerConnection) bool {
+	cm.publishMu.Lock()
+	if cm.closed || ctx.Err() != nil || cm.ctx.Err() != nil {
+		cm.publishMu.Unlock()
+		return false
+	}
+
 	sc.SetHealthConfig(cm.config.HealthTimeout)
-
-	// Set reconnection callback to trigger reconnection when health check fails
 	sc.SetReconnectCallback(func(serverAddr string) {
-		cm.startReconnection(serverAddr)
+		cm.startReconnection(ctx, serverAddr)
 	})
+	sc.MarkHealthy()
+	cm.connections.Store(sc.ServerAddr(), sc)
+	cm.publishMu.Unlock()
 
-	// Start all heartbeat loops (send, receive, health check) using the unified method
-	// All loops use the same context for coordinated shutdown
-	sc.StartHeartbeatLoops(cm.config.HeartbeatInterval)
+	select {
+	case cm.NewConns <- sc:
+	case <-ctx.Done():
+		cm.rollbackPublication(sc)
+		return false
+	case <-cm.ctx.Done():
+		cm.rollbackPublication(sc)
+		return false
+	}
+
+	// NewConns delivery transfers ownership and cannot be rolled back. Stop
+	// waits for this publisher before closing connections owned by the manager.
+	cm.publishMu.Lock()
+	if !cm.closed && ctx.Err() == nil && cm.ctx.Err() == nil {
+		sc.StartHeartbeatLoops(cm.config.HeartbeatInterval)
+	}
+	cm.publishMu.Unlock()
+	return true
+}
+
+func (cm *ConnectionManager) rollbackPublication(sc *ServerConnection) {
+	cm.publishMu.Lock()
+	removed := cm.connections.CompareAndDelete(sc.ServerAddr(), sc)
+	cm.publishMu.Unlock()
+	if removed {
+		sc.MarkUnhealthy()
+	}
 }
 
 // CalculateBackoff calculates the backoff duration for a given attempt number.
@@ -215,7 +258,13 @@ func CalculateBackoff(attempt int) time.Duration {
 }
 
 // startReconnection starts a reconnection goroutine for a server if not already reconnecting.
-func (cm *ConnectionManager) startReconnection(serverAddr string) {
+func (cm *ConnectionManager) startReconnection(ctx context.Context, serverAddr string) {
+	cm.publishMu.Lock()
+	defer cm.publishMu.Unlock()
+	if cm.closed || ctx.Err() != nil || cm.ctx.Err() != nil {
+		return
+	}
+
 	cm.reconnectMu.Lock()
 	if cm.reconnecting[serverAddr] {
 		cm.reconnectMu.Unlock()
@@ -225,12 +274,12 @@ func (cm *ConnectionManager) startReconnection(serverAddr string) {
 	cm.reconnectMu.Unlock()
 
 	cm.wg.Go(func() {
-		cm.reconnectionLoop(serverAddr)
+		cm.reconnectionLoop(ctx, serverAddr)
 	})
 }
 
 // reconnectionLoop attempts to reconnect to a server with exponential backoff.
-func (cm *ConnectionManager) reconnectionLoop(serverAddr string) {
+func (cm *ConnectionManager) reconnectionLoop(ctx context.Context, serverAddr string) {
 	defer func() {
 		cm.reconnectMu.Lock()
 		delete(cm.reconnecting, serverAddr)
@@ -253,6 +302,8 @@ func (cm *ConnectionManager) reconnectionLoop(serverAddr string) {
 	attempt := 0
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-cm.ctx.Done():
 			return
 		default:
@@ -267,27 +318,14 @@ func (cm *ConnectionManager) reconnectionLoop(serverAddr string) {
 
 		// Wait for backoff duration
 		select {
+		case <-ctx.Done():
+			return
 		case <-cm.ctx.Done():
 			return
 		case <-time.After(backoff):
 		}
 
-		// Reuse existing session cache for reconnection
-		sessionCache := cm.sessionCaches.GetOrCreate(serverAddr)
-
-		// Create new server connection
-		sc := NewServerConnection(
-			endpoint.Address,
-			endpoint.ServerName,
-			sessionCache,
-			cm.logger,
-		)
-
-		// Attempt to connect
-		connectCtx, cancel := context.WithTimeout(cm.ctx, 30*time.Second)
-		err := sc.Connect(connectCtx, cm.baseTLSConfig, cm.quicConfig)
-		cancel()
-
+		sc, err := cm.connectAndRegister(ctx, *endpoint)
 		if err != nil {
 			cm.logger.Warn().
 				Str("server", serverAddr).
@@ -298,34 +336,15 @@ func (cm *ConnectionManager) reconnectionLoop(serverAddr string) {
 			continue
 		}
 
-		// Register with server
-		if err := sc.Register(cm.config.ClientID); err != nil {
-			cm.logger.Warn().
-				Str("server", serverAddr).
-				Int("attempt", attempt+1).
-				Err(err).
-				Msg("registration failed during reconnection")
+		if !cm.publishServerConnection(ctx, sc) {
 			_ = sc.Close()
-			attempt++
-			continue
+			return
 		}
-
-		// Success - update connection map
-		cm.connections.Store(serverAddr, sc)
 
 		cm.logger.Info().
 			Str("server", serverAddr).
 			Int("attempts", attempt+1).
 			Msg("reconnection successful")
-
-		// Setup and start all heartbeat loops for reconnected server
-		cm.setupServerConnection(sc)
-
-		// Notify client of the new connection
-		select {
-		case cm.NewConns <- sc:
-		case <-cm.ctx.Done():
-		}
 
 		return
 	}
@@ -337,32 +356,29 @@ func (cm *ConnectionManager) reconnectionLoop(serverAddr string) {
 func (cm *ConnectionManager) Stop() error {
 	cm.logger.Info().Msg("stopping connection manager")
 
-	// Cancel context to stop all goroutines
+	cm.publishMu.Lock()
+	cm.closed = true
 	cm.cancel()
+	cm.publishMu.Unlock()
 
-	// Wait for all goroutines to finish (with timeout)
-	done := make(chan struct{})
-	go func() {
-		cm.wg.Wait()
-		close(done)
-	}()
+	cm.wg.Wait()
+	cm.logger.Debug().Msg("all goroutines stopped")
 
-	select {
-	case <-done:
-		cm.logger.Debug().Msg("all goroutines stopped")
-	case <-time.After(10 * time.Second):
-		cm.logger.Warn().Msg("timeout waiting for goroutines to stop")
-	}
-
-	// Close all connections
-	var closeErrors []error
+	cm.publishMu.Lock()
+	var published []*ServerConnection
 	cm.connections.Range(func(key, value any) bool {
-		sc := value.(*ServerConnection)
-		if err := sc.Close(); err != nil {
-			closeErrors = append(closeErrors, fmt.Errorf("close %s: %w", key.(string), err))
-		}
+		published = append(published, value.(*ServerConnection))
+		cm.connections.Delete(key)
 		return true
 	})
+	cm.publishMu.Unlock()
+
+	var closeErrors []error
+	for _, sc := range published {
+		if err := sc.Close(); err != nil {
+			closeErrors = append(closeErrors, fmt.Errorf("close %s: %w", sc.ServerAddr(), err))
+		}
+	}
 
 	if len(closeErrors) > 0 {
 		cm.logger.Warn().Int("errors", len(closeErrors)).Msg("errors during shutdown")

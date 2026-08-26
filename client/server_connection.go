@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"net"
+	"net/netip"
 	"sync/atomic"
 	"time"
 
@@ -111,8 +113,16 @@ func (sc *ServerConnection) Connect(ctx context.Context, baseTLSConfig *tls.Conf
 	tlsConfig := baseTLSConfig.Clone()
 	tlsConfig.ServerName = sc.serverName
 	tlsConfig.ClientSessionCache = sc.sessionCache
+	dialAddr, originalHost, err := resolveServerAddress(ctx, net.DefaultResolver, sc.serverAddr)
+	if err != nil {
+		sc.state.Store(int32(StateDisconnected))
+		return fmt.Errorf("resolve server %s: %w", sc.serverAddr, err)
+	}
+	if tlsConfig.ServerName == "" {
+		tlsConfig.ServerName = originalHost
+	}
 
-	conn, err := quic.DialAddr(ctx, sc.serverAddr, tlsConfig, quicConfig)
+	conn, err := quic.DialAddr(ctx, dialAddr, tlsConfig, quicConfig)
 	if err != nil {
 		sc.state.Store(int32(StateDisconnected))
 		return fmt.Errorf("dial server %s: %w", sc.serverAddr, err)
@@ -123,6 +133,35 @@ func (sc *ServerConnection) Connect(ctx context.Context, baseTLSConfig *tls.Conf
 	sc.logger.Info().Msg("connected to server")
 
 	return nil
+}
+
+func resolveServerAddress(ctx context.Context, resolver *net.Resolver, address string) (string, string, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", "", err
+	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		return address, host, nil
+	}
+
+	addresses, err := resolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return "", "", err
+	}
+	if len(addresses) == 0 {
+		return "", "", fmt.Errorf("host %q resolved without an address", host)
+	}
+	selectedAddress := preferredServerIP(addresses)
+	return net.JoinHostPort(selectedAddress.String(), port), host, nil
+}
+
+func preferredServerIP(addresses []net.IPAddr) net.IPAddr {
+	for _, address := range addresses {
+		if address.IP.To4() != nil {
+			return address
+		}
+	}
+	return addresses[0]
 }
 
 // ServerAddr returns the server address this connection is for.
@@ -249,7 +288,7 @@ func (sc *ServerConnection) CheckReceivedHealth() bool {
 // It sends heartbeats to the server at the configured interval,
 // receives heartbeats from the server updating lastReceivedFromServer timestamp,
 // and checks for heartbeat timeout to detect unhealthy connection.
-func (sc *ServerConnection) heartbeatLoop(sendInterval time.Duration) {
+func (sc *ServerConnection) heartbeatLoop(sendInterval time.Duration, controlStream *quic.Stream) {
 	sc.logger.Debug().
 		Dur("send_interval", sendInterval).
 		Dur("health_timeout", sc.healthTimeout).
@@ -283,7 +322,7 @@ func (sc *ServerConnection) heartbeatLoop(sendInterval time.Duration) {
 				return
 			}
 		}
-	}(sc.ctx, sc.controlStream, readCh)
+	}(sc.ctx, controlStream, readCh)
 
 	heartbeatDeadline := time.After(sc.healthTimeout)
 	for {
@@ -294,7 +333,7 @@ func (sc *ServerConnection) heartbeatLoop(sendInterval time.Duration) {
 
 		case <-sendTicker.C:
 			// Send heartbeat to server
-			if err := sc.SendHeartbeat(); err != nil {
+			if err := sc.sendHeartbeat(controlStream); err != nil {
 				sc.logger.Debug().Err(err).Msg("heartbeat send failed, exiting loop")
 				return
 			}
@@ -377,14 +416,20 @@ func (sc *ServerConnection) StartHeartbeatLoops(heartbeatInterval time.Duration)
 		Dur("health_timeout", sc.healthTimeout).
 		Msg("starting heartbeat loop")
 
-	go sc.heartbeatLoop(heartbeatInterval)
+	controlStream := sc.controlStream
+	go sc.heartbeatLoop(heartbeatInterval, controlStream)
 }
 
 // --- Connection Lifecycle Methods ---
 
 // Register sends a registration message to the server and waits for acknowledgment.
-// This should be called after Connect() succeeds.
-func (sc *ServerConnection) Register(clientID string) error {
+// The context governs opening the stream, writing the registration, and reading and
+// validating the acknowledgment. A Background context has no registration deadline;
+// ConnectionManager supplies its internal 30-second per-attempt deadline.
+// Success installs the provisional control stream; ConnectionManager owns health,
+// publication, and heartbeat startup.
+// This should be called after Connect succeeds.
+func (sc *ServerConnection) Register(ctx context.Context, clientID string) error {
 	if sc.conn == nil {
 		return fmt.Errorf("not connected")
 	}
@@ -392,11 +437,46 @@ func (sc *ServerConnection) Register(clientID string) error {
 	sc.logger.Info().Str("client_id", clientID).Msg("registering with server")
 
 	// Open control stream
-	stream, err := sc.conn.OpenStreamSync(sc.ctx)
+	stream, err := sc.conn.OpenStreamSync(ctx)
 	if err != nil {
-		return fmt.Errorf("open control stream: %w", err)
+		return registrationIOError(ctx, "open control stream", err)
 	}
-	sc.controlStream = stream
+
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		stream.CancelRead(0)
+		stream.CancelWrite(0)
+		_ = stream.Close()
+	}()
+
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := stream.SetDeadline(deadline); err != nil {
+			return registrationIOError(ctx, "set registration deadline", err)
+		}
+	}
+
+	cancelUnblocked := make(chan struct{})
+	stopCancellation := context.AfterFunc(ctx, func() {
+		defer close(cancelUnblocked)
+		_ = stream.SetDeadline(time.Now())
+	})
+	stopCalled := false
+	stopAndWait := func() bool {
+		stopCalled = true
+		if stopCancellation() {
+			return true
+		}
+		<-cancelUnblocked
+		return false
+	}
+	defer func() {
+		if !stopCalled {
+			_ = stopAndWait()
+		}
+	}()
 
 	// Send registration message
 	err = protocol.WriteRegister(
@@ -406,29 +486,50 @@ func (sc *ServerConnection) Register(clientID string) error {
 		config.DefaultCapabilities,
 	)
 	if err != nil {
-		return fmt.Errorf("send registration: %w", err)
+		return registrationIOError(ctx, "send registration", err)
 	}
 
 	// Read acknowledgment
 	var ackMsg protocol.RegisterAckMsg
 	if err := protocol.ReadTypedMessage(stream, protocol.MsgTypeRegisterAck, &ackMsg); err != nil {
-		return fmt.Errorf("read registration ack: %w", err)
+		return registrationIOError(ctx, "read registration ack", err)
 	}
 
 	if err := sc.acceptRegisterAck(ackMsg); err != nil {
 		return err
 	}
+	if !stopAndWait() {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("registration canceled: %w", err)
+		}
+		return fmt.Errorf("registration cancellation callback already started")
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("registration canceled: %w", err)
+	}
+	if err := stream.SetDeadline(time.Time{}); err != nil {
+		return fmt.Errorf("clear registration deadline: %w", err)
+	}
+
+	sc.controlStream = stream
+	committed = true
 
 	sc.logger.Info().Str("message", ackMsg.Message).Msg("registered with server")
 	return nil
 }
 
-func (sc *ServerConnection) acceptRegisterAck(ack protocol.RegisterAckMsg) error {
-	if err := protocol.ValidateRegisterAck(ack); err != nil {
-		return err
+func registrationIOError(ctx context.Context, operation string, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("%s: %w: %w", operation, ctxErr, err)
 	}
-	sc.MarkHealthy()
-	return nil
+	if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+		return fmt.Errorf("%s: %w: %w", operation, context.DeadlineExceeded, err)
+	}
+	return fmt.Errorf("%s: %w", operation, err)
+}
+
+func (sc *ServerConnection) acceptRegisterAck(ack protocol.RegisterAckMsg) error {
+	return protocol.ValidateRegisterAck(ack)
 }
 
 // SendHeartbeat sends a heartbeat message on the control stream.
@@ -436,7 +537,11 @@ func (sc *ServerConnection) acceptRegisterAck(ack protocol.RegisterAckMsg) error
 // On success, the connection is marked healthy. On failure, it's marked unhealthy
 // and reconnection is triggered if a callback is set.
 func (sc *ServerConnection) SendHeartbeat() error {
-	if sc.controlStream == nil {
+	return sc.sendHeartbeat(sc.controlStream)
+}
+
+func (sc *ServerConnection) sendHeartbeat(controlStream *quic.Stream) error {
+	if controlStream == nil {
 		// No control stream is a failure condition - mark unhealthy (Requirement 1.3)
 		sc.MarkUnhealthy()
 		sc.logger.Error().Msg("heartbeat send failed: no control stream")
@@ -452,7 +557,7 @@ func (sc *ServerConnection) SendHeartbeat() error {
 
 	// Non-blocking write - does not wait for any response (Requirement 1.2)
 	// The heartbeat message contains a Unix timestamp (Requirement 1.4)
-	err := protocol.WriteHeartbeat(sc.controlStream, time.Now().Unix())
+	err := protocol.WriteHeartbeat(controlStream, time.Now().Unix())
 	if err != nil {
 		// Mark connection as unhealthy on write error (Requirement 1.3)
 		sc.MarkUnhealthy()

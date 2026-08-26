@@ -8,7 +8,7 @@ import (
 	"github.com/rs/zerolog"
 )
 
-func TestAcceptRegisterAckPublishesOnlyNegotiatedConnection(t *testing.T) {
+func TestAcceptRegisterAckOnlyValidatesNegotiation(t *testing.T) {
 	newConnection := func() *ServerConnection {
 		return NewServerConnection(
 			"server.example.com:8443",
@@ -48,7 +48,7 @@ func TestAcceptRegisterAckPublishesOnlyNegotiatedConnection(t *testing.T) {
 		}
 	})
 
-	t.Run("v2 acknowledgment becomes healthy", func(t *testing.T) {
+	t.Run("v2 acknowledgment remains provisional", func(t *testing.T) {
 		connection := newConnection()
 		err := connection.acceptRegisterAck(protocol.RegisterAckMsg{
 			Success:              true,
@@ -58,8 +58,8 @@ func TestAcceptRegisterAckPublishesOnlyNegotiatedConnection(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !connection.IsHealthy() {
-			t.Fatal("connection remained unhealthy after successful negotiation")
+		if connection.IsHealthy() {
+			t.Fatal("acknowledgment validation published provisional connection")
 		}
 	})
 }

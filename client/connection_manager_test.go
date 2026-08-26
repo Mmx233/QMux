@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"crypto/tls"
 	"testing"
 	"time"
@@ -360,5 +361,97 @@ func TestConnectionManager_HealthyCount(t *testing.T) {
 
 	if cm.HealthyCount() != 0 {
 		t.Errorf("expected 0 healthy count initially, got %d", cm.HealthyCount())
+	}
+}
+
+func TestConnectionManagerStopJoinsBlockedPublication(t *testing.T) {
+	cfg := &config.Client{
+		ClientID:          "blocked-publication",
+		HeartbeatInterval: time.Hour,
+		HealthTimeout:     2 * time.Hour,
+		Server: config.ClientServer{Servers: []config.ServerEndpoint{{
+			Address:    "127.0.0.1:8443",
+			ServerName: "localhost",
+		}}},
+	}
+	cm, err := NewConnectionManager(cfg, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cm.NewConns = make(chan *ServerConnection)
+
+	sc := NewServerConnection(
+		cfg.Server.Servers[0].Address,
+		cfg.Server.Servers[0].ServerName,
+		cm.sessionCaches.GetOrCreate(cfg.Server.Servers[0].Address),
+		zerolog.Nop(),
+	)
+	published := make(chan bool, 1)
+	cm.publishMu.Lock()
+	cm.wg.Go(func() {
+		committed := cm.publishServerConnection(context.Background(), sc)
+		if !committed {
+			_ = sc.Close()
+		}
+		published <- committed
+	})
+	cm.publishMu.Unlock()
+
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for cm.GetConnection(sc.ServerAddr()) != sc {
+		select {
+		case <-deadline.C:
+			t.Fatal("connection did not reach the publication gate")
+		case <-ticker.C:
+		}
+	}
+
+	if err := cm.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	if committed := <-published; committed {
+		t.Fatal("blocked NewConns delivery committed during Stop")
+	}
+	if cm.TotalCount() != 0 {
+		t.Fatalf("Stop retained %d published connections", cm.TotalCount())
+	}
+	if sc.State() != StateDisconnected {
+		t.Fatalf("provisional connection state = %s, want disconnected", sc.State())
+	}
+	select {
+	case got := <-cm.NewConns:
+		t.Fatalf("received connection after Stop: %p", got)
+	default:
+	}
+}
+
+func TestStartReconnectionRejectsCanceledRunContext(t *testing.T) {
+	cfg := &config.Client{
+		ClientID: "canceled-run",
+		Server: config.ClientServer{Servers: []config.ServerEndpoint{{
+			Address:    "127.0.0.1:8443",
+			ServerName: "localhost",
+		}}},
+	}
+	cm, err := NewConnectionManager(cfg, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	cancelRun()
+
+	cm.startReconnection(runCtx, cfg.Server.Servers[0].Address)
+
+	cm.reconnectMu.Lock()
+	reconnecting := len(cm.reconnecting)
+	cm.reconnectMu.Unlock()
+	if reconnecting != 0 {
+		t.Fatalf("canceled run started %d reconnection workers", reconnecting)
+	}
+	if err := cm.Stop(); err != nil {
+		t.Fatal(err)
 	}
 }
