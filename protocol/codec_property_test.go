@@ -21,7 +21,7 @@ func TestJSONDecodeAllocationReduction_Property(t *testing.T) {
 		version := rapid.StringMatching(`[0-9]+\.[0-9]+`).Draw(t, "version")
 		capCount := rapid.IntRange(0, 5).Draw(t, "capCount")
 		capabilities := make([]string, capCount)
-		for i := 0; i < capCount; i++ {
+		for i := range capCount {
 			capabilities[i] = rapid.SampledFrom([]string{"tcp", "udp", "quic", "http"}).Draw(t, "cap")
 		}
 

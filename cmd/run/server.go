@@ -22,7 +22,7 @@ var (
 	}
 )
 
-func runServer(cmd *cobra.Command, args []string) error {
+func runServer(_ *cobra.Command, _ []string) error {
 	logger := log.With().Str("com", "server-cmd").Logger()
 
 	// Load configuration

@@ -15,6 +15,7 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
+//goland:noinspection GoNameStartsWithPackageName
 const (
 	ChallengeSize = 32               // 256 bits
 	ResponseSize  = 64               // SHA512 output size
@@ -23,6 +24,8 @@ const (
 )
 
 // ChallengeAuth implements challenge-response authentication using HMAC-SHA512
+//
+//goland:noinspection GoNameStartsWithPackageName
 type ChallengeAuth struct {
 	token []byte
 }
@@ -136,7 +139,7 @@ func (c *ChallengeAuth) VerifyConn(ctx context.Context, conn *quic.Conn) (bool, 
 	if err != nil {
 		return false, fmt.Errorf("open auth stream: %w", err)
 	}
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 
 	// Generate and send challenge
 	challenge, err := GenerateChallenge()

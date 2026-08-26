@@ -68,6 +68,27 @@ func generateTestCert(t *testing.T) (tls.Certificate, *x509.CertPool) {
 	return tlsCert, certPool
 }
 
+func newTestSTEKServerConfig(t *testing.T, cert tls.Certificate, interval time.Duration, overlap uint8) (*RotateManager, *tls.Config) {
+	t.Helper()
+	manager, err := NewRotateManager(interval, overlap)
+	if err != nil {
+		t.Fatalf("failed to create STEK manager: %v", err)
+	}
+
+	tlsConf := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		ClientAuth:   tls.NoClientCert,
+		NextProtos:   []string{"test-proto"},
+	}
+	tlsConf.SetSessionTicketKeys(*manager.Keys.Load())
+	tlsConf.GetConfigForClient = func(_ *tls.ClientHelloInfo) (*tls.Config, error) {
+		cfg := tlsConf.Clone()
+		cfg.SetSessionTicketKeys(*manager.Keys.Load())
+		return cfg, nil
+	}
+	return manager, tlsConf
+}
+
 // TestSTEKRotationDoesNotBreakExistingConnections verifies that high-speed STEK rotation
 // does not affect existing QUIC connections or their ability to resume sessions.
 func TestSTEKRotationDoesNotBreakExistingConnections(t *testing.T) {
@@ -75,25 +96,7 @@ func TestSTEKRotationDoesNotBreakExistingConnections(t *testing.T) {
 	serverCert, certPool := generateTestCert(t)
 
 	// Create STEK manager with very fast rotation (10ms interval, 3 key overlap)
-	stekManager, err := NewRotateManager(10*time.Millisecond, 3)
-	if err != nil {
-		t.Fatalf("failed to create STEK manager: %v", err)
-	}
-
-	// Setup server TLS config with STEK
-	serverTLSConf := &tls.Config{
-		Certificates: []tls.Certificate{serverCert},
-		ClientAuth:   tls.NoClientCert,
-		NextProtos:   []string{"test-proto"},
-	}
-	serverTLSConf.SetSessionTicketKeys(*stekManager.Keys.Load())
-
-	// Dynamic key update via GetConfigForClient
-	serverTLSConf.GetConfigForClient = func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
-		cfg := serverTLSConf.Clone()
-		cfg.SetSessionTicketKeys(*stekManager.Keys.Load())
-		return cfg, nil
-	}
+	stekManager, serverTLSConf := newTestSTEKServerConfig(t, serverCert, 10*time.Millisecond, 3)
 
 	// Start UDP listener
 	udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
@@ -104,7 +107,7 @@ func TestSTEKRotationDoesNotBreakExistingConnections(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to listen UDP: %v", err)
 	}
-	defer udpConn.Close()
+	defer func() { _ = udpConn.Close() }()
 
 	serverAddr := udpConn.LocalAddr().String()
 	t.Logf("Server listening on %s", serverAddr)
@@ -117,7 +120,7 @@ func TestSTEKRotationDoesNotBreakExistingConnections(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create QUIC listener: %v", err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -155,14 +158,14 @@ func TestSTEKRotationDoesNotBreakExistingConnections(t *testing.T) {
 						return
 					}
 					go func(s *quic.Stream) {
-						defer (*s).Close()
+						defer func() { _ = (*s).Close() }()
 						buf := make([]byte, 1024)
 						for {
 							n, err := (*s).Read(buf)
 							if err != nil {
 								return
 							}
-							(*s).Write(buf[:n])
+							_, _ = (*s).Write(buf[:n])
 						}
 					}(stream)
 				}
@@ -209,10 +212,9 @@ func TestSTEKRotationDoesNotBreakExistingConnections(t *testing.T) {
 	var wg sync.WaitGroup
 	startTime := time.Now()
 
-	for i := 0; i < numConnections; i++ {
-		wg.Add(1)
-		go func(connID int) {
-			defer wg.Done()
+	for i := range numConnections {
+		connID := i
+		wg.Go(func() {
 
 			// Create client connection
 			conn, err := quic.DialAddr(ctx, serverAddr, clientTLSConf, &quic.Config{
@@ -223,7 +225,7 @@ func TestSTEKRotationDoesNotBreakExistingConnections(t *testing.T) {
 				t.Logf("Connection %d: dial error: %v", connID, err)
 				return
 			}
-			defer conn.CloseWithError(0, "done")
+			defer func() { _ = conn.CloseWithError(0, "done") }()
 
 			// Send messages continuously during test duration
 			for time.Since(startTime) < testDuration {
@@ -241,14 +243,14 @@ func TestSTEKRotationDoesNotBreakExistingConnections(t *testing.T) {
 				testMsg := fmt.Sprintf("conn-%d-msg-%d", connID, msgNum)
 				_, err = stream.Write([]byte(testMsg))
 				if err != nil {
-					stream.Close()
+					_ = stream.Close()
 					continue
 				}
 
 				// Read echo
 				buf := make([]byte, len(testMsg))
 				_, err = stream.Read(buf)
-				stream.Close()
+				_ = stream.Close()
 				if err != nil {
 					continue
 				}
@@ -260,7 +262,7 @@ func TestSTEKRotationDoesNotBreakExistingConnections(t *testing.T) {
 				// Small delay between messages
 				time.Sleep(5 * time.Millisecond)
 			}
-		}(i)
+		})
 	}
 
 	// Wait for all clients to finish
@@ -301,29 +303,14 @@ func TestSTEKRotationSessionResumption(t *testing.T) {
 
 	// Create STEK manager with 50ms rotation and 3 key overlap
 	// This means keys are valid for 150ms (3 * 50ms)
-	stekManager, err := NewRotateManager(50*time.Millisecond, 3)
-	if err != nil {
-		t.Fatalf("failed to create STEK manager: %v", err)
-	}
-
-	serverTLSConf := &tls.Config{
-		Certificates: []tls.Certificate{serverCert},
-		ClientAuth:   tls.NoClientCert,
-		NextProtos:   []string{"test-proto"},
-	}
-	serverTLSConf.SetSessionTicketKeys(*stekManager.Keys.Load())
-	serverTLSConf.GetConfigForClient = func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
-		cfg := serverTLSConf.Clone()
-		cfg.SetSessionTicketKeys(*stekManager.Keys.Load())
-		return cfg, nil
-	}
+	stekManager, serverTLSConf := newTestSTEKServerConfig(t, serverCert, 50*time.Millisecond, 3)
 
 	udpAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:0")
 	udpConn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
 		t.Fatalf("failed to listen: %v", err)
 	}
-	defer udpConn.Close()
+	defer func() { _ = udpConn.Close() }()
 
 	serverAddr := udpConn.LocalAddr().String()
 
@@ -332,7 +319,7 @@ func TestSTEKRotationSessionResumption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to listen: %v", err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -355,8 +342,8 @@ func TestSTEKRotationSessionResumption(t *testing.T) {
 				}
 				buf := make([]byte, 1024)
 				n, _ := (*stream).Read(buf)
-				(*stream).Write(buf[:n])
-				(*stream).Close()
+				_, _ = (*stream).Write(buf[:n])
+				_ = (*stream).Close()
 			}(conn)
 		}
 	}()
@@ -368,7 +355,7 @@ func TestSTEKRotationSessionResumption(t *testing.T) {
 	}
 
 	// Test multiple reconnections during rotation
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		t.Run(fmt.Sprintf("Reconnection_%d", i), func(t *testing.T) {
 			conn, err := quic.DialAddr(ctx, serverAddr, clientTLSConf, &quic.Config{
 				MaxIdleTimeout: 30 * time.Second,
@@ -379,7 +366,7 @@ func TestSTEKRotationSessionResumption(t *testing.T) {
 
 			stream, err := conn.OpenStreamSync(ctx)
 			if err != nil {
-				conn.CloseWithError(0, "")
+				_ = conn.CloseWithError(0, "")
 				t.Fatalf("open stream failed: %v", err)
 			}
 
@@ -388,9 +375,9 @@ func TestSTEKRotationSessionResumption(t *testing.T) {
 			if err != nil {
 				t.Fatalf("write failed: %v", err)
 			}
-			stream.Close()
+			_ = stream.Close()
 
-			conn.CloseWithError(0, "done")
+			_ = conn.CloseWithError(0, "done")
 
 			// Wait for some rotations before next connection
 			time.Sleep(60 * time.Millisecond)
@@ -407,32 +394,17 @@ func TestSTEKRotationUnderLoad(t *testing.T) {
 	serverCert, certPool := generateTestCert(t)
 
 	// Very aggressive rotation: 5ms interval
-	stekManager, err := NewRotateManager(5*time.Millisecond, 4)
-	if err != nil {
-		t.Fatalf("failed to create STEK manager: %v", err)
-	}
-
-	serverTLSConf := &tls.Config{
-		Certificates: []tls.Certificate{serverCert},
-		ClientAuth:   tls.NoClientCert,
-		NextProtos:   []string{"test-proto"},
-	}
-	serverTLSConf.SetSessionTicketKeys(*stekManager.Keys.Load())
-	serverTLSConf.GetConfigForClient = func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
-		cfg := serverTLSConf.Clone()
-		cfg.SetSessionTicketKeys(*stekManager.Keys.Load())
-		return cfg, nil
-	}
+	stekManager, serverTLSConf := newTestSTEKServerConfig(t, serverCert, 5*time.Millisecond, 4)
 
 	udpAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:0")
 	udpConn, _ := net.ListenUDP("udp", udpAddr)
-	defer udpConn.Close()
+	defer func() { _ = udpConn.Close() }()
 
 	serverAddr := udpConn.LocalAddr().String()
 
 	tr := quic.Transport{Conn: udpConn}
 	listener, _ := tr.Listen(serverTLSConf, &quic.Config{MaxIdleTimeout: 30 * time.Second})
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -456,8 +428,8 @@ func TestSTEKRotationUnderLoad(t *testing.T) {
 					go func(s *quic.Stream) {
 						buf := make([]byte, 1024)
 						n, _ := (*s).Read(buf)
-						(*s).Write(buf[:n])
-						(*s).Close()
+						_, _ = (*s).Write(buf[:n])
+						_ = (*s).Close()
 					}(stream)
 				}
 			}(conn)
@@ -477,12 +449,9 @@ func TestSTEKRotationUnderLoad(t *testing.T) {
 
 	// Spawn many concurrent clients
 	var wg sync.WaitGroup
-	for i := 0; i < 20; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-
-			for j := 0; j < 10; j++ {
+	for range 20 {
+		wg.Go(func() {
+			for range 10 {
 				if ctx.Err() != nil {
 					return
 				}
@@ -497,19 +466,19 @@ func TestSTEKRotationUnderLoad(t *testing.T) {
 
 				stream, err := conn.OpenStreamSync(ctx)
 				if err != nil {
-					conn.CloseWithError(0, "")
+					_ = conn.CloseWithError(0, "")
 					failCount.Add(1)
 					continue
 				}
 
-				stream.Write([]byte("ping"))
-				stream.Close()
-				conn.CloseWithError(0, "done")
+				_, _ = stream.Write([]byte("ping"))
+				_ = stream.Close()
+				_ = conn.CloseWithError(0, "done")
 				successCount.Add(1)
 
 				time.Sleep(10 * time.Millisecond)
 			}
-		}(i)
+		})
 	}
 
 	wg.Wait()

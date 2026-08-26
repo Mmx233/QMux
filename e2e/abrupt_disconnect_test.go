@@ -34,28 +34,18 @@ func TestClientAbruptDisconnect_MTLS(t *testing.T) {
 // testClientAbruptDisconnect is the core test function for abrupt disconnect scenarios
 func testClientAbruptDisconnect(t *testing.T, loadBalancer string) {
 	certDir := generateTestCertificates(t)
-	defer os.RemoveAll(certDir)
 
 	// Start local TCP echo server
 	localListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to start local server: %v", err)
 	}
-	defer localListener.Close()
+	closeOnCleanup(t, localListener)
 
 	localAddr := localListener.Addr().(*net.TCPAddr)
 	t.Logf("Local echo server listening on %s", localAddr)
 
-	// Echo server goroutine
-	go func() {
-		for {
-			conn, err := localListener.Accept()
-			if err != nil {
-				return
-			}
-			go io.Copy(conn, conn)
-		}
-	}()
+	serveTCPEcho(localListener)
 
 	// Get free ports for QMux server
 	quicPort := getFreePort(t)
@@ -97,25 +87,28 @@ func testClientAbruptDisconnect(t *testing.T, loadBalancer string) {
 
 	// Create client config file for client 1 (will be started via exec)
 	client1ConfigPath := filepath.Join(certDir, "client1.yaml")
-	client1Config := map[string]interface{}{
+	client1Config := map[string]any{
 		"client_id": "client-1",
-		"server": map[string]interface{}{
-			"servers": []map[string]interface{}{
+		"server": map[string]any{
+			"servers": []map[string]any{
 				{"address": fmt.Sprintf("127.0.0.1:%d", quicPort), "server_name": "localhost"},
 			},
 		},
-		"local": map[string]interface{}{
+		"local": map[string]any{
 			"host": "127.0.0.1",
 			"port": localAddr.Port,
 		},
-		"tls": map[string]interface{}{
+		"tls": map[string]any{
 			"ca_cert_file":     filepath.Join(certDir, "ca.crt"),
 			"client_cert_file": filepath.Join(certDir, "client.crt"),
 			"client_key_file":  filepath.Join(certDir, "client.key"),
 		},
 		// Use default heartbeat_interval (10s) and health_timeout (30s)
 	}
-	client1ConfigData, _ := yaml.Marshal(client1Config)
+	client1ConfigData, err := yaml.Marshal(client1Config)
+	if err != nil {
+		t.Fatalf("marshal client1 config: %v", err)
+	}
 	if err := os.WriteFile(client1ConfigPath, client1ConfigData, 0600); err != nil {
 		t.Fatalf("failed to write client1 config: %v", err)
 	}
@@ -139,8 +132,8 @@ func testClientAbruptDisconnect(t *testing.T, loadBalancer string) {
 	defer func() {
 		if client1Cmd.Process != nil {
 			// Kill the entire process group
-			syscall.Kill(-client1Cmd.Process.Pid, syscall.SIGKILL)
-			client1Cmd.Wait()
+			_ = syscall.Kill(-client1Cmd.Process.Pid, syscall.SIGKILL)
+			_ = client1Cmd.Wait()
 		}
 	}()
 	t.Logf("Client 1 started with PID %d", client1Cmd.Process.Pid)
@@ -198,7 +191,7 @@ func testClientAbruptDisconnect(t *testing.T, loadBalancer string) {
 		t.Fatalf("failed to kill client 1 process group: %v", err)
 	}
 	// Wait for process to be killed
-	client1Cmd.Wait()
+	_ = client1Cmd.Wait()
 	t.Log("Client 1 killed")
 
 	// Test multiple connections to measure success rate
@@ -207,7 +200,7 @@ func testClientAbruptDisconnect(t *testing.T, loadBalancer string) {
 
 	t.Logf("Testing %d connection attempts after abrupt disconnect...", totalAttempts)
 
-	for i := 0; i < totalAttempts; i++ {
+	for range totalAttempts {
 		if testConnection(t, trafficPort) {
 			successCount++
 		}
@@ -230,10 +223,13 @@ func testConnection(t *testing.T, trafficPort int) bool {
 		t.Logf("connection failed: %v", err)
 		return false
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	testData := "Test data after abrupt disconnect"
-	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Logf("set deadline failed: %v", err)
+		return false
+	}
 
 	if _, err := conn.Write([]byte(testData)); err != nil {
 		t.Logf("write failed: %v", err)
@@ -263,28 +259,18 @@ func TestServerRestartReconnect_MTLS(t *testing.T) {
 
 	// Generate mTLS certificates for the test
 	certDir := generateTestCertificates(t)
-	defer os.RemoveAll(certDir)
 
 	// Start local TCP echo server on a random port
 	localListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to start local echo server: %v", err)
 	}
-	defer localListener.Close()
+	closeOnCleanup(t, localListener)
 
 	localAddr := localListener.Addr().(*net.TCPAddr)
 	t.Logf("Local echo server listening on %s", localAddr)
 
-	// Echo server goroutine: echo back all received data
-	go func() {
-		for {
-			conn, err := localListener.Accept()
-			if err != nil {
-				return
-			}
-			go io.Copy(conn, conn)
-		}
-	}()
+	serveTCPEcho(localListener)
 
 	// Get free ports for QMux server
 	quicPort := getFreePort(t)

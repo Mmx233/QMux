@@ -133,7 +133,7 @@ func (s *Server) startListener(ctx context.Context, listenerConf config.QuicList
 	if err != nil {
 		return fmt.Errorf("listen UDP: %w", err)
 	}
-	defer udpConn.Close()
+	defer func() { _ = udpConn.Close() }()
 
 	// Initialize session ticket key rotation
 	var stekManager *stek.RotateManager
@@ -194,7 +194,7 @@ func (s *Server) startListener(ctx context.Context, listenerConf config.QuicList
 	if err != nil {
 		return fmt.Errorf("listen QUIC: %w", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	// Start session ticket key rotation
 	if stekManager != nil {

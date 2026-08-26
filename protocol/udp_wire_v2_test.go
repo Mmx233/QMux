@@ -16,14 +16,22 @@ func (fn udpAssemblerFunc) AddFragment(sessionID uint32, fragID uint16, index, t
 }
 
 func TestUDPWireV2Constants(t *testing.T) {
-	if UDPDatagramTypeNormal != 0x20 || UDPDatagramTypeFragment != 0x21 {
-		t.Fatalf("unexpected packet types: normal=%#x fragment=%#x", UDPDatagramTypeNormal, UDPDatagramTypeFragment)
+	constants := []struct {
+		name string
+		got  int
+		want int
+	}{
+		{"normal packet type", UDPDatagramTypeNormal, 0x20},
+		{"fragment packet type", UDPDatagramTypeFragment, 0x21},
+		{"normal header size", UDPHeaderSize, 5},
+		{"fragment header size", UDPFragHeaderSize, 9},
+		{"normal payload limit", MaxUDPPayload, 1195},
+		{"fragment payload limit", MaxFragPayload, 1191},
 	}
-	if UDPHeaderSize != 5 || UDPFragHeaderSize != 9 {
-		t.Fatalf("unexpected header sizes: normal=%d fragment=%d", UDPHeaderSize, UDPFragHeaderSize)
-	}
-	if MaxUDPPayload != 1195 || MaxFragPayload != 1191 {
-		t.Fatalf("unexpected payload limits: normal=%d fragment=%d", MaxUDPPayload, MaxFragPayload)
+	for _, constant := range constants {
+		if constant.got != constant.want {
+			t.Errorf("%s: got %#x, want %#x", constant.name, constant.got, constant.want)
+		}
 	}
 }
 
@@ -51,7 +59,7 @@ func TestUDPWireV2RegressionBinaryPayload(t *testing.T) {
 
 func TestUDPWireV2ArbitraryBinaryRoundTrip(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
-	for iteration := 0; iteration < 1000; iteration++ {
+	for iteration := range 1000 {
 		payload := make([]byte, rng.Intn(MaxUDPPayload+1))
 		if _, err := rng.Read(payload); err != nil {
 			t.Fatal(err)

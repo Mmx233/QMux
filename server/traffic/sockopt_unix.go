@@ -8,7 +8,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func setSocketOptions(network, address string, c syscall.RawConn) error {
+func setSocketOptions(_, _ string, c syscall.RawConn) error {
 	var sysErr error
 	err := c.Control(func(fd uintptr) {
 		// Increase socket buffer sizes

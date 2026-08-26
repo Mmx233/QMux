@@ -17,7 +17,7 @@ func TestServerCountValidation_Property(t *testing.T) {
 
 		// Create servers with valid addresses
 		servers := make([]ServerEndpoint, count)
-		for i := 0; i < count; i++ {
+		for i := range count {
 			servers[i] = ServerEndpoint{
 				Address:    fmt.Sprintf("server%d.example.com:%d", i, 8443+i),
 				ServerName: fmt.Sprintf("server%d.example.com", i),
@@ -105,7 +105,7 @@ func TestDuplicateDeduplication_Property(t *testing.T) {
 		// Generate a base set of unique addresses
 		uniqueCount := rapid.IntRange(1, 5).Draw(t, "uniqueCount")
 		baseAddresses := make([]string, uniqueCount)
-		for i := 0; i < uniqueCount; i++ {
+		for i := range uniqueCount {
 			baseAddresses[i] = fmt.Sprintf("server%d.example.com:%d", i, 8443+i)
 		}
 
@@ -115,7 +115,7 @@ func TestDuplicateDeduplication_Property(t *testing.T) {
 		servers := make([]ServerEndpoint, totalCount)
 
 		// First, add all unique addresses
-		for i := 0; i < uniqueCount; i++ {
+		for i := range uniqueCount {
 			servers[i] = ServerEndpoint{
 				Address:    baseAddresses[i],
 				ServerName: fmt.Sprintf("server%d.example.com", i),

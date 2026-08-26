@@ -71,7 +71,7 @@ func (m *mockStream) AddHeartbeatToRead() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	// Write a heartbeat message to the read buffer
-	protocol.WriteHeartbeat(&m.readBuffer, time.Now().Unix())
+	_ = protocol.WriteHeartbeat(&m.readBuffer, time.Now().Unix())
 }
 
 func (m *mockStream) GetWrittenData() []byte {
@@ -154,7 +154,7 @@ func TestServerHeartbeatNonBlocking_Property(t *testing.T) {
 
 		stream := newMockStream()
 
-		for i := 0; i < numHeartbeats; i++ {
+		for range numHeartbeats {
 			start := time.Now()
 			err := protocol.WriteHeartbeat(stream, time.Now().Unix())
 			elapsed := time.Since(start)
@@ -187,7 +187,7 @@ func TestServerHeartbeatContainsTimestamp_Property(t *testing.T) {
 		// Reasonable time range: within 1 second of current time
 		maxTimeDiff := int64(1)
 
-		for i := 0; i < numHeartbeats; i++ {
+		for range numHeartbeats {
 			beforeTime := time.Now().Unix()
 
 			var buf bytes.Buffer

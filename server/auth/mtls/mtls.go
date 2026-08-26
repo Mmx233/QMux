@@ -10,6 +10,8 @@ import (
 )
 
 // MTLSAuth implements mTLS authentication
+//
+//goland:noinspection GoNameStartsWithPackageName
 type MTLSAuth struct {
 	caCertPool *x509.CertPool
 }
@@ -22,7 +24,7 @@ func New(caCertPool *x509.CertPool) auth.Auth {
 }
 
 // VerifyConn verifies a QUIC connection using mTLS
-func (m *MTLSAuth) VerifyConn(ctx context.Context, conn *quic.Conn) (bool, error) {
+func (m *MTLSAuth) VerifyConn(_ context.Context, conn *quic.Conn) (bool, error) {
 	// Get TLS connection state
 	tlsState := conn.ConnectionState().TLS
 

@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"testing"
 	"time"
 
@@ -33,10 +34,10 @@ func TestServerConnection_Close_NoGoroutineLeak(t *testing.T) {
 	cache := tls.NewLRUClientSessionCache(0)
 
 	// Create and close multiple connections
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		conn := NewServerConnection("server.example.com:8443", "server.example.com", cache, logger)
 		conn.MarkHealthy()
-		conn.Close()
+		_ = conn.Close()
 	}
 }
 
@@ -51,9 +52,9 @@ func TestServerConnection_RapidCreateClose_NoLeak(t *testing.T) {
 	cache := tls.NewLRUClientSessionCache(0)
 
 	// Rapid create/close cycle
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		conn := NewServerConnection("server.example.com:8443", "server.example.com", cache, logger)
-		conn.Close()
+		_ = conn.Close()
 	}
 }
 
@@ -82,7 +83,7 @@ func TestConnectionManager_Stop_NoGoroutineLeak(t *testing.T) {
 	}
 
 	// Stop without starting - should still clean up properly
-	cm.Stop()
+	_ = cm.Stop()
 }
 
 // TestConnectionManager_CreateDestroy_NoLeak tests multiple create/destroy cycles
@@ -94,7 +95,7 @@ func TestConnectionManager_CreateDestroy_NoLeak(t *testing.T) {
 
 	logger := zerolog.Nop()
 
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		cfg := &config.Client{
 			ClientID: "test-client",
 			Server: config.ClientServer{
@@ -109,7 +110,7 @@ func TestConnectionManager_CreateDestroy_NoLeak(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
-		cm.Stop()
+		_ = cm.Stop()
 	}
 }
 
@@ -120,13 +121,13 @@ func TestSessionCacheManager_NoLeak(t *testing.T) {
 	scm := NewSessionCacheManager()
 
 	// Create many caches
-	for i := 0; i < 100; i++ {
-		scm.GetOrCreate("server" + string(rune('0'+i%10)) + ".example.com:8443")
+	for i := range 100 {
+		scm.GetOrCreate("server" + fmt.Sprintf("%c", '0'+i%10) + ".example.com:8443")
 	}
 
 	// Access existing caches
-	for i := 0; i < 100; i++ {
-		scm.Get("server" + string(rune('0'+i%10)) + ".example.com:8443")
+	for i := range 100 {
+		scm.Get("server" + fmt.Sprintf("%c", '0'+i%10) + ".example.com:8443")
 	}
 }
 
@@ -145,7 +146,7 @@ func TestConcurrentConnectionOperations_NoLeak(t *testing.T) {
 
 	// Producer: create connections
 	go func() {
-		for i := 0; i < 50; i++ {
+		for range 50 {
 			conn := NewServerConnection("server.example.com:8443", "server.example.com", cache, logger)
 			conns <- conn
 		}
@@ -157,7 +158,7 @@ func TestConcurrentConnectionOperations_NoLeak(t *testing.T) {
 		for conn := range conns {
 			conn.MarkHealthy()
 			conn.MarkUnhealthy()
-			conn.Close()
+			_ = conn.Close()
 		}
 		close(done)
 	}()
@@ -200,7 +201,7 @@ func TestConnectionManager_ContextCancellation_NoLeak(t *testing.T) {
 	_ = cm.Start(ctx)
 
 	// Stop to ensure cleanup
-	cm.Stop()
+	_ = cm.Stop()
 }
 
 // TestServerConnection_StateTransitions_NoLeak verifies state transitions
@@ -216,13 +217,13 @@ func TestServerConnection_StateTransitions_NoLeak(t *testing.T) {
 	conn := NewServerConnection("server.example.com:8443", "server.example.com", cache, logger)
 
 	// Rapid state transitions
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		conn.MarkHealthy()
 		conn.MarkUnhealthy()
 		conn.CheckHealth(time.Second)
 	}
 
-	conn.Close()
+	_ = conn.Close()
 }
 
 // Feature: bidirectional-heartbeat, Property 17: Goroutine Cleanup on Close
@@ -247,7 +248,7 @@ func TestGoroutineCleanupOnClose_Property(t *testing.T) {
 
 		// Create connections and start heartbeat loops
 		connections := make([]*ServerConnection, connCount)
-		for i := 0; i < connCount; i++ {
+		for i := range connCount {
 			conn := NewServerConnection(
 				"server.example.com:8443",
 				"server.example.com",
@@ -273,7 +274,7 @@ func TestGoroutineCleanupOnClose_Property(t *testing.T) {
 
 		// Close all connections
 		for _, conn := range connections {
-			conn.Close()
+			_ = conn.Close()
 		}
 
 		// Wait for goroutines to terminate (bounded time)
@@ -310,7 +311,7 @@ func TestGoroutineCleanupOnClose_RapidClose_Property(t *testing.T) {
 		// Generate random number of rapid create/close cycles (5-20)
 		cycleCount := rapid.IntRange(5, 20).Draw(t, "cycleCount")
 
-		for i := 0; i < cycleCount; i++ {
+		for range cycleCount {
 			conn := NewServerConnection(
 				"server.example.com:8443",
 				"server.example.com",
@@ -323,7 +324,7 @@ func TestGoroutineCleanupOnClose_RapidClose_Property(t *testing.T) {
 			conn.StartHeartbeatLoops(100 * time.Millisecond)
 
 			// Immediately close (tests rapid shutdown)
-			conn.Close()
+			_ = conn.Close()
 		}
 
 		// Wait for all goroutines to terminate
@@ -347,7 +348,7 @@ func TestGoroutineCleanupOnClose_ContextCancellation_Property(t *testing.T) {
 		connCount := rapid.IntRange(1, 3).Draw(t, "connCount")
 
 		connections := make([]*ServerConnection, connCount)
-		for i := 0; i < connCount; i++ {
+		for i := range connCount {
 			conn := NewServerConnection(
 				"server.example.com:8443",
 				"server.example.com",
@@ -365,7 +366,7 @@ func TestGoroutineCleanupOnClose_ContextCancellation_Property(t *testing.T) {
 
 		// Close connections (which cancels context)
 		for _, conn := range connections {
-			conn.Close()
+			_ = conn.Close()
 		}
 
 		// Property: goroutines should terminate promptly after context cancellation

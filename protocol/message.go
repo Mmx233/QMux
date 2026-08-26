@@ -63,13 +63,15 @@ type ErrorMsg struct {
 // Message wraps a typed message with its type
 type Message struct {
 	Type    byte
-	Payload interface{}
+	Payload any
 }
 
-const (
-	ProtocolVersion     = "2.0"
-	CapabilityUDPWireV2 = "udp-wire-v2"
-)
+// ProtocolVersion is retained as the exported wire-version API.
+//
+//goland:noinspection GoNameStartsWithPackageName
+const ProtocolVersion = "2.0"
+
+const CapabilityUDPWireV2 = "udp-wire-v2"
 
 // HasCapability reports whether capabilities contains capability.
 func HasCapability(capabilities []string, capability string) bool {

@@ -2,24 +2,17 @@ package e2e
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/Mmx233/QMux/client"
-	"github.com/Mmx233/QMux/config"
-	"github.com/Mmx233/QMux/server"
 )
 
 // ============================================
@@ -88,27 +81,22 @@ func (rm *resourceMonitor) start() {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 
-	rm.wg.Add(1)
-	go func() {
-		defer rm.wg.Done()
+	rm.wg.Go(func() {
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
-
-		var prevTotalCPU uint64
-		var prevTime = time.Now()
 
 		for {
 			select {
 			case <-rm.stopCh:
 				return
 			case <-ticker.C:
-				rm.sample(&prevTotalCPU, &prevTime)
+				rm.sample()
 			}
 		}
-	}()
+	})
 }
 
-func (rm *resourceMonitor) sample(prevTotalCPU *uint64, prevTime *time.Time) {
+func (rm *resourceMonitor) sample() {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 
@@ -117,10 +105,6 @@ func (rm *resourceMonitor) sample(prevTotalCPU *uint64, prevTime *time.Time) {
 
 	// CPU: estimate based on GC CPU fraction and goroutine count
 	// This is an approximation since Go doesn't expose per-process CPU directly
-	now := time.Now()
-	elapsed := now.Sub(*prevTime).Seconds()
-	*prevTime = now
-
 	// Use NumGoroutine as a proxy for activity level
 	numGoroutines := runtime.NumGoroutine()
 	numCPU := runtime.NumCPU()
@@ -135,8 +119,6 @@ func (rm *resourceMonitor) sample(prevTotalCPU *uint64, prevTime *time.Time) {
 	// Also factor in GC CPU fraction
 	gcCPU := m.GCCPUFraction * 100
 	cpuEstimate = cpuEstimate + gcCPU
-
-	_ = elapsed // suppress unused warning
 
 	rm.mu.Lock()
 	rm.cpuSamples = append(rm.cpuSamples, cpuEstimate)
@@ -182,113 +164,6 @@ func (rm *resourceMonitor) stop() resourceStats {
 }
 
 // ============================================
-// Process Resource Monitor (for external processes)
-// ============================================
-
-type processResourceMonitor struct {
-	pids     []int
-	stopCh   chan struct{}
-	wg       sync.WaitGroup
-	mu       sync.Mutex
-	cpuTotal float64
-	memTotal float64
-	samples  int64
-	maxCPU   float64
-	maxMem   float64
-}
-
-func newProcessResourceMonitor(pids ...int) *processResourceMonitor {
-	return &processResourceMonitor{
-		pids:   pids,
-		stopCh: make(chan struct{}),
-	}
-}
-
-func (pm *processResourceMonitor) addPID(pid int) {
-	pm.mu.Lock()
-	pm.pids = append(pm.pids, pid)
-	pm.mu.Unlock()
-}
-
-func (pm *processResourceMonitor) start() {
-	pm.wg.Add(1)
-	go func() {
-		defer pm.wg.Done()
-		ticker := time.NewTicker(200 * time.Millisecond)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-pm.stopCh:
-				return
-			case <-ticker.C:
-				pm.sampleProcesses()
-			}
-		}
-	}()
-}
-
-func (pm *processResourceMonitor) sampleProcesses() {
-	pm.mu.Lock()
-	pids := make([]int, len(pm.pids))
-	copy(pids, pm.pids)
-	pm.mu.Unlock()
-
-	var totalCPU, totalMem float64
-
-	for _, pid := range pids {
-		cpu, mem := getProcessStats(pid)
-		totalCPU += cpu
-		totalMem += mem
-	}
-
-	pm.mu.Lock()
-	pm.cpuTotal += totalCPU
-	pm.memTotal += totalMem
-	pm.samples++
-	if totalCPU > pm.maxCPU {
-		pm.maxCPU = totalCPU
-	}
-	if totalMem > pm.maxMem {
-		pm.maxMem = totalMem
-	}
-	pm.mu.Unlock()
-}
-
-func (pm *processResourceMonitor) stop() (avgCPU, maxCPU, avgMem, maxMem float64) {
-	close(pm.stopCh)
-	pm.wg.Wait()
-
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-
-	if pm.samples == 0 {
-		return 0, 0, 0, 0
-	}
-
-	return pm.cpuTotal / float64(pm.samples), pm.maxCPU,
-		pm.memTotal / float64(pm.samples), pm.maxMem
-}
-
-// getProcessStats returns CPU% and Memory MB for a process
-// Uses ps command on macOS/Linux
-func getProcessStats(pid int) (cpuPercent, memMB float64) {
-	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "%cpu,%mem,rss", "--no-headers")
-	output, err := cmd.Output()
-	if err != nil {
-		return 0, 0
-	}
-
-	fields := strings.Fields(string(output))
-	if len(fields) >= 3 {
-		cpuPercent, _ = strconv.ParseFloat(fields[0], 64)
-		rssKB, _ := strconv.ParseFloat(fields[2], 64)
-		memMB = rssKB / 1024
-	}
-	return
-}
-
-// ============================================
 // Benchmark Result with Resources
 // ============================================
 
@@ -303,6 +178,27 @@ type benchResultWithResources struct {
 	goRoutines int
 }
 
+func appendBenchmarkResult(
+	results *[]benchResultWithResources,
+	name string,
+	result *iperf3Result,
+	stats resourceStats,
+) {
+	if result == nil {
+		return
+	}
+	*results = append(*results, benchResultWithResources{
+		name:       name,
+		sentMbps:   result.End.SumSent.BitsPerSecond / 1e6,
+		recvMbps:   result.End.SumReceived.BitsPerSecond / 1e6,
+		avgCPU:     stats.avgCPUPercent,
+		maxCPU:     stats.maxCPUPercent,
+		avgMemMB:   stats.avgMemoryMB,
+		maxMemMB:   stats.maxMemoryMB,
+		goRoutines: runtime.NumGoroutine(),
+	})
+}
+
 // ============================================
 // iperf3 Availability Check
 // ============================================
@@ -310,6 +206,47 @@ type benchResultWithResources struct {
 func iperf3Available() bool {
 	_, err := exec.LookPath("iperf3")
 	return err == nil
+}
+
+func newIperf3ServerCommand(port int) *exec.Cmd {
+	serverCmd := exec.Command("iperf3", "-s", "-p", strconv.Itoa(port), "-1")
+	serverCmd.Stdout = io.Discard
+	serverCmd.Stderr = io.Discard
+	return serverCmd
+}
+
+func startIperf3Server(t testing.TB, port int) {
+	t.Helper()
+	serverCmd := newIperf3ServerCommand(port)
+	if err := serverCmd.Start(); err != nil {
+		t.Fatalf("start iperf3 server: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = serverCmd.Process.Kill()
+	})
+}
+
+func iperf3ClientArgs(port, durationSeconds, threads int, protocol string, jsonOutput bool) []string {
+	args := []string{
+		"-c", "127.0.0.1",
+		"-p", strconv.Itoa(port),
+		"-t", strconv.Itoa(durationSeconds),
+		"-P", strconv.Itoa(threads),
+	}
+	if jsonOutput {
+		args = append(args, "-J")
+	}
+	if protocol == "udp" {
+		args = append(args, "-u", "-b", "0")
+	}
+	return args
+}
+
+func logIperf3ExitError(t testing.TB, err error) {
+	t.Helper()
+	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
+		t.Logf("iperf3 stderr: %s", string(exitErr.Stderr))
+	}
 }
 
 // ============================================
@@ -326,7 +263,6 @@ func TestIperf3SpeedReport(t *testing.T) {
 	}
 
 	certDir := generateTestCertificates(t)
-	defer os.RemoveAll(certDir)
 
 	t.Log("=== QMux iperf3 Speed Report ===")
 	t.Log("")
@@ -376,32 +312,11 @@ func TestIperf3SpeedReport(t *testing.T) {
 
 func runIperf3DirectBaseline(t *testing.T, protocol string, threads int) {
 	serverPort := getFreePort(t)
-
-	serverArgs := []string{"-s", "-p", strconv.Itoa(serverPort), "-1"}
-	serverCmd := exec.Command("iperf3", serverArgs...)
-	serverCmd.Stdout = io.Discard
-	serverCmd.Stderr = io.Discard
-
-	if err := serverCmd.Start(); err != nil {
-		t.Fatalf("failed to start iperf3 server: %v", err)
-	}
-	defer serverCmd.Process.Kill()
+	startIperf3Server(t, serverPort)
 
 	time.Sleep(500 * time.Millisecond)
 
-	clientArgs := []string{
-		"-c", "127.0.0.1",
-		"-p", strconv.Itoa(serverPort),
-		"-t", "5",
-		"-P", strconv.Itoa(threads),
-		"-J",
-	}
-
-	if protocol == "udp" {
-		clientArgs = append(clientArgs, "-u", "-b", "0")
-	}
-
-	clientCmd := exec.Command("iperf3", clientArgs...)
+	clientCmd := exec.Command("iperf3", iperf3ClientArgs(serverPort, 5, threads, protocol, true)...)
 	output, err := clientCmd.Output()
 	if err != nil {
 		t.Fatalf("iperf3 client failed: %v", err)
@@ -417,87 +332,20 @@ func runIperf3DirectBaseline(t *testing.T, protocol string, threads int) {
 
 func runIperf3ThroughQMux(t *testing.T, certDir string, protocol string, threads int) {
 	localPort := getFreePort(t)
-	serverArgs := []string{"-s", "-p", strconv.Itoa(localPort), "-1"}
-	serverCmd := exec.Command("iperf3", serverArgs...)
-	serverCmd.Stdout = io.Discard
-	serverCmd.Stderr = io.Discard
-
-	if err := serverCmd.Start(); err != nil {
-		t.Fatalf("failed to start iperf3 server: %v", err)
-	}
-	defer serverCmd.Process.Kill()
-
+	startIperf3Server(t, localPort)
 	time.Sleep(300 * time.Millisecond)
-
-	quicPort := getFreePort(t)
-	trafficPort := getFreePort(t)
-	quicConfig := getOptimizedQuicConfig()
 
 	qmuxProtocol := protocol
 	if protocol == "udp" {
 		qmuxProtocol = "both"
 	}
+	trafficPort := setupQMuxEndpoint(t, certDir, qmuxProtocol, fmt.Sprintf("iperf3-%s-client", protocol), localPort,
+		2*time.Minute, 300*time.Millisecond, 500*time.Millisecond, true)
 
-	serverConfig := &config.Server{
-		Listeners: []config.QuicListener{{
-			QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
-			TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
-			Protocol:    qmuxProtocol,
-			Quic:        quicConfig,
-		}},
-		Auth: config.ServerAuth{Method: "mtls", CACertFile: filepath.Join(certDir, "ca.crt")},
-		TLS: config.ServerTLS{
-			ServerCertFile: filepath.Join(certDir, "server.crt"),
-			ServerKeyFile:  filepath.Join(certDir, "server.key"),
-		},
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	go server.Start(ctx, serverConfig)
-	time.Sleep(300 * time.Millisecond)
-
-	clientConfig := &config.Client{
-		ClientID: fmt.Sprintf("iperf3-%s-client", protocol),
-		Server: config.ClientServer{
-			Servers: []config.ServerEndpoint{{Address: fmt.Sprintf("127.0.0.1:%d", quicPort), ServerName: "localhost"}},
-		},
-		Local: config.LocalService{Host: "127.0.0.1", Port: localPort},
-		TLS: config.ClientTLS{
-			CACertFile:     filepath.Join(certDir, "ca.crt"),
-			ClientCertFile: filepath.Join(certDir, "client.crt"),
-			ClientKeyFile:  filepath.Join(certDir, "client.key"),
-		},
-		Quic: quicConfig,
-	}
-
-	c, err := client.New(clientConfig)
-	if err != nil {
-		t.Fatalf("failed to create client: %v", err)
-	}
-
-	go c.Start(ctx)
-	time.Sleep(500 * time.Millisecond)
-
-	clientArgs := []string{
-		"-c", "127.0.0.1",
-		"-p", strconv.Itoa(trafficPort),
-		"-t", "5",
-		"-P", strconv.Itoa(threads),
-		"-J",
-	}
-
-	if protocol == "udp" {
-		clientArgs = append(clientArgs, "-u", "-b", "0")
-	}
-
-	clientCmd := exec.Command("iperf3", clientArgs...)
+	clientCmd := exec.Command("iperf3", iperf3ClientArgs(trafficPort, 5, threads, protocol, true)...)
 	output, err := clientCmd.Output()
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			t.Logf("iperf3 stderr: %s", string(exitErr.Stderr))
-		}
+		logIperf3ExitError(t, err)
 		t.Fatalf("iperf3 client through QMux failed: %v", err)
 	}
 
@@ -574,7 +422,6 @@ func TestIperf3ComprehensiveBenchmark(t *testing.T) {
 	}
 
 	certDir := generateTestCertificates(t)
-	defer os.RemoveAll(certDir)
 
 	t.Log("=== Comprehensive iperf3 Benchmark with Resource Monitoring ===")
 	t.Log("")
@@ -586,18 +433,7 @@ func TestIperf3ComprehensiveBenchmark(t *testing.T) {
 		for _, threads := range []int{1, 2, 4} {
 			t.Run(fmt.Sprintf("%dThread", threads), func(t *testing.T) {
 				result, stats := runIperf3BaselineWithResources(t, "tcp", threads)
-				if result != nil {
-					results = append(results, benchResultWithResources{
-						name:       fmt.Sprintf("TCP Baseline %d-thread", threads),
-						sentMbps:   result.End.SumSent.BitsPerSecond / 1e6,
-						recvMbps:   result.End.SumReceived.BitsPerSecond / 1e6,
-						avgCPU:     stats.avgCPUPercent,
-						maxCPU:     stats.maxCPUPercent,
-						avgMemMB:   stats.avgMemoryMB,
-						maxMemMB:   stats.maxMemoryMB,
-						goRoutines: runtime.NumGoroutine(),
-					})
-				}
+				appendBenchmarkResult(&results, fmt.Sprintf("TCP Baseline %d-thread", threads), result, stats)
 			})
 		}
 	})
@@ -607,18 +443,7 @@ func TestIperf3ComprehensiveBenchmark(t *testing.T) {
 		for _, threads := range []int{1, 2, 4} {
 			t.Run(fmt.Sprintf("%dThread", threads), func(t *testing.T) {
 				result, stats := runIperf3QMuxWithResources(t, certDir, "tcp", threads)
-				if result != nil {
-					results = append(results, benchResultWithResources{
-						name:       fmt.Sprintf("TCP QMux %d-thread", threads),
-						sentMbps:   result.End.SumSent.BitsPerSecond / 1e6,
-						recvMbps:   result.End.SumReceived.BitsPerSecond / 1e6,
-						avgCPU:     stats.avgCPUPercent,
-						maxCPU:     stats.maxCPUPercent,
-						avgMemMB:   stats.avgMemoryMB,
-						maxMemMB:   stats.maxMemoryMB,
-						goRoutines: runtime.NumGoroutine(),
-					})
-				}
+				appendBenchmarkResult(&results, fmt.Sprintf("TCP QMux %d-thread", threads), result, stats)
 			})
 		}
 	})
@@ -628,18 +453,7 @@ func TestIperf3ComprehensiveBenchmark(t *testing.T) {
 		for _, threads := range []int{1, 2} {
 			t.Run(fmt.Sprintf("%dThread", threads), func(t *testing.T) {
 				result, stats := runIperf3BaselineWithResources(t, "udp", threads)
-				if result != nil {
-					results = append(results, benchResultWithResources{
-						name:       fmt.Sprintf("UDP Baseline %d-thread", threads),
-						sentMbps:   result.End.SumSent.BitsPerSecond / 1e6,
-						recvMbps:   result.End.SumReceived.BitsPerSecond / 1e6,
-						avgCPU:     stats.avgCPUPercent,
-						maxCPU:     stats.maxCPUPercent,
-						avgMemMB:   stats.avgMemoryMB,
-						maxMemMB:   stats.maxMemoryMB,
-						goRoutines: runtime.NumGoroutine(),
-					})
-				}
+				appendBenchmarkResult(&results, fmt.Sprintf("UDP Baseline %d-thread", threads), result, stats)
 			})
 		}
 	})
@@ -649,18 +463,7 @@ func TestIperf3ComprehensiveBenchmark(t *testing.T) {
 		for _, threads := range []int{1, 2} {
 			t.Run(fmt.Sprintf("%dThread", threads), func(t *testing.T) {
 				result, stats := runIperf3QMuxWithResources(t, certDir, "udp", threads)
-				if result != nil {
-					results = append(results, benchResultWithResources{
-						name:       fmt.Sprintf("UDP QMux %d-thread", threads),
-						sentMbps:   result.End.SumSent.BitsPerSecond / 1e6,
-						recvMbps:   result.End.SumReceived.BitsPerSecond / 1e6,
-						avgCPU:     stats.avgCPUPercent,
-						maxCPU:     stats.maxCPUPercent,
-						avgMemMB:   stats.avgMemoryMB,
-						maxMemMB:   stats.maxMemoryMB,
-						goRoutines: runtime.NumGoroutine(),
-					})
-				}
+				appendBenchmarkResult(&results, fmt.Sprintf("UDP QMux %d-thread", threads), result, stats)
 			})
 		}
 	})
@@ -690,32 +493,19 @@ func runIperf3BaselineWithResources(t *testing.T, protocol string, threads int) 
 	monitor := newResourceMonitor()
 	monitor.start()
 
-	serverCmd := exec.Command("iperf3", "-s", "-p", strconv.Itoa(serverPort), "-1")
-	serverCmd.Stdout = io.Discard
-	serverCmd.Stderr = io.Discard
-
+	serverCmd := newIperf3ServerCommand(serverPort)
 	if err := serverCmd.Start(); err != nil {
 		monitor.stop()
 		t.Errorf("failed to start iperf3 server: %v", err)
 		return nil, resourceStats{}
 	}
-	defer serverCmd.Process.Kill()
+	t.Cleanup(func() {
+		_ = serverCmd.Process.Kill()
+	})
 
 	time.Sleep(500 * time.Millisecond)
 
-	clientArgs := []string{
-		"-c", "127.0.0.1",
-		"-p", strconv.Itoa(serverPort),
-		"-t", "5",
-		"-P", strconv.Itoa(threads),
-		"-J",
-	}
-
-	if protocol == "udp" {
-		clientArgs = append(clientArgs, "-u", "-b", "0")
-	}
-
-	clientCmd := exec.Command("iperf3", clientArgs...)
+	clientCmd := exec.Command("iperf3", iperf3ClientArgs(serverPort, 5, threads, protocol, true)...)
 	output, err := clientCmd.Output()
 
 	stats := monitor.stop()
@@ -732,95 +522,30 @@ func runIperf3BaselineWithResources(t *testing.T, protocol string, threads int) 
 
 func runIperf3QMuxWithResources(t *testing.T, certDir string, protocol string, threads int) (*iperf3Result, resourceStats) {
 	localPort := getFreePort(t)
-	serverCmd := exec.Command("iperf3", "-s", "-p", strconv.Itoa(localPort), "-1")
-	serverCmd.Stdout = io.Discard
-	serverCmd.Stderr = io.Discard
-
-	if err := serverCmd.Start(); err != nil {
-		t.Errorf("failed to start iperf3 server: %v", err)
-		return nil, resourceStats{}
-	}
-	defer serverCmd.Process.Kill()
-
+	startIperf3Server(t, localPort)
 	time.Sleep(300 * time.Millisecond)
-
-	quicPort := getFreePort(t)
-	trafficPort := getFreePort(t)
-	quicConfig := getOptimizedQuicConfig()
 
 	qmuxProtocol := protocol
 	if protocol == "udp" {
 		qmuxProtocol = "both"
 	}
-
-	serverConfig := &config.Server{
-		Listeners: []config.QuicListener{{
-			QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
-			TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
-			Protocol:    qmuxProtocol,
-			Quic:        quicConfig,
-		}},
-		Auth: config.ServerAuth{Method: "mtls", CACertFile: filepath.Join(certDir, "ca.crt")},
-		TLS: config.ServerTLS{
-			ServerCertFile: filepath.Join(certDir, "server.crt"),
-			ServerKeyFile:  filepath.Join(certDir, "server.key"),
-		},
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	go server.Start(ctx, serverConfig)
-	time.Sleep(300 * time.Millisecond)
-
-	clientConfig := &config.Client{
-		ClientID: fmt.Sprintf("iperf3-%s-%d", protocol, threads),
-		Server: config.ClientServer{
-			Servers: []config.ServerEndpoint{{Address: fmt.Sprintf("127.0.0.1:%d", quicPort), ServerName: "localhost"}},
-		},
-		Local: config.LocalService{Host: "127.0.0.1", Port: localPort},
-		TLS: config.ClientTLS{
-			CACertFile:     filepath.Join(certDir, "ca.crt"),
-			ClientCertFile: filepath.Join(certDir, "client.crt"),
-			ClientKeyFile:  filepath.Join(certDir, "client.key"),
-		},
-		Quic: quicConfig,
-	}
-
-	c, err := client.New(clientConfig)
-	if err != nil {
-		t.Errorf("failed to create client: %v", err)
+	trafficPort := setupQMuxEndpoint(t, certDir, qmuxProtocol, fmt.Sprintf("iperf3-%s-%d", protocol, threads), localPort,
+		2*time.Minute, 300*time.Millisecond, 500*time.Millisecond, false)
+	if trafficPort == 0 {
 		return nil, resourceStats{}
 	}
-
-	go c.Start(ctx)
-	time.Sleep(500 * time.Millisecond)
 
 	// Start resource monitor AFTER QMux is set up, to measure only during transfer
 	monitor := newResourceMonitor()
 	monitor.start()
 
-	clientArgs := []string{
-		"-c", "127.0.0.1",
-		"-p", strconv.Itoa(trafficPort),
-		"-t", "5",
-		"-P", strconv.Itoa(threads),
-		"-J",
-	}
-
-	if protocol == "udp" {
-		clientArgs = append(clientArgs, "-u", "-b", "0")
-	}
-
-	clientCmd := exec.Command("iperf3", clientArgs...)
+	clientCmd := exec.Command("iperf3", iperf3ClientArgs(trafficPort, 5, threads, protocol, true)...)
 	output, err := clientCmd.Output()
 
 	stats := monitor.stop()
 
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			t.Logf("iperf3 stderr: %s", string(exitErr.Stderr))
-		}
+		logIperf3ExitError(t, err)
 		t.Errorf("iperf3 client through QMux failed: %v", err)
 		return nil, stats
 	}
@@ -844,72 +569,15 @@ func TestIperf3LiveOutput(t *testing.T) {
 	}
 
 	certDir := generateTestCertificates(t)
-	defer os.RemoveAll(certDir)
 
 	localPort := getFreePort(t)
-	serverCmd := exec.Command("iperf3", "-s", "-p", strconv.Itoa(localPort), "-1")
-	serverCmd.Stdout = io.Discard
-	serverCmd.Stderr = io.Discard
-
-	if err := serverCmd.Start(); err != nil {
-		t.Fatalf("failed to start iperf3 server: %v", err)
-	}
-	defer serverCmd.Process.Kill()
-
+	startIperf3Server(t, localPort)
 	time.Sleep(300 * time.Millisecond)
 
-	quicPort := getFreePort(t)
-	trafficPort := getFreePort(t)
-	quicConfig := getOptimizedQuicConfig()
+	trafficPort := setupQMuxEndpoint(t, certDir, "tcp", "iperf3-live-client", localPort,
+		2*time.Minute, 300*time.Millisecond, 500*time.Millisecond, true)
 
-	serverConfig := &config.Server{
-		Listeners: []config.QuicListener{{
-			QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
-			TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
-			Protocol:    "tcp",
-			Quic:        quicConfig,
-		}},
-		Auth: config.ServerAuth{Method: "mtls", CACertFile: filepath.Join(certDir, "ca.crt")},
-		TLS: config.ServerTLS{
-			ServerCertFile: filepath.Join(certDir, "server.crt"),
-			ServerKeyFile:  filepath.Join(certDir, "server.key"),
-		},
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	go server.Start(ctx, serverConfig)
-	time.Sleep(300 * time.Millisecond)
-
-	clientConfig := &config.Client{
-		ClientID: "iperf3-live-client",
-		Server: config.ClientServer{
-			Servers: []config.ServerEndpoint{{Address: fmt.Sprintf("127.0.0.1:%d", quicPort), ServerName: "localhost"}},
-		},
-		Local: config.LocalService{Host: "127.0.0.1", Port: localPort},
-		TLS: config.ClientTLS{
-			CACertFile:     filepath.Join(certDir, "ca.crt"),
-			ClientCertFile: filepath.Join(certDir, "client.crt"),
-			ClientKeyFile:  filepath.Join(certDir, "client.key"),
-		},
-		Quic: quicConfig,
-	}
-
-	c, err := client.New(clientConfig)
-	if err != nil {
-		t.Fatalf("failed to create client: %v", err)
-	}
-
-	go c.Start(ctx)
-	time.Sleep(500 * time.Millisecond)
-
-	clientCmd := exec.Command("iperf3",
-		"-c", "127.0.0.1",
-		"-p", strconv.Itoa(trafficPort),
-		"-t", "10",
-		"-P", "2",
-	)
+	clientCmd := exec.Command("iperf3", iperf3ClientArgs(trafficPort, 10, 2, "tcp", false)...)
 
 	stdout, err := clientCmd.StdoutPipe()
 	if err != nil {
@@ -929,6 +597,3 @@ func TestIperf3LiveOutput(t *testing.T) {
 		t.Logf("iperf3 finished with: %v", err)
 	}
 }
-
-// Suppress unused variable warnings
-var _ = atomic.AddInt64

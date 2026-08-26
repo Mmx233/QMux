@@ -50,7 +50,7 @@ func TestProperty_TokenValidation_ValidToken(t *testing.T) {
 
 		// Generate random bytes for the token
 		tokenBytes := make([]byte, tokenLength)
-		for i := 0; i < tokenLength; i++ {
+		for i := range tokenLength {
 			// Generate printable ASCII characters (32-126) for readable tokens
 			tokenBytes[i] = byte(rapid.IntRange(32, 126).Draw(t, "char"))
 		}
@@ -79,7 +79,7 @@ func TestProperty_TokenValidation_ShortToken(t *testing.T) {
 
 		// Generate random bytes for the token
 		tokenBytes := make([]byte, tokenLength)
-		for i := 0; i < tokenLength; i++ {
+		for i := range tokenLength {
 			// Generate printable ASCII characters (32-126) for readable tokens
 			tokenBytes[i] = byte(rapid.IntRange(32, 126).Draw(t, "char"))
 		}

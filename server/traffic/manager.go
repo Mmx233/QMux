@@ -105,10 +105,10 @@ func (m *Manager) Stop() {
 	for _, listener := range m.listeners {
 		listener.cancel()
 		if listener.TCPListener != nil {
-			listener.TCPListener.Close()
+			_ = listener.TCPListener.Close()
 		}
 		if listener.UDPConn != nil {
-			listener.UDPConn.Close()
+			_ = listener.UDPConn.Close()
 		}
 	}
 

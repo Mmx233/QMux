@@ -32,10 +32,10 @@ func init() {
 	Cmd.Flags().StringVarP(&outputDir, "output", "o", "./certs", "output directory")
 	Cmd.Flags().IntVarP(&validYears, "years", "y", 10, "certificate validity in years")
 	Cmd.Flags().StringSliceVarP(&serverNames, "server-name", "s", nil, "server DNS names for the certificate (required, can be specified multiple times)")
-	Cmd.MarkFlagRequired("server-name")
+	_ = Cmd.MarkFlagRequired("server-name")
 }
 
-func runGenerate(cmd *cobra.Command, args []string) error {
+func runGenerate(_ *cobra.Command, _ []string) error {
 	logger := log.With().Str("com", "generate").Logger()
 
 	logger.Info().Str("dir", outputDir).Int("years", validYears).Msg("generating certificates")

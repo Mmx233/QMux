@@ -25,10 +25,6 @@ func TestNewRotateManager(t *testing.T) {
 		t.Errorf("Expected 1 initial key, got %d", len(*keys))
 	}
 
-	// Verify key is 32 bytes
-	if len((*keys)[0]) != 32 {
-		t.Errorf("Key has wrong length: expected 32, got %d", len((*keys)[0]))
-	}
 }
 
 func TestNewRotateManager_InvalidParameters(t *testing.T) {
@@ -54,12 +50,18 @@ func TestNewRotateManager_InvalidParameters(t *testing.T) {
 	}
 }
 
-func TestRotateManager_Rotation(t *testing.T) {
-	// overlap=2 means: 1 current + up to 2 old keys = max 3 keys
-	manager, err := NewRotateManager(100*time.Millisecond, 2)
+func newTestRotateManager(t *testing.T, interval time.Duration, overlap uint8) *RotateManager {
+	t.Helper()
+	manager, err := NewRotateManager(interval, overlap)
 	if err != nil {
 		t.Fatalf("NewRotateManager failed: %v", err)
 	}
+	return manager
+}
+
+func TestRotateManager_Rotation(t *testing.T) {
+	// overlap=2 means: 1 current + up to 2 old keys = max 3 keys
+	manager := newTestRotateManager(t, 100*time.Millisecond, 2)
 
 	// Get initial key (should be only 1)
 	initialKeys := manager.Keys.Load()
@@ -69,7 +71,7 @@ func TestRotateManager_Rotation(t *testing.T) {
 	key0 := (*initialKeys)[0]
 
 	// First rotation: [key1, key0]
-	err = manager.rotate()
+	err := manager.rotate()
 	if err != nil {
 		t.Fatalf("rotate() failed: %v", err)
 	}
@@ -163,7 +165,7 @@ func TestRotateManager_OverlapLimit(t *testing.T) {
 
 	// Rotate multiple times and verify max keys = 1 + overlap
 	expectedCounts := []int{2, 3, 3, 3, 3} // after each rotation
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		err = manager.rotate()
 		if err != nil {
 			t.Fatalf("rotate() failed on iteration %d: %v", i, err)
@@ -184,10 +186,7 @@ func TestRotateManager_OverlapLimit(t *testing.T) {
 
 func TestRotateManager_ZeroOverlap(t *testing.T) {
 	// overlap=0 means only keep current key, no old keys
-	manager, err := NewRotateManager(time.Hour, 0)
-	if err != nil {
-		t.Fatalf("NewRotateManager failed: %v", err)
-	}
+	manager := newTestRotateManager(t, time.Hour, 0)
 
 	// Initial: 1 key
 	keys := manager.Keys.Load()
@@ -197,7 +196,7 @@ func TestRotateManager_ZeroOverlap(t *testing.T) {
 	key0 := (*keys)[0]
 
 	// After rotation: still only 1 key (new one, old one dropped)
-	err = manager.rotate()
+	err := manager.rotate()
 	if err != nil {
 		t.Fatalf("rotate() failed: %v", err)
 	}
@@ -210,7 +209,7 @@ func TestRotateManager_ZeroOverlap(t *testing.T) {
 	}
 
 	// Multiple rotations should always result in 1 key
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		err = manager.rotate()
 		if err != nil {
 			t.Fatalf("rotate() failed on iteration %d: %v", i, err)

@@ -98,10 +98,7 @@ func (m *RotateManager) rotate() error {
 	currentKeys := m.Keys.Load()
 
 	// Calculate how many old keys to keep (up to overlap)
-	oldKeysToKeep := len(*currentKeys)
-	if oldKeysToKeep > int(m.overlap) {
-		oldKeysToKeep = int(m.overlap)
-	}
+	oldKeysToKeep := min(len(*currentKeys), int(m.overlap))
 
 	// Create new slice: new key + old keys
 	newKeys := make([][32]byte, 1+oldKeysToKeep)

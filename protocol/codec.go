@@ -14,7 +14,7 @@ var json = jsoniter.ConfigCompatibleWithStandardLibrary
 // Wire format: [1 byte type][4 bytes length][payload]
 
 // WriteMessage writes a message to the writer using buffer pooling to reduce allocations.
-func WriteMessage(w io.Writer, msgType byte, payload interface{}) error {
+func WriteMessage(w io.Writer, msgType byte, payload any) error {
 	// Get buffer from pool
 	buf := GetBuffer()
 	defer PutBuffer(buf)
@@ -71,7 +71,7 @@ func ReadMessage(r io.Reader) (msgType byte, payload []byte, err error) {
 }
 
 // DecodeMessage decodes a payload into a message structure
-func DecodeMessage(payload []byte, msg interface{}) error {
+func DecodeMessage(payload []byte, msg any) error {
 	if err := json.Unmarshal(payload, msg); err != nil {
 		return fmt.Errorf("unmarshal payload: %w", err)
 	}
@@ -79,7 +79,7 @@ func DecodeMessage(payload []byte, msg interface{}) error {
 }
 
 // ReadTypedMessage reads and decodes a message in one call
-func ReadTypedMessage(r io.Reader, expectedType byte, msg interface{}) error {
+func ReadTypedMessage(r io.Reader, expectedType byte, msg any) error {
 	msgType, payload, err := ReadMessage(r)
 	if err != nil {
 		return err

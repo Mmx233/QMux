@@ -25,7 +25,7 @@ var (
 	maxReconnectDelay = 60 * time.Second
 )
 
-func runClient(cmd *cobra.Command, args []string) error {
+func runClient(_ *cobra.Command, _ []string) error {
 	logger := log.With().Str("com", "client-cmd").Logger()
 
 	// Load configuration with validation

@@ -27,7 +27,7 @@ func TestConnectionPool_Stop_NoGoroutineLeak(t *testing.T) {
 	balancer := NewRoundRobinBalancer()
 
 	// Create and stop multiple pools
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		pool := New(fmt.Sprintf("127.0.0.1:%d", 8443+i), balancer, logger)
 		pool.Stop()
 	}
@@ -45,7 +45,7 @@ func TestConnectionPool_RapidCreateStop_NoLeak(t *testing.T) {
 	balancer := NewRoundRobinBalancer()
 
 	// Rapid create/stop cycle
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		pool := New("127.0.0.1:8443", balancer, logger)
 		pool.Stop()
 	}
@@ -65,8 +65,8 @@ func TestConnectionPool_AddRemove_NoLeak(t *testing.T) {
 	defer pool.Stop()
 
 	// Add and remove many clients
-	for i := 0; i < 100; i++ {
-		clientID := "client-" + string(rune('0'+i%10))
+	for i := range 100 {
+		clientID := fmt.Sprintf("client-%c", '0'+i%10)
 		conn := &ClientConn{
 			ID:           clientID,
 			RegisteredAt: time.Now(),
@@ -82,8 +82,8 @@ func TestConnectionPool_AddRemove_NoLeak(t *testing.T) {
 	}
 
 	// Remove all
-	for i := 0; i < 10; i++ {
-		clientID := "client-" + string(rune('0'+i))
+	for i := range 10 {
+		clientID := fmt.Sprintf("client-%c", '0'+i)
 		pool.Remove(clientID)
 	}
 }
@@ -103,11 +103,10 @@ func TestConnectionPool_ConcurrentOperations_NoLeak(t *testing.T) {
 	opsPerGoroutine := 50
 
 	// Concurrent adds
-	for i := 0; i < numGoroutines; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for j := 0; j < opsPerGoroutine; j++ {
+	for i := range numGoroutines {
+		wg.Go(func() {
+			id := i
+			for range opsPerGoroutine {
 				clientID := "client-" + string(rune('A'+id))
 				conn := &ClientConn{
 					ID:           clientID,
@@ -115,34 +114,31 @@ func TestConnectionPool_ConcurrentOperations_NoLeak(t *testing.T) {
 					LastSeen:     time.Now(),
 				}
 				pool.Remove(clientID)
-				pool.Add(clientID, conn)
+				_ = pool.Add(clientID, conn)
 			}
-		}(i)
+		})
 	}
 
 	// Concurrent selects
-	for i := 0; i < numGoroutines; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < opsPerGoroutine; j++ {
-				pool.Select()
+	for range numGoroutines {
+		wg.Go(func() {
+			for range opsPerGoroutine {
+				_, _ = pool.Select()
 			}
-		}()
+		})
 	}
 
 	// Concurrent health updates
-	for i := 0; i < numGoroutines; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
+	for i := range numGoroutines {
+		wg.Go(func() {
+			id := i
 			clientID := "client-" + string(rune('A'+id))
-			for j := 0; j < opsPerGoroutine; j++ {
+			for range opsPerGoroutine {
 				pool.MarkHealthy(clientID)
 				pool.MarkUnhealthy(clientID)
 				pool.UpdateLastSeen(clientID)
 			}
-		}(i)
+		})
 	}
 
 	wg.Wait()
@@ -164,10 +160,10 @@ func TestConnectionPool_ClientHealthTransitions_NoLeak(t *testing.T) {
 		RegisteredAt: time.Now(),
 		LastSeen:     time.Now(),
 	}
-	pool.Add("test-client", conn)
+	_ = pool.Add("test-client", conn)
 
 	// Rapid health transitions
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		pool.MarkHealthy("test-client")
 		pool.MarkUnhealthy("test-client")
 	}

@@ -55,7 +55,7 @@ func (l *Listener) acceptTCP() {
 
 // handleTCPConnection handles a single TCP connection
 func (l *Listener) handleTCPConnection(conn net.Conn) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	logger := l.logger.With().
 		Str("remote", conn.RemoteAddr().String()).
@@ -81,7 +81,7 @@ func (l *Listener) handleTCPConnection(conn net.Conn) {
 		l.Pool.MarkUnhealthy(client.ID)
 		return
 	}
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 
 	// Send NewConn message
 	connID := connid.Generate()

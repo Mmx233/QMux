@@ -52,7 +52,7 @@ func (m *SessionCacheManager) Clear(serverAddr string) {
 // This is primarily useful for testing.
 func (m *SessionCacheManager) Count() int {
 	count := 0
-	m.caches.Range(func(_, _ interface{}) bool {
+	m.caches.Range(func(_, _ any) bool {
 		count++
 		return true
 	})
@@ -63,7 +63,7 @@ func (m *SessionCacheManager) Count() int {
 // This is primarily useful for testing and debugging.
 func (m *SessionCacheManager) Addresses() []string {
 	var addresses []string
-	m.caches.Range(func(key, _ interface{}) bool {
+	m.caches.Range(func(key, _ any) bool {
 		addresses = append(addresses, key.(string))
 		return true
 	})

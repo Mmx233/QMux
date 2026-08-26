@@ -14,13 +14,21 @@ const (
 	LargePayloadSize  = 65536 // 64 KB - large message
 )
 
-// generatePayload creates a byte slice of the specified size
-func generatePayload(size int) []byte {
-	payload := make([]byte, size)
-	for i := range payload {
-		payload[i] = byte(i % 256)
+func TestBufferSizeConstants(t *testing.T) {
+	sizes := []struct {
+		name string
+		got  int
+		want int
+	}{
+		{"small", SmallBufferSize, 256},
+		{"medium", MediumBufferSize, 4096},
+		{"large", LargeBufferSize, 65536},
 	}
-	return payload
+	for _, size := range sizes {
+		if size.got != size.want {
+			t.Errorf("%s buffer size = %d, want %d", size.name, size.got, size.want)
+		}
+	}
 }
 
 // createTestMessage creates a test message struct with a payload of the given size
@@ -37,7 +45,7 @@ func createTestPayload(size int) testPayload {
 }
 
 // preEncodeMessage encodes a message and returns the bytes for read benchmarks
-func preEncodeMessage(msgType byte, payload interface{}) []byte {
+func preEncodeMessage(msgType byte, payload any) []byte {
 	var buf bytes.Buffer
 	if err := WriteMessage(&buf, msgType, payload); err != nil {
 		panic(err)
@@ -111,7 +119,7 @@ func BenchmarkDecodeMessage(b *testing.B) {
 	messages := []struct {
 		name    string
 		msgType byte
-		payload interface{}
+		payload any
 	}{
 		{"Register", MsgTypeRegister, RegisterMsg{
 			ClientID:     "client-12345",
@@ -140,7 +148,7 @@ func BenchmarkDecodeMessage(b *testing.B) {
 			b.ResetTimer()
 
 			for i := 0; i < b.N; i++ {
-				var decoded interface{}
+				var decoded any
 				switch m.msgType {
 				case MsgTypeRegister:
 					decoded = &RegisterMsg{}

@@ -99,10 +99,8 @@ func (cm *ConnectionManager) Start(ctx context.Context) error {
 	var connectionErrors []error
 
 	for _, server := range servers {
-		wg.Add(1)
-		go func(endpoint config.ServerEndpoint) {
-			defer wg.Done()
-
+		wg.Go(func() {
+			endpoint := server
 			// Get or create session cache for this server
 			sessionCache := cm.sessionCaches.GetOrCreate(endpoint.Address)
 
@@ -147,7 +145,7 @@ func (cm *ConnectionManager) Start(ctx context.Context) error {
 				connectionErrors = append(connectionErrors, fmt.Errorf("server %s registration: %w", endpoint.Address, err))
 				mu.Unlock()
 
-				sc.Close()
+				_ = sc.Close()
 				cm.startReconnection(endpoint.Address)
 				return
 			}
@@ -159,7 +157,7 @@ func (cm *ConnectionManager) Start(ctx context.Context) error {
 			cm.logger.Info().
 				Str("server", endpoint.Address).
 				Msg("successfully connected and registered")
-		}(server)
+		})
 	}
 
 	// Wait for all connection attempts to complete
@@ -207,7 +205,7 @@ func CalculateBackoff(attempt int) time.Duration {
 	}
 
 	backoff := InitialBackoff
-	for i := 0; i < attempt; i++ {
+	for range attempt {
 		backoff *= BackoffFactor
 		if backoff > MaxBackoff {
 			return MaxBackoff
@@ -226,13 +224,13 @@ func (cm *ConnectionManager) startReconnection(serverAddr string) {
 	cm.reconnecting[serverAddr] = true
 	cm.reconnectMu.Unlock()
 
-	cm.wg.Add(1)
-	go cm.reconnectionLoop(serverAddr)
+	cm.wg.Go(func() {
+		cm.reconnectionLoop(serverAddr)
+	})
 }
 
 // reconnectionLoop attempts to reconnect to a server with exponential backoff.
 func (cm *ConnectionManager) reconnectionLoop(serverAddr string) {
-	defer cm.wg.Done()
 	defer func() {
 		cm.reconnectMu.Lock()
 		delete(cm.reconnecting, serverAddr)
@@ -307,7 +305,7 @@ func (cm *ConnectionManager) reconnectionLoop(serverAddr string) {
 				Int("attempt", attempt+1).
 				Err(err).
 				Msg("registration failed during reconnection")
-			sc.Close()
+			_ = sc.Close()
 			attempt++
 			continue
 		}
@@ -358,7 +356,7 @@ func (cm *ConnectionManager) Stop() error {
 
 	// Close all connections
 	var closeErrors []error
-	cm.connections.Range(func(key, value interface{}) bool {
+	cm.connections.Range(func(key, value any) bool {
 		sc := value.(*ServerConnection)
 		if err := sc.Close(); err != nil {
 			closeErrors = append(closeErrors, fmt.Errorf("close %s: %w", key.(string), err))
@@ -377,7 +375,7 @@ func (cm *ConnectionManager) Stop() error {
 // GetAllConnections returns all server connections.
 func (cm *ConnectionManager) GetAllConnections() []*ServerConnection {
 	var conns []*ServerConnection
-	cm.connections.Range(func(key, value interface{}) bool {
+	cm.connections.Range(func(key, value any) bool {
 		conns = append(conns, value.(*ServerConnection))
 		return true
 	})
@@ -395,7 +393,7 @@ func (cm *ConnectionManager) GetConnection(serverAddr string) *ServerConnection 
 // HealthyCount returns the number of healthy connections.
 func (cm *ConnectionManager) HealthyCount() int {
 	count := 0
-	cm.connections.Range(func(_, value interface{}) bool {
+	cm.connections.Range(func(_, value any) bool {
 		if sc := value.(*ServerConnection); sc.IsHealthy() {
 			count++
 		}
@@ -407,7 +405,7 @@ func (cm *ConnectionManager) HealthyCount() int {
 // TotalCount returns the total number of connections.
 func (cm *ConnectionManager) TotalCount() int {
 	count := 0
-	cm.connections.Range(func(_, _ interface{}) bool {
+	cm.connections.Range(func(_, _ any) bool {
 		count++
 		return true
 	})

@@ -6,6 +6,58 @@ import (
 	"pgregory.net/rapid"
 )
 
+type propertyBufferPool struct {
+	name string
+	size int
+	get  func() *[]byte
+	put  func(*[]byte)
+}
+
+func checkReusedBufferSizeInvariant(t *testing.T, pool propertyBufferPool) {
+	t.Helper()
+	rapid.Check(t, func(t *rapid.T) {
+		iterations := rapid.IntRange(1, 20).Draw(t, "iterations")
+		for i := range iterations {
+			buf := pool.get()
+			if len(*buf) != pool.size {
+				t.Errorf("%s iteration %d: buffer length %d, expected %d", pool.name, i, len(*buf), pool.size)
+			}
+
+			writeLen := rapid.IntRange(0, pool.size).Draw(t, "writeLen")
+			for j := range writeLen {
+				(*buf)[j] = byte(j % 256)
+			}
+			pool.put(buf)
+
+			reused := pool.get()
+			if len(*reused) != pool.size {
+				t.Errorf("%s iteration %d after reuse: buffer length %d, expected %d", pool.name, i, len(*reused), pool.size)
+			}
+			pool.put(reused)
+		}
+	})
+}
+
+func checkConcurrentBufferSizeInvariant(t *testing.T, pool propertyBufferPool) {
+	t.Helper()
+	rapid.Check(t, func(t *rapid.T) {
+		numBuffers := rapid.IntRange(1, 50).Draw(t, "numBuffers")
+		buffers := make([]*[]byte, numBuffers)
+		for i := range numBuffers {
+			buffers[i] = pool.get()
+			if buffers[i] == nil {
+				t.Fatalf("%s buffer %d is nil", pool.name, i)
+			}
+			if len(*buffers[i]) != pool.size {
+				t.Errorf("%s buffer %d has length %d, expected %d", pool.name, i, len(*buffers[i]), pool.size)
+			}
+		}
+		for i := range numBuffers {
+			pool.put(buffers[i])
+		}
+	})
+}
+
 // Feature: udp-performance-optimization, Property 2: Datagram Buffer Size Invariant
 // *For any* call to GetDatagramBuffer, the returned buffer SHALL have a length of
 // exactly MaxDatagramSize (1200 bytes).
@@ -18,7 +70,7 @@ func TestDatagramBufferSizeInvariant_Property(t *testing.T) {
 		// Generate a random number of buffer requests to simulate various usage patterns
 		numRequests := rapid.IntRange(1, 10).Draw(t, "numRequests")
 
-		for i := 0; i < numRequests; i++ {
+		for range numRequests {
 			// Get a datagram buffer from the pool
 			buf := GetDatagramBuffer()
 
@@ -48,68 +100,18 @@ func TestDatagramBufferSizeInvariant_Property(t *testing.T) {
 // TestDatagramBufferSizeInvariant_ReusedBuffers_Property verifies that buffers
 // returned to the pool and retrieved again still maintain the size invariant.
 func TestDatagramBufferSizeInvariant_ReusedBuffers_Property(t *testing.T) {
-	rapid.Check(t, func(t *rapid.T) {
-		// Get a buffer, modify it (simulate usage), return it, get it again
-		iterations := rapid.IntRange(1, 20).Draw(t, "iterations")
-
-		for i := 0; i < iterations; i++ {
-			buf := GetDatagramBuffer()
-
-			// Verify size before any modification
-			if len(*buf) != MaxDatagramSize {
-				t.Errorf("Iteration %d: buffer length %d, expected %d",
-					i, len(*buf), MaxDatagramSize)
-			}
-
-			// Simulate writing data to the buffer (common usage pattern)
-			writeLen := rapid.IntRange(0, MaxDatagramSize).Draw(t, "writeLen")
-			for j := 0; j < writeLen; j++ {
-				(*buf)[j] = byte(j % 256)
-			}
-
-			// Return to pool
-			PutDatagramBuffer(buf)
-
-			// Get another buffer (may or may not be the same one)
-			buf2 := GetDatagramBuffer()
-
-			// Property: Size invariant must hold regardless of pool state
-			if len(*buf2) != MaxDatagramSize {
-				t.Errorf("Iteration %d (after reuse): buffer length %d, expected %d",
-					i, len(*buf2), MaxDatagramSize)
-			}
-
-			PutDatagramBuffer(buf2)
-		}
+	checkReusedBufferSizeInvariant(t, propertyBufferPool{
+		name: "datagram", size: MaxDatagramSize,
+		get: GetDatagramBuffer, put: PutDatagramBuffer,
 	})
 }
 
 // TestDatagramBufferSizeInvariant_ConcurrentAccess_Property verifies the size
 // invariant holds under concurrent access patterns.
 func TestDatagramBufferSizeInvariant_ConcurrentAccess_Property(t *testing.T) {
-	rapid.Check(t, func(t *rapid.T) {
-		// Get multiple buffers concurrently (simulated by getting many at once)
-		numBuffers := rapid.IntRange(1, 50).Draw(t, "numBuffers")
-		buffers := make([]*[]byte, numBuffers)
-
-		// Get all buffers
-		for i := 0; i < numBuffers; i++ {
-			buffers[i] = GetDatagramBuffer()
-
-			// Property: Each buffer must have exactly MaxDatagramSize bytes
-			if buffers[i] == nil {
-				t.Fatalf("Buffer %d is nil", i)
-			}
-			if len(*buffers[i]) != MaxDatagramSize {
-				t.Errorf("Buffer %d has length %d, expected %d",
-					i, len(*buffers[i]), MaxDatagramSize)
-			}
-		}
-
-		// Return all buffers
-		for i := 0; i < numBuffers; i++ {
-			PutDatagramBuffer(buffers[i])
-		}
+	checkConcurrentBufferSizeInvariant(t, propertyBufferPool{
+		name: "datagram", size: MaxDatagramSize,
+		get: GetDatagramBuffer, put: PutDatagramBuffer,
 	})
 }
 
@@ -125,7 +127,7 @@ func TestReadBufferSizeInvariant_Property(t *testing.T) {
 		// Generate a random number of buffer requests to simulate various usage patterns
 		numRequests := rapid.IntRange(1, 10).Draw(t, "numRequests")
 
-		for i := 0; i < numRequests; i++ {
+		for range numRequests {
 			// Get a read buffer from the pool
 			buf := GetReadBuffer()
 
@@ -155,67 +157,37 @@ func TestReadBufferSizeInvariant_Property(t *testing.T) {
 // TestReadBufferSizeInvariant_ReusedBuffers_Property verifies that buffers
 // returned to the pool and retrieved again still maintain the size invariant.
 func TestReadBufferSizeInvariant_ReusedBuffers_Property(t *testing.T) {
-	rapid.Check(t, func(t *rapid.T) {
-		// Get a buffer, modify it (simulate usage), return it, get it again
-		iterations := rapid.IntRange(1, 20).Draw(t, "iterations")
-
-		for i := 0; i < iterations; i++ {
-			buf := GetReadBuffer()
-
-			// Verify size before any modification
-			if len(*buf) != ReadBufferSize {
-				t.Errorf("Iteration %d: buffer length %d, expected %d",
-					i, len(*buf), ReadBufferSize)
-			}
-
-			// Simulate writing data to the buffer (common usage pattern for UDP reads)
-			writeLen := rapid.IntRange(0, ReadBufferSize).Draw(t, "writeLen")
-			for j := 0; j < writeLen; j++ {
-				(*buf)[j] = byte(j % 256)
-			}
-
-			// Return to pool
-			PutReadBuffer(buf)
-
-			// Get another buffer (may or may not be the same one)
-			buf2 := GetReadBuffer()
-
-			// Property: Size invariant must hold regardless of pool state
-			if len(*buf2) != ReadBufferSize {
-				t.Errorf("Iteration %d (after reuse): buffer length %d, expected %d",
-					i, len(*buf2), ReadBufferSize)
-			}
-
-			PutReadBuffer(buf2)
-		}
+	checkReusedBufferSizeInvariant(t, propertyBufferPool{
+		name: "read", size: ReadBufferSize,
+		get: GetReadBuffer, put: PutReadBuffer,
 	})
 }
 
 // TestReadBufferSizeInvariant_ConcurrentAccess_Property verifies the size
 // invariant holds under concurrent access patterns.
 func TestReadBufferSizeInvariant_ConcurrentAccess_Property(t *testing.T) {
-	rapid.Check(t, func(t *rapid.T) {
-		// Get multiple buffers concurrently (simulated by getting many at once)
-		numBuffers := rapid.IntRange(1, 50).Draw(t, "numBuffers")
-		buffers := make([]*[]byte, numBuffers)
-
-		// Get all buffers
-		for i := 0; i < numBuffers; i++ {
-			buffers[i] = GetReadBuffer()
-
-			// Property: Each buffer must have exactly ReadBufferSize (65535) bytes
-			if buffers[i] == nil {
-				t.Fatalf("Buffer %d is nil", i)
-			}
-			if len(*buffers[i]) != ReadBufferSize {
-				t.Errorf("Buffer %d has length %d, expected %d",
-					i, len(*buffers[i]), ReadBufferSize)
-			}
-		}
-
-		// Return all buffers
-		for i := 0; i < numBuffers; i++ {
-			PutReadBuffer(buffers[i])
-		}
+	checkConcurrentBufferSizeInvariant(t, propertyBufferPool{
+		name: "read", size: ReadBufferSize,
+		get: GetReadBuffer, put: PutReadBuffer,
 	})
+}
+
+func TestInitBufferPoolCustomSizes(t *testing.T) {
+	t.Cleanup(func() {
+		InitBufferPool(DefaultDatagramBufferSize, DefaultReadBufferSize, DefaultFragmentBufferSize)
+	})
+
+	const datagramSize, readSize, fragmentSize = 512, 2048, 503
+	InitBufferPool(datagramSize, readSize, fragmentSize)
+
+	for name, buffer := range map[string]*[]byte{
+		"datagram": GetDatagramBuffer(),
+		"read":     GetReadBuffer(),
+		"fragment": GetFragmentBuffer(),
+	} {
+		want := map[string]int{"datagram": datagramSize, "read": readSize, "fragment": fragmentSize}[name]
+		if len(*buffer) != want {
+			t.Errorf("%s buffer length = %d, want %d", name, len(*buffer), want)
+		}
+	}
 }

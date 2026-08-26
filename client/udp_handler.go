@@ -3,8 +3,8 @@ package client
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -77,8 +77,8 @@ func NewUDPHandler(localHost string, localPort int, enableFragmentation bool, lo
 }
 
 // Start starts the UDP handler for a QUIC connection
-func (h *UDPHandler) Start(ctx context.Context, quicConn quic.Conn) {
-	go h.receiveDatagrams(ctx, &quicConn)
+func (h *UDPHandler) Start(ctx context.Context, quicConn *quic.Conn) {
+	go h.receiveDatagrams(ctx, quicConn)
 	go h.cleanupLoop()
 }
 
@@ -89,7 +89,7 @@ func (h *UDPHandler) Stop() {
 	// Close all local connections
 	h.sessions.Range(func(key, value any) bool {
 		session := value.(*UDPSession)
-		session.localConn.Close()
+		_ = session.localConn.Close()
 		return true
 	})
 }
@@ -146,7 +146,7 @@ func (h *UDPHandler) getOrCreateSession(sessionID uint32, quicConn *quic.Conn) (
 	}
 
 	// Slow path: create new session
-	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", h.localHost, h.localPort))
+	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(h.localHost, strconv.Itoa(h.localPort)))
 	if err != nil {
 		return nil, err
 	}
@@ -171,7 +171,7 @@ func (h *UDPHandler) getOrCreateSession(sessionID uint32, quicConn *quic.Conn) (
 	actual, loaded := h.sessions.LoadOrStore(sessionID, session)
 	if loaded {
 		// Another goroutine created the session first
-		localConn.Close()
+		_ = localConn.Close()
 		return actual.(*UDPSession), nil
 	}
 
@@ -190,7 +190,7 @@ func (h *UDPHandler) readLocalResponses(session *UDPSession) {
 		bufPtr := protocol.GetReadBuffer()
 		buf := *bufPtr
 
-		session.localConn.SetReadDeadline(time.Now().Add(udpSessionTimeout))
+		_ = session.localConn.SetReadDeadline(time.Now().Add(udpSessionTimeout))
 		n, err := session.localConn.Read(buf)
 		if err != nil {
 			select {
@@ -248,7 +248,7 @@ func (h *UDPHandler) readLocalResponses(session *UDPSession) {
 func (h *UDPHandler) closeSession(sessionID uint32) {
 	if sessionI, ok := h.sessions.LoadAndDelete(sessionID); ok {
 		session := sessionI.(*UDPSession)
-		session.localConn.Close()
+		_ = session.localConn.Close()
 		h.logger.Debug().Uint32("session_id", sessionID).Msg("UDP session closed")
 	}
 }

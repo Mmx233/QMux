@@ -25,7 +25,7 @@ func TestHealthStatusIndependence_Property(t *testing.T) {
 
 		// Create N server connections
 		connections := make([]*ServerConnection, n)
-		for i := 0; i < n; i++ {
+		for i := range n {
 			addr := rapid.SampledFrom([]string{
 				"server1.example.com:8443",
 				"server2.example.com:8443",
@@ -290,7 +290,7 @@ func TestReceiveUpdatesTimestamp_Property(t *testing.T) {
 
 		var previousTimestamp time.Time
 
-		for i := 0; i < updateCount; i++ {
+		for i := range updateCount {
 			// Get timestamp before update
 			previousTimestamp = conn.LastReceivedFromServer()
 
@@ -338,17 +338,15 @@ func TestReceiveUpdatesTimestamp_Concurrent_Property(t *testing.T) {
 		updatesPerGoroutine := rapid.IntRange(5, 20).Draw(t, "updatesPerGoroutine")
 
 		var wg sync.WaitGroup
-		wg.Add(goroutineCount)
 
-		for g := 0; g < goroutineCount; g++ {
-			go func() {
-				defer wg.Done()
-				for i := 0; i < updatesPerGoroutine; i++ {
+		for range goroutineCount {
+			wg.Go(func() {
+				for range updatesPerGoroutine {
 					conn.UpdateLastReceivedFromServer()
 					// Read timestamp to verify no data race
 					_ = conn.LastReceivedFromServer()
 				}
-			}()
+			})
 		}
 
 		wg.Wait()
@@ -399,10 +397,9 @@ func TestHealthDetermination_Property(t *testing.T) {
 
 		// Test case 3: Wait for less than timeout - should still be healthy
 		// Use a fraction of the timeout to ensure we're within bounds
-		waitTime := healthTimeout / 4
-		if waitTime > 50*time.Millisecond {
-			waitTime = 50 * time.Millisecond // Cap wait time for test speed
-		}
+		waitTime := min(healthTimeout/4,
+			// Cap wait time for test speed
+			50*time.Millisecond)
 		time.Sleep(waitTime)
 
 		if !conn.CheckReceivedHealth() {
@@ -523,10 +520,7 @@ func TestUnhealthyTriggersReconnection_Property(t *testing.T) {
 
 		// Wait for timeout to be exceeded plus buffer for the timeout check ticker
 		// The timeout check interval is healthTimeout/2 (min 100ms)
-		timeoutCheckInterval := healthTimeout / 2
-		if timeoutCheckInterval < 100*time.Millisecond {
-			timeoutCheckInterval = 100 * time.Millisecond
-		}
+		timeoutCheckInterval := max(healthTimeout/2, 100*time.Millisecond)
 		waitTime := healthTimeout + timeoutCheckInterval + 100*time.Millisecond
 		time.Sleep(waitTime)
 
@@ -546,7 +540,7 @@ func TestUnhealthyTriggersReconnection_Property(t *testing.T) {
 		}
 
 		// Cleanup
-		conn.Close()
+		_ = conn.Close()
 	})
 }
 
@@ -578,7 +572,7 @@ func TestUnhealthyTriggersReconnection_NoFalsePositive_Property(t *testing.T) {
 		updateCount := rapid.IntRange(2, 5).Draw(t, "updateCount")
 
 		// Send heartbeats at regular intervals (well within timeout)
-		for i := 0; i < updateCount; i++ {
+		for i := range updateCount {
 			time.Sleep(50 * time.Millisecond)
 			conn.UpdateLastReceivedFromServer()
 
@@ -599,7 +593,7 @@ func TestUnhealthyTriggersReconnection_NoFalsePositive_Property(t *testing.T) {
 		}
 
 		// Cleanup
-		conn.Close()
+		_ = conn.Close()
 	})
 }
 
@@ -661,7 +655,7 @@ func TestNonBlockingHeartbeatSend_WithMockStream_Property(t *testing.T) {
 		sendCount := rapid.IntRange(1, 10).Draw(t, "sendCount")
 
 		// Property: multiple sends should all complete quickly
-		for i := 0; i < sendCount; i++ {
+		for i := range sendCount {
 			start := time.Now()
 			// Write to mock stream
 			mockStream.Reset()
@@ -680,7 +674,7 @@ func TestNonBlockingHeartbeatSend_WithMockStream_Property(t *testing.T) {
 		}
 
 		// Cleanup
-		conn.Close()
+		_ = conn.Close()
 	})
 }
 
@@ -698,7 +692,7 @@ func (m *mockControlStream) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
-func (m *mockControlStream) Read(p []byte) (n int, err error) {
+func (m *mockControlStream) Read(_ []byte) (n int, err error) {
 	// Block forever to simulate no response - but we shouldn't reach here
 	// because non-blocking send doesn't wait for response
 	select {}
@@ -779,7 +773,7 @@ func TestWriteErrorMarksUnhealthy_Property(t *testing.T) {
 		}
 
 		// Cleanup
-		conn.Close()
+		_ = conn.Close()
 	})
 }
 
@@ -805,7 +799,7 @@ func TestWriteErrorMarksUnhealthy_WithFailingStream_Property(t *testing.T) {
 		// Generate number of error scenarios (1-5)
 		errorCount := rapid.IntRange(1, 5).Draw(t, "errorCount")
 
-		for i := 0; i < errorCount; i++ {
+		for i := range errorCount {
 			// Reset state for each iteration
 			conn.MarkHealthy()
 			reconnectCalled.Store(false)
@@ -829,7 +823,7 @@ func TestWriteErrorMarksUnhealthy_WithFailingStream_Property(t *testing.T) {
 			}
 		}
 
-		conn.Close()
+		_ = conn.Close()
 	})
 }
 
@@ -870,6 +864,6 @@ func TestWriteErrorMarksUnhealthy_NoCallback_Property(t *testing.T) {
 			t.Fatalf("state should be StateUnhealthy, got %v", conn.State())
 		}
 
-		conn.Close()
+		_ = conn.Close()
 	})
 }

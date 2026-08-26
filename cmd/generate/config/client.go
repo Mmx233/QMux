@@ -16,7 +16,7 @@ var ClientCmd = &cobra.Command{
 	RunE:  runClientGenerate,
 }
 
-func runClientGenerate(cmd *cobra.Command, args []string) error {
+func runClientGenerate(_ *cobra.Command, _ []string) error {
 	logger := log.With().Str("com", "generate").Logger()
 	outputPath := GetConfigFile()
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -71,12 +72,13 @@ func (c *Client) Start(ctx context.Context) error {
 
 	c.logger.Info().
 		Strs("servers", serverAddrs).
-		Str("local", fmt.Sprintf("%s:%d", c.config.Local.Host, c.config.Local.Port)).
+		Str("local", net.JoinHostPort(c.config.Local.Host, strconv.Itoa(c.config.Local.Port))).
 		Msg("starting client")
 
 	// Listen for new connections (initial + reconnected) from the connection manager
-	c.wg.Add(1)
-	go c.handleNewConnections(ctx)
+	c.wg.Go(func() {
+		c.handleNewConnections(ctx)
+	})
 
 	// Start connection manager (handles connecting to all servers)
 	if err := c.connMgr.Start(ctx); err != nil {
@@ -98,8 +100,6 @@ func (c *Client) Start(ctx context.Context) error {
 // handleNewConnections listens on the connection manager's NewConns channel
 // and starts stream acceptance and UDP handler for each new connection.
 func (c *Client) handleNewConnections(ctx context.Context) {
-	defer c.wg.Done()
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -108,8 +108,9 @@ func (c *Client) handleNewConnections(ctx context.Context) {
 			if !ok {
 				return
 			}
-			c.wg.Add(1)
-			go c.acceptStreamsFromConnection(ctx, sc)
+			c.wg.Go(func() {
+				c.acceptStreamsFromConnection(ctx, sc)
+			})
 
 			if sc.Connection() != nil {
 				udpHandler := NewUDPHandler(
@@ -119,7 +120,7 @@ func (c *Client) handleNewConnections(ctx context.Context) {
 					c.logger,
 				)
 				c.udpHandlers.Store(sc.ServerAddr(), udpHandler)
-				udpHandler.Start(ctx, *sc.Connection())
+				udpHandler.Start(ctx, sc.Connection())
 			}
 		}
 	}
@@ -127,8 +128,6 @@ func (c *Client) handleNewConnections(ctx context.Context) {
 
 // acceptStreamsFromConnection accepts incoming streams from a specific server connection
 func (c *Client) acceptStreamsFromConnection(ctx context.Context, sc *ServerConnection) {
-	defer c.wg.Done()
-
 	logger := c.logger.With().Str("server", sc.ServerAddr()).Logger()
 
 	for {
@@ -146,13 +145,15 @@ func (c *Client) acceptStreamsFromConnection(ctx context.Context, sc *ServerConn
 			return
 		}
 
-		go c.handleStream(ctx, stream, sc)
+		go c.handleStream(stream, sc)
 	}
 }
 
 // handleStream handles a single stream from server
-func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *ServerConnection) {
-	defer stream.Close()
+func (c *Client) handleStream(stream *quic.Stream, sc *ServerConnection) {
+	defer func() {
+		_ = stream.Close()
+	}()
 
 	// Read NewConn message
 	var msg protocol.NewConnMsg
@@ -172,14 +173,16 @@ func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *Serv
 	logger.Info().Msg("new connection from server")
 
 	// Connect to local service
-	localAddr := fmt.Sprintf("%s:%d", c.config.Local.Host, c.config.Local.Port)
+	localAddr := net.JoinHostPort(c.config.Local.Host, strconv.Itoa(c.config.Local.Port))
 	localConn, err := net.DialTimeout(msg.Protocol, localAddr, 5*time.Second)
 	if err != nil {
 		logger.Error().Err(err).Str("local_addr", localAddr).Msg("dial local service failed")
-		protocol.WriteConnClose(stream, msg.ConnID, fmt.Sprintf("dial failed: %v", err))
+		_ = protocol.WriteConnClose(stream, msg.ConnID, fmt.Sprintf("dial failed: %v", err))
 		return
 	}
-	defer localConn.Close()
+	defer func() {
+		_ = localConn.Close()
+	}()
 
 	// Optimize TCP connection
 	if tc, ok := localConn.(*net.TCPConn); ok {
@@ -208,7 +211,7 @@ func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *Serv
 	}
 
 	// Send close message
-	protocol.WriteConnClose(stream, msg.ConnID, "closed")
+	_ = protocol.WriteConnClose(stream, msg.ConnID, "closed")
 }
 
 // shutdown gracefully shuts down the client
@@ -216,7 +219,7 @@ func (c *Client) shutdown() error {
 	c.cancel()
 
 	// Stop all UDP handlers
-	c.udpHandlers.Range(func(key, value interface{}) bool {
+	c.udpHandlers.Range(func(key, value any) bool {
 		if handler, ok := value.(*UDPHandler); ok {
 			handler.Stop()
 		}
@@ -224,9 +227,9 @@ func (c *Client) shutdown() error {
 	})
 
 	// Close all local connections
-	c.localConns.Range(func(key, value interface{}) bool {
+	c.localConns.Range(func(key, value any) bool {
 		if conn, ok := value.(net.Conn); ok {
-			conn.Close()
+			_ = conn.Close()
 		}
 		return true
 	})

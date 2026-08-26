@@ -16,14 +16,14 @@ func TestSessionCacheUniqueness_Property(t *testing.T) {
 		// Generate N distinct server addresses (1-10)
 		n := rapid.IntRange(1, 10).Draw(t, "addressCount")
 		addresses := make([]string, n)
-		for i := 0; i < n; i++ {
+		for i := range n {
 			addresses[i] = fmt.Sprintf("server%d.example.com:%d", i, 8443+i)
 		}
 
 		manager := NewSessionCacheManager()
 
 		// Create caches for all addresses
-		caches := make(map[string]interface{})
+		caches := make(map[string]any)
 		for _, addr := range addresses {
 			cache := manager.GetOrCreate(addr)
 			caches[addr] = cache

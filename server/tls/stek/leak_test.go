@@ -63,7 +63,7 @@ func TestRotateManager_ContextCancellation_NoLeak(t *testing.T) {
 func TestRotateManager_RapidStartStop_NoLeak(t *testing.T) {
 	defer goleak.VerifyNone(t)
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		manager, err := NewRotateManager(50*time.Millisecond, 2)
 		if err != nil {
 			t.Fatalf("failed to create manager: %v", err)

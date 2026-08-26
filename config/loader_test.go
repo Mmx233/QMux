@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -80,7 +81,7 @@ port: not closed`
 func TestLoadConfig_RoundTrip_Property(t *testing.T) {
 	// Property: For any valid config struct, writing to YAML and loading back
 	// should produce an equivalent struct.
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		// Generate random config values
 		original := testConfig{
 			Name:    randomString(i),
@@ -125,7 +126,7 @@ func randomString(seed int) string {
 	chars := "abcdefghijklmnopqrstuvwxyz0123456789-_"
 	length := (seed % 20) + 1
 	result := make([]byte, length)
-	for i := 0; i < length; i++ {
+	for i := range length {
 		result[i] = chars[(seed+i*7)%len(chars)]
 	}
 	return string(result)
@@ -240,9 +241,9 @@ func TestLoadClientConfig_TooManyServers(t *testing.T) {
 server:
   servers:
 `
-	for i := 0; i < 11; i++ {
-		content += "    - address: \"server" + string(rune('a'+i)) + ".example.com:8443\"\n"
-		content += "      server_name: \"server" + string(rune('a'+i)) + ".example.com\"\n"
+	for i := range 11 {
+		content += fmt.Sprintf("    - address: \"server%c.example.com:8443\"\n", 'a'+i)
+		content += fmt.Sprintf("      server_name: \"server%c.example.com\"\n", 'a'+i)
 	}
 	content += `local:
   host: "127.0.0.1"

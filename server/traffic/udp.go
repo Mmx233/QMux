@@ -302,7 +302,7 @@ func (h *UDPHandler) cleanupLoop() {
 		case <-h.ctx.Done():
 			return
 		case <-ticker.C:
-			h.sessions.Range(func(key, value interface{}) bool {
+			h.sessions.Range(func(key, value any) bool {
 				session := value.(*UDPSession)
 				if session.isExpired(udpSessionTimeout) {
 					h.logger.Debug().Str("addr", key.(string)).Msg("cleaning up expired UDP session")

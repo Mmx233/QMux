@@ -494,7 +494,7 @@ func (sc *ServerConnection) Close() error {
 
 	// Close control stream first
 	if sc.controlStream != nil {
-		sc.controlStream.Close()
+		_ = sc.controlStream.Close()
 		sc.controlStream = nil
 	}
 

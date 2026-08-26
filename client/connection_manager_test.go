@@ -22,7 +22,7 @@ func TestSessionCachePersistence_Property(t *testing.T) {
 		// Generate N server addresses (1-5)
 		n := rapid.IntRange(1, 5).Draw(t, "serverCount")
 		addresses := make([]string, n)
-		for i := 0; i < n; i++ {
+		for i := range n {
 			addresses[i] = rapid.StringMatching(`server[0-9]+\.example\.com:8443`).Draw(t, "serverAddr")
 		}
 
@@ -37,7 +37,7 @@ func TestSessionCachePersistence_Property(t *testing.T) {
 
 		// Close all connections
 		for _, conn := range connections {
-			conn.Close()
+			_ = conn.Close()
 		}
 
 		// Property: session caches should still be accessible after connection close
@@ -65,7 +65,7 @@ func TestExponentialBackoffReconnection_Property(t *testing.T) {
 
 		// Calculate backoffs for all attempts
 		backoffs := make([]time.Duration, n)
-		for i := 0; i < n; i++ {
+		for i := range n {
 			backoffs[i] = CalculateBackoff(i)
 		}
 
@@ -108,7 +108,7 @@ func TestGracefulShutdownCompleteness_Property(t *testing.T) {
 
 		// Create connections
 		connections := make([]*ServerConnection, n)
-		for i := 0; i < n; i++ {
+		for i := range n {
 			addr := rapid.StringMatching(`server[0-9]+\.example\.com:8443`).Draw(t, "serverAddr")
 			cache := sessionCacheManager.GetOrCreate(addr)
 			connections[i] = NewServerConnection(addr, "server.example.com", cache, logger)
@@ -120,7 +120,7 @@ func TestGracefulShutdownCompleteness_Property(t *testing.T) {
 
 		// Close all connections (simulating Stop behavior)
 		for _, conn := range connections {
-			conn.Close()
+			_ = conn.Close()
 		}
 
 		// Property: all connections should be in StateDisconnected

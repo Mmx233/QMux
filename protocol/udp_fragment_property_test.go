@@ -1,12 +1,118 @@
 package protocol
 
 import (
+	"bytes"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
 
 	"pgregory.net/rapid"
 )
+
+func drawPropertyData(t *rapid.T, minSize, maxSize int) []byte {
+	data := make([]byte, rapid.IntRange(minSize, maxSize).Draw(t, "dataLen"))
+	for i := range data {
+		data[i] = byte(rapid.IntRange(0, 255).Draw(t, "dataByte"))
+	}
+	return data
+}
+
+func reassemblePropertyResults(t *rapid.T, sessionID uint32, results []DatagramResult, order []int, checkSession bool) []byte {
+	if order == nil {
+		order = make([]int, len(results))
+		for i := range order {
+			order[i] = i
+		}
+	}
+
+	assembler := NewFragmentAssembler()
+	var reassembled []byte
+	for _, i := range order {
+		parsedSessionID, isFragmented, fragID, fragIndex, fragTotal, payload, err := ParseUDPDatagram(results[i].Data)
+		if err != nil {
+			t.Fatalf("ParseUDPDatagram failed for fragment %d: %v", i, err)
+		}
+		if !isFragmented {
+			t.Errorf("Fragment %d is not marked as fragmented", i)
+		}
+		if checkSession && parsedSessionID != sessionID {
+			t.Errorf("Fragment %d has session ID %d, expected %d", i, parsedSessionID, sessionID)
+		}
+
+		assembled, err := assembler.AddFragment(parsedSessionID, fragID, fragIndex, fragTotal, payload)
+		if err != nil {
+			t.Fatalf("AddFragment failed for fragment %d: %v", i, err)
+		}
+		if assembled != nil {
+			reassembled = assembled
+		}
+	}
+	return reassembled
+}
+
+func assertPropertyPayloadEqual(t *rapid.T, got, want []byte) {
+	if got == nil {
+		t.Fatal("Reassembly did not complete")
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("Reassembled payload differs from original: got %d bytes, want %d", len(got), len(want))
+	}
+}
+
+func collectConcurrentFragmentIDs(
+	sessionID uint32,
+	data []byte,
+	counters []*atomic.Uint32,
+	numGoroutines, callsPerGoroutine int,
+	simultaneousStart bool,
+	stopOnError bool,
+) [][]uint16 {
+	collected := make([][]uint16, len(counters))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	var start <-chan struct{}
+	var barrier chan struct{}
+	if simultaneousStart {
+		barrier = make(chan struct{})
+		start = barrier
+	}
+
+	for counterIndex := range counters {
+		for range numGoroutines {
+			wg.Go(func() {
+				if start != nil {
+					<-start
+				}
+				for range callsPerGoroutine {
+					results, err := FragmentUDPPooled(sessionID, data, counters[counterIndex], true)
+					if err != nil {
+						if stopOnError {
+							return
+						}
+						continue
+					}
+					if len(results) > 0 {
+						_, isFragmented, fragID, _, _, _, parseErr := ParseUDPDatagram(results[0].Data)
+						if parseErr == nil && isFragmented {
+							mu.Lock()
+							collected[counterIndex] = append(collected[counterIndex], fragID)
+							mu.Unlock()
+						}
+					}
+					ReleaseDatagramResults(results)
+				}
+			})
+		}
+	}
+
+	if simultaneousStart {
+		close(barrier)
+	}
+	wg.Wait()
+	return collected
+}
 
 // Feature: udp-performance-optimization, Property 1: Pooled Fragment Lifecycle
 // *For any* valid UDP data and session ID, calling `FragmentUDPPooled` SHALL return
@@ -123,19 +229,8 @@ func TestPooledFragmentLifecycle_SmallPackets_Property(t *testing.T) {
 // for packets that require fragmentation (data > MaxUDPPayload).
 func TestPooledFragmentLifecycle_LargePackets_Property(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		// Generate random session ID
 		sessionID := rapid.Uint32().Draw(t, "sessionID")
-
-		// Generate large data that requires fragmentation
-		// MaxUDPPayload = 1195, so anything larger needs fragmentation
-		// Limit to reasonable size to avoid too many fragments (max 255)
-		// MaxFragPayload = 1191, so max data = 255 * 1191 = ~303KB
-		// We'll test up to 50KB for reasonable test times
-		dataLen := rapid.IntRange(MaxUDPPayload+1, 50*1024).Draw(t, "dataLen")
-		data := make([]byte, dataLen)
-		for i := range data {
-			data[i] = byte(rapid.IntRange(0, 255).Draw(t, "dataByte"))
-		}
+		data := drawPropertyData(t, MaxUDPPayload+1, 50*1024)
 
 		var fragIDCounter atomic.Uint32
 
@@ -145,7 +240,7 @@ func TestPooledFragmentLifecycle_LargePackets_Property(t *testing.T) {
 		}
 
 		// Property: Large packets should produce multiple results
-		expectedFragments := (dataLen + MaxFragPayload - 1) / MaxFragPayload
+		expectedFragments := (len(data) + MaxFragPayload - 1) / MaxFragPayload
 		if len(results) != expectedFragments {
 			t.Errorf("Expected %d fragments, got %d", expectedFragments, len(results))
 		}
@@ -190,7 +285,7 @@ func TestPooledFragmentLifecycle_FragmentationDisabled_Property(t *testing.T) {
 		results, err := FragmentUDPPooled(sessionID, data, &fragIDCounter, false)
 
 		// Property: Should return ErrFragmentationDisabled
-		if err != ErrFragmentationDisabled {
+		if !errors.Is(err, ErrFragmentationDisabled) {
 			t.Errorf("Expected ErrFragmentationDisabled, got %v", err)
 		}
 
@@ -265,18 +360,8 @@ func TestPooledFragmentLifecycle_EmptyResults_Property(t *testing.T) {
 // reassembling it produces the original data.
 func TestFragmentReassemblyRoundTrip_Property(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		// Generate random session ID
 		sessionID := rapid.Uint32().Draw(t, "sessionID")
-
-		// Generate data that requires fragmentation (> MaxUDPPayload = 1195 bytes)
-		// Limit to reasonable size to avoid too many fragments (max 255)
-		// MaxFragPayload = 1191, so max data = 255 * 1191 = ~303KB
-		// We'll test up to 50KB for reasonable test times
-		dataLen := rapid.IntRange(MaxUDPPayload+1, 50*1024).Draw(t, "dataLen")
-		data := make([]byte, dataLen)
-		for i := range data {
-			data[i] = byte(rapid.IntRange(0, 255).Draw(t, "dataByte"))
-		}
+		data := drawPropertyData(t, MaxUDPPayload+1, 50*1024)
 
 		var fragIDCounter atomic.Uint32
 
@@ -289,59 +374,10 @@ func TestFragmentReassemblyRoundTrip_Property(t *testing.T) {
 
 		// Property: Should produce multiple fragments for large data
 		if len(results) < 2 {
-			t.Fatalf("Expected multiple fragments for data of size %d, got %d", dataLen, len(results))
+			t.Fatalf("Expected multiple fragments for data of size %d, got %d", len(data), len(results))
 		}
 
-		// Create a fragment assembler for reassembly
-		assembler := NewFragmentAssembler()
-
-		// Parse and reassemble all fragments
-		var reassembled []byte
-		for i, result := range results {
-			// Parse the datagram to extract fragment info
-			parsedSessionID, isFragmented, fragID, fragIndex, fragTotal, payload, err := ParseUDPDatagram(result.Data)
-			if err != nil {
-				t.Fatalf("ParseUDPDatagram failed for fragment %d: %v", i, err)
-			}
-
-			// Property: All fragments should be marked as fragmented
-			if !isFragmented {
-				t.Errorf("Fragment %d is not marked as fragmented", i)
-			}
-
-			// Property: Session ID should match
-			if parsedSessionID != sessionID {
-				t.Errorf("Fragment %d has wrong session ID: expected %d, got %d", i, sessionID, parsedSessionID)
-			}
-
-			// Add fragment to assembler
-			result, err := assembler.AddFragment(parsedSessionID, fragID, fragIndex, fragTotal, payload)
-			if err != nil {
-				t.Fatalf("AddFragment failed for fragment %d: %v", i, err)
-			}
-
-			// The last fragment should complete the reassembly
-			if result != nil {
-				reassembled = result
-			}
-		}
-
-		// Property: Reassembly should complete
-		if reassembled == nil {
-			t.Fatal("Reassembly did not complete after all fragments were added")
-		}
-
-		// Property: Reassembled data should equal original data
-		if len(reassembled) != len(data) {
-			t.Errorf("Reassembled data length mismatch: expected %d, got %d", len(data), len(reassembled))
-		}
-
-		for i := range data {
-			if i < len(reassembled) && reassembled[i] != data[i] {
-				t.Errorf("Data mismatch at byte %d: expected %d, got %d", i, data[i], reassembled[i])
-				break // Only report first mismatch
-			}
-		}
+		assertPropertyPayloadEqual(t, reassemblePropertyResults(t, sessionID, results, nil, true), data)
 	})
 }
 
@@ -350,13 +386,7 @@ func TestFragmentReassemblyRoundTrip_Property(t *testing.T) {
 func TestFragmentReassemblyRoundTrip_OutOfOrder_Property(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		sessionID := rapid.Uint32().Draw(t, "sessionID")
-
-		// Generate data that requires fragmentation
-		dataLen := rapid.IntRange(MaxUDPPayload+1, 20*1024).Draw(t, "dataLen")
-		data := make([]byte, dataLen)
-		for i := range data {
-			data[i] = byte(rapid.IntRange(0, 255).Draw(t, "dataByte"))
-		}
+		data := drawPropertyData(t, MaxUDPPayload+1, 20*1024)
 
 		var fragIDCounter atomic.Uint32
 
@@ -378,46 +408,7 @@ func TestFragmentReassemblyRoundTrip_OutOfOrder_Property(t *testing.T) {
 			order[i], order[j] = order[j], order[i]
 		}
 
-		assembler := NewFragmentAssembler()
-
-		var reassembled []byte
-		for _, idx := range order {
-			result := results[idx]
-			parsedSessionID, isFragmented, fragID, fragIndex, fragTotal, payload, err := ParseUDPDatagram(result.Data)
-			if err != nil {
-				t.Fatalf("ParseUDPDatagram failed: %v", err)
-			}
-
-			if !isFragmented {
-				t.Error("Fragment not marked as fragmented")
-			}
-
-			assembled, err := assembler.AddFragment(parsedSessionID, fragID, fragIndex, fragTotal, payload)
-			if err != nil {
-				t.Fatalf("AddFragment failed: %v", err)
-			}
-
-			if assembled != nil {
-				reassembled = assembled
-			}
-		}
-
-		// Property: Reassembly should complete regardless of order
-		if reassembled == nil {
-			t.Fatal("Reassembly did not complete")
-		}
-
-		// Property: Reassembled data should equal original
-		if len(reassembled) != len(data) {
-			t.Errorf("Length mismatch: expected %d, got %d", len(data), len(reassembled))
-		}
-
-		for i := range data {
-			if i < len(reassembled) && reassembled[i] != data[i] {
-				t.Errorf("Data mismatch at byte %d", i)
-				break
-			}
-		}
+		assertPropertyPayloadEqual(t, reassemblePropertyResults(t, sessionID, results, order, false), data)
 	})
 }
 
@@ -449,44 +440,7 @@ func TestFragmentReassemblyRoundTrip_BoundarySize_Property(t *testing.T) {
 			t.Errorf("Expected %d fragments, got %d", numFragments, len(results))
 		}
 
-		assembler := NewFragmentAssembler()
-
-		var reassembled []byte
-		for i, result := range results {
-			parsedSessionID, isFragmented, fragID, fragIndex, fragTotal, payload, err := ParseUDPDatagram(result.Data)
-			if err != nil {
-				t.Fatalf("ParseUDPDatagram failed for fragment %d: %v", i, err)
-			}
-
-			if !isFragmented {
-				t.Errorf("Fragment %d not marked as fragmented", i)
-			}
-
-			assembled, err := assembler.AddFragment(parsedSessionID, fragID, fragIndex, fragTotal, payload)
-			if err != nil {
-				t.Fatalf("AddFragment failed for fragment %d: %v", i, err)
-			}
-
-			if assembled != nil {
-				reassembled = assembled
-			}
-		}
-
-		if reassembled == nil {
-			t.Fatal("Reassembly did not complete")
-		}
-
-		// Property: Reassembled data should equal original exactly
-		if len(reassembled) != len(data) {
-			t.Errorf("Length mismatch: expected %d, got %d", len(data), len(reassembled))
-		}
-
-		for i := range data {
-			if i < len(reassembled) && reassembled[i] != data[i] {
-				t.Errorf("Data mismatch at byte %d", i)
-				break
-			}
-		}
+		assertPropertyPayloadEqual(t, reassemblePropertyResults(t, sessionID, results, nil, false), data)
 	})
 }
 
@@ -520,44 +474,7 @@ func TestFragmentReassemblyRoundTrip_MinFragmentation_Property(t *testing.T) {
 			t.Errorf("Expected %d fragments, got %d", expectedFragments, len(results))
 		}
 
-		assembler := NewFragmentAssembler()
-
-		var reassembled []byte
-		for i, result := range results {
-			parsedSessionID, isFragmented, fragID, fragIndex, fragTotal, payload, err := ParseUDPDatagram(result.Data)
-			if err != nil {
-				t.Fatalf("ParseUDPDatagram failed for fragment %d: %v", i, err)
-			}
-
-			if !isFragmented {
-				t.Errorf("Fragment %d not marked as fragmented", i)
-			}
-
-			assembled, err := assembler.AddFragment(parsedSessionID, fragID, fragIndex, fragTotal, payload)
-			if err != nil {
-				t.Fatalf("AddFragment failed for fragment %d: %v", i, err)
-			}
-
-			if assembled != nil {
-				reassembled = assembled
-			}
-		}
-
-		if reassembled == nil {
-			t.Fatal("Reassembly did not complete")
-		}
-
-		// Property: Reassembled data should equal original exactly
-		if len(reassembled) != len(data) {
-			t.Errorf("Length mismatch: expected %d, got %d", len(data), len(reassembled))
-		}
-
-		for i := range data {
-			if i < len(reassembled) && reassembled[i] != data[i] {
-				t.Errorf("Data mismatch at byte %d", i)
-				break
-			}
-		}
+		assertPropertyPayloadEqual(t, reassemblePropertyResults(t, sessionID, results, nil, false), data)
 	})
 }
 
@@ -594,7 +511,7 @@ func TestShardCalculationDeterminism_Property(t *testing.T) {
 
 		// Property 2: Same fragment ID should always map to the same shard (determinism)
 		// Call getShard multiple times and verify consistency
-		for i := 0; i < 10; i++ {
+		for i := range 10 {
 			repeatShard := assembler.getShard(fragID)
 			if repeatShard != shard {
 				t.Errorf("Non-deterministic shard calculation: fragID=%d returned different shards on call %d",
@@ -646,7 +563,7 @@ func TestShardCalculationDeterminism_Distribution_Property(t *testing.T) {
 		assembler := NewShardedFragmentAssembler(shardCount)
 
 		// Track which shard each fragment ID maps to
-		for i := 0; i < numFragIDs; i++ {
+		for range numFragIDs {
 			fragID := rapid.Uint16().Draw(t, "fragID")
 
 			shard := assembler.getShard(fragID)
@@ -801,7 +718,7 @@ func TestConcurrentFragmentCorrectness_Property(t *testing.T) {
 
 		var fragIDCounter atomic.Uint32
 
-		for i := 0; i < numPackets; i++ {
+		for i := range numPackets {
 			// Generate unique session ID for each packet
 			sessionID := rapid.Uint32().Draw(t, "sessionID")
 
@@ -881,12 +798,9 @@ func TestConcurrentFragmentCorrectness_Property(t *testing.T) {
 		var wg sync.WaitGroup
 		fragmentsPerGoroutine := (len(allFragments) + numGoroutines - 1) / numGoroutines
 
-		for g := 0; g < numGoroutines; g++ {
+		for g := range numGoroutines {
 			start := g * fragmentsPerGoroutine
-			end := start + fragmentsPerGoroutine
-			if end > len(allFragments) {
-				end = len(allFragments)
-			}
+			end := min(start+fragmentsPerGoroutine, len(allFragments))
 			if start >= len(allFragments) {
 				break
 			}
@@ -1016,7 +930,7 @@ func TestConcurrentFragmentCorrectness_HighContention_Property(t *testing.T) {
 		var reassembledMu sync.Mutex
 		var wg sync.WaitGroup
 
-		for i := 0; i < numGoroutines; i++ {
+		for i := range numGoroutines {
 			wg.Add(1)
 			go func(frag fragmentInfo) {
 				defer wg.Done()
@@ -1086,7 +1000,7 @@ func TestConcurrentFragmentCorrectness_MultiplePacketsSameShard_Property(t *test
 
 		var fragIDCounter atomic.Uint32
 
-		for i := 0; i < numPackets; i++ {
+		for i := range numPackets {
 			sessionID := rapid.Uint32().Draw(t, "sessionID")
 
 			// Generate data requiring fragmentation
@@ -1250,7 +1164,7 @@ func TestConcurrentFragmentCorrectness_DuplicateFragments_Property(t *testing.T)
 		duplicateCount := rapid.IntRange(2, 4).Draw(t, "duplicateCount")
 		var allFragments []fragmentInfo
 		for _, frag := range fragments {
-			for d := 0; d < duplicateCount; d++ {
+			for range duplicateCount {
 				allFragments = append(allFragments, frag)
 			}
 		}
@@ -1335,49 +1249,10 @@ func TestAtomicCounterThreadSafety_Property(t *testing.T) {
 		// Generate random session ID
 		sessionID := rapid.Uint32().Draw(t, "sessionID")
 
-		// Generate data that requires fragmentation (> MaxUDPPayload = 1195 bytes)
-		// This ensures FragmentUDPPooled will use the atomic counter
-		dataLen := rapid.IntRange(MaxUDPPayload+1, 5*1024).Draw(t, "dataLen")
-		data := make([]byte, dataLen)
-		for i := range data {
-			data[i] = byte(rapid.IntRange(0, 255).Draw(t, "dataByte"))
-		}
-
-		// Collect all fragment IDs from all goroutines
-		var collectedFragIDs []uint16
-		var mu sync.Mutex
-		var wg sync.WaitGroup
-
-		for g := 0; g < numGoroutines; g++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-
-				for c := 0; c < callsPerGoroutine; c++ {
-					// Call FragmentUDPPooled with the shared counter
-					results, err := FragmentUDPPooled(sessionID, data, &fragIDCounter, true)
-					if err != nil {
-						return
-					}
-
-					// Extract fragment ID from the first fragment
-					// All fragments in a single call share the same fragment ID
-					if len(results) > 0 {
-						_, isFragmented, fragID, _, _, _, err := ParseUDPDatagram(results[0].Data)
-						if err == nil && isFragmented {
-							mu.Lock()
-							collectedFragIDs = append(collectedFragIDs, fragID)
-							mu.Unlock()
-						}
-					}
-
-					// Release the buffers
-					ReleaseDatagramResults(results)
-				}
-			}()
-		}
-
-		wg.Wait()
+		data := drawPropertyData(t, MaxUDPPayload+1, 5*1024)
+		collectedFragIDs := collectConcurrentFragmentIDs(
+			sessionID, data, []*atomic.Uint32{&fragIDCounter}, numGoroutines, callsPerGoroutine, false, true,
+		)[0]
 
 		// Property: Total number of fragment IDs should equal total calls
 		expectedCalls := numGoroutines * callsPerGoroutine
@@ -1417,51 +1292,10 @@ func TestAtomicCounterThreadSafety_HighContention_Property(t *testing.T) {
 		var fragIDCounter atomic.Uint32
 		sessionID := rapid.Uint32().Draw(t, "sessionID")
 
-		// Use data that requires fragmentation
-		dataLen := rapid.IntRange(MaxUDPPayload+1, 3*1024).Draw(t, "dataLen")
-		data := make([]byte, dataLen)
-		for i := range data {
-			data[i] = byte(rapid.IntRange(0, 255).Draw(t, "dataByte"))
-		}
-
-		var collectedFragIDs []uint16
-		var mu sync.Mutex
-		var wg sync.WaitGroup
-
-		// Start all goroutines simultaneously using a barrier
-		startBarrier := make(chan struct{})
-
-		for g := 0; g < numGoroutines; g++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-
-				// Wait for all goroutines to be ready
-				<-startBarrier
-
-				for c := 0; c < callsPerGoroutine; c++ {
-					results, err := FragmentUDPPooled(sessionID, data, &fragIDCounter, true)
-					if err != nil {
-						continue
-					}
-
-					if len(results) > 0 {
-						_, isFragmented, fragID, _, _, _, err := ParseUDPDatagram(results[0].Data)
-						if err == nil && isFragmented {
-							mu.Lock()
-							collectedFragIDs = append(collectedFragIDs, fragID)
-							mu.Unlock()
-						}
-					}
-
-					ReleaseDatagramResults(results)
-				}
-			}()
-		}
-
-		// Release all goroutines at once for maximum contention
-		close(startBarrier)
-		wg.Wait()
+		data := drawPropertyData(t, MaxUDPPayload+1, 3*1024)
+		collectedFragIDs := collectConcurrentFragmentIDs(
+			sessionID, data, []*atomic.Uint32{&fragIDCounter}, numGoroutines, callsPerGoroutine, true, false,
+		)[0]
 
 		// Property: All fragment IDs should be unique
 		seen := make(map[uint16]int)
@@ -1500,43 +1334,10 @@ func TestAtomicCounterThreadSafety_SequentialIDs_Property(t *testing.T) {
 		var fragIDCounter atomic.Uint32
 		sessionID := rapid.Uint32().Draw(t, "sessionID")
 
-		// Data requiring fragmentation
-		dataLen := rapid.IntRange(MaxUDPPayload+1, 4*1024).Draw(t, "dataLen")
-		data := make([]byte, dataLen)
-		for i := range data {
-			data[i] = byte(rapid.IntRange(0, 255).Draw(t, "dataByte"))
-		}
-
-		var collectedFragIDs []uint16
-		var mu sync.Mutex
-		var wg sync.WaitGroup
-
-		for g := 0; g < numGoroutines; g++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-
-				for c := 0; c < callsPerGoroutine; c++ {
-					results, err := FragmentUDPPooled(sessionID, data, &fragIDCounter, true)
-					if err != nil {
-						continue
-					}
-
-					if len(results) > 0 {
-						_, isFragmented, fragID, _, _, _, err := ParseUDPDatagram(results[0].Data)
-						if err == nil && isFragmented {
-							mu.Lock()
-							collectedFragIDs = append(collectedFragIDs, fragID)
-							mu.Unlock()
-						}
-					}
-
-					ReleaseDatagramResults(results)
-				}
-			}()
-		}
-
-		wg.Wait()
+		data := drawPropertyData(t, MaxUDPPayload+1, 4*1024)
+		collectedFragIDs := collectConcurrentFragmentIDs(
+			sessionID, data, []*atomic.Uint32{&fragIDCounter}, numGoroutines, callsPerGoroutine, false, false,
+		)[0]
 
 		expectedCalls := numGoroutines * callsPerGoroutine
 
@@ -1585,49 +1386,11 @@ func TestAtomicCounterThreadSafety_MultipleCounters_Property(t *testing.T) {
 
 		sessionID := rapid.Uint32().Draw(t, "sessionID")
 
-		// Data requiring fragmentation
-		dataLen := rapid.IntRange(MaxUDPPayload+1, 3*1024).Draw(t, "dataLen")
-		data := make([]byte, dataLen)
-		for i := range data {
-			data[i] = byte(rapid.IntRange(0, 255).Draw(t, "dataByte"))
-		}
+		data := drawPropertyData(t, MaxUDPPayload+1, 3*1024)
 
-		// Collect fragment IDs per counter
-		collectedFragIDsPerCounter := make([][]uint16, numCounters)
-		for i := range collectedFragIDsPerCounter {
-			collectedFragIDsPerCounter[i] = make([]uint16, 0)
-		}
-		var mu sync.Mutex
-		var wg sync.WaitGroup
-
-		for counterIdx := 0; counterIdx < numCounters; counterIdx++ {
-			for g := 0; g < numGoroutines; g++ {
-				wg.Add(1)
-				go func(cIdx int) {
-					defer wg.Done()
-
-					for c := 0; c < callsPerGoroutine; c++ {
-						results, err := FragmentUDPPooled(sessionID, data, counters[cIdx], true)
-						if err != nil {
-							continue
-						}
-
-						if len(results) > 0 {
-							_, isFragmented, fragID, _, _, _, err := ParseUDPDatagram(results[0].Data)
-							if err == nil && isFragmented {
-								mu.Lock()
-								collectedFragIDsPerCounter[cIdx] = append(collectedFragIDsPerCounter[cIdx], fragID)
-								mu.Unlock()
-							}
-						}
-
-						ReleaseDatagramResults(results)
-					}
-				}(counterIdx)
-			}
-		}
-
-		wg.Wait()
+		collectedFragIDsPerCounter := collectConcurrentFragmentIDs(
+			sessionID, data, counters, numGoroutines, callsPerGoroutine, false, false,
+		)
 
 		// Property: Each counter should have unique fragment IDs within its scope
 		for cIdx, fragIDs := range collectedFragIDsPerCounter {
@@ -1673,49 +1436,16 @@ func TestAtomicCounterThreadSafety_CounterOverflow_Property(t *testing.T) {
 
 		sessionID := rapid.Uint32().Draw(t, "sessionID")
 
-		// Data requiring fragmentation
-		dataLen := rapid.IntRange(MaxUDPPayload+1, 3*1024).Draw(t, "dataLen")
-		data := make([]byte, dataLen)
-		for i := range data {
-			data[i] = byte(rapid.IntRange(0, 255).Draw(t, "dataByte"))
-		}
+		data := drawPropertyData(t, MaxUDPPayload+1, 3*1024)
 
 		// Make enough calls to wrap around uint16
 		numCalls := rapid.IntRange(10, 20).Draw(t, "numCalls")
 
-		var collectedFragIDs []uint16
-		var mu sync.Mutex
-		var wg sync.WaitGroup
-
 		numGoroutines := rapid.IntRange(2, 8).Draw(t, "numGoroutines")
 		callsPerGoroutine := (numCalls + numGoroutines - 1) / numGoroutines
-
-		for g := 0; g < numGoroutines; g++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-
-				for c := 0; c < callsPerGoroutine; c++ {
-					results, err := FragmentUDPPooled(sessionID, data, &fragIDCounter, true)
-					if err != nil {
-						continue
-					}
-
-					if len(results) > 0 {
-						_, isFragmented, fragID, _, _, _, err := ParseUDPDatagram(results[0].Data)
-						if err == nil && isFragmented {
-							mu.Lock()
-							collectedFragIDs = append(collectedFragIDs, fragID)
-							mu.Unlock()
-						}
-					}
-
-					ReleaseDatagramResults(results)
-				}
-			}()
-		}
-
-		wg.Wait()
+		collectedFragIDs := collectConcurrentFragmentIDs(
+			sessionID, data, []*atomic.Uint32{&fragIDCounter}, numGoroutines, callsPerGoroutine, false, false,
+		)[0]
 
 		// Property: All fragment IDs should still be unique even with wrap-around
 		seen := make(map[uint16]int)

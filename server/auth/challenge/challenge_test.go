@@ -121,7 +121,7 @@ func TestProperty_ChallengeUniqueness(t *testing.T) {
 	const numChallenges = 1000
 	seen := make(map[string]bool, numChallenges)
 
-	for i := 0; i < numChallenges; i++ {
+	for i := range numChallenges {
 		challenge, err := GenerateChallenge()
 		if err != nil {
 			t.Fatalf("GenerateChallenge() failed at iteration %d: %v", i, err)
@@ -223,7 +223,7 @@ func TestWireProtocol_InvalidChallengeSize(t *testing.T) {
 	// Create a buffer with wrong challenge size
 	var buf bytes.Buffer
 	wrongSize := make([]byte, 16) // Wrong size (should be 32)
-	writeChallenge(&buf, wrongSize)
+	_ = writeChallenge(&buf, wrongSize)
 
 	// Try to read - should fail due to size mismatch
 	_, err := readChallenge(bytes.NewReader(buf.Bytes()))
@@ -237,7 +237,7 @@ func TestWireProtocol_InvalidResponseSize(t *testing.T) {
 	// Create a buffer with wrong response size
 	var buf bytes.Buffer
 	wrongSize := make([]byte, 32) // Wrong size (should be 64)
-	writeResponse(&buf, wrongSize)
+	_ = writeResponse(&buf, wrongSize)
 
 	// Try to read - should fail due to size mismatch
 	_, err := readResponse(bytes.NewReader(buf.Bytes()))

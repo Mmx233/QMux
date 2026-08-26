@@ -22,10 +22,8 @@ import (
 
 // generateTestCertificates generates test certificates for integration tests
 func generateTestCertificates(t testing.TB) string {
-	tempDir, err := os.MkdirTemp("", "qmux-test-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
+	t.Helper()
+	tempDir := t.TempDir()
 
 	// Generate certificates using the existing logic
 	caKey, caCert, err := certs.GenerateCA(1)
@@ -63,106 +61,208 @@ func generateTestCertificates(t testing.TB) string {
 	return tempDir
 }
 
-// TestTCPReverseProxy_MTLS tests TCP reverse proxy functionality with mTLS authentication
-func TestTCPReverseProxy_MTLS(t *testing.T) {
-	certDir := generateTestCertificates(t)
-	defer os.RemoveAll(certDir)
+func closeOnCleanup(t testing.TB, closer io.Closer) {
+	t.Helper()
+	t.Cleanup(func() {
+		_ = closer.Close()
+	})
+}
 
-	// Start local TCP echo server
-	localListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to start local server: %v", err)
-	}
-	defer localListener.Close()
-
-	localAddr := localListener.Addr().(*net.TCPAddr)
-	t.Logf("Local echo server listening on %s", localAddr)
-
-	// Echo server
+func serveTCPEcho(listener net.Listener) {
 	go func() {
 		for {
-			conn, err := localListener.Accept()
+			conn, err := listener.Accept()
 			if err != nil {
 				return
 			}
-			go func(c net.Conn) {
-				defer c.Close()
-				io.Copy(c, c) // Echo back
-			}(conn)
+			go func() {
+				defer func() { _ = conn.Close() }()
+				_, _ = io.Copy(conn, conn)
+			}()
 		}
 	}()
+}
 
-	// Start QMux server
-	quicPort := getFreePort(t)
-	trafficPort := getFreePort(t)
+func serveUDPEcho(conn net.PacketConn, stopOnWriteError bool) {
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			n, addr, err := conn.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if _, err := conn.WriteTo(buf[:n], addr); err != nil && stopOnWriteError {
+				return
+			}
+		}
+	}()
+}
 
-	serverConfig := &config.Server{
-		Listeners: []config.QuicListener{
-			{
-				QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
-				TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
-				Protocol:    "tcp",
-			},
-		},
+func assertTCPEcho(t testing.TB, addr string, data []byte) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial TCP echo server: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set TCP echo deadline: %v", err)
+	}
+	if _, err := conn.Write(data); err != nil {
+		t.Fatalf("write TCP echo request: %v", err)
+	}
+
+	buf := make([]byte, len(data))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatalf("read TCP echo response: %v", err)
+	}
+	if !bytes.Equal(buf, data) {
+		t.Fatalf("TCP echo data mismatch: got %q, want %q", buf, data)
+	}
+}
+
+func startTestServer(ctx context.Context, cfg *config.Server) {
+	go func() {
+		_ = server.Start(ctx, cfg)
+	}()
+}
+
+func startTestClient(ctx context.Context, c *client.Client) {
+	go func() {
+		_ = c.Start(ctx)
+	}()
+}
+
+func startTestServerReporting(ctx context.Context, cfg *config.Server) <-chan error {
+	errCh := make(chan error, 1)
+	go func() {
+		if err := server.Start(ctx, cfg); err != nil && !errors.Is(err, context.Canceled) {
+			errCh <- err
+		}
+	}()
+	return errCh
+}
+
+func startTestClientReporting(ctx context.Context, c *client.Client) <-chan error {
+	errCh := make(chan error, 1)
+	go func() {
+		if err := c.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			errCh <- err
+		}
+	}()
+	return errCh
+}
+
+func startTCPEchoListener(t testing.TB) (net.Listener, int) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("start local TCP echo server: %v", err)
+	}
+	closeOnCleanup(t, listener)
+	serveTCPEcho(listener)
+	return listener, listener.Addr().(*net.TCPAddr).Port
+}
+
+func startUDPEchoListener(t testing.TB) (net.PacketConn, int) {
+	t.Helper()
+	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("start local UDP echo server: %v", err)
+	}
+	closeOnCleanup(t, conn)
+	serveUDPEcho(conn, false)
+	return conn, conn.LocalAddr().(*net.UDPAddr).Port
+}
+
+func newMTLSServerConfig(
+	certDir, protocol string,
+	quicPort, trafficPort int,
+	heartbeatInterval, healthTimeout time.Duration,
+) *config.Server {
+	return &config.Server{
+		Listeners: []config.QuicListener{{
+			QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
+			TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
+			Protocol:    protocol,
+		}},
 		Auth: config.ServerAuth{
 			Method:     "mtls",
 			CACertFile: filepath.Join(certDir, "ca.crt"),
 		},
 		TLS: config.ServerTLS{
-
 			ServerCertFile: filepath.Join(certDir, "server.crt"),
 			ServerKeyFile:  filepath.Join(certDir, "server.key"),
 		},
-		HeartbeatInterval: 1 * time.Second,
-		HealthTimeout:     3 * time.Second,
+		HeartbeatInterval: heartbeatInterval,
+		HealthTimeout:     healthTimeout,
 	}
+}
+
+func newMTLSClientConfig(
+	certDir, clientID string,
+	localPort int,
+	heartbeatInterval, healthTimeout time.Duration,
+	quicPorts ...int,
+) *config.Client {
+	servers := make([]config.ServerEndpoint, len(quicPorts))
+	for i, port := range quicPorts {
+		servers[i] = config.ServerEndpoint{
+			Address:    fmt.Sprintf("127.0.0.1:%d", port),
+			ServerName: "localhost",
+		}
+	}
+	return &config.Client{
+		ClientID: clientID,
+		Server:   config.ClientServer{Servers: servers},
+		Local:    config.LocalService{Host: "127.0.0.1", Port: localPort},
+		TLS: config.ClientTLS{
+			CACertFile:     filepath.Join(certDir, "ca.crt"),
+			ClientCertFile: filepath.Join(certDir, "client.crt"),
+			ClientKeyFile:  filepath.Join(certDir, "client.key"),
+		},
+		HeartbeatInterval: heartbeatInterval,
+		HealthTimeout:     healthTimeout,
+	}
+}
+
+func newTestClient(t testing.TB, cfg *config.Client) *client.Client {
+	t.Helper()
+	c, err := client.New(cfg)
+	if err != nil {
+		t.Fatalf("create test client %q: %v", cfg.ClientID, err)
+	}
+	return c
+}
+
+// TestTCPReverseProxy_MTLS tests TCP reverse proxy functionality with mTLS authentication
+func TestTCPReverseProxy_MTLS(t *testing.T) {
+	certDir := generateTestCertificates(t)
+
+	localListener, localPort := startTCPEchoListener(t)
+	t.Logf("Local echo server listening on %s", localListener.Addr())
+
+	// Start QMux server
+	quicPort := getFreePort(t)
+	trafficPort := getFreePort(t)
+
+	serverConfig := newMTLSServerConfig(certDir, "tcp", quicPort, trafficPort, time.Second, 3*time.Second)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	// Start server
-	serverErrCh := make(chan error, 1)
-	go func() {
-		if err := server.Start(ctx, serverConfig); err != nil && !errors.Is(err, context.Canceled) {
-			serverErrCh <- err
-		}
-	}()
+	serverErrCh := startTestServerReporting(ctx, serverConfig)
 
 	// Give server time to start
 	time.Sleep(500 * time.Millisecond)
 
 	// Start QMux client
-	clientConfig := &config.Client{
-		ClientID: "test-client",
-		Server: config.ClientServer{
-			Servers: []config.ServerEndpoint{
-				{Address: fmt.Sprintf("127.0.0.1:%d", quicPort), ServerName: "localhost"},
-			},
-		},
-		Local: config.LocalService{
-			Host: "127.0.0.1",
-			Port: localAddr.Port,
-		},
-		TLS: config.ClientTLS{
-			CACertFile: filepath.Join(certDir, "ca.crt"),
+	clientConfig := newMTLSClientConfig(certDir, "test-client", localPort, time.Second, 0, quicPort)
+	c := newTestClient(t, clientConfig)
 
-			ClientCertFile: filepath.Join(certDir, "client.crt"),
-			ClientKeyFile:  filepath.Join(certDir, "client.key"),
-		},
-		HeartbeatInterval: 1 * time.Second,
-	}
-
-	c, err := client.New(clientConfig)
-	if err != nil {
-		t.Fatalf("failed to create client: %v", err)
-	}
-
-	clientErrCh := make(chan error, 1)
-	go func() {
-		if err := c.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			clientErrCh <- err
-		}
-	}()
+	clientErrCh := startTestClientReporting(ctx, c)
 
 	// Give client time to connect
 	time.Sleep(500 * time.Millisecond)
@@ -181,10 +281,12 @@ func TestTCPReverseProxy_MTLS(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed to connect to traffic port: %v", err)
 			}
-			defer conn.Close()
+			closeOnCleanup(t, conn)
 
 			// Set deadline
-			conn.SetDeadline(time.Now().Add(5 * time.Second))
+			if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				t.Fatalf("set deadline: %v", err)
+			}
 
 			// Send data
 			n, err := conn.Write([]byte(data))
@@ -225,101 +327,29 @@ func TestTCPReverseProxy_MTLS(t *testing.T) {
 // TestUDPReverseProxy_MTLS tests UDP reverse proxy functionality with mTLS authentication
 func TestUDPReverseProxy_MTLS(t *testing.T) {
 	certDir := generateTestCertificates(t)
-	defer os.RemoveAll(certDir)
 
-	// Start local UDP echo server
-	localConn, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to start local UDP server: %v", err)
-	}
-	defer localConn.Close()
-
-	localAddr := localConn.LocalAddr().(*net.UDPAddr)
-	t.Logf("Local UDP echo server listening on %s", localAddr)
-
-	// UDP echo server
-	go func() {
-		buf := make([]byte, 65535)
-		for {
-			n, addr, err := localConn.ReadFrom(buf)
-			if err != nil {
-				return
-			}
-			// Echo back
-			localConn.WriteTo(buf[:n], addr)
-		}
-	}()
+	localConn, localPort := startUDPEchoListener(t)
+	t.Logf("Local UDP echo server listening on %s", localConn.LocalAddr())
 
 	// Start QMux server
 	quicPort := getFreePort(t)
 	trafficPort := getFreePort(t)
 
-	serverConfig := &config.Server{
-		Listeners: []config.QuicListener{
-			{
-				QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
-				TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
-				Protocol:    "udp",
-			},
-		},
-		Auth: config.ServerAuth{
-			Method:     "mtls",
-			CACertFile: filepath.Join(certDir, "ca.crt"),
-		},
-		TLS: config.ServerTLS{
-
-			ServerCertFile: filepath.Join(certDir, "server.crt"),
-			ServerKeyFile:  filepath.Join(certDir, "server.key"),
-		},
-		HeartbeatInterval: 1 * time.Second,
-		HealthTimeout:     3 * time.Second,
-	}
+	serverConfig := newMTLSServerConfig(certDir, "udp", quicPort, trafficPort, time.Second, 3*time.Second)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	// Start server
-	serverErrCh := make(chan error, 1)
-	go func() {
-		if err := server.Start(ctx, serverConfig); err != nil && !errors.Is(err, context.Canceled) {
-			serverErrCh <- err
-		}
-	}()
+	serverErrCh := startTestServerReporting(ctx, serverConfig)
 
 	time.Sleep(500 * time.Millisecond)
 
 	// Start QMux client
-	clientConfig := &config.Client{
-		ClientID: "test-client-udp",
-		Server: config.ClientServer{
-			Servers: []config.ServerEndpoint{
-				{Address: fmt.Sprintf("127.0.0.1:%d", quicPort), ServerName: "localhost"},
-			},
-		},
-		Local: config.LocalService{
-			Host: "127.0.0.1",
-			Port: localAddr.Port,
-		},
-		TLS: config.ClientTLS{
-			CACertFile: filepath.Join(certDir, "ca.crt"),
+	clientConfig := newMTLSClientConfig(certDir, "test-client-udp", localPort, time.Second, 0, quicPort)
+	c := newTestClient(t, clientConfig)
 
-			ClientCertFile: filepath.Join(certDir, "client.crt"),
-			ClientKeyFile:  filepath.Join(certDir, "client.key"),
-		},
-		HeartbeatInterval: 1 * time.Second,
-	}
-
-	c, err := client.New(clientConfig)
-	if err != nil {
-		t.Fatalf("failed to create client: %v", err)
-	}
-
-	clientErrCh := make(chan error, 1)
-	go func() {
-		if err := c.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			clientErrCh <- err
-		}
-	}()
+	clientErrCh := startTestClientReporting(ctx, c)
 
 	time.Sleep(500 * time.Millisecond)
 
@@ -338,9 +368,11 @@ func TestUDPReverseProxy_MTLS(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed to dial UDP: %v", err)
 			}
-			defer conn.Close()
+			closeOnCleanup(t, conn)
 
-			conn.SetDeadline(time.Now().Add(5 * time.Second))
+			if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				t.Fatalf("set deadline: %v", err)
+			}
 
 			// Send data
 			_, err = conn.Write(data)
@@ -374,123 +406,70 @@ func TestUDPReverseProxy_MTLS(t *testing.T) {
 // TestConcurrentConnections_MTLS tests multiple concurrent connections with mTLS authentication
 func TestConcurrentConnections_MTLS(t *testing.T) {
 	certDir := generateTestCertificates(t)
-	defer os.RemoveAll(certDir)
 
-	// Start local TCP echo server
-	localListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to start local server: %v", err)
-	}
-	defer localListener.Close()
-
-	localAddr := localListener.Addr().(*net.TCPAddr)
-
-	go func() {
-		for {
-			conn, err := localListener.Accept()
-			if err != nil {
-				return
-			}
-			go io.Copy(conn, conn)
-		}
-	}()
+	_, localPort := startTCPEchoListener(t)
 
 	// Start QMux infrastructure
 	quicPort := getFreePort(t)
 	trafficPort := getFreePort(t)
 
-	serverConfig := &config.Server{
-		Listeners: []config.QuicListener{
-			{
-				QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
-				TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
-				Protocol:    "tcp",
-			},
-		},
-		Auth: config.ServerAuth{
-			Method:     "mtls",
-			CACertFile: filepath.Join(certDir, "ca.crt"),
-		},
-		TLS: config.ServerTLS{
-
-			ServerCertFile: filepath.Join(certDir, "server.crt"),
-			ServerKeyFile:  filepath.Join(certDir, "server.key"),
-		},
-	}
+	serverConfig := newMTLSServerConfig(certDir, "tcp", quicPort, trafficPort, 0, 0)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	go server.Start(ctx, serverConfig)
+	startTestServer(ctx, serverConfig)
 	time.Sleep(500 * time.Millisecond)
 
-	clientConfig := &config.Client{
-		ClientID: "test-client-concurrent",
-		Server: config.ClientServer{
-			Servers: []config.ServerEndpoint{
-				{Address: fmt.Sprintf("127.0.0.1:%d", quicPort), ServerName: "localhost"},
-			},
-		},
-		Local: config.LocalService{
-			Host: "127.0.0.1",
-			Port: localAddr.Port,
-		},
-		TLS: config.ClientTLS{
-			CACertFile: filepath.Join(certDir, "ca.crt"),
+	clientConfig := newMTLSClientConfig(certDir, "test-client-concurrent", localPort, 0, 0, quicPort)
+	c := newTestClient(t, clientConfig)
 
-			ClientCertFile: filepath.Join(certDir, "client.crt"),
-			ClientKeyFile:  filepath.Join(certDir, "client.key"),
-		},
-	}
-
-	c, err := client.New(clientConfig)
-	if err != nil {
-		t.Fatalf("failed to create client: %v", err)
-	}
-
-	go c.Start(ctx)
+	startTestClient(ctx, c)
 	time.Sleep(500 * time.Millisecond)
 
 	// Test 10 concurrent connections
 	var wg sync.WaitGroup
-	errors := make(chan error, 10)
+	errCh := make(chan error, 10)
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
 
 			conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", trafficPort), 5*time.Second)
 			if err != nil {
-				errors <- fmt.Errorf("conn %d: dial failed: %w", id, err)
+				errCh <- fmt.Errorf("conn %d: dial failed: %w", id, err)
 				return
 			}
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 
 			data := fmt.Sprintf("Connection %d: %s", id, strings.Repeat("X", 100))
-			conn.SetDeadline(time.Now().Add(5 * time.Second))
+			if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				errCh <- fmt.Errorf("conn %d: set deadline: %w", id, err)
+				return
+			}
 
 			if _, err := conn.Write([]byte(data)); err != nil {
-				errors <- fmt.Errorf("conn %d: write failed: %w", id, err)
+				errCh <- fmt.Errorf("conn %d: write failed: %w", id, err)
 				return
 			}
 
 			buf := make([]byte, len(data))
 			if _, err := io.ReadFull(conn, buf); err != nil {
-				errors <- fmt.Errorf("conn %d: read failed: %w", id, err)
+				errCh <- fmt.Errorf("conn %d: read failed: %w", id, err)
 				return
 			}
 
 			if string(buf) != data {
-				errors <- fmt.Errorf("conn %d: data mismatch", id)
+				errCh <- fmt.Errorf("conn %d: data mismatch", id)
 			}
 		}(i)
 	}
 
 	wg.Wait()
-	close(errors)
+	close(errCh)
 
-	for err := range errors {
+	for err := range errCh {
 		t.Error(err)
 	}
 }
@@ -498,102 +477,31 @@ func TestConcurrentConnections_MTLS(t *testing.T) {
 // TestClientReconnection_MTLS tests client reconnection and failover with mTLS authentication
 func TestClientReconnection_MTLS(t *testing.T) {
 	certDir := generateTestCertificates(t)
-	defer os.RemoveAll(certDir)
 
-	// Start local TCP echo server
-	localListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to start local server: %v", err)
-	}
-	defer localListener.Close()
-
-	localAddr := localListener.Addr().(*net.TCPAddr)
-
-	go func() {
-		for {
-			conn, err := localListener.Accept()
-			if err != nil {
-				return
-			}
-			go io.Copy(conn, conn)
-		}
-	}()
+	_, localPort := startTCPEchoListener(t)
 
 	// Start QMux server
 	quicPort := getFreePort(t)
 	trafficPort := getFreePort(t)
 
-	serverConfig := &config.Server{
-		Listeners: []config.QuicListener{
-			{
-				QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
-				TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
-				Protocol:    "tcp",
-			},
-		},
-		Auth: config.ServerAuth{
-			Method:     "mtls",
-			CACertFile: filepath.Join(certDir, "ca.crt"),
-		},
-		TLS: config.ServerTLS{
-
-			ServerCertFile: filepath.Join(certDir, "server.crt"),
-			ServerKeyFile:  filepath.Join(certDir, "server.key"),
-		},
-		HeartbeatInterval: 500 * time.Millisecond,
-		HealthTimeout:     1 * time.Second,
-	}
+	serverConfig := newMTLSServerConfig(certDir, "tcp", quicPort, trafficPort, 500*time.Millisecond, time.Second)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	go server.Start(ctx, serverConfig)
+	startTestServer(ctx, serverConfig)
 	time.Sleep(500 * time.Millisecond)
 
 	// Start first client
-	clientConfig := &config.Client{
-		ClientID: "test-client-reconnect",
-		Server: config.ClientServer{
-			Servers: []config.ServerEndpoint{
-				{Address: fmt.Sprintf("127.0.0.1:%d", quicPort), ServerName: "localhost"},
-			},
-		},
-		Local: config.LocalService{
-			Host: "127.0.0.1",
-			Port: localAddr.Port,
-		},
-		TLS: config.ClientTLS{
-			CACertFile: filepath.Join(certDir, "ca.crt"),
-
-			ClientCertFile: filepath.Join(certDir, "client.crt"),
-			ClientKeyFile:  filepath.Join(certDir, "client.key"),
-		},
-		HeartbeatInterval: 500 * time.Millisecond,
-	}
-
-	c1, err := client.New(clientConfig)
-	if err != nil {
-		t.Fatalf("failed to create first client: %v", err)
-	}
+	clientConfig := newMTLSClientConfig(certDir, "test-client-reconnect", localPort, 500*time.Millisecond, 0, quicPort)
+	c1 := newTestClient(t, clientConfig)
 
 	client1Ctx, client1Cancel := context.WithCancel(ctx)
-	go c1.Start(client1Ctx)
+	startTestClient(client1Ctx, c1)
 	time.Sleep(500 * time.Millisecond)
 
 	// Test connection works with first client
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", trafficPort), 5*time.Second)
-	if err != nil {
-		t.Fatalf("failed to connect to traffic port: %v", err)
-	}
-	testData := "First client test"
-	conn.SetDeadline(time.Now().Add(5 * time.Second))
-	conn.Write([]byte(testData))
-	buf := make([]byte, len(testData))
-	io.ReadFull(conn, buf)
-	if string(buf) != testData {
-		t.Fatalf("data mismatch with first client")
-	}
-	conn.Close()
+	assertTCPEcho(t, fmt.Sprintf("127.0.0.1:%d", trafficPort), []byte("First client test"))
 
 	t.Log("First client connection successful")
 
@@ -604,30 +512,15 @@ func TestClientReconnection_MTLS(t *testing.T) {
 	t.Log("First client disconnected")
 
 	// Start second client with same ID
-	c2, err := client.New(clientConfig)
-	if err != nil {
-		t.Fatalf("failed to create second client: %v", err)
-	}
+	c2 := newTestClient(t, clientConfig)
 
 	client2Ctx, client2Cancel := context.WithCancel(ctx)
 	defer client2Cancel()
-	go c2.Start(client2Ctx)
+	startTestClient(client2Ctx, c2)
 	time.Sleep(500 * time.Millisecond)
 
 	// Test connection works with second client (failover)
-	conn, err = net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", trafficPort), 5*time.Second)
-	if err != nil {
-		t.Fatalf("failed to connect after reconnection: %v", err)
-	}
-	testData = "Second client test"
-	conn.SetDeadline(time.Now().Add(5 * time.Second))
-	conn.Write([]byte(testData))
-	buf = make([]byte, len(testData))
-	io.ReadFull(conn, buf)
-	if string(buf) != testData {
-		t.Fatalf("data mismatch with second client")
-	}
-	conn.Close()
+	assertTCPEcho(t, fmt.Sprintf("127.0.0.1:%d", trafficPort), []byte("Second client test"))
 
 	t.Log("Client reconnection and failover successful")
 }
@@ -639,81 +532,31 @@ func getFreePort(t testing.TB) int {
 		t.Fatalf("failed to get free port: %v", err)
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
-	listener.Close()
+	if err := listener.Close(); err != nil {
+		t.Fatalf("close free-port listener: %v", err)
+	}
 	return port
 }
 
 // BenchmarkClientAuth_MTLS benchmarks client authentication with mTLS authentication
 func BenchmarkClientAuth_MTLS(b *testing.B) {
 	certDir := generateTestCertificates(b)
-	defer os.RemoveAll(certDir)
 
-	// Start local TCP echo server
-	localListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		b.Fatalf("failed to start local server: %v", err)
-	}
-	defer localListener.Close()
-
-	localAddr := localListener.Addr().(*net.TCPAddr)
-
-	go func() {
-		for {
-			conn, err := localListener.Accept()
-			if err != nil {
-				return
-			}
-			go io.Copy(conn, conn)
-		}
-	}()
+	_, localPort := startTCPEchoListener(b)
 
 	// Start QMux server
 	quicPort := getFreePort(b)
 	trafficPort := getFreePort(b)
 
-	serverConfig := &config.Server{
-		Listeners: []config.QuicListener{
-			{
-				QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
-				TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
-				Protocol:    "tcp",
-			},
-		},
-		Auth: config.ServerAuth{
-			Method:     "mtls",
-			CACertFile: filepath.Join(certDir, "ca.crt"),
-		},
-		TLS: config.ServerTLS{
-
-			ServerCertFile: filepath.Join(certDir, "server.crt"),
-			ServerKeyFile:  filepath.Join(certDir, "server.key"),
-		},
-	}
+	serverConfig := newMTLSServerConfig(certDir, "tcp", quicPort, trafficPort, 0, 0)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	go server.Start(ctx, serverConfig)
+	startTestServer(ctx, serverConfig)
 	time.Sleep(500 * time.Millisecond)
 
-	clientConfig := &config.Client{
-		ClientID: "bench-client-auth",
-		Server: config.ClientServer{
-			Servers: []config.ServerEndpoint{
-				{Address: fmt.Sprintf("127.0.0.1:%d", quicPort), ServerName: "localhost"},
-			},
-		},
-		Local: config.LocalService{
-			Host: "127.0.0.1",
-			Port: localAddr.Port,
-		},
-		TLS: config.ClientTLS{
-			CACertFile: filepath.Join(certDir, "ca.crt"),
-
-			ClientCertFile: filepath.Join(certDir, "client.crt"),
-			ClientKeyFile:  filepath.Join(certDir, "client.key"),
-		},
-	}
+	clientConfig := newMTLSClientConfig(certDir, "bench-client-auth", localPort, 0, 0, quicPort)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -739,81 +582,24 @@ func BenchmarkClientAuth_MTLS(b *testing.B) {
 // BenchmarkTCPConnection_MTLS benchmarks TCP connection throughput with mTLS authentication
 func BenchmarkTCPConnection_MTLS(b *testing.B) {
 	certDir := generateTestCertificates(b)
-	defer os.RemoveAll(certDir)
-
-	// Start local TCP echo server
-	localListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		b.Fatalf("failed to start local server: %v", err)
-	}
-	defer localListener.Close()
-
-	localAddr := localListener.Addr().(*net.TCPAddr)
-
-	go func() {
-		for {
-			conn, err := localListener.Accept()
-			if err != nil {
-				return
-			}
-			go io.Copy(conn, conn)
-		}
-	}()
+	_, localPort := startTCPEchoListener(b)
 
 	// Start QMux server
 	quicPort := getFreePort(b)
 	trafficPort := getFreePort(b)
 
-	serverConfig := &config.Server{
-		Listeners: []config.QuicListener{
-			{
-				QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
-				TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
-				Protocol:    "tcp",
-			},
-		},
-		Auth: config.ServerAuth{
-			Method:     "mtls",
-			CACertFile: filepath.Join(certDir, "ca.crt"),
-		},
-		TLS: config.ServerTLS{
-
-			ServerCertFile: filepath.Join(certDir, "server.crt"),
-			ServerKeyFile:  filepath.Join(certDir, "server.key"),
-		},
-	}
+	serverConfig := newMTLSServerConfig(certDir, "tcp", quicPort, trafficPort, 0, 0)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	go server.Start(ctx, serverConfig)
+	startTestServer(ctx, serverConfig)
 	time.Sleep(500 * time.Millisecond)
 
-	clientConfig := &config.Client{
-		ClientID: "bench-client-tcp",
-		Server: config.ClientServer{
-			Servers: []config.ServerEndpoint{
-				{Address: fmt.Sprintf("127.0.0.1:%d", quicPort), ServerName: "localhost"},
-			},
-		},
-		Local: config.LocalService{
-			Host: "127.0.0.1",
-			Port: localAddr.Port,
-		},
-		TLS: config.ClientTLS{
-			CACertFile: filepath.Join(certDir, "ca.crt"),
+	clientConfig := newMTLSClientConfig(certDir, "bench-client-tcp", localPort, 0, 0, quicPort)
+	c := newTestClient(b, clientConfig)
 
-			ClientCertFile: filepath.Join(certDir, "client.crt"),
-			ClientKeyFile:  filepath.Join(certDir, "client.key"),
-		},
-	}
-
-	c, err := client.New(clientConfig)
-	if err != nil {
-		b.Fatalf("failed to create client: %v", err)
-	}
-
-	go c.Start(ctx)
+	startTestClient(ctx, c)
 	time.Sleep(500 * time.Millisecond)
 
 	testData := []byte(strings.Repeat("X", 1024)) // 1KB
@@ -827,94 +613,44 @@ func BenchmarkTCPConnection_MTLS(b *testing.B) {
 			b.Fatalf("failed to connect: %v", err)
 		}
 
-		conn.SetDeadline(time.Now().Add(5 * time.Second))
-		conn.Write(testData)
+		if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			b.Fatalf("set deadline: %v", err)
+		}
+		if _, err := conn.Write(testData); err != nil {
+			b.Fatalf("write: %v", err)
+		}
 
 		buf := make([]byte, len(testData))
-		io.ReadFull(conn, buf)
-		conn.Close()
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			b.Fatalf("read: %v", err)
+		}
+		if err := conn.Close(); err != nil {
+			b.Fatalf("close: %v", err)
+		}
 	}
 }
 
 // BenchmarkUDPConnection_MTLS benchmarks UDP connection throughput with mTLS authentication
 func BenchmarkUDPConnection_MTLS(b *testing.B) {
 	certDir := generateTestCertificates(b)
-	defer os.RemoveAll(certDir)
-
-	// Start local UDP echo server
-	localConn, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		b.Fatalf("failed to start local UDP server: %v", err)
-	}
-	defer localConn.Close()
-
-	localAddr := localConn.LocalAddr().(*net.UDPAddr)
-
-	go func() {
-		buf := make([]byte, 65535)
-		for {
-			n, addr, err := localConn.ReadFrom(buf)
-			if err != nil {
-				return
-			}
-			localConn.WriteTo(buf[:n], addr)
-		}
-	}()
+	_, localPort := startUDPEchoListener(b)
 
 	// Start QMux server
 	quicPort := getFreePort(b)
 	trafficPort := getFreePort(b)
 
-	serverConfig := &config.Server{
-		Listeners: []config.QuicListener{
-			{
-				QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
-				TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
-				Protocol:    "udp",
-			},
-		},
-		Auth: config.ServerAuth{
-			Method:     "mtls",
-			CACertFile: filepath.Join(certDir, "ca.crt"),
-		},
-		TLS: config.ServerTLS{
-
-			ServerCertFile: filepath.Join(certDir, "server.crt"),
-			ServerKeyFile:  filepath.Join(certDir, "server.key"),
-		},
-	}
+	serverConfig := newMTLSServerConfig(certDir, "udp", quicPort, trafficPort, 0, 0)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	go server.Start(ctx, serverConfig)
+	startTestServer(ctx, serverConfig)
 	time.Sleep(500 * time.Millisecond)
 
-	clientConfig := &config.Client{
-		ClientID: "bench-client-udp",
-		Server: config.ClientServer{
-			Servers: []config.ServerEndpoint{
-				{Address: fmt.Sprintf("127.0.0.1:%d", quicPort), ServerName: "localhost"},
-			},
-		},
-		Local: config.LocalService{
-			Host: "127.0.0.1",
-			Port: localAddr.Port,
-		},
-		TLS: config.ClientTLS{
-			CACertFile: filepath.Join(certDir, "ca.crt"),
+	clientConfig := newMTLSClientConfig(certDir, "bench-client-udp", localPort, 0, 0, quicPort)
+	c := newTestClient(b, clientConfig)
 
-			ClientCertFile: filepath.Join(certDir, "client.crt"),
-			ClientKeyFile:  filepath.Join(certDir, "client.key"),
-		},
-	}
-
-	c, err := client.New(clientConfig)
-	if err != nil {
-		b.Fatalf("failed to create client: %v", err)
-	}
-
-	go c.Start(ctx)
+	startTestClient(ctx, c)
 	time.Sleep(500 * time.Millisecond)
 
 	testData := []byte(strings.Repeat("U", 512)) // 512 bytes
@@ -928,93 +664,44 @@ func BenchmarkUDPConnection_MTLS(b *testing.B) {
 			b.Fatalf("failed to dial UDP: %v", err)
 		}
 
-		conn.SetDeadline(time.Now().Add(5 * time.Second))
-		conn.Write(testData)
+		if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			b.Fatalf("set deadline: %v", err)
+		}
+		if _, err := conn.Write(testData); err != nil {
+			b.Fatalf("write: %v", err)
+		}
 
 		buf := make([]byte, 65535)
-		conn.Read(buf)
-		conn.Close()
+		if _, err := conn.Read(buf); err != nil {
+			b.Fatalf("read: %v", err)
+		}
+		if err := conn.Close(); err != nil {
+			b.Fatalf("close: %v", err)
+		}
 	}
 }
 
 // BenchmarkTCPThroughput_MTLS benchmarks sustained TCP throughput with mTLS authentication
 func BenchmarkTCPThroughput_MTLS(b *testing.B) {
 	certDir := generateTestCertificates(b)
-	defer os.RemoveAll(certDir)
-
-	// Start local TCP echo server
-	localListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		b.Fatalf("failed to start local server: %v", err)
-	}
-	defer localListener.Close()
-
-	localAddr := localListener.Addr().(*net.TCPAddr)
-
-	go func() {
-		for {
-			conn, err := localListener.Accept()
-			if err != nil {
-				return
-			}
-			go io.Copy(conn, conn)
-		}
-	}()
+	_, localPort := startTCPEchoListener(b)
 
 	// Start QMux server
 	quicPort := getFreePort(b)
 	trafficPort := getFreePort(b)
 
-	serverConfig := &config.Server{
-		Listeners: []config.QuicListener{
-			{
-				QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
-				TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
-				Protocol:    "tcp",
-			},
-		},
-		Auth: config.ServerAuth{
-			Method:     "mtls",
-			CACertFile: filepath.Join(certDir, "ca.crt"),
-		},
-		TLS: config.ServerTLS{
-
-			ServerCertFile: filepath.Join(certDir, "server.crt"),
-			ServerKeyFile:  filepath.Join(certDir, "server.key"),
-		},
-	}
+	serverConfig := newMTLSServerConfig(certDir, "tcp", quicPort, trafficPort, 0, 0)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	go server.Start(ctx, serverConfig)
+	startTestServer(ctx, serverConfig)
 	time.Sleep(500 * time.Millisecond)
 
-	clientConfig := &config.Client{
-		ClientID: "bench-client-throughput",
-		Server: config.ClientServer{
-			Servers: []config.ServerEndpoint{
-				{Address: fmt.Sprintf("127.0.0.1:%d", quicPort), ServerName: "localhost"},
-			},
-		},
-		Local: config.LocalService{
-			Host: "127.0.0.1",
-			Port: localAddr.Port,
-		},
-		TLS: config.ClientTLS{
-			CACertFile: filepath.Join(certDir, "ca.crt"),
+	clientConfig := newMTLSClientConfig(certDir, "bench-client-throughput", localPort, 0, 0, quicPort)
+	c := newTestClient(b, clientConfig)
 
-			ClientCertFile: filepath.Join(certDir, "client.crt"),
-			ClientKeyFile:  filepath.Join(certDir, "client.key"),
-		},
-	}
-
-	c, err := client.New(clientConfig)
-	if err != nil {
-		b.Fatalf("failed to create client: %v", err)
-	}
-
-	go c.Start(ctx)
+	startTestClient(ctx, c)
 	time.Sleep(500 * time.Millisecond)
 
 	// Open persistent connection
@@ -1022,7 +709,7 @@ func BenchmarkTCPThroughput_MTLS(b *testing.B) {
 	if err != nil {
 		b.Fatalf("failed to connect: %v", err)
 	}
-	defer conn.Close()
+	closeOnCleanup(b, conn)
 
 	testData := []byte(strings.Repeat("X", 10240)) // 10KB chunks
 	buf := make([]byte, len(testData))
@@ -1031,36 +718,24 @@ func BenchmarkTCPThroughput_MTLS(b *testing.B) {
 	b.SetBytes(int64(len(testData)))
 
 	for i := 0; i < b.N; i++ {
-		conn.SetDeadline(time.Now().Add(5 * time.Second))
-		conn.Write(testData)
-		io.ReadFull(conn, buf)
+		if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			b.Fatalf("set deadline: %v", err)
+		}
+		if _, err := conn.Write(testData); err != nil {
+			b.Fatalf("write: %v", err)
+		}
+		if _, err := io.ReadFull(conn, buf); err != nil {
+			b.Fatalf("read: %v", err)
+		}
 	}
 }
 
 // TestMultiServerConnection_MTLS tests client connecting to multiple servers simultaneously
 func TestMultiServerConnection_MTLS(t *testing.T) {
 	certDir := generateTestCertificates(t)
-	defer os.RemoveAll(certDir)
 
-	// Start local TCP echo server
-	localListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to start local server: %v", err)
-	}
-	defer localListener.Close()
-
-	localAddr := localListener.Addr().(*net.TCPAddr)
-	t.Logf("Local echo server listening on %s", localAddr)
-
-	go func() {
-		for {
-			conn, err := localListener.Accept()
-			if err != nil {
-				return
-			}
-			go io.Copy(conn, conn)
-		}
-	}()
+	localListener, localPort := startTCPEchoListener(t)
+	t.Logf("Local echo server listening on %s", localListener.Addr())
 
 	// Start two QMux servers
 	quicPort1 := getFreePort(t)
@@ -1068,85 +743,23 @@ func TestMultiServerConnection_MTLS(t *testing.T) {
 	quicPort2 := getFreePort(t)
 	trafficPort2 := getFreePort(t)
 
-	serverConfig1 := &config.Server{
-		Listeners: []config.QuicListener{
-			{
-				QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort1),
-				TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort1),
-				Protocol:    "tcp",
-			},
-		},
-		Auth: config.ServerAuth{
-			Method:     "mtls",
-			CACertFile: filepath.Join(certDir, "ca.crt"),
-		},
-		TLS: config.ServerTLS{
-
-			ServerCertFile: filepath.Join(certDir, "server.crt"),
-			ServerKeyFile:  filepath.Join(certDir, "server.key"),
-		},
-		HeartbeatInterval: 1 * time.Second,
-		HealthTimeout:     3 * time.Second,
-	}
-
-	serverConfig2 := &config.Server{
-		Listeners: []config.QuicListener{
-			{
-				QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort2),
-				TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort2),
-				Protocol:    "tcp",
-			},
-		},
-		Auth: config.ServerAuth{
-			Method:     "mtls",
-			CACertFile: filepath.Join(certDir, "ca.crt"),
-		},
-		TLS: config.ServerTLS{
-
-			ServerCertFile: filepath.Join(certDir, "server.crt"),
-			ServerKeyFile:  filepath.Join(certDir, "server.key"),
-		},
-		HeartbeatInterval: 1 * time.Second,
-		HealthTimeout:     3 * time.Second,
-	}
+	serverConfig1 := newMTLSServerConfig(certDir, "tcp", quicPort1, trafficPort1, time.Second, 3*time.Second)
+	serverConfig2 := newMTLSServerConfig(certDir, "tcp", quicPort2, trafficPort2, time.Second, 3*time.Second)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	// Start both servers
-	go server.Start(ctx, serverConfig1)
-	go server.Start(ctx, serverConfig2)
+	startTestServer(ctx, serverConfig1)
+	startTestServer(ctx, serverConfig2)
 	time.Sleep(500 * time.Millisecond)
 
 	t.Logf("Server 1 listening on QUIC port %d, traffic port %d", quicPort1, trafficPort1)
 	t.Logf("Server 2 listening on QUIC port %d, traffic port %d", quicPort2, trafficPort2)
 
 	// Start client with multi-server configuration
-	clientConfig := &config.Client{
-		ClientID: "test-client-multiserver",
-		Server: config.ClientServer{
-			Servers: []config.ServerEndpoint{
-				{Address: fmt.Sprintf("127.0.0.1:%d", quicPort1), ServerName: "localhost"},
-				{Address: fmt.Sprintf("127.0.0.1:%d", quicPort2), ServerName: "localhost"},
-			},
-		},
-		Local: config.LocalService{
-			Host: "127.0.0.1",
-			Port: localAddr.Port,
-		},
-		TLS: config.ClientTLS{
-			CACertFile: filepath.Join(certDir, "ca.crt"),
-
-			ClientCertFile: filepath.Join(certDir, "client.crt"),
-			ClientKeyFile:  filepath.Join(certDir, "client.key"),
-		},
-		HeartbeatInterval: 1 * time.Second,
-	}
-
-	c, err := client.New(clientConfig)
-	if err != nil {
-		t.Fatalf("failed to create client: %v", err)
-	}
+	clientConfig := newMTLSClientConfig(certDir, "test-client-multiserver", localPort, time.Second, 0, quicPort1, quicPort2)
+	c := newTestClient(t, clientConfig)
 
 	clientErrCh := make(chan error, 1)
 	go func() {
@@ -1172,27 +785,7 @@ func TestMultiServerConnection_MTLS(t *testing.T) {
 	// Test traffic through both servers
 	for i, trafficPort := range []int{trafficPort1, trafficPort2} {
 		t.Run(fmt.Sprintf("Server_%d", i+1), func(t *testing.T) {
-			conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", trafficPort), 5*time.Second)
-			if err != nil {
-				t.Fatalf("failed to connect to traffic port %d: %v", trafficPort, err)
-			}
-			defer conn.Close()
-
-			testData := fmt.Sprintf("Hello from server %d", i+1)
-			conn.SetDeadline(time.Now().Add(5 * time.Second))
-
-			if _, err := conn.Write([]byte(testData)); err != nil {
-				t.Fatalf("failed to write: %v", err)
-			}
-
-			buf := make([]byte, len(testData))
-			if _, err := io.ReadFull(conn, buf); err != nil {
-				t.Fatalf("failed to read: %v", err)
-			}
-
-			if string(buf) != testData {
-				t.Fatalf("data mismatch: got %q, expected %q", string(buf), testData)
-			}
+			assertTCPEcho(t, fmt.Sprintf("127.0.0.1:%d", trafficPort), []byte(fmt.Sprintf("Hello from server %d", i+1)))
 		})
 	}
 
@@ -1209,26 +802,8 @@ func TestMultiServerConnection_MTLS(t *testing.T) {
 // TestMultiServerFailover_MTLS tests client failover when one server goes down
 func TestMultiServerFailover_MTLS(t *testing.T) {
 	certDir := generateTestCertificates(t)
-	defer os.RemoveAll(certDir)
 
-	// Start local TCP echo server
-	localListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to start local server: %v", err)
-	}
-	defer localListener.Close()
-
-	localAddr := localListener.Addr().(*net.TCPAddr)
-
-	go func() {
-		for {
-			conn, err := localListener.Accept()
-			if err != nil {
-				return
-			}
-			go io.Copy(conn, conn)
-		}
-	}()
+	_, localPort := startTCPEchoListener(t)
 
 	// Start two QMux servers
 	quicPort1 := getFreePort(t)
@@ -1236,90 +811,28 @@ func TestMultiServerFailover_MTLS(t *testing.T) {
 	quicPort2 := getFreePort(t)
 	trafficPort2 := getFreePort(t)
 
-	serverConfig1 := &config.Server{
-		Listeners: []config.QuicListener{
-			{
-				QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort1),
-				TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort1),
-				Protocol:    "tcp",
-			},
-		},
-		Auth: config.ServerAuth{
-			Method:     "mtls",
-			CACertFile: filepath.Join(certDir, "ca.crt"),
-		},
-		TLS: config.ServerTLS{
-
-			ServerCertFile: filepath.Join(certDir, "server.crt"),
-			ServerKeyFile:  filepath.Join(certDir, "server.key"),
-		},
-		HeartbeatInterval: 500 * time.Millisecond,
-		HealthTimeout:     1 * time.Second,
-	}
-
-	serverConfig2 := &config.Server{
-		Listeners: []config.QuicListener{
-			{
-				QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort2),
-				TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort2),
-				Protocol:    "tcp",
-			},
-		},
-		Auth: config.ServerAuth{
-			Method:     "mtls",
-			CACertFile: filepath.Join(certDir, "ca.crt"),
-		},
-		TLS: config.ServerTLS{
-
-			ServerCertFile: filepath.Join(certDir, "server.crt"),
-			ServerKeyFile:  filepath.Join(certDir, "server.key"),
-		},
-		HeartbeatInterval: 500 * time.Millisecond,
-		HealthTimeout:     1 * time.Second,
-	}
+	serverConfig1 := newMTLSServerConfig(certDir, "tcp", quicPort1, trafficPort1, 500*time.Millisecond, time.Second)
+	serverConfig2 := newMTLSServerConfig(certDir, "tcp", quicPort2, trafficPort2, 500*time.Millisecond, time.Second)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	// Start server 1 with its own context so we can cancel it
 	server1Ctx, server1Cancel := context.WithCancel(ctx)
-	go server.Start(server1Ctx, serverConfig1)
+	startTestServer(server1Ctx, serverConfig1)
 
 	// Start server 2
-	go server.Start(ctx, serverConfig2)
+	startTestServer(ctx, serverConfig2)
 	time.Sleep(500 * time.Millisecond)
 
 	t.Logf("Server 1 listening on QUIC port %d, traffic port %d", quicPort1, trafficPort1)
 	t.Logf("Server 2 listening on QUIC port %d, traffic port %d", quicPort2, trafficPort2)
 
 	// Start client with multi-server configuration
-	clientConfig := &config.Client{
-		ClientID: "test-client-failover",
-		Server: config.ClientServer{
-			Servers: []config.ServerEndpoint{
-				{Address: fmt.Sprintf("127.0.0.1:%d", quicPort1), ServerName: "localhost"},
-				{Address: fmt.Sprintf("127.0.0.1:%d", quicPort2), ServerName: "localhost"},
-			},
-		},
-		Local: config.LocalService{
-			Host: "127.0.0.1",
-			Port: localAddr.Port,
-		},
-		TLS: config.ClientTLS{
-			CACertFile: filepath.Join(certDir, "ca.crt"),
+	clientConfig := newMTLSClientConfig(certDir, "test-client-failover", localPort, 500*time.Millisecond, 0, quicPort1, quicPort2)
+	c := newTestClient(t, clientConfig)
 
-			ClientCertFile: filepath.Join(certDir, "client.crt"),
-			ClientKeyFile:  filepath.Join(certDir, "client.key"),
-		},
-		HeartbeatInterval: 500 * time.Millisecond,
-	}
-
-	c, err := client.New(clientConfig)
-	if err != nil {
-		t.Fatalf("failed to create client: %v", err)
-	}
-
-	go c.Start(ctx)
+	startTestClient(ctx, c)
 	time.Sleep(1 * time.Second)
 
 	// Verify both connections are healthy
@@ -1329,19 +842,7 @@ func TestMultiServerFailover_MTLS(t *testing.T) {
 	t.Log("Both servers connected and healthy")
 
 	// Test traffic through server 1 before shutdown
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", trafficPort1), 5*time.Second)
-	if err != nil {
-		t.Fatalf("failed to connect to server 1: %v", err)
-	}
-	testData := "Before failover"
-	conn.SetDeadline(time.Now().Add(5 * time.Second))
-	conn.Write([]byte(testData))
-	buf := make([]byte, len(testData))
-	io.ReadFull(conn, buf)
-	if string(buf) != testData {
-		t.Fatalf("data mismatch before failover")
-	}
-	conn.Close()
+	assertTCPEcho(t, fmt.Sprintf("127.0.0.1:%d", trafficPort1), []byte("Before failover"))
 	t.Log("Traffic through server 1 successful before failover")
 
 	// Shutdown server 1
@@ -1354,19 +855,7 @@ func TestMultiServerFailover_MTLS(t *testing.T) {
 	t.Logf("Healthy connections after server 1 shutdown: %d", healthyCount)
 
 	// Traffic through server 2 should still work
-	conn, err = net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", trafficPort2), 5*time.Second)
-	if err != nil {
-		t.Fatalf("failed to connect to server 2 after failover: %v", err)
-	}
-	testData = "After failover"
-	conn.SetDeadline(time.Now().Add(5 * time.Second))
-	conn.Write([]byte(testData))
-	buf = make([]byte, len(testData))
-	io.ReadFull(conn, buf)
-	if string(buf) != testData {
-		t.Fatalf("data mismatch after failover")
-	}
-	conn.Close()
+	assertTCPEcho(t, fmt.Sprintf("127.0.0.1:%d", trafficPort2), []byte("After failover"))
 
 	t.Log("Failover test successful - traffic continues through remaining server")
 }

@@ -2,6 +2,7 @@ package pool
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -24,7 +25,7 @@ func TestRoundRobinBalancer_Basic(t *testing.T) {
 
 	// Test round-robin distribution
 	selections := make(map[string]int)
-	for i := 0; i < 9; i++ {
+	for range 9 {
 		selected, err := balancer.Select(clients)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -56,7 +57,7 @@ func TestRoundRobinBalancer_SkipUnhealthy(t *testing.T) {
 	clients[2].healthy.Store(true)
 
 	selections := make(map[string]int)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		selected, err := balancer.Select(clients)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -130,18 +131,16 @@ func TestRoundRobinBalancer_Concurrent(t *testing.T) {
 	var wg sync.WaitGroup
 	errCh := make(chan error, 100)
 
-	for i := 0; i < 100; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 100; j++ {
+	for range 100 {
+		wg.Go(func() {
+			for range 100 {
 				_, err := balancer.Select(clients)
 				if err != nil {
 					errCh <- err
 					return
 				}
 			}
-		}()
+		})
 	}
 
 	wg.Wait()
@@ -167,7 +166,7 @@ func TestRoundRobinBalancer_DynamicHealth(t *testing.T) {
 	}
 
 	// Select a few times
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		_, err := balancer.Select(clients)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -179,7 +178,7 @@ func TestRoundRobinBalancer_DynamicHealth(t *testing.T) {
 
 	// Continue selecting - should skip client2
 	selections := make(map[string]int)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		selected, err := balancer.Select(clients)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -300,18 +299,16 @@ func TestLeastConnectionsBalancer_Concurrent(t *testing.T) {
 	var wg sync.WaitGroup
 	errCh := make(chan error, 100)
 
-	for i := 0; i < 100; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 100; j++ {
+	for range 100 {
+		wg.Go(func() {
+			for range 100 {
 				_, err := balancer.Select(clients)
 				if err != nil {
 					errCh <- err
 					return
 				}
 			}
-		}()
+		})
 	}
 
 	wg.Wait()
@@ -385,7 +382,7 @@ func TestLeastConnectionsBalancer_EqualConnections(t *testing.T) {
 	}
 
 	// Verify consistency across multiple calls
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		s, err := balancer.Select(clients)
 		if err != nil {
 			t.Fatalf("unexpected error on iteration %d: %v", i, err)
@@ -401,8 +398,8 @@ func BenchmarkRoundRobinBalancer(b *testing.B) {
 	balancer := NewRoundRobinBalancer()
 
 	clients := make([]*ClientConn, 10)
-	for i := 0; i < 10; i++ {
-		clients[i] = &ClientConn{ID: string(rune('A' + i))}
+	for i := range 10 {
+		clients[i] = &ClientConn{ID: fmt.Sprintf("%c", 'A'+i)}
 		clients[i].healthy.Store(true)
 	}
 
@@ -417,8 +414,8 @@ func BenchmarkLeastConnectionsBalancer(b *testing.B) {
 	balancer := NewLeastConnectionsBalancer()
 
 	clients := make([]*ClientConn, 10)
-	for i := 0; i < 10; i++ {
-		clients[i] = &ClientConn{ID: string(rune('A' + i))}
+	for i := range 10 {
+		clients[i] = &ClientConn{ID: fmt.Sprintf("%c", 'A'+i)}
 		clients[i].healthy.Store(true)
 		clients[i].ActiveConns.Store(int64(i))
 	}
@@ -432,7 +429,7 @@ func BenchmarkLeastConnectionsBalancer(b *testing.B) {
 // createBenchmarkClients generates n healthy ClientConn instances for benchmarking
 func createBenchmarkClients(n int) []*ClientConn {
 	clients := make([]*ClientConn, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		clients[i] = &ClientConn{ID: string(rune('A' + (i % 26)))}
 		clients[i].healthy.Store(true)
 		clients[i].ActiveConns.Store(int64(i % 100))
@@ -442,80 +439,33 @@ func createBenchmarkClients(n int) []*ClientConn {
 
 // BenchmarkRoundRobinBalancer_Sizes benchmarks round-robin selection with varying client counts
 func BenchmarkRoundRobinBalancer_Sizes(b *testing.B) {
-	b.Run("10_clients", func(b *testing.B) {
-		balancer := NewRoundRobinBalancer()
-		clients := createBenchmarkClients(10)
-
-		b.ReportAllocs()
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			_, _ = balancer.Select(clients)
-		}
-	})
-
-	b.Run("100_clients", func(b *testing.B) {
-		balancer := NewRoundRobinBalancer()
-		clients := createBenchmarkClients(100)
-
-		b.ReportAllocs()
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			_, _ = balancer.Select(clients)
-		}
-	})
-
-	b.Run("1000_clients", func(b *testing.B) {
-		balancer := NewRoundRobinBalancer()
-		clients := createBenchmarkClients(1000)
-
-		b.ReportAllocs()
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			_, _ = balancer.Select(clients)
-		}
-	})
+	benchmarkBalancerSizes(b, func() LoadBalancer { return NewRoundRobinBalancer() })
 }
 
 // BenchmarkLeastConnectionsBalancer_Sizes benchmarks least-connections selection with varying client counts
 func BenchmarkLeastConnectionsBalancer_Sizes(b *testing.B) {
-	b.Run("10_clients", func(b *testing.B) {
-		balancer := NewLeastConnectionsBalancer()
-		clients := createBenchmarkClients(10)
+	benchmarkBalancerSizes(b, func() LoadBalancer { return NewLeastConnectionsBalancer() })
+}
 
-		b.ReportAllocs()
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			_, _ = balancer.Select(clients)
-		}
-	})
+func benchmarkBalancerSizes(b *testing.B, newBalancer func() LoadBalancer) {
+	for _, size := range []int{10, 100, 1000} {
+		b.Run(fmt.Sprintf("%d_clients", size), func(b *testing.B) {
+			balancer := newBalancer()
+			clients := createBenchmarkClients(size)
 
-	b.Run("100_clients", func(b *testing.B) {
-		balancer := NewLeastConnectionsBalancer()
-		clients := createBenchmarkClients(100)
-
-		b.ReportAllocs()
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			_, _ = balancer.Select(clients)
-		}
-	})
-
-	b.Run("1000_clients", func(b *testing.B) {
-		balancer := NewLeastConnectionsBalancer()
-		clients := createBenchmarkClients(1000)
-
-		b.ReportAllocs()
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			_, _ = balancer.Select(clients)
-		}
-	})
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_, _ = balancer.Select(clients)
+			}
+		})
+	}
 }
 
 // createMixedHealthClients generates n clients with 50% healthy/unhealthy
 func createMixedHealthClients(n int) []*ClientConn {
 	clients := make([]*ClientConn, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		clients[i] = &ClientConn{ID: string(rune('A' + (i % 26)))}
 		clients[i].healthy.Store(i%2 == 0) // 50% healthy
 		clients[i].ActiveConns.Store(int64(i % 100))
@@ -588,7 +538,7 @@ func TestBalancerAllocationConstancy_Property(t *testing.T) {
 
 		// Create clients with mixed health status (some unhealthy to trigger allocation path)
 		clients := make([]*ClientConn, clientCount)
-		for i := 0; i < clientCount; i++ {
+		for i := range clientCount {
 			clients[i] = &ClientConn{ID: string(rune('A' + (i % 26)))}
 			// Make 20% of clients unhealthy to test the allocation path
 			clients[i].healthy.Store(i%5 != 0)
@@ -633,7 +583,7 @@ func TestAllHealthyFastPath_Property(t *testing.T) {
 
 		// Create all healthy clients
 		clients := make([]*ClientConn, clientCount)
-		for i := 0; i < clientCount; i++ {
+		for i := range clientCount {
 			clients[i] = &ClientConn{ID: string(rune('A' + (i % 26)))}
 			clients[i].healthy.Store(true)
 			clients[i].ActiveConns.Store(int64(i % 100))

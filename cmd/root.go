@@ -31,7 +31,7 @@ var (
 				fmt.Println(Version)
 				return
 			}
-			cmd.Help()
+			_ = cmd.Help()
 		},
 	}
 )

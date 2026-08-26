@@ -49,19 +49,19 @@ func initPool(datagramSize, readSize, fragmentSize int) {
 
 	udpPool = &UDPBufferPool{
 		datagramPool: sync.Pool{
-			New: func() interface{} {
+			New: func() any {
 				buf := make([]byte, DatagramBufferSize)
 				return &buf
 			},
 		},
 		readPool: sync.Pool{
-			New: func() interface{} {
+			New: func() any {
 				buf := make([]byte, ReadBufferSize)
 				return &buf
 			},
 		},
 		fragmentPool: sync.Pool{
-			New: func() interface{} {
+			New: func() any {
 				buf := make([]byte, FragmentBufferSize)
 				return &buf
 			},

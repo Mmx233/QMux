@@ -17,14 +17,14 @@ const (
 
 // bufferPool is a sync.Pool for reusing byte buffers to reduce allocations
 var bufferPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return new(bytes.Buffer)
 	},
 }
 
 // copyBufferPool is a sync.Pool for reusing copy buffers
 var copyBufferPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		buf := make([]byte, CopyBufferSize)
 		return &buf
 	},
@@ -33,8 +33,17 @@ var copyBufferPool = sync.Pool{
 // GetBuffer retrieves a buffer from the pool.
 // The buffer is reset and ready for use.
 func GetBuffer() *bytes.Buffer {
+	return GetBufferWithSize(0)
+}
+
+// GetBufferWithSize retrieves a buffer from the pool and grows it to the specified size hint.
+// This helps reduce reallocations when the approximate size is known.
+func GetBufferWithSize(sizeHint int) *bytes.Buffer {
 	buf := bufferPool.Get().(*bytes.Buffer)
 	buf.Reset()
+	if sizeHint > 0 && buf.Cap() < sizeHint {
+		buf.Grow(sizeHint)
+	}
 	return buf
 }
 
@@ -50,16 +59,6 @@ func PutBuffer(buf *bytes.Buffer) {
 	}
 	buf.Reset()
 	bufferPool.Put(buf)
-}
-
-// GetBufferWithSize retrieves a buffer from the pool and grows it to the specified size hint.
-// This helps reduce reallocations when the approximate size is known.
-func GetBufferWithSize(sizeHint int) *bytes.Buffer {
-	buf := GetBuffer()
-	if sizeHint > 0 && buf.Cap() < sizeHint {
-		buf.Grow(sizeHint)
-	}
-	return buf
 }
 
 // GetCopyBuffer retrieves a copy buffer from the pool.
@@ -89,16 +88,12 @@ func Relay(a, b io.ReadWriter) error {
 	errCh := make(chan error, 2)
 
 	go func() {
-		bufPtr := GetCopyBuffer()
-		defer PutCopyBuffer(bufPtr)
-		_, err := io.CopyBuffer(a, b, *bufPtr)
+		_, err := CopyBuffered(a, b)
 		errCh <- err
 	}()
 
 	go func() {
-		bufPtr := GetCopyBuffer()
-		defer PutCopyBuffer(bufPtr)
-		_, err := io.CopyBuffer(b, a, *bufPtr)
+		_, err := CopyBuffered(b, a)
 		errCh <- err
 	}()
 
