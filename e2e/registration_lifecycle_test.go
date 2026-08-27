@@ -91,6 +91,76 @@ func TestHealthyEndpointPublishesWhileRegistrationPeerStalls(t *testing.T) {
 	}
 }
 
+func TestClientStopWithLiveBackgroundStart(t *testing.T) {
+	certDir := generateTestCertificates(t)
+	_, localPort := startTCPEchoListener(t)
+	quicPort := getFreePort(t)
+	trafficPort := getFreePort(t)
+
+	serverCtx := t.Context()
+	serverErr := startTestServerReporting(serverCtx, newMTLSServerConfig(
+		certDir,
+		"tcp",
+		quicPort,
+		trafficPort,
+		20*time.Millisecond,
+		500*time.Millisecond,
+	))
+	clientConfig := newMTLSClientConfig(
+		certDir,
+		"lif004-background-stop",
+		localPort,
+		20*time.Millisecond,
+		500*time.Millisecond,
+		quicPort,
+	)
+	waitForQUICListener(t, serverCtx, clientConfig, serverErr)
+
+	clientInstance := newTestClient(t, clientConfig)
+	clientDone := make(chan error, 1)
+	go func() {
+		clientDone <- clientInstance.Start(context.Background())
+	}()
+	assertTCPEchoEventually(
+		t,
+		serverCtx,
+		fmt.Sprintf("127.0.0.1:%d", trafficPort),
+		[]byte("live client stopped without caller cancellation"),
+		clientDone,
+		serverErr,
+	)
+	if got := clientInstance.HealthyConnectionCount(); got != 1 {
+		t.Fatalf("healthy connections before Stop = %d, want 1", got)
+	}
+	select {
+	case err := <-clientDone:
+		t.Fatalf("Client.Start returned before Stop: %v", err)
+	default:
+	}
+
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- clientInstance.Stop() }()
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("Stop returned error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Client.Stop did not return with a live caller context")
+	}
+	select {
+	case err := <-clientDone:
+		if err != nil {
+			t.Fatalf("Start returned error after Stop: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Client.Start did not return after Stop")
+	}
+	if got := clientInstance.TotalConnectionCount(); got != 0 {
+		t.Fatalf("connections after Stop = %d, want 0", got)
+	}
+}
+
 func waitForQUICListener(
 	t *testing.T,
 	ctx context.Context,

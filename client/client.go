@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -15,6 +16,13 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+var (
+	// ErrClientAlreadyStarted is returned when Start is called more than once.
+	ErrClientAlreadyStarted = errors.New("client already started")
+	// ErrClientStopped is returned when Start is called after shutdown.
+	ErrClientStopped = errors.New("client stopped")
+)
+
 // Client represents the QMux client
 type Client struct {
 	config      *config.Client
@@ -22,9 +30,14 @@ type Client struct {
 	udpHandlers sync.Map // serverAddr -> *UDPHandler
 	localConns  sync.Map // connID -> net.Conn
 	logger      zerolog.Logger
-	ctx         context.Context
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
+
+	lifecycleMu  sync.Mutex
+	started      bool
+	stopped      bool
+	runCancel    context.CancelFunc
+	shutdownOnce sync.Once
+	shutdownErr  error
+	wg           sync.WaitGroup
 }
 
 // New creates a new client
@@ -42,12 +55,9 @@ func New(conf *config.Client) (*Client, error) {
 		return nil, fmt.Errorf("load credentials: %w", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-
 	// Create connection manager
 	connMgr, err := NewConnectionManager(conf, logger)
 	if err != nil {
-		cancel()
 		return nil, fmt.Errorf("create connection manager: %w", err)
 	}
 
@@ -55,13 +65,28 @@ func New(conf *config.Client) (*Client, error) {
 		config:  conf,
 		connMgr: connMgr,
 		logger:  logger,
-		ctx:     ctx,
-		cancel:  cancel,
 	}, nil
 }
 
 // Start starts the client
 func (c *Client) Start(ctx context.Context) error {
+	c.lifecycleMu.Lock()
+	if c.stopped {
+		c.lifecycleMu.Unlock()
+		return ErrClientStopped
+	}
+	if c.started {
+		c.lifecycleMu.Unlock()
+		return ErrClientAlreadyStarted
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	c.started = true
+	c.runCancel = cancel
+	c.wg.Go(func() {
+		c.handleNewConnections(runCtx)
+	})
+	c.lifecycleMu.Unlock()
+
 	servers := c.config.Server.GetServers()
 	serverAddrs := make([]string, len(servers))
 	for i, s := range servers {
@@ -73,13 +98,9 @@ func (c *Client) Start(ctx context.Context) error {
 		Str("local", net.JoinHostPort(c.config.Local.Host, strconv.Itoa(c.config.Local.Port))).
 		Msg("starting client")
 
-	// Listen for new connections (initial + reconnected) from the connection manager
-	c.wg.Go(func() {
-		c.handleNewConnections(ctx)
-	})
-
 	// Start connection manager (handles connecting to all servers)
-	if err := c.connMgr.Start(ctx); err != nil {
+	if err := c.connMgr.Start(runCtx); err != nil {
+		_ = c.shutdown()
 		return fmt.Errorf("start connection manager: %w", err)
 	}
 
@@ -88,8 +109,8 @@ func (c *Client) Start(ctx context.Context) error {
 		Int("total", c.connMgr.TotalCount()).
 		Msg("client started successfully")
 
-	// Wait for context cancellation
-	<-ctx.Done()
+	// Wait for caller cancellation or an external Stop.
+	<-runCtx.Done()
 	c.logger.Info().Msg("client shutting down")
 
 	return c.shutdown()
@@ -263,36 +284,44 @@ func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *Serv
 
 // shutdown gracefully shuts down the client
 func (c *Client) shutdown() error {
-	c.cancel()
+	c.shutdownOnce.Do(func() {
+		c.lifecycleMu.Lock()
+		c.stopped = true
+		cancel := c.runCancel
+		c.lifecycleMu.Unlock()
 
-	// Stop all UDP handlers
-	c.udpHandlers.Range(func(key, value any) bool {
-		if handler, ok := value.(*UDPHandler); ok {
-			handler.Stop()
+		if cancel != nil {
+			cancel()
 		}
-		return true
+
+		// Join every tracked user of ServerConnection.conn before Stop clears it.
+		c.wg.Wait()
+
+		if c.connMgr != nil {
+			if err := c.connMgr.Stop(); err != nil {
+				c.logger.Error().Err(err).Msg("error stopping connection manager")
+				c.shutdownErr = fmt.Errorf("stop connection manager: %w", err)
+			}
+		}
+
+		c.udpHandlers.Range(func(key, value any) bool {
+			if handler, ok := value.(*UDPHandler); ok {
+				handler.Stop()
+			}
+			return true
+		})
+
+		c.localConns.Range(func(key, value any) bool {
+			if conn, ok := value.(net.Conn); ok {
+				_ = conn.Close()
+			}
+			return true
+		})
+
+		c.logger.Info().Msg("client shutdown complete")
 	})
 
-	// Close all local connections
-	c.localConns.Range(func(key, value any) bool {
-		if conn, ok := value.(net.Conn); ok {
-			_ = conn.Close()
-		}
-		return true
-	})
-
-	// Wait for stream handlers to finish
-	c.wg.Wait()
-
-	// Stop connection manager (closes all server connections)
-	if c.connMgr != nil {
-		if err := c.connMgr.Stop(); err != nil {
-			c.logger.Error().Err(err).Msg("error stopping connection manager")
-		}
-	}
-
-	c.logger.Info().Msg("client shutdown complete")
-	return nil
+	return c.shutdownErr
 }
 
 // Stop stops the client
