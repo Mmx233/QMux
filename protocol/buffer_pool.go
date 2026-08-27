@@ -75,9 +75,15 @@ func PutCopyBuffer(buf *[]byte) {
 	copyBufferPool.Put(buf)
 }
 
-// CopyBuffered copies from src to dst using a pooled 512KB buffer for better throughput.
+// CopyBuffered uses WriterTo or ReaderFrom when available, and a pooled 512KB buffer otherwise.
 // Returns the number of bytes copied and any error encountered.
 func CopyBuffered(dst io.Writer, src io.Reader) (int64, error) {
+	if wt, ok := src.(io.WriterTo); ok {
+		return wt.WriteTo(dst)
+	}
+	if rf, ok := dst.(io.ReaderFrom); ok {
+		return rf.ReadFrom(src)
+	}
 	bufPtr := GetCopyBuffer()
 	defer PutCopyBuffer(bufPtr)
 	return io.CopyBuffer(dst, src, *bufPtr)
