@@ -1,6 +1,8 @@
 package protocol
 
 import (
+	"bytes"
+	"sync/atomic"
 	"testing"
 
 	"pgregory.net/rapid"
@@ -174,11 +176,15 @@ func TestReadBufferSizeInvariant_ConcurrentAccess_Property(t *testing.T) {
 
 func TestInitBufferPoolCustomSizes(t *testing.T) {
 	t.Cleanup(func() {
-		InitBufferPool(DefaultDatagramBufferSize, DefaultReadBufferSize, DefaultFragmentBufferSize)
+		if err := InitBufferPool(DefaultDatagramBufferSize, DefaultReadBufferSize, DefaultFragmentBufferSize); err != nil {
+			t.Errorf("restore default buffer pool: %v", err)
+		}
 	})
 
-	const datagramSize, readSize, fragmentSize = 512, 2048, 503
-	InitBufferPool(datagramSize, readSize, fragmentSize)
+	const datagramSize, readSize, fragmentSize = MaxDatagramSize + 512, 2048, 503
+	if err := InitBufferPool(datagramSize, readSize, fragmentSize); err != nil {
+		t.Fatalf("InitBufferPool: %v", err)
+	}
 
 	for name, buffer := range map[string]*[]byte{
 		"datagram": GetDatagramBuffer(),
@@ -189,5 +195,100 @@ func TestInitBufferPoolCustomSizes(t *testing.T) {
 		if len(*buffer) != want {
 			t.Errorf("%s buffer length = %d, want %d", name, len(*buffer), want)
 		}
+	}
+}
+
+// Reinitialization here only isolates validation cases; runtime reinitialization remains unsupported and belongs to UDP-007.
+func TestInitBufferPoolDatagramSizeValidation(t *testing.T) {
+	tests := []struct {
+		name         string
+		datagramSize int
+		wantErr      bool
+	}{
+		{name: "minimum", datagramSize: MaxDatagramSize},
+		{name: "zero uses default", datagramSize: 0},
+		{name: "negative uses default", datagramSize: -17},
+		{name: "below minimum", datagramSize: MaxDatagramSize - 1, wantErr: true},
+		{name: "small positive", datagramSize: 64, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := InitBufferPool(DefaultDatagramBufferSize, DefaultReadBufferSize, DefaultFragmentBufferSize); err != nil {
+				t.Fatalf("initialize default buffer pool: %v", err)
+			}
+			t.Cleanup(func() {
+				if err := InitBufferPool(DefaultDatagramBufferSize, DefaultReadBufferSize, DefaultFragmentBufferSize); err != nil {
+					t.Errorf("restore default buffer pool: %v", err)
+				}
+			})
+
+			poolBefore := udpPool
+			datagramBefore, readBefore, fragmentBefore := DatagramBufferSize, ReadBufferSize, FragmentBufferSize
+			const readSize, fragmentSize = 23456, 789
+			err := InitBufferPool(tt.datagramSize, readSize, fragmentSize)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("InitBufferPool returned nil error")
+				}
+				if udpPool != poolBefore || DatagramBufferSize != datagramBefore || ReadBufferSize != readBefore || FragmentBufferSize != fragmentBefore {
+					t.Fatal("rejected initialization changed buffer pool state")
+				}
+
+				for name, pool := range map[string]propertyBufferPool{
+					"datagram": {size: datagramBefore, get: GetDatagramBuffer, put: PutDatagramBuffer},
+					"read":     {size: readBefore, get: GetReadBuffer, put: PutReadBuffer},
+					"fragment": {size: fragmentBefore, get: GetFragmentBuffer, put: PutFragmentBuffer},
+				} {
+					buf := pool.get()
+					if len(*buf) != pool.size {
+						t.Errorf("%s buffer length = %d, want %d", name, len(*buf), pool.size)
+					}
+					pool.put(buf)
+				}
+
+				const sessionID uint32 = 0x12345678
+				payload := bytes.Repeat([]byte{0xa5}, MaxUDPPayload)
+				var fragIDCounter atomic.Uint32
+				results, fragmentErr := FragmentUDPPooled(sessionID, payload, &fragIDCounter, true)
+				if fragmentErr != nil {
+					t.Fatalf("FragmentUDPPooled: %v", fragmentErr)
+				}
+				t.Cleanup(func() { ReleaseDatagramResults(results) })
+				if len(results) != 1 {
+					t.Fatalf("datagram count = %d, want 1", len(results))
+				}
+				decoded, decodeErr := DecodeUDPDatagram(results[0].Data)
+				if decodeErr != nil {
+					t.Fatalf("DecodeUDPDatagram: %v", decodeErr)
+				}
+				if decoded.SessionID != sessionID {
+					t.Errorf("session ID = %#x, want %#x", decoded.SessionID, sessionID)
+				}
+				if !bytes.Equal(decoded.Payload, payload) {
+					t.Error("decoded payload differs from input")
+				}
+				if len(results[0].Data) != MaxDatagramSize {
+					t.Errorf("datagram length = %d, want %d", len(results[0].Data), MaxDatagramSize)
+				}
+				ReleaseDatagramResults(results)
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("InitBufferPool: %v", err)
+			}
+			for name, pool := range map[string]propertyBufferPool{
+				"datagram": {size: MaxDatagramSize, get: GetDatagramBuffer, put: PutDatagramBuffer},
+				"read":     {size: readSize, get: GetReadBuffer, put: PutReadBuffer},
+				"fragment": {size: fragmentSize, get: GetFragmentBuffer, put: PutFragmentBuffer},
+			} {
+				buf := pool.get()
+				if len(*buf) != pool.size {
+					t.Errorf("%s buffer length = %d, want %d", name, len(*buf), pool.size)
+				}
+				pool.put(buf)
+			}
+		})
 	}
 }

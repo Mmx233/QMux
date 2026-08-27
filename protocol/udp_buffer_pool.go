@@ -1,6 +1,9 @@
 package protocol
 
-import "sync"
+import (
+	"fmt"
+	"sync"
+)
 
 // Default UDP buffer size constants
 const (
@@ -70,9 +73,12 @@ func initPool(datagramSize, readSize, fragmentSize int) {
 }
 
 // InitBufferPool initializes the buffer pool with custom sizes.
-// This should be called once at startup before any buffer operations.
-// If any size is <= 0, the default value will be used.
-func InitBufferPool(datagramSize, readSize, fragmentSize int) {
+// It may only be called during startup, before any buffer operation, and must
+// not run concurrently with Get or Put calls. If any size is <= 0, its default
+// is used. datagramSize must be at least MaxDatagramSize because UDP wire v2
+// fixes the maximum datagram size at that value. On validation failure, the
+// current pool and sizes remain unchanged.
+func InitBufferPool(datagramSize, readSize, fragmentSize int) error {
 	if datagramSize <= 0 {
 		datagramSize = DefaultDatagramBufferSize
 	}
@@ -82,7 +88,11 @@ func InitBufferPool(datagramSize, readSize, fragmentSize int) {
 	if fragmentSize <= 0 {
 		fragmentSize = DefaultFragmentBufferSize
 	}
+	if datagramSize < MaxDatagramSize {
+		return fmt.Errorf("datagram buffer size %d is below minimum %d", datagramSize, MaxDatagramSize)
+	}
 	initPool(datagramSize, readSize, fragmentSize)
+	return nil
 }
 
 // GetDatagramBuffer returns a buffer for datagram operations.
