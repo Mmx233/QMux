@@ -4,15 +4,23 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"time"
 
 	"github.com/Mmx233/QMux/protocol"
 	"github.com/Mmx233/QMux/server/connid"
+	"github.com/Mmx233/QMux/server/pool"
 	"github.com/quic-go/quic-go"
 )
 
-const trafficStreamCancelCode quic.StreamErrorCode = 0
+const (
+	trafficStreamCancelCode quic.StreamErrorCode = 0
+	tcpSetupTimeout                              = 5 * time.Second
+	maxPendingTCPSetups                          = 128
+)
+
+var errNoTCPStreamCapacity = errors.New("no TCP stream capacity")
 
 type tcpFlow struct {
 	conn net.Conn
@@ -22,17 +30,30 @@ type tcpFlow struct {
 	stream  *quic.Stream
 }
 
-func (f *tcpFlow) setStream(stream *quic.Stream) {
+func (f *tcpFlow) setStream(stream *quic.Stream) bool {
 	f.mu.Lock()
 	if !f.aborted {
 		f.stream = stream
 		f.mu.Unlock()
-		return
+		return true
 	}
 	f.mu.Unlock()
 
 	stream.CancelRead(trafficStreamCancelCode)
 	stream.CancelWrite(trafficStreamCancelCode)
+	return false
+}
+
+func (f *tcpFlow) isAborted() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.aborted
+}
+
+func (f *tcpFlow) commitStream(stream *quic.Stream) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return !f.aborted && f.stream == stream
 }
 
 // abort forcefully tears down both relay directions after a relay failure or
@@ -107,6 +128,12 @@ func (l *Listener) acceptTCP() {
 				continue
 			}
 		}
+		setupDeadline := time.Now().Add(tcpSetupTimeout)
+		releaseSetup, ok := acquireTCPSetup(l.tcpSetupSlots)
+		if !ok {
+			_ = conn.Close()
+			continue
+		}
 
 		if tc, ok := conn.(*net.TCPConn); ok {
 			_ = tc.SetNoDelay(true)
@@ -115,8 +142,17 @@ func (l *Listener) acceptTCP() {
 		}
 
 		l.handlerWG.Go(func() {
-			l.handleTCPConnection(conn)
+			l.handleTCPConnection(conn, setupDeadline, releaseSetup)
 		})
+	}
+}
+
+func acquireTCPSetup(slots chan struct{}) (func(), bool) {
+	select {
+	case slots <- struct{}{}:
+		return sync.OnceFunc(func() { <-slots }), true
+	default:
+		return nil, false
 	}
 }
 
@@ -140,7 +176,8 @@ func (l *Listener) removeTCPFlow(flow *tcpFlow) {
 }
 
 // handleTCPConnection handles a single TCP connection.
-func (l *Listener) handleTCPConnection(conn net.Conn) {
+func (l *Listener) handleTCPConnection(conn net.Conn, setupDeadline time.Time, releaseSetup func()) {
+	defer releaseSetup()
 	flow, ok := l.addTCPFlow(conn)
 	if !ok {
 		return
@@ -155,25 +192,66 @@ func (l *Listener) handleTCPConnection(conn net.Conn) {
 
 	logger.Debug().Msg("new TCP connection")
 
-	client, err := l.Pool.SelectProtocol("tcp")
+	admission, err := l.Pool.BeginTCPAdmission()
 	if err != nil {
 		logger.Error().Err(err).Msg("no available client")
 		return
 	}
+	var currentLease *pool.TCPLease
+	defer func() {
+		if currentLease != nil {
+			currentLease.Release()
+		}
+	}()
 
-	logger = logger.With().Str("client_id", client.ID).Logger()
-	logger.Debug().Msg("selected client")
+	var (
+		client *pool.ClientConn
+		stream *quic.Stream
+	)
+	for {
+		if !time.Now().Before(setupDeadline) {
+			logger.Debug().Err(os.ErrDeadlineExceeded).Msg("TCP setup deadline reached")
+			return
+		}
+		currentLease, err = admission.Next()
+		if err != nil {
+			logger.Error().Err(err).Msg("select TCP client failed")
+			return
+		}
+		if currentLease == nil {
+			logger.Debug().Err(errNoTCPStreamCapacity).Msg("TCP setup rejected")
+			return
+		}
+		client = currentLease.Client()
+		clientLogger := logger.With().Str("client_id", client.ID).Logger()
+		clientLogger.Debug().Msg("selected client")
 
-	stream, err := client.Conn.OpenStreamSync(l.ctx)
-	if err != nil {
-		logger.Error().Err(err).Msg("open stream failed")
-		if l.ctx.Err() == nil && !l.Pool.MarkUnhealthy(client) {
-			logger.Debug().Msg("ignored stale client stream-open failure")
+		stream, err = client.Conn.OpenStream()
+		if err == nil {
+			logger = clientLogger
+			break
+		}
+		if _, ok := errors.AsType[*quic.StreamLimitReachedError](err); ok {
+			currentLease.Release()
+			currentLease = nil
+			stream = nil
+			continue
+		}
+
+		clientLogger.Error().Err(err).Msg("open stream failed")
+		if l.ctx.Err() == nil && !flow.isAborted() && !l.Pool.MarkUnhealthy(client) {
+			clientLogger.Debug().Msg("ignored stale client stream-open failure")
 		}
 		return
 	}
-	flow.setStream(stream)
-	defer func() { _ = flow.closeSendGracefully() }()
+	if !flow.setStream(stream) {
+		return
+	}
+	if err := stream.SetWriteDeadline(setupDeadline); err != nil {
+		logger.Error().Err(err).Msg("set NewConn write deadline failed")
+		flow.abort()
+		return
+	}
 
 	connID := connid.Generate()
 	err = protocol.WriteNewConn(
@@ -185,18 +263,41 @@ func (l *Listener) handleTCPConnection(conn net.Conn) {
 		time.Now().Unix(),
 	)
 	if err != nil {
-		logger.Error().Err(err).Msg("send NewConn message failed")
-		if l.ctx.Err() == nil && !l.Pool.MarkUnhealthy(client) {
-			logger.Debug().Msg("ignored stale client NewConn write failure")
+		localAbort := l.ctx.Err() != nil || flow.isAborted()
+		var streamErr *quic.StreamError
+		switch {
+		case localAbort:
+			logger.Debug().Err(err).Msg("NewConn write interrupted by shutdown")
+		case errors.Is(err, os.ErrDeadlineExceeded):
+			logger.Error().Err(err).Msg("NewConn write deadline reached")
+		case errors.As(err, &streamErr):
+			logger.Debug().Err(err).Msg("NewConn stream canceled")
+		default:
+			logger.Error().Err(err).Msg("send NewConn message failed")
+			if !l.Pool.MarkUnhealthy(client) {
+				logger.Debug().Msg("ignored stale client NewConn write failure")
+			}
 		}
+		flow.abort()
 		return
 	}
+	if err := stream.SetWriteDeadline(time.Time{}); err != nil {
+		logger.Error().Err(err).Msg("clear NewConn write deadline failed")
+		flow.abort()
+		return
+	}
+	if !flow.commitStream(stream) {
+		return
+	}
+	if !currentLease.Commit() {
+		logger.Error().Msg("commit TCP admission lease failed")
+		flow.abort()
+		return
+	}
+	releaseSetup()
+	defer func() { _ = flow.closeSendGracefully() }()
 
 	logger.Debug().Uint64("conn_id", connID).Msg("forwarding connection")
-
-	client.ActiveConns.Add(1)
-	client.TotalConns.Add(1)
-	defer client.ActiveConns.Add(-1)
 
 	relay := protocol.StartRelay(conn, stream,
 		func(err error) error {

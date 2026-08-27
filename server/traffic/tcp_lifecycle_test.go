@@ -512,6 +512,9 @@ func TestTCPRelayManagerShutdownAbortsFlowControlBlockedSend(t *testing.T) {
 	if active := pooledClient.ActiveConns.Load(); active != 0 {
 		t.Fatalf("active connections after Manager.Wait = %d, want 0", active)
 	}
+	if got := manager.listeners[0].Pool.EligibleCount("tcp"); got != 1 {
+		t.Fatalf("eligible clients after local manager shutdown = %d, want 1", got)
+	}
 
 	if err := peerStream.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
 		t.Fatalf("set blocked peer stream read deadline: %v", err)

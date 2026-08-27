@@ -123,7 +123,9 @@ func (l *LeastConnectionsBalancer) selectFromSlice(clients []*ClientConn) (*Clie
 	minConns := int64(^uint64(0) >> 1) // Max int64
 
 	for _, c := range clients {
-		conns := c.ActiveConns.Load()
+		// Commit increments active before decrementing pending. Read in the
+		// opposite order so selection may briefly overcount, but never undercount.
+		conns := c.tcpPending.Load() + c.ActiveConns.Load()
 		if conns < minConns {
 			minConns = conns
 			selected = c

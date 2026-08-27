@@ -73,10 +73,11 @@ type Listener struct {
 	fixedWG   sync.WaitGroup
 	handlerWG sync.WaitGroup
 
-	flowsMu      sync.Mutex
-	flowsClosing bool
-	flows        map[*tcpFlow]struct{}
-	udpHandler   *UDPHandler
+	flowsMu       sync.Mutex
+	flowsClosing  bool
+	flows         map[*tcpFlow]struct{}
+	tcpSetupSlots chan struct{}
+	udpHandler    *UDPHandler
 }
 
 // NewManager creates a new traffic manager.
@@ -236,6 +237,7 @@ func (m *Manager) newListener(ctx context.Context, listenerConf config.QuicListe
 		ctx:                 listenerCtx,
 		cancel:              listenerCancel,
 		flows:               make(map[*tcpFlow]struct{}),
+		tcpSetupSlots:       make(chan struct{}, maxPendingTCPSetups),
 		logger: m.logger.With().
 			Str("traffic_addr", listenerConf.TrafficAddr).
 			Str("quic_addr", listenerConf.QuicAddr).

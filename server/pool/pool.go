@@ -43,12 +43,31 @@ type ClientConn struct {
 	// Connection tracking
 	ActiveConns atomic.Int64
 	TotalConns  atomic.Uint64
+	tcpPending  atomic.Int64
 
 	// Health
 	healthy atomic.Bool
 
 	// Registration tracks whether this pointer has been consumed as a generation.
 	added atomic.Bool
+}
+
+// TCPAdmission walks a stable snapshot of TCP-capable connection generations.
+// It is owned by one traffic handler.
+type TCPAdmission struct {
+	pool       *ConnectionPool
+	candidates []*ClientConn
+	next       int
+	balanced   bool
+	balanceErr error
+}
+
+// TCPLease accounts for one TCP setup against an exact connection generation.
+// It is owned by one traffic handler and remains valid if that generation is replaced.
+type TCPLease struct {
+	pool  *ConnectionPool
+	conn  *ClientConn
+	state tcpLeaseState
 }
 
 // Reservation holds an unpublished client generation while registration is
@@ -66,6 +85,16 @@ const (
 	reservationCommitted
 	reservationAborted
 )
+
+type tcpLeaseState uint8
+
+const (
+	tcpLeasePending tcpLeaseState = iota
+	tcpLeaseActive
+	tcpLeaseReleased
+)
+
+const maxPendingTCPSetupsPerClient = 16
 
 // ClientMetadata contains client information
 type ClientMetadata struct {
@@ -275,13 +304,140 @@ func (p *ConnectionPool) SelectProtocol(protocol string) (*ClientConn, error) {
 	return p.balancer.Select(eligible)
 }
 
+// BeginTCPAdmission snapshots eligible generations. Generations added later are
+// intentionally ignored.
+func (p *ConnectionPool) BeginTCPAdmission() (*TCPAdmission, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if len(p.clients) == 0 {
+		return nil, ErrNoClientsAvailable
+	}
+	clients := p.clientSliceLocked()
+	candidates := make([]*ClientConn, 0, len(clients))
+	for _, conn := range clients {
+		if isEligible(conn, "tcp") {
+			candidates = append(candidates, conn)
+		}
+	}
+	if len(candidates) == 0 {
+		return nil, ErrNoEligibleClients
+	}
+
+	return &TCPAdmission{pool: p, candidates: candidates}, nil
+}
+
+// Next reserves the next still-current candidate. The first call selects and
+// reserves under one pool lock; later calls walk the same snapshot without
+// invoking the balancer again. A nil lease means the snapshot is exhausted or
+// every remaining generation is saturated.
+func (a *TCPAdmission) Next() (*TCPLease, error) {
+	if a == nil || a.pool == nil {
+		return nil, nil
+	}
+
+	a.pool.mu.Lock()
+	defer a.pool.mu.Unlock()
+	if !a.balanced {
+		a.balanced = true
+		eligible := make([]*ClientConn, 0, len(a.candidates))
+		for _, conn := range a.candidates {
+			if a.pool.isCurrentLocked(conn) &&
+				isEligible(conn, "tcp") &&
+				conn.tcpPending.Load() < maxPendingTCPSetupsPerClient {
+				eligible = append(eligible, conn)
+			}
+		}
+		if len(eligible) != 0 {
+			selected, err := a.pool.balancer.Select(eligible)
+			if err != nil {
+				a.balanceErr = err
+				return nil, err
+			}
+			if slices.Index(eligible, selected) < 0 {
+				a.balanceErr = fmt.Errorf("load balancer selected a client outside the TCP candidate set")
+				return nil, a.balanceErr
+			}
+			selectedIndex := slices.Index(a.candidates, selected)
+			a.candidates[0], a.candidates[selectedIndex] = a.candidates[selectedIndex], a.candidates[0]
+		}
+	}
+	if a.balanceErr != nil {
+		return nil, a.balanceErr
+	}
+
+	for a.next < len(a.candidates) {
+		conn := a.candidates[a.next]
+		a.next++
+
+		if a.pool.isCurrentLocked(conn) &&
+			isEligible(conn, "tcp") &&
+			conn.tcpPending.Load() < maxPendingTCPSetupsPerClient {
+			conn.tcpPending.Add(1)
+			return &TCPLease{pool: a.pool, conn: conn, state: tcpLeasePending}, nil
+		}
+	}
+	return nil, nil
+}
+
+// Client returns the exact generation held by the lease.
+func (l *TCPLease) Client() *ClientConn {
+	if l == nil {
+		return nil
+	}
+	return l.conn
+}
+
+// Commit moves a pending setup to the established connection counters.
+func (l *TCPLease) Commit() bool {
+	if l == nil || l.pool == nil {
+		return false
+	}
+	l.pool.mu.Lock()
+	defer l.pool.mu.Unlock()
+	if l.state != tcpLeasePending {
+		return false
+	}
+
+	// Lock-free load balancing may briefly overcount, but must never undercount.
+	l.conn.ActiveConns.Add(1)
+	l.conn.TotalConns.Add(1)
+	l.conn.tcpPending.Add(-1)
+	l.state = tcpLeaseActive
+	return true
+}
+
+// Release idempotently balances either a pending or established lease.
+func (l *TCPLease) Release() bool {
+	if l == nil || l.pool == nil {
+		return false
+	}
+	l.pool.mu.Lock()
+	defer l.pool.mu.Unlock()
+
+	switch l.state {
+	case tcpLeasePending:
+		l.conn.tcpPending.Add(-1)
+	case tcpLeaseActive:
+		l.conn.ActiveConns.Add(-1)
+	case tcpLeaseReleased:
+		return false
+	}
+	l.state = tcpLeaseReleased
+	return true
+}
+
 // rebuildClientSlice rebuilds the cached client slice from the map
 func (p *ConnectionPool) rebuildClientSlice() []*ClientConn {
 	// Use write lock to prevent multiple goroutines from rebuilding simultaneously
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Double-check if another goroutine already rebuilt while we waited for the lock
+	return p.clientSliceLocked()
+}
+
+func (p *ConnectionPool) clientSliceLocked() []*ClientConn {
+	// Double-check if another goroutine already rebuilt while we waited for the lock.
 	clientsPtr := p.cachedClients.Load()
 	if clientsPtr != nil {
 		return *clientsPtr
