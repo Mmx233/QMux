@@ -443,7 +443,7 @@ func TestStartReconnectionRejectsCanceledRunContext(t *testing.T) {
 	runCtx, cancelRun := context.WithCancel(context.Background())
 	cancelRun()
 
-	cm.startReconnection(runCtx, cfg.Server.Servers[0].Address)
+	cm.startReconnection(runCtx, cfg.Server.Servers[0].Address, nil)
 
 	cm.reconnectMu.Lock()
 	reconnecting := len(cm.reconnecting)

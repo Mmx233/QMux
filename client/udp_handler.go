@@ -57,6 +57,12 @@ type UDPHandler struct {
 	logger              zerolog.Logger
 	ctx                 context.Context
 	cancel              context.CancelFunc
+	lifecycleMu         sync.Mutex
+	started             bool
+	closed              bool
+	closeOnce           sync.Once
+	fixedWG             sync.WaitGroup
+	readerWG            sync.WaitGroup
 
 	// Fragment assembler for reassembling fragmented packets (sharded for reduced lock contention)
 	fragmentAssembler *protocol.ShardedFragmentAssembler
@@ -64,44 +70,79 @@ type UDPHandler struct {
 
 // NewUDPHandler creates a new UDP handler
 func NewUDPHandler(localHost string, localPort int, enableFragmentation bool, logger zerolog.Logger) *UDPHandler {
-	ctx, cancel := context.WithCancel(context.Background())
 	return &UDPHandler{
 		localHost:           localHost,
 		localPort:           localPort,
 		enableFragmentation: enableFragmentation,
 		logger:              logger.With().Str("component", "udp_handler").Logger(),
-		ctx:                 ctx,
-		cancel:              cancel,
 		fragmentAssembler:   protocol.NewShardedFragmentAssembler(protocol.DefaultShardCount),
 	}
 }
 
 // Start starts the UDP handler for a QUIC connection
 func (h *UDPHandler) Start(ctx context.Context, quicConn *quic.Conn) {
-	go h.receiveDatagrams(ctx, quicConn)
-	go h.cleanupLoop()
+	h.lifecycleMu.Lock()
+	if h.started || h.closed {
+		h.lifecycleMu.Unlock()
+		return
+	}
+	h.ctx, h.cancel = context.WithCancel(ctx)
+	h.started = true
+	h.fixedWG.Add(2)
+	h.lifecycleMu.Unlock()
+
+	go func() {
+		defer h.fixedWG.Done()
+		h.receiveDatagrams(quicConn)
+	}()
+	go func() {
+		defer h.fixedWG.Done()
+		h.cleanupLoop()
+	}()
 }
 
 // Stop stops the UDP handler
 func (h *UDPHandler) Stop() {
-	h.cancel()
+	h.closeOnce.Do(func() {
+		h.lifecycleMu.Lock()
+		h.closed = true
+		cancel := h.cancel
+		h.lifecycleMu.Unlock()
 
-	// Close all local connections
-	h.sessions.Range(func(key, value any) bool {
-		session := value.(*UDPSession)
-		_ = session.localConn.Close()
-		return true
+		if cancel != nil {
+			cancel()
+		}
+		h.fragmentAssembler.Close()
+		h.sessions.Range(func(key, _ any) bool {
+			if sessionI, loaded := h.sessions.LoadAndDelete(key); loaded {
+				_ = sessionI.(*UDPSession).localConn.Close()
+			}
+			return true
+		})
 	})
 }
 
-// receiveDatagrams receives QUIC datagrams and forwards to local UDP service
-func (h *UDPHandler) receiveDatagrams(ctx context.Context, quicConn *quic.Conn) {
+func (h *UDPHandler) wait() {
+	// Join the sole reader producer before its readers. The caller must first
+	// close the owning QUIC connection because SendDatagram has no context.
+	h.fixedWG.Wait()
+	h.readerWG.Wait()
+}
+
+func (h *UDPHandler) stopAndWait() {
+	h.Stop()
+	h.wait()
+}
+
+// receiveDatagrams is only started after Start initializes h.ctx and is the
+// sole production producer of session readers.
+func (h *UDPHandler) receiveDatagrams(quicConn *quic.Conn) {
+	// This fixedWG goroutine can stop itself, but must not wait for itself.
+	defer h.Stop()
 	for {
-		dgram, err := quicConn.ReceiveDatagram(ctx)
+		dgram, err := quicConn.ReceiveDatagram(h.ctx)
 		if err != nil {
 			select {
-			case <-ctx.Done():
-				return
 			case <-h.ctx.Done():
 				return
 			default:
@@ -167,18 +208,30 @@ func (h *UDPHandler) getOrCreateSession(sessionID uint32, quicConn *quic.Conn) (
 	}
 	session.updateLastActive()
 
-	// Store session
+	h.lifecycleMu.Lock()
+	if !h.started || h.closed || h.ctx.Err() != nil {
+		h.lifecycleMu.Unlock()
+		_ = localConn.Close()
+		return nil, context.Canceled
+	}
+
+	// Store session and register its reader while the lifecycle gate is open.
 	actual, loaded := h.sessions.LoadOrStore(sessionID, session)
 	if loaded {
-		// Another goroutine created the session first
+		h.lifecycleMu.Unlock()
 		_ = localConn.Close()
 		return actual.(*UDPSession), nil
 	}
+	h.readerWG.Add(1)
+	h.lifecycleMu.Unlock()
 
 	h.logger.Debug().Uint32("session_id", sessionID).Str("local_addr", addr.String()).Msg("UDP session created")
 
 	// Start reading responses from local service
-	go h.readLocalResponses(session)
+	go func() {
+		defer h.readerWG.Done()
+		h.readLocalResponses(session)
+	}()
 
 	return session, nil
 }

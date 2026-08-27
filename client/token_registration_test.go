@@ -107,7 +107,7 @@ func TestTokenRegistrationRequiresExactSchemeEcho(t *testing.T) {
 	if err == nil {
 		t.Fatal("token registration accepted an acknowledgment without a scheme echo")
 	}
-	if sc.controlStream != nil {
+	if sc.controlStream.Load() != nil {
 		t.Fatal("failed token registration committed the control stream")
 	}
 	if err := awaitLifecycle(t, serverDone, "downgrade peer result"); err != nil {

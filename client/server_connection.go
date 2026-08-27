@@ -54,8 +54,8 @@ type ServerConnection struct {
 	serverName   string
 	sessionCache tls.ClientSessionCache
 
-	conn          *quic.Conn
-	controlStream *quic.Stream
+	conn          atomic.Pointer[quic.Conn]
+	controlStream atomic.Pointer[quic.Stream]
 
 	// Health tracking
 	healthy       atomic.Bool
@@ -129,7 +129,7 @@ func (sc *ServerConnection) Connect(ctx context.Context, baseTLSConfig *tls.Conf
 		return fmt.Errorf("dial server %s: %w", sc.serverAddr, err)
 	}
 
-	sc.conn = conn
+	sc.conn.Store(conn)
 	sc.state.Store(int32(StateConnected))
 	sc.logger.Info().Msg("connected to server")
 
@@ -183,7 +183,7 @@ func (sc *ServerConnection) State() ConnectionState {
 // Connection returns the underlying QUIC connection.
 // Returns nil if not connected.
 func (sc *ServerConnection) Connection() *quic.Conn {
-	return sc.conn
+	return sc.conn.Load()
 }
 
 // --- Health Tracking Methods ---
@@ -197,6 +197,9 @@ func (sc *ServerConnection) IsHealthy() bool {
 
 // MarkHealthy marks the connection as healthy and updates the last heartbeat timestamp.
 func (sc *ServerConnection) MarkHealthy() {
+	if sc.ctx.Err() != nil {
+		return
+	}
 	wasHealthy := sc.healthy.Swap(true)
 	sc.lastHeartbeat.Store(time.Now().UnixNano())
 
@@ -204,15 +207,28 @@ func (sc *ServerConnection) MarkHealthy() {
 		sc.state.Store(int32(StateConnected))
 		sc.logger.Info().Msg("connection marked healthy")
 	}
+	if sc.ctx.Err() != nil {
+		sc.healthy.Store(false)
+		sc.state.Store(int32(StateDisconnected))
+	}
 }
 
 // MarkUnhealthy marks the connection as unhealthy.
 func (sc *ServerConnection) MarkUnhealthy() {
+	if sc.ctx.Err() != nil {
+		sc.healthy.Store(false)
+		sc.state.Store(int32(StateDisconnected))
+		return
+	}
 	wasHealthy := sc.healthy.Swap(false)
 
 	if wasHealthy {
 		sc.state.Store(int32(StateUnhealthy))
 		sc.logger.Warn().Msg("connection marked unhealthy")
+	}
+	if sc.ctx.Err() != nil {
+		sc.healthy.Store(false)
+		sc.state.Store(int32(StateDisconnected))
 	}
 }
 
@@ -417,7 +433,7 @@ func (sc *ServerConnection) StartHeartbeatLoops(heartbeatInterval time.Duration)
 		Dur("health_timeout", sc.healthTimeout).
 		Msg("starting heartbeat loop")
 
-	controlStream := sc.controlStream
+	controlStream := sc.controlStream.Load()
 	go sc.heartbeatLoop(heartbeatInterval, controlStream)
 }
 
@@ -438,14 +454,15 @@ func (sc *ServerConnection) Register(ctx context.Context, clientID string) error
 // publication, and heartbeat startup.
 // This should be called after Connect succeeds.
 func (sc *ServerConnection) RegisterWithAuth(ctx context.Context, clientID string, auth config.ClientAuth) error {
-	if sc.conn == nil {
+	conn := sc.conn.Load()
+	if conn == nil {
 		return fmt.Errorf("not connected")
 	}
 	auth.ApplyDefaults()
 	if err := auth.Validate(); err != nil {
 		return fmt.Errorf("invalid client authentication: %w", err)
 	}
-	if err := sc.waitForHandshake(ctx); err != nil {
+	if err := sc.waitForHandshake(ctx, conn); err != nil {
 		return err
 	}
 
@@ -461,7 +478,7 @@ func (sc *ServerConnection) RegisterWithAuth(ctx context.Context, clientID strin
 				Version:      protocol.ProtocolVersion,
 				Capabilities: capabilities,
 			},
-			sc.conn.ConnectionState().TLS,
+			conn.ConnectionState().TLS,
 		)
 		if err != nil {
 			return fmt.Errorf("compute token authentication proof: %w", err)
@@ -475,7 +492,7 @@ func (sc *ServerConnection) RegisterWithAuth(ctx context.Context, clientID strin
 	sc.logger.Info().Str("client_id", clientID).Msg("registering with server")
 
 	// Open control stream
-	stream, err := sc.conn.OpenStreamSync(ctx)
+	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
 		return registrationIOError(ctx, "open control stream", err)
 	}
@@ -555,21 +572,21 @@ func (sc *ServerConnection) RegisterWithAuth(ctx context.Context, clientID strin
 		return fmt.Errorf("clear registration deadline: %w", err)
 	}
 
-	sc.controlStream = stream
+	sc.controlStream.Store(stream)
 	committed = true
 
 	sc.logger.Info().Str("message", ackMsg.Message).Msg("registered with server")
 	return nil
 }
 
-func (sc *ServerConnection) waitForHandshake(ctx context.Context) error {
+func (sc *ServerConnection) waitForHandshake(ctx context.Context, conn *quic.Conn) error {
 	select {
-	case <-sc.conn.HandshakeComplete():
+	case <-conn.HandshakeComplete():
 		return nil
 	case <-ctx.Done():
 		return fmt.Errorf("wait for TLS handshake: %w", ctx.Err())
-	case <-sc.conn.Context().Done():
-		return fmt.Errorf("wait for TLS handshake: connection closed: %w", context.Cause(sc.conn.Context()))
+	case <-conn.Context().Done():
+		return fmt.Errorf("wait for TLS handshake: connection closed: %w", context.Cause(conn.Context()))
 	}
 }
 
@@ -596,7 +613,7 @@ func (sc *ServerConnection) acceptRegisterAckWithAuth(ack protocol.RegisterAckMs
 // On success, the connection is marked healthy. On failure, it's marked unhealthy
 // and reconnection is triggered if a callback is set.
 func (sc *ServerConnection) SendHeartbeat() error {
-	return sc.sendHeartbeat(sc.controlStream)
+	return sc.sendHeartbeat(sc.controlStream.Load())
 }
 
 func (sc *ServerConnection) sendHeartbeat(controlStream *quic.Stream) error {
@@ -639,11 +656,12 @@ func (sc *ServerConnection) sendHeartbeat(controlStream *quic.Stream) error {
 // AcceptStream accepts an incoming stream from this server.
 // This blocks until a stream is available or the context is cancelled.
 func (sc *ServerConnection) AcceptStream(ctx context.Context) (*quic.Stream, error) {
-	if sc.conn == nil {
+	conn := sc.conn.Load()
+	if conn == nil {
 		return nil, fmt.Errorf("not connected")
 	}
 
-	stream, err := sc.conn.AcceptStream(ctx)
+	stream, err := conn.AcceptStream(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("accept stream: %w", err)
 	}
@@ -657,9 +675,8 @@ func (sc *ServerConnection) Close() error {
 	sc.cancel()
 
 	// Close control stream first
-	if sc.controlStream != nil {
-		_ = sc.controlStream.Close()
-		sc.controlStream = nil
+	if controlStream := sc.controlStream.Swap(nil); controlStream != nil {
+		_ = controlStream.Close()
 	}
 
 	// Always mark as disconnected and unhealthy
@@ -667,9 +684,8 @@ func (sc *ServerConnection) Close() error {
 	sc.healthy.Store(false)
 
 	// Close QUIC connection if exists
-	if sc.conn != nil {
-		err := sc.conn.CloseWithError(0, "shutdown")
-		sc.conn = nil
+	if conn := sc.conn.Swap(nil); conn != nil {
+		err := conn.CloseWithError(0, "shutdown")
 		sc.logger.Info().Msg("connection closed")
 		return err
 	}

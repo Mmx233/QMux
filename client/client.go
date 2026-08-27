@@ -131,15 +131,22 @@ func (c *Client) handleNewConnections(ctx context.Context) {
 				c.acceptStreamsFromConnection(ctx, sc)
 			})
 
-			if sc.Connection() != nil {
+			conn := sc.Connection()
+			if conn != nil {
 				udpHandler := NewUDPHandler(
 					c.config.Local.Host,
 					c.config.Local.Port,
 					c.config.UDP.IsFragmentationEnabled(),
 					c.logger,
 				)
-				c.udpHandlers.Store(sc.ServerAddr(), udpHandler)
-				udpHandler.Start(ctx, sc.Connection())
+				udpHandler.Start(ctx, conn)
+				previousI, replaced := c.udpHandlers.Swap(sc.ServerAddr(), udpHandler)
+				if replaced {
+					previous := previousI.(*UDPHandler)
+					if previous != udpHandler {
+						previous.stopAndWait()
+					}
+				}
 			}
 		}
 	}
@@ -307,6 +314,12 @@ func (c *Client) shutdown() error {
 		c.udpHandlers.Range(func(key, value any) bool {
 			if handler, ok := value.(*UDPHandler); ok {
 				handler.Stop()
+			}
+			return true
+		})
+		c.udpHandlers.Range(func(key, value any) bool {
+			if handler, ok := value.(*UDPHandler); ok {
+				handler.wait()
 			}
 			return true
 		})

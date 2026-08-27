@@ -135,7 +135,7 @@ func (cm *ConnectionManager) Start(ctx context.Context) error {
 				connectionErrors = append(connectionErrors, fmt.Errorf("server %s: %w", endpoint.Address, err))
 				mu.Unlock()
 
-				cm.startReconnection(ctx, endpoint.Address)
+				cm.startReconnection(ctx, endpoint.Address, nil)
 				return
 			}
 
@@ -211,11 +211,19 @@ func (cm *ConnectionManager) publishServerConnection(ctx context.Context, sc *Se
 
 	sc.SetHealthConfig(cm.config.HealthTimeout)
 	sc.SetReconnectCallback(func(serverAddr string) {
-		cm.startReconnection(ctx, serverAddr)
+		cm.startReconnection(ctx, serverAddr, sc)
 	})
 	sc.MarkHealthy()
-	cm.connections.Store(sc.ServerAddr(), sc)
+	previousI, replaced := cm.connections.Swap(sc.ServerAddr(), sc)
 	cm.publishMu.Unlock()
+	// Keep this Close before delivery: the consumer's old stopAndWait relies on
+	// closing its owning QUIC connection to unblock context-free SendDatagram.
+	if replaced {
+		previous := previousI.(*ServerConnection)
+		if previous != sc {
+			_ = previous.Close()
+		}
+	}
 
 	select {
 	case cm.NewConns <- sc:
@@ -264,10 +272,18 @@ func CalculateBackoff(attempt int) time.Duration {
 }
 
 // startReconnection starts a reconnection goroutine for a server if not already reconnecting.
-func (cm *ConnectionManager) startReconnection(ctx context.Context, serverAddr string) {
+func (cm *ConnectionManager) startReconnection(ctx context.Context, serverAddr string, expected *ServerConnection) {
 	cm.publishMu.Lock()
 	defer cm.publishMu.Unlock()
 	if cm.closed || ctx.Err() != nil || cm.ctx.Err() != nil {
+		return
+	}
+	current, exists := cm.connections.Load(serverAddr)
+	if expected != nil {
+		if !exists || current != expected {
+			return
+		}
+	} else if exists {
 		return
 	}
 
@@ -280,17 +296,23 @@ func (cm *ConnectionManager) startReconnection(ctx context.Context, serverAddr s
 	cm.reconnectMu.Unlock()
 
 	cm.wg.Go(func() {
-		cm.reconnectionLoop(ctx, serverAddr)
+		cm.reconnectionLoop(ctx, serverAddr, expected)
 	})
 }
 
 // reconnectionLoop attempts to reconnect to a server with exponential backoff.
-func (cm *ConnectionManager) reconnectionLoop(ctx context.Context, serverAddr string) {
-	defer func() {
+func (cm *ConnectionManager) reconnectionLoop(ctx context.Context, serverAddr string, expected *ServerConnection) {
+	ownsSlot := true
+	releaseSlot := func() {
+		if !ownsSlot {
+			return
+		}
 		cm.reconnectMu.Lock()
 		delete(cm.reconnecting, serverAddr)
 		cm.reconnectMu.Unlock()
-	}()
+		ownsSlot = false
+	}
+	defer releaseSlot()
 
 	// Find the server endpoint configuration
 	var endpoint *config.ServerEndpoint
@@ -303,6 +325,23 @@ func (cm *ConnectionManager) reconnectionLoop(ctx context.Context, serverAddr st
 	if endpoint == nil {
 		cm.logger.Error().Str("server", serverAddr).Msg("server not found in configuration")
 		return
+	}
+
+	cm.publishMu.Lock()
+	if expected != nil {
+		detached := cm.connections.CompareAndDelete(serverAddr, expected)
+		if !detached {
+			cm.publishMu.Unlock()
+			return
+		}
+		cm.publishMu.Unlock()
+		_ = expected.Close()
+	} else {
+		_, exists := cm.connections.Load(serverAddr)
+		cm.publishMu.Unlock()
+		if exists {
+			return
+		}
 	}
 
 	attempt := 0
@@ -342,6 +381,9 @@ func (cm *ConnectionManager) reconnectionLoop(ctx context.Context, serverAddr st
 			continue
 		}
 
+		// Release before publication and heartbeat startup so an immediate failure
+		// callback can claim the next reconnect intent.
+		releaseSlot()
 		if !cm.publishServerConnection(ctx, sc) {
 			_ = sc.Close()
 			return
