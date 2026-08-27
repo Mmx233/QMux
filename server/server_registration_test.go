@@ -29,6 +29,28 @@ import (
 
 const registrationTestAddress = "registration-test"
 
+type registrationSessionCache struct {
+	tls.ClientSessionCache
+	put chan struct{}
+}
+
+func newRegistrationSessionCache() *registrationSessionCache {
+	return &registrationSessionCache{
+		ClientSessionCache: tls.NewLRUClientSessionCache(1),
+		put:                make(chan struct{}, 1),
+	}
+}
+
+func (c *registrationSessionCache) Put(key string, state *tls.ClientSessionState) {
+	c.ClientSessionCache.Put(key, state)
+	if state != nil {
+		select {
+		case c.put <- struct{}{}:
+		default:
+		}
+	}
+}
+
 func TestTokenRegistrationTransaction(t *testing.T) {
 	secret := []byte("0123456789abcdef0123456789abcdef")
 	authenticator, err := tokenauth.New(secret)
@@ -348,49 +370,114 @@ func TestAuthenticatedIncompatibleRegistrationGetsNegativeAck(t *testing.T) {
 	}
 }
 
-func TestMTLSRegistrationUsesClientOpenedControlStream(t *testing.T) {
-	certificate, roots := registrationTestCertificate(t)
-	authenticator := mtls.New(roots)
-	harness := newRegistrationHarnessWithTLS(
-		t,
-		authenticator,
-		time.Second,
-		&tls.Config{
-			Certificates: []tls.Certificate{certificate},
-			ClientAuth:   tls.RequireAndVerifyClientCert,
-			ClientCAs:    roots,
-			MinVersion:   tls.VersionTLS13,
-			NextProtos:   []string{"qmux-registration-test"},
-		},
-		&tls.Config{
-			RootCAs:      roots,
-			Certificates: []tls.Certificate{certificate},
-			ServerName:   "localhost",
-			MinVersion:   tls.VersionTLS13,
-			NextProtos:   []string{"qmux-registration-test"},
-		},
+func TestMTLSRegistrationAcceptsTLSVerifiedChains(t *testing.T) {
+	tests := []struct {
+		name             string
+		withIntermediate bool
+		wantPeerCerts    int
+		wantVerified     int
+	}{
+		{name: "root-direct", wantPeerCerts: 1, wantVerified: 2},
+		{name: "root-intermediate-leaf", withIntermediate: true, wantPeerCerts: 2, wantVerified: 3},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clientCertificate, clientRoots := registrationTestClientCertificate(
+				t, test.name, test.withIntermediate, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+			)
+			serverTLS, clientTLS := registrationMTLSTLSConfigs(t, clientRoots, clientCertificate)
+			harness := newRegistrationHarnessWithTLS(t, mtls.New(clientRoots), time.Second, serverTLS, clientTLS)
+
+			registerMTLSClient(t, harness, "mtls-"+test.name)
+			serverState := harness.serverConn.ConnectionState().TLS
+			if got := len(serverState.PeerCertificates); got != test.wantPeerCerts {
+				t.Fatalf("server PeerCertificates length = %d, want %d", got, test.wantPeerCerts)
+			}
+			if got := len(serverState.VerifiedChains[0]); got != test.wantVerified {
+				t.Fatalf("server verified chain length = %d, want %d", got, test.wantVerified)
+			}
+		})
+	}
+}
+
+func TestMTLSRegistrationAcceptsResumedTLS13Session(t *testing.T) {
+	clientCertificate, clientRoots := registrationTestClientCertificate(
+		t, "resumed", true, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	)
-	stream := harness.openStream(t)
-	if err := protocol.WriteRegister(
-		stream,
-		"mtls-client",
-		protocol.ProtocolVersion,
-		[]string{protocol.CapabilityUDPWireV2},
-	); err != nil {
-		t.Fatalf("WriteRegister() error = %v", err)
+	serverTLS, clientTLS := registrationMTLSTLSConfigs(t, clientRoots, clientCertificate)
+	cache := newRegistrationSessionCache()
+	clientTLS.ClientSessionCache = cache
+
+	first := newRegistrationHarnessWithTLS(t, mtls.New(clientRoots), time.Second, serverTLS, clientTLS)
+	registerMTLSClient(t, first, "mtls-first")
+	if first.client.ConnectionState().TLS.DidResume || first.serverConn.ConnectionState().TLS.DidResume {
+		t.Fatal("first mTLS connection unexpectedly resumed a TLS session")
 	}
-	var ack protocol.RegisterAckMsg
-	if err := protocol.ReadTypedMessage(stream, protocol.MsgTypeRegisterAck, &ack); err != nil {
-		t.Fatalf("read mTLS registration Ack: %v", err)
+	select {
+	case <-cache.put:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for TLS session ticket")
 	}
-	if err := protocol.ValidateRegisterAckWithAuth(ack, ""); err != nil {
-		t.Fatalf("ValidateRegisterAckWithAuth() error = %v", err)
+	if err := first.client.CloseWithError(0, "resume test"); err != nil {
+		t.Fatalf("close first mTLS connection: %v", err)
 	}
-	eventually(t, time.Second, func() bool { return harness.pool.Count() == 1 })
+	first.waitForHandler(t)
+
+	second := newRegistrationHarnessWithTLS(t, mtls.New(clientRoots), time.Second, serverTLS, clientTLS)
+	if !second.client.ConnectionState().TLS.DidResume || !second.serverConn.ConnectionState().TLS.DidResume {
+		t.Fatal("second mTLS connection did not resume the TLS session on both peers")
+	}
+	verifiedChains := second.serverConn.ConnectionState().TLS.VerifiedChains
+	if len(verifiedChains) != 1 {
+		t.Fatalf("resumed server verified chain count = %d, want 1", len(verifiedChains))
+	}
+	if got := len(verifiedChains[0]); got != 3 {
+		t.Fatalf("resumed server verified chain length = %d, want 3", got)
+	}
+	registerMTLSClient(t, second, "mtls-second")
+}
+
+func TestMTLSHandshakeRejectsUnverifiedClientCertificates(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		noCert      bool
+		serverOnly  bool
+		foreignRoot bool
+	}{
+		{name: "no-certificate", noCert: true},
+		{name: "server-auth-only", serverOnly: true},
+		{name: "foreign-root", foreignRoot: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			usage := []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}
+			if test.serverOnly {
+				usage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+			}
+			clientCertificate, clientRoots := registrationTestClientCertificate(t, test.name, false, usage)
+			if test.foreignRoot {
+				_, clientRoots = registrationTestClientCertificate(
+					t, "trusted-root", false, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+				)
+			}
+			serverTLS, clientTLS := registrationMTLSTLSConfigs(t, clientRoots, clientCertificate)
+			if test.noCert {
+				clientTLS.Certificates = nil
+			} else {
+				// Force the certificate onto the wire so EKU/root failures cannot
+				// silently degrade into the no-certificate case.
+				clientTLS.Certificates = nil
+				clientTLS.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+					return &clientCertificate, nil
+				}
+			}
+			assertMTLSHandshakeRejected(t, serverTLS, clientTLS, !test.noCert)
+		})
+	}
 }
 
 type registrationHarness struct {
 	client      *quic.Conn
+	serverConn  *quic.Conn
 	pool        *pool.ConnectionPool
 	slots       chan struct{}
 	cancel      context.CancelFunc
@@ -444,7 +531,9 @@ func newRegistrationHarnessWithTLS(
 	ctx, cancel := context.WithCancel(context.Background())
 	accepted := make(chan *quic.Conn, 1)
 	acceptErr := make(chan error, 1)
+	acceptDone := make(chan struct{})
 	go func() {
+		defer close(acceptDone)
 		conn, err := listener.Accept(ctx)
 		if err != nil {
 			acceptErr <- err
@@ -452,12 +541,21 @@ func newRegistrationHarnessWithTLS(
 		}
 		accepted <- conn
 	}()
-	client, err := quic.DialAddr(ctx, listener.Addr().String(), clientTLS, &quic.Config{})
-	if err != nil {
+	t.Cleanup(func() {
 		cancel()
 		_ = listener.Close()
+		select {
+		case <-acceptDone:
+		case <-time.After(2 * time.Second):
+			t.Error("QUIC accept loop did not stop")
+		}
 		_ = transport.Close()
 		_ = udpConn.Close()
+	})
+	dialCtx, cancelDial := context.WithTimeout(ctx, 2*time.Second)
+	client, err := quic.DialAddr(dialCtx, listener.Addr().String(), clientTLS, &quic.Config{})
+	cancelDial()
+	if err != nil {
 		t.Fatalf("dial QUIC: %v", err)
 	}
 	var serverConn *quic.Conn
@@ -499,6 +597,7 @@ func newRegistrationHarnessWithTLS(
 
 	harness := &registrationHarness{
 		client:      client,
+		serverConn:  serverConn,
 		pool:        connectionPool,
 		slots:       slots,
 		cancel:      cancel,
@@ -513,9 +612,6 @@ func newRegistrationHarnessWithTLS(
 			t.Error("server connection handler did not stop")
 		}
 		connectionPool.Stop()
-		_ = listener.Close()
-		_ = transport.Close()
-		_ = udpConn.Close()
 	})
 	return harness
 }
@@ -532,6 +628,27 @@ func (h *registrationHarness) openStream(t *testing.T) *quic.Stream {
 		t.Fatalf("SetReadDeadline() error = %v", err)
 	}
 	return stream
+}
+
+func registerMTLSClient(t *testing.T, harness *registrationHarness, clientID string) {
+	t.Helper()
+	stream := harness.openStream(t)
+	if err := protocol.WriteRegister(
+		stream,
+		clientID,
+		protocol.ProtocolVersion,
+		[]string{protocol.CapabilityUDPWireV2},
+	); err != nil {
+		t.Fatalf("WriteRegister() error = %v", err)
+	}
+	var ack protocol.RegisterAckMsg
+	if err := protocol.ReadTypedMessage(stream, protocol.MsgTypeRegisterAck, &ack); err != nil {
+		t.Fatalf("read mTLS registration Ack: %v", err)
+	}
+	if err := protocol.ValidateRegisterAckWithAuth(ack, ""); err != nil {
+		t.Fatalf("ValidateRegisterAckWithAuth() error = %v", err)
+	}
+	eventually(t, time.Second, func() bool { return harness.pool.Count() == 1 })
 }
 
 func (h *registrationHarness) waitForHandler(t *testing.T) {
@@ -606,6 +723,200 @@ func eventually(t *testing.T, timeout time.Duration, condition func() bool) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+func registrationMTLSTLSConfigs(
+	t *testing.T,
+	clientRoots *x509.CertPool,
+	clientCertificate tls.Certificate,
+) (*tls.Config, *tls.Config) {
+	t.Helper()
+	serverCertificate, serverRoots := registrationTestCertificate(t)
+	return &tls.Config{
+		Certificates: []tls.Certificate{serverCertificate},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    clientRoots,
+		MinVersion:   tls.VersionTLS13,
+		MaxVersion:   tls.VersionTLS13,
+		NextProtos:   []string{"qmux-registration-test"},
+	}, &tls.Config{
+		RootCAs:      serverRoots,
+		Certificates: []tls.Certificate{clientCertificate},
+		ServerName:   "localhost",
+		MinVersion:   tls.VersionTLS13,
+		MaxVersion:   tls.VersionTLS13,
+		NextProtos:   []string{"qmux-registration-test"},
+	}
+}
+
+func assertMTLSHandshakeRejected(
+	t *testing.T,
+	serverTLS, clientTLS *tls.Config,
+	expectCertificate bool,
+) {
+	t.Helper()
+	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatalf("listen UDP: %v", err)
+	}
+	transport := &quic.Transport{Conn: udpConn}
+	listener, err := transport.Listen(serverTLS, &quic.Config{})
+	if err != nil {
+		_ = transport.Close()
+		_ = udpConn.Close()
+		t.Fatalf("listen QUIC: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	accepted := make(chan *quic.Conn, 1)
+	acceptDone := make(chan struct{})
+	go func() {
+		defer close(acceptDone)
+		conn, acceptErr := listener.Accept(ctx)
+		if acceptErr == nil {
+			accepted <- conn
+		}
+	}()
+
+	var client *quic.Conn
+	t.Cleanup(func() {
+		if client != nil {
+			_ = client.CloseWithError(0, "test complete")
+		}
+		cancel()
+		_ = listener.Close()
+		select {
+		case <-acceptDone:
+		case <-time.After(2 * time.Second):
+			t.Error("mTLS rejection accept loop did not stop")
+		}
+		_ = transport.Close()
+		_ = udpConn.Close()
+	})
+
+	dialCtx, cancelDial := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelDial()
+	client, err = quic.DialAddr(dialCtx, listener.Addr().String(), clientTLS, &quic.Config{})
+	if err == nil {
+		_, err = client.AcceptStream(dialCtx)
+	}
+	var transportError *quic.TransportError
+	if !errors.As(err, &transportError) || !transportError.ErrorCode.IsCryptoError() {
+		t.Fatalf("mTLS rejection error = %T %v, want QUIC crypto close", err, err)
+	}
+	const certificateRequired = quic.TransportErrorCode(0x174)
+	if expectCertificate && transportError.ErrorCode == certificateRequired {
+		t.Fatal("mTLS rejection reported certificate_required after the client sent a certificate")
+	}
+	if !expectCertificate && transportError.ErrorCode != certificateRequired {
+		t.Fatalf("mTLS rejection code = %#x, want certificate_required %#x",
+			transportError.ErrorCode, certificateRequired)
+	}
+	cancel()
+	_ = listener.Close()
+	select {
+	case <-acceptDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("mTLS rejection accept loop did not stop")
+	}
+	// Listener.Accept only publishes connections with completed TLS handshakes.
+	// Without one, the production handler, registration, and pool are unreachable.
+	select {
+	case conn := <-accepted:
+		_ = conn.CloseWithError(0, "unexpected accepted connection")
+		t.Fatal("rejected mTLS handshake produced a server connection")
+	default:
+	}
+}
+
+func registrationTestClientCertificate(
+	t *testing.T,
+	name string,
+	withIntermediate bool,
+	usages []x509.ExtKeyUsage,
+) (tls.Certificate, *x509.CertPool) {
+	t.Helper()
+	rootKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate client root key: %v", err)
+	}
+	rootTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: name + " root"},
+		NotBefore:             time.Now().Add(-time.Minute),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	rootDER, err := x509.CreateCertificate(
+		rand.Reader, rootTemplate, rootTemplate, &rootKey.PublicKey, rootKey,
+	)
+	if err != nil {
+		t.Fatalf("create client root certificate: %v", err)
+	}
+	root, err := x509.ParseCertificate(rootDER)
+	if err != nil {
+		t.Fatalf("parse client root certificate: %v", err)
+	}
+
+	issuer, issuerKey := root, rootKey
+	var intermediateDER []byte
+	if withIntermediate {
+		intermediateKey, keyErr := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if keyErr != nil {
+			t.Fatalf("generate client intermediate key: %v", keyErr)
+		}
+		intermediateTemplate := &x509.Certificate{
+			SerialNumber:          big.NewInt(2),
+			Subject:               pkix.Name{CommonName: name + " intermediate"},
+			NotBefore:             time.Now().Add(-time.Minute),
+			NotAfter:              time.Now().Add(time.Hour),
+			KeyUsage:              x509.KeyUsageCertSign,
+			BasicConstraintsValid: true,
+			IsCA:                  true,
+		}
+		intermediateDER, err = x509.CreateCertificate(
+			rand.Reader, intermediateTemplate, root, &intermediateKey.PublicKey, rootKey,
+		)
+		if err != nil {
+			t.Fatalf("create client intermediate certificate: %v", err)
+		}
+		issuer, err = x509.ParseCertificate(intermediateDER)
+		if err != nil {
+			t.Fatalf("parse client intermediate certificate: %v", err)
+		}
+		issuerKey = intermediateKey
+	}
+
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate client leaf key: %v", err)
+	}
+	leafTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(3),
+		Subject:      pkix.Name{CommonName: name + " client"},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  usages,
+	}
+	leafDER, err := x509.CreateCertificate(
+		rand.Reader, leafTemplate, issuer, &leafKey.PublicKey, issuerKey,
+	)
+	if err != nil {
+		t.Fatalf("create client leaf certificate: %v", err)
+	}
+	leaf, err := x509.ParseCertificate(leafDER)
+	if err != nil {
+		t.Fatalf("parse client leaf certificate: %v", err)
+	}
+	chain := [][]byte{leafDER}
+	if withIntermediate {
+		chain = append(chain, intermediateDER)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(root)
+	return tls.Certificate{Certificate: chain, PrivateKey: leafKey, Leaf: leaf}, roots
 }
 
 func registrationTestCertificate(t *testing.T) (tls.Certificate, *x509.CertPool) {

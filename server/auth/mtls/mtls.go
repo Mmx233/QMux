@@ -3,38 +3,29 @@ package mtls
 import (
 	"crypto/tls"
 	"crypto/x509"
-	"fmt"
+	"errors"
 
 	"github.com/Mmx233/QMux/server/auth"
 )
 
-// MTLSAuth implements mTLS authentication
+// MTLSAuth accepts client certificates already verified by the TLS handshake.
 //
 //goland:noinspection GoNameStartsWithPackageName
-type MTLSAuth struct {
-	caCertPool *x509.CertPool
+type MTLSAuth struct{}
+
+// New creates a new mTLS authenticator. The caller must install caCertPool in
+// tls.Config.ClientCAs; the completed TLS handshake is the sole verification
+// authority.
+func New(_ *x509.CertPool) auth.Auth {
+	return &MTLSAuth{}
 }
 
-// New creates a new mTLS authenticator
-func New(caCertPool *x509.CertPool) auth.Auth {
-	return &MTLSAuth{caCertPool: caCertPool}
-}
-
-// Verify preserves the existing application-level mTLS verification after the
-// transport handshake has completed.
-func (m *MTLSAuth) Verify(state tls.ConnectionState, _ auth.Registration) error {
+func (*MTLSAuth) Verify(state tls.ConnectionState, _ auth.Registration) error {
 	if !state.HandshakeComplete {
-		return fmt.Errorf("TLS handshake is incomplete")
+		return errors.New("TLS handshake is incomplete")
 	}
-	if len(state.PeerCertificates) == 0 {
-		return fmt.Errorf("no client certificate provided")
-	}
-	opts := x509.VerifyOptions{
-		Roots:     m.caCertPool,
-		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
-	}
-	if _, err := state.PeerCertificates[0].Verify(opts); err != nil {
-		return fmt.Errorf("certificate verification failed: %w", err)
+	if len(state.VerifiedChains) == 0 {
+		return errors.New("client certificate was not verified by TLS")
 	}
 	return nil
 }
