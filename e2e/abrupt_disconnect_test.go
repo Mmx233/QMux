@@ -250,9 +250,196 @@ func testConnection(t *testing.T, trafficPort int) bool {
 	return true
 }
 
+func openVerifiedTCPConnection(t *testing.T, trafficPort int) net.Conn {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", trafficPort), 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial held TCP connection: %v", err)
+	}
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		_ = conn.Close()
+		t.Fatalf("set held TCP connection deadline: %v", err)
+	}
+
+	testData := []byte("held TCP relay verification")
+	if _, err := conn.Write(testData); err != nil {
+		_ = conn.Close()
+		t.Fatalf("write held TCP connection: %v", err)
+	}
+	buf := make([]byte, len(testData))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		_ = conn.Close()
+		t.Fatalf("read held TCP connection: %v", err)
+	}
+	if string(buf) != string(testData) {
+		_ = conn.Close()
+		t.Fatalf("held TCP connection data mismatch: got %q, want %q", buf, testData)
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		_ = conn.Close()
+		t.Fatalf("clear held TCP connection deadline: %v", err)
+	}
+	return conn
+}
+
+func assertConnectionClosed(t *testing.T, conn net.Conn) {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set closed connection deadline: %v", err)
+	}
+	var buf [1]byte
+	if _, err := conn.Read(buf[:]); err == nil {
+		t.Fatal("held TCP connection remained usable after Server.Start returned")
+	} else {
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			t.Fatalf("held TCP connection remained open after Server.Start returned: %v", err)
+		}
+	}
+}
+
+func testUDPConnection(t *testing.T, trafficPort int) bool {
+	t.Helper()
+	conn, err := net.DialTimeout("udp", fmt.Sprintf("127.0.0.1:%d", trafficPort), 5*time.Second)
+	if err != nil {
+		t.Logf("UDP connection failed: %v", err)
+		return false
+	}
+	defer func() { _ = conn.Close() }()
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Logf("set UDP deadline failed: %v", err)
+		return false
+	}
+
+	testData := []byte("UDP restart verification")
+	if _, err := conn.Write(testData); err != nil {
+		t.Logf("UDP write failed: %v", err)
+		return false
+	}
+	buf := make([]byte, len(testData))
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Logf("UDP read failed: %v", err)
+		return false
+	}
+	if n != len(testData) || string(buf[:n]) != string(testData) {
+		t.Logf("UDP data mismatch: got %q, expected %q", buf[:n], testData)
+		return false
+	}
+	return true
+}
+
+func startRestartEchoBackend(t *testing.T) int {
+	t.Helper()
+	loopback := net.ParseIP("127.0.0.1")
+
+	const maxAttempts = 32
+	var lastTCPBindErr error
+	for range maxAttempts {
+		udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: loopback})
+		if err != nil {
+			t.Fatalf("start local UDP echo server: %v", err)
+		}
+		port := udpConn.LocalAddr().(*net.UDPAddr).Port
+
+		tcpListener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: loopback, Port: port})
+		if err != nil {
+			lastTCPBindErr = err
+			if closeErr := udpConn.Close(); closeErr != nil {
+				t.Fatalf("release unusable local UDP echo socket: %v (TCP bind: %v)", closeErr, err)
+			}
+			continue
+		}
+
+		reservedUDPPort := udpConn.LocalAddr().(*net.UDPAddr).Port
+		reservedTCPPort := tcpListener.Addr().(*net.TCPAddr).Port
+		if reservedUDPPort != port || reservedTCPPort != port {
+			closeErr := errors.Join(udpConn.Close(), tcpListener.Close())
+			t.Fatalf("invalid live local echo reservations: TCP=%d UDP=%d (close: %v)",
+				reservedTCPPort, reservedUDPPort, closeErr)
+		}
+
+		t.Cleanup(func() {
+			if err := errors.Join(tcpListener.Close(), udpConn.Close()); err != nil {
+				t.Errorf("close local TCP/UDP echo sockets: %v", err)
+			}
+		})
+		serveTCPEcho(tcpListener)
+		serveUDPEcho(udpConn, false)
+		return port
+	}
+
+	t.Fatalf("start TCP and UDP echo servers on one port after %d attempts: %v", maxAttempts, lastTCPBindErr)
+	return 0
+}
+
+// reserveRestartServerPorts keeps all three sockets open until it has a
+// distinct QUIC UDP port and one traffic port bindable by both TCP and UDP.
+func reserveRestartServerPorts(t *testing.T) (quicPort, trafficPort int, release func() error) {
+	t.Helper()
+	loopback := net.ParseIP("127.0.0.1")
+	quicReservation, err := net.ListenUDP("udp", &net.UDPAddr{IP: loopback})
+	if err != nil {
+		t.Fatalf("reserve QUIC UDP port: %v", err)
+	}
+	quicPort = quicReservation.LocalAddr().(*net.UDPAddr).Port
+
+	const maxAttempts = 32
+	var lastTCPBindErr error
+	for range maxAttempts {
+		// Pick the traffic number from the UDP namespace while the QUIC UDP
+		// reservation is live. The kernel therefore cannot choose quicPort.
+		trafficUDP, err := net.ListenUDP("udp", &net.UDPAddr{IP: loopback})
+		if err != nil {
+			closeErr := quicReservation.Close()
+			t.Fatalf("reserve traffic UDP port: %v (close QUIC reservation: %v)", err, closeErr)
+		}
+		trafficPort = trafficUDP.LocalAddr().(*net.UDPAddr).Port
+		if trafficPort == quicPort {
+			if err := trafficUDP.Close(); err != nil {
+				quicCloseErr := quicReservation.Close()
+				t.Fatalf("release colliding traffic UDP reservation: %v (close QUIC reservation: %v)", err, quicCloseErr)
+			}
+			continue
+		}
+
+		trafficTCP, err := net.ListenTCP("tcp", &net.TCPAddr{IP: loopback, Port: trafficPort})
+		if err != nil {
+			lastTCPBindErr = err
+			if closeErr := trafficUDP.Close(); closeErr != nil {
+				quicCloseErr := quicReservation.Close()
+				t.Fatalf("release unusable traffic UDP reservation: %v (TCP bind: %v; close QUIC reservation: %v)",
+					closeErr, err, quicCloseErr)
+			}
+			continue
+		}
+
+		reservedTrafficUDPPort := trafficUDP.LocalAddr().(*net.UDPAddr).Port
+		reservedTrafficTCPPort := trafficTCP.Addr().(*net.TCPAddr).Port
+		if reservedTrafficUDPPort != trafficPort || reservedTrafficTCPPort != trafficPort || trafficPort == quicPort {
+			closeErr := errors.Join(trafficUDP.Close(), trafficTCP.Close(), quicReservation.Close())
+			t.Fatalf(
+				"invalid live port reservations: QUIC=%d traffic TCP=%d traffic UDP=%d (close: %v)",
+				quicPort, reservedTrafficTCPPort, reservedTrafficUDPPort, closeErr,
+			)
+		}
+
+		return quicPort, trafficPort, func() error {
+			return errors.Join(trafficUDP.Close(), trafficTCP.Close(), quicReservation.Close())
+		}
+	}
+
+	if err := quicReservation.Close(); err != nil {
+		t.Fatalf("find dual-protocol traffic port after %d attempts (last TCP bind: %v; close QUIC reservation: %v)",
+			maxAttempts, lastTCPBindErr, err)
+	}
+	t.Fatalf("find dual-protocol traffic port after %d attempts: %v", maxAttempts, lastTCPBindErr)
+	return 0, 0, nil
+}
+
 // TestServerRestartReconnect_MTLS tests that clients automatically reconnect
-// after the server is stopped and restarted, and can successfully handle
-// requests through the traffic port after reconnection.
+// after the server is stopped and restarted, and can successfully handle TCP
+// and UDP requests through the same traffic address after reconnection.
 func TestServerRestartReconnect_MTLS(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -260,21 +447,12 @@ func TestServerRestartReconnect_MTLS(t *testing.T) {
 	// Generate mTLS certificates for the test
 	certDir := generateTestCertificates(t)
 
-	// Start local TCP echo server on a random port
-	localListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to start local echo server: %v", err)
-	}
-	closeOnCleanup(t, localListener)
+	localPort := startRestartEchoBackend(t)
+	t.Logf("Local TCP and UDP echo servers listening on 127.0.0.1:%d", localPort)
 
-	localAddr := localListener.Addr().(*net.TCPAddr)
-	t.Logf("Local echo server listening on %s", localAddr)
-
-	serveTCPEcho(localListener)
-
-	// Get free ports for QMux server
-	quicPort := getFreePort(t)
-	trafficPort := getFreePort(t)
+	// Reserve distinct ports while simultaneously proving that the traffic
+	// numeric port is available to both TCP and UDP, then release before Start.
+	quicPort, trafficPort, releaseServerPorts := reserveRestartServerPorts(t)
 	t.Logf("Allocated QUIC port %d, traffic port %d", quicPort, trafficPort)
 
 	// Configure QMux server with short heartbeat and health timeout
@@ -283,7 +461,7 @@ func TestServerRestartReconnect_MTLS(t *testing.T) {
 			{
 				QuicAddr:    fmt.Sprintf("127.0.0.1:%d", quicPort),
 				TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort),
-				Protocol:    "tcp",
+				Protocol:    "both",
 			},
 		},
 		Auth: config.ServerAuth{
@@ -293,6 +471,8 @@ func TestServerRestartReconnect_MTLS(t *testing.T) {
 		TLS: config.ServerTLS{
 			ServerCertFile: filepath.Join(certDir, "server.crt"),
 			ServerKeyFile:  filepath.Join(certDir, "server.key"),
+			SessionTicketEncryptionKeyRotationInterval: 24 * time.Hour,
+			SessionTicketEncryptionKeyRotationOverlap:  2,
 		},
 		HeartbeatInterval: 1 * time.Second,
 		HealthTimeout:     3 * time.Second,
@@ -301,12 +481,20 @@ func TestServerRestartReconnect_MTLS(t *testing.T) {
 	// Start QMux server with a cancellable context
 	serverCtx, serverCancel := context.WithCancel(ctx)
 	defer serverCancel()
+	firstServerErr := make(chan error, 1)
+	if err := releaseServerPorts(); err != nil {
+		t.Fatalf("release restart server port reservations: %v", err)
+	}
 	go func() {
-		if err := server.Start(serverCtx, serverConfig); err != nil && !errors.Is(err, context.Canceled) {
-			t.Logf("server error: %v", err)
-		}
+		firstServerErr <- server.Start(serverCtx, serverConfig)
 	}()
 	time.Sleep(500 * time.Millisecond)
+	select {
+	case err := <-firstServerErr:
+		t.Fatalf("server stopped unexpectedly after initial start: %v", err)
+	default:
+		// Server is running.
+	}
 	t.Logf("QMux server started on QUIC port %d, traffic port %d", quicPort, trafficPort)
 
 	// Create and start client-1 in-process
@@ -319,7 +507,7 @@ func TestServerRestartReconnect_MTLS(t *testing.T) {
 		},
 		Local: config.LocalService{
 			Host: "127.0.0.1",
-			Port: localAddr.Port,
+			Port: localPort,
 		},
 		TLS: config.ClientTLS{
 			CACertFile:     filepath.Join(certDir, "ca.crt"),
@@ -354,7 +542,7 @@ func TestServerRestartReconnect_MTLS(t *testing.T) {
 		},
 		Local: config.LocalService{
 			Host: "127.0.0.1",
-			Port: localAddr.Port,
+			Port: localPort,
 		},
 		TLS: config.ClientTLS{
 			CACertFile:     filepath.Join(certDir, "ca.crt"),
@@ -396,14 +584,27 @@ func TestServerRestartReconnect_MTLS(t *testing.T) {
 
 	t.Log("Both clients connected and healthy")
 
-	// Verify initial end-to-end connection via traffic port
-	if !testConnection(t, trafficPort) {
-		t.Fatalf("initial connection verification failed: traffic port %d is not working", trafficPort)
+	// Keep a verified TCP relay open and idle across cancellation, then verify
+	// that shutdown terminates the external endpoint before restart.
+	heldTCPConn := openVerifiedTCPConnection(t, trafficPort)
+	defer func() { _ = heldTCPConn.Close() }()
+	if !testUDPConnection(t, trafficPort) {
+		t.Fatalf("initial UDP verification failed: traffic port %d is not working", trafficPort)
 	}
-	t.Log("Initial connection verification passed")
+	t.Log("Initial TCP and UDP connection verification passed")
+
 	// Stop the QMux server by cancelling its context
 	t.Log("Stopping QMux server...")
 	serverCancel()
+	select {
+	case err := <-firstServerErr:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("server shutdown returned unexpected error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for server shutdown")
+	}
+	assertConnectionClosed(t, heldTCPConn)
 
 	// Wait for both clients to detect the disconnect (healthy drops to 0)
 	t.Log("Waiting for clients to detect server shutdown...")
@@ -424,30 +625,22 @@ func TestServerRestartReconnect_MTLS(t *testing.T) {
 disconnected:
 	t.Log("Both clients detected server shutdown")
 
-	// Use a new traffic port for the restarted server since the old traffic
-	// manager's TCP listener is not closed by server.Start on context cancel.
-	trafficPort2 := getFreePort(t)
-	serverConfig.Listeners[0].TrafficAddr = fmt.Sprintf("127.0.0.1:%d", trafficPort2)
-	t.Logf("Allocated new traffic port %d for server restart", trafficPort2)
-
-	// Restart the QMux server with a new cancellable context
+	// Restart the QMux server on the same QUIC and traffic addresses.
 	serverCtx2, serverCancel2 := context.WithCancel(ctx)
 	defer serverCancel2()
-	serverErrCh := make(chan error, 1)
+	secondServerErr := make(chan error, 1)
 	go func() {
-		serverErrCh <- server.Start(serverCtx2, serverConfig)
+		secondServerErr <- server.Start(serverCtx2, serverConfig)
 	}()
 	// Give the server a moment to start, then verify it didn't fail immediately
 	time.Sleep(500 * time.Millisecond)
 	select {
-	case err := <-serverErrCh:
-		if err != nil && !errors.Is(err, context.Canceled) {
-			t.Fatalf("server failed to restart: %v", err)
-		}
+	case err := <-secondServerErr:
+		t.Fatalf("server stopped unexpectedly after restart: %v", err)
 	default:
 		// Server is running
 	}
-	t.Logf("QMux server restarted on QUIC port %d, traffic port %d", quicPort, trafficPort2)
+	t.Logf("QMux server restarted on QUIC port %d, traffic port %d", quicPort, trafficPort)
 
 	// Wait for both clients to reconnect
 	t.Log("Waiting for both clients to reconnect...")
@@ -471,12 +664,28 @@ reconnected:
 		c1.HealthyConnectionCount(), c1.TotalConnectionCount(),
 		c2.HealthyConnectionCount(), c2.TotalConnectionCount())
 
-	// Verify end-to-end connection works after reconnection using the new traffic port
-	if !testConnection(t, trafficPort2) {
-		t.Fatalf("post-reconnection connection verification failed: traffic port %d is not working; client-1 healthy=%d total=%d, client-2 healthy=%d total=%d",
-			trafficPort2,
+	// Verify both protocols after reconnection using the same traffic port.
+	if !testConnection(t, trafficPort) {
+		t.Fatalf("post-reconnection TCP verification failed: traffic port %d is not working; client-1 healthy=%d total=%d, client-2 healthy=%d total=%d",
+			trafficPort,
 			c1.HealthyConnectionCount(), c1.TotalConnectionCount(),
 			c2.HealthyConnectionCount(), c2.TotalConnectionCount())
 	}
-	t.Log("Post-reconnection connection verification passed")
+	if !testUDPConnection(t, trafficPort) {
+		t.Fatalf("post-reconnection UDP verification failed: traffic port %d is not working; client-1 healthy=%d total=%d, client-2 healthy=%d total=%d",
+			trafficPort,
+			c1.HealthyConnectionCount(), c1.TotalConnectionCount(),
+			c2.HealthyConnectionCount(), c2.TotalConnectionCount())
+	}
+	t.Log("Post-reconnection TCP and UDP connection verification passed")
+
+	serverCancel2()
+	select {
+	case err := <-secondServerErr:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("restarted server shutdown returned unexpected error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for restarted server shutdown")
+	}
 }

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -48,6 +49,46 @@ type registrationAckWriter func(
 	[]string,
 	string,
 ) error
+
+type trafficLifecycle interface {
+	Start(context.Context) error
+	Close()
+	Wait()
+}
+
+type listenerStartFunc func(context.Context, config.QuicListener) error
+
+type listenerErrorState struct {
+	mu           sync.Mutex
+	first        error
+	shuttingDown bool
+	notify       chan struct{}
+}
+
+func newListenerErrorState() *listenerErrorState {
+	return &listenerErrorState{notify: make(chan struct{})}
+}
+
+func (s *listenerErrorState) report(err error) {
+	if err == nil {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.shuttingDown || s.first != nil {
+		return
+	}
+	s.first = err
+	close(s.notify)
+}
+
+func (s *listenerErrorState) beginShutdown() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.shuttingDown = true
+	return s.first
+}
 
 // New creates a new server
 func New(conf *config.Server) (*Server, error) {
@@ -114,31 +155,85 @@ func Start(ctx context.Context, conf *config.Server) error {
 	if err != nil {
 		return err
 	}
+	defer func() {
+		for _, connectionPool := range srv.pools {
+			connectionPool.Stop()
+		}
+	}()
 
 	// Start traffic manager
 	srv.trafficManager = traffic.NewManager(conf, srv.pools, srv.logger)
-	if err := srv.trafficManager.Start(ctx); err != nil {
+	return superviseServer(ctx, srv.trafficManager, conf.Listeners, srv.startListener)
+}
+
+func superviseServer(
+	ctx context.Context,
+	trafficManager trafficLifecycle,
+	listenerConfs []config.QuicListener,
+	startListener listenerStartFunc,
+) error {
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+
+	// Traffic Start is a startup transaction. Runtime ownership begins only
+	// after it has successfully bound and launched all configured listeners.
+	if err := trafficManager.Start(ctx); err != nil {
+		trafficManager.Close()
+		trafficManager.Wait()
+		if cause := context.Cause(ctx); cause != nil &&
+			(errors.Is(err, cause) || errors.Is(err, ctx.Err())) {
+			return cause
+		}
 		return fmt.Errorf("start traffic manager: %w", err)
 	}
 
-	// Start QUIC listeners
-	errCh := make(chan error, len(conf.Listeners))
-	for _, listenerConf := range conf.Listeners {
+	// QUIC listener cancellation is deliberately detached from caller
+	// cancellation. This lets the supervisor initiate traffic shutdown before
+	// closing QUIC transports and the established tunnels they own.
+	listenerCtx, cancelListeners := context.WithCancelCause(context.WithoutCancel(ctx))
+	var listenerWG sync.WaitGroup
+	errorState := newListenerErrorState()
+	for _, listenerConf := range listenerConfs {
+		listenerWG.Add(1)
 		go func(lc config.QuicListener) {
-			if err := srv.startListener(ctx, lc); err != nil {
-				errCh <- fmt.Errorf("listener on %s: %w", lc.QuicAddr, err)
+			defer listenerWG.Done()
+			err := startListener(listenerCtx, lc)
+			if err == nil && listenerCtx.Err() == nil {
+				err = errors.New("listener stopped unexpectedly")
+			}
+			if err != nil {
+				errorState.report(fmt.Errorf("listener on %s: %w", lc.QuicAddr, err))
 			}
 		}(listenerConf)
 	}
 
-	// Wait for first error or context cancellation
 	select {
-	case err := <-errCh:
-		return err
 	case <-ctx.Done():
-		srv.logger.Info().Msg("server shutting down")
-		return ctx.Err()
+	case <-errorState.notify:
 	}
+
+	firstErr := errorState.beginShutdown()
+	shutdownCause := firstErr
+	if shutdownCause == nil {
+		shutdownCause = context.Cause(ctx)
+	}
+	if shutdownCause == nil {
+		shutdownCause = context.Canceled
+	}
+
+	// Two-phase shutdown is important: stop admitting traffic, then close all
+	// QUIC transports and join their connection handlers before waiting for
+	// traffic tunnels to finish unwinding.
+	trafficManager.Close()
+	cancelListeners(shutdownCause)
+	listenerWG.Wait()
+	trafficManager.Wait()
+
+	if firstErr != nil {
+		return firstErr
+	}
+	return context.Cause(ctx)
 }
 
 // startListener starts a QUIC listener
@@ -215,14 +310,23 @@ func (s *Server) startListener(ctx context.Context, listenerConf config.QuicList
 
 	ln, err := tr.Listen(tlsConf, quicConf)
 	if err != nil {
+		_ = tr.Close()
 		return fmt.Errorf("listen QUIC: %w", err)
 	}
-	defer func() { _ = ln.Close() }()
+	var connectionWG sync.WaitGroup
+	defer func() {
+		_ = ln.Close()
+		_ = tr.Close()
+		_ = udpConn.Close()
+		connectionWG.Wait()
+		if stekManager != nil {
+			stekManager.Stop()
+		}
+	}()
 
 	// Start session ticket key rotation
 	if stekManager != nil {
 		stekManager.Start(ctx)
-		defer stekManager.Stop()
 	}
 
 	logger.Info().
@@ -239,8 +343,7 @@ func (s *Server) startListener(ctx context.Context, listenerConf config.QuicList
 			if ctx.Err() != nil {
 				return nil
 			}
-			logger.Error().Err(err).Msg("accept connection failed")
-			continue
+			return fmt.Errorf("accept connection: %w", err)
 		}
 
 		permit, ok := acquirePendingRegistration(pendingRegistrations)
@@ -250,9 +353,9 @@ func (s *Server) startListener(ctx context.Context, listenerConf config.QuicList
 			continue
 		}
 
-		go func() {
+		connectionWG.Go(func() {
 			s.handleConnection(ctx, conn, listenerConf.QuicAddr, permit)
-		}()
+		})
 	}
 }
 
@@ -481,7 +584,6 @@ func (s *Server) handleControlStream(
 	quicAddr string,
 ) {
 	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
 
 	logger := s.logger.With().
 		Str("client_id", clientConn.ID).
@@ -499,9 +601,11 @@ func (s *Server) handleControlStream(
 		err     error
 	}
 	readCh := make(chan readResult, 1)
+	readerDone := make(chan struct{})
 
 	// Start a goroutine to read messages
 	go func(ctx context.Context, stream *quic.Stream, readCh chan readResult, conn *quic.Conn) {
+		defer close(readerDone)
 		for {
 			msgType, _, err := protocol.ReadMessage(stream)
 			select {
@@ -516,6 +620,11 @@ func (s *Server) handleControlStream(
 			}
 		}
 	}(ctx, clientConn.ControlStream, readCh, clientConn.Conn)
+	defer func() {
+		cancel()
+		clientConn.ControlStream.CancelRead(registrationStreamErrorCode)
+		<-readerDone
+	}()
 
 	heartbeatDeadline := time.After(s.config.HealthTimeout)
 	for {

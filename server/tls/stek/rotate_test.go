@@ -2,6 +2,7 @@ package stek
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 )
@@ -148,6 +149,61 @@ func TestRotateManager_StartStop(t *testing.T) {
 
 	// Wait for context to expire
 	<-ctx.Done()
+}
+
+func TestRotateManager_StopJoinsAndIsIdempotent(t *testing.T) {
+	manager := newTestRotateManager(t, time.Hour, 2)
+	manager.Start(context.Background())
+
+	var callers sync.WaitGroup
+	callers.Add(8)
+	for range 8 {
+		go func() {
+			defer callers.Done()
+			manager.Stop()
+		}()
+	}
+	callers.Wait()
+
+	select {
+	case <-manager.doneCh:
+	default:
+		t.Fatal("Stop returned before the background goroutine exited")
+	}
+}
+
+func TestRotateManager_StopBeforeStart(t *testing.T) {
+	manager := newTestRotateManager(t, time.Hour, 2)
+	manager.Stop()
+	manager.Start(context.Background())
+	manager.Stop()
+
+	manager.mu.Lock()
+	started := manager.started
+	manager.mu.Unlock()
+	if started {
+		t.Fatal("Start launched rotation after Stop")
+	}
+	select {
+	case <-manager.doneCh:
+	default:
+		t.Fatal("Stop before Start did not complete the lifecycle")
+	}
+}
+
+func TestRotateManager_ContextCancellationIsJoinable(t *testing.T) {
+	manager := newTestRotateManager(t, time.Hour, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	manager.Start(ctx)
+	cancel()
+
+	select {
+	case <-manager.doneCh:
+	case <-time.After(time.Second):
+		t.Fatal("rotation goroutine did not exit after context cancellation")
+	}
+
+	manager.Stop()
 }
 
 func TestRotateManager_OverlapLimit(t *testing.T) {

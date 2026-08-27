@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -26,6 +27,10 @@ type RotateManager struct {
 	overlap  uint8
 	ticker   *time.Ticker
 	stopCh   chan struct{}
+	doneCh   chan struct{}
+	mu       sync.Mutex
+	started  bool
+	stopped  bool
 	logger   zerolog.Logger
 }
 
@@ -56,6 +61,8 @@ func NewRotateManager(interval time.Duration, overlap uint8) (*RotateManager, er
 		Keys:     &atomic.Pointer[[][32]byte]{},
 		interval: interval,
 		overlap:  overlap,
+		stopCh:   make(chan struct{}),
+		doneCh:   make(chan struct{}),
 		logger:   log.With().Str("com", "stek").Logger(),
 	}
 
@@ -119,46 +126,60 @@ func (m *RotateManager) rotate() error {
 // Start begins the periodic key rotation in a background goroutine.
 // The rotation will continue until the context is cancelled or Stop is called.
 func (m *RotateManager) Start(ctx context.Context) {
-	m.ticker = time.NewTicker(m.interval)
-	m.stopCh = make(chan struct{})
+	m.mu.Lock()
+	if m.started || m.stopped {
+		m.mu.Unlock()
+		return
+	}
+	m.started = true
+	ticker := time.NewTicker(m.interval)
+	m.ticker = ticker
 
 	m.logger.Info().
 		Dur("interval", m.interval).
 		Uint8("overlap", m.overlap).
 		Msg("starting session ticket key rotation")
+	m.mu.Unlock()
 
-	go m.run(ctx)
+	go m.run(ctx, ticker)
 }
 
 // run is the background goroutine that handles periodic key rotation.
-func (m *RotateManager) run(ctx context.Context) {
+
+func (m *RotateManager) run(ctx context.Context, ticker *time.Ticker) {
+	defer ticker.Stop()
+	defer close(m.doneCh)
+
 	for {
 		select {
-		case <-m.ticker.C:
+		case <-ticker.C:
 			if err := m.rotate(); err != nil {
 				m.logger.Error().Err(err).Msg("failed to rotate session ticket keys")
 				// Continue running despite error
 			}
 		case <-ctx.Done():
 			m.logger.Info().Msg("stopping session ticket key rotation (context cancelled)")
-			m.ticker.Stop()
 			return
 		case <-m.stopCh:
 			m.logger.Info().Msg("stopping session ticket key rotation")
-			m.ticker.Stop()
 			return
 		}
 	}
 }
 
-// Stop gracefully stops the key rotation. This method is idempotent and safe to call multiple times.
+// Stop gracefully stops the key rotation and waits for its background goroutine
+// to exit. This method is idempotent and safe to call before Start.
 func (m *RotateManager) Stop() {
-	if m.stopCh != nil {
-		select {
-		case <-m.stopCh:
-			// Already stopped
-		default:
-			close(m.stopCh)
+	m.mu.Lock()
+	if !m.stopped {
+		m.stopped = true
+		close(m.stopCh)
+		if !m.started {
+			close(m.doneCh)
 		}
 	}
+	doneCh := m.doneCh
+	m.mu.Unlock()
+
+	<-doneCh
 }

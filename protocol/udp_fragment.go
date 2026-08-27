@@ -30,17 +30,18 @@ const (
 )
 
 var (
-	ErrPacketTooLarge        = errors.New("packet too large to fragment")
-	ErrSessionIDMismatch     = errors.New("session ID mismatch")
-	ErrInvalidFragIndex      = errors.New("invalid fragment index")
-	ErrFragmentTotalMismatch = errors.New("fragment total mismatch")
-	ErrDatagramTooShort      = errors.New("datagram too short")
-	ErrDatagramTooLarge      = errors.New("datagram exceeds maximum size")
-	ErrUnknownDatagramType   = errors.New("unknown UDP datagram type")
-	ErrInvalidFragTotal      = errors.New("invalid fragment total")
-	ErrEmptyFragmentPayload  = errors.New("empty fragment payload")
-	ErrFragmentAssemblerNil  = errors.New("fragment assembler is required")
-	ErrFragmentationDisabled = errors.New("fragmentation disabled, packet too large")
+	ErrPacketTooLarge          = errors.New("packet too large to fragment")
+	ErrSessionIDMismatch       = errors.New("session ID mismatch")
+	ErrInvalidFragIndex        = errors.New("invalid fragment index")
+	ErrFragmentTotalMismatch   = errors.New("fragment total mismatch")
+	ErrDatagramTooShort        = errors.New("datagram too short")
+	ErrDatagramTooLarge        = errors.New("datagram exceeds maximum size")
+	ErrUnknownDatagramType     = errors.New("unknown UDP datagram type")
+	ErrInvalidFragTotal        = errors.New("invalid fragment total")
+	ErrEmptyFragmentPayload    = errors.New("empty fragment payload")
+	ErrFragmentAssemblerNil    = errors.New("fragment assembler is required")
+	ErrFragmentAssemblerClosed = errors.New("fragment assembler is closed")
+	ErrFragmentationDisabled   = errors.New("fragmentation disabled, packet too large")
 )
 
 // UDPDatagram is a validated UDP wire v2 datagram.
@@ -155,6 +156,10 @@ func FragmentUDPPooled(sessionID uint32, data []byte, fragIDCounter *atomic.Uint
 type FragmentAssembler struct {
 	mu        sync.Mutex
 	fragments map[uint16]*fragmentGroup // fragmentID -> group
+	closed    bool
+	stopCh    chan struct{}
+	doneCh    chan struct{}
+	closeOnce sync.Once
 }
 
 type fragmentGroup struct {
@@ -250,10 +255,19 @@ func cleanupExpiredFragmentGroups(groups map[uint16]*fragmentGroup, now time.Tim
 	}
 }
 
+func releaseAllFragmentGroups(groups map[uint16]*fragmentGroup) {
+	for id, group := range groups {
+		releaseFragmentGroup(group)
+		delete(groups, id)
+	}
+}
+
 // NewFragmentAssembler creates a new fragment assembler
 func NewFragmentAssembler() *FragmentAssembler {
 	fa := &FragmentAssembler{
 		fragments: make(map[uint16]*fragmentGroup),
+		stopCh:    make(chan struct{}),
+		doneCh:    make(chan struct{}),
 	}
 	go fa.cleanupLoop()
 	return fa
@@ -263,12 +277,37 @@ func NewFragmentAssembler() *FragmentAssembler {
 func (fa *FragmentAssembler) cleanupLoop() {
 	ticker := time.NewTicker(FragmentTimeout)
 	defer ticker.Stop()
+	defer close(fa.doneCh)
 
-	for range ticker.C {
-		fa.mu.Lock()
-		cleanupExpiredFragmentGroups(fa.fragments, time.Now())
-		fa.mu.Unlock()
+	for {
+		select {
+		case <-ticker.C:
+			fa.mu.Lock()
+			cleanupExpiredFragmentGroups(fa.fragments, time.Now())
+			fa.mu.Unlock()
+		case <-fa.stopCh:
+			return
+		}
 	}
+}
+
+// Close stops cleanup, waits for its goroutine to exit, and releases all
+// pending fragment groups. It is safe to call multiple times.
+func (fa *FragmentAssembler) Close() {
+	fa.closeOnce.Do(func() {
+		fa.mu.Lock()
+		fa.closed = true
+		releaseAllFragmentGroups(fa.fragments)
+		stopCh, doneCh := fa.stopCh, fa.doneCh
+		if stopCh != nil {
+			close(stopCh)
+		}
+		fa.mu.Unlock()
+
+		if doneCh != nil {
+			<-doneCh
+		}
+	})
 }
 
 // AddFragment adds a fragment and returns the complete packet if all fragments received
@@ -280,6 +319,9 @@ func (fa *FragmentAssembler) AddFragment(sessionID uint32, fragID uint16, index,
 
 	fa.mu.Lock()
 	defer fa.mu.Unlock()
+	if fa.closed {
+		return nil, ErrFragmentAssemblerClosed
+	}
 
 	group, err := loadOrCreateFragmentGroup(fa.fragments, sessionID, fragID, index, total)
 	if err != nil {
@@ -313,6 +355,12 @@ type fragmentShard struct {
 type ShardedFragmentAssembler struct {
 	shards     []fragmentShard
 	shardCount uint16
+
+	lifecycleMu sync.RWMutex
+	closed      bool
+	stopCh      chan struct{}
+	doneCh      chan struct{}
+	closeOnce   sync.Once
 }
 
 // NewShardedFragmentAssembler creates a new sharded fragment assembler
@@ -324,6 +372,8 @@ func NewShardedFragmentAssembler(shardCount int) *ShardedFragmentAssembler {
 	sfa := &ShardedFragmentAssembler{
 		shards:     make([]fragmentShard, shardCount),
 		shardCount: uint16(shardCount),
+		stopCh:     make(chan struct{}),
+		doneCh:     make(chan struct{}),
 	}
 
 	for i := range sfa.shards {
@@ -343,16 +393,48 @@ func (sfa *ShardedFragmentAssembler) getShard(fragID uint16) *fragmentShard {
 func (sfa *ShardedFragmentAssembler) cleanupLoop() {
 	ticker := time.NewTicker(FragmentTimeout)
 	defer ticker.Stop()
+	defer close(sfa.doneCh)
 
-	for range ticker.C {
-		now := time.Now()
+	for {
+		select {
+		case <-ticker.C:
+			sfa.lifecycleMu.RLock()
+			now := time.Now()
+			for i := range sfa.shards {
+				shard := &sfa.shards[i]
+				shard.mu.Lock()
+				cleanupExpiredFragmentGroups(shard.fragments, now)
+				shard.mu.Unlock()
+			}
+			sfa.lifecycleMu.RUnlock()
+		case <-sfa.stopCh:
+			return
+		}
+	}
+}
+
+// Close stops cleanup, waits for its goroutine to exit, and releases all
+// pending fragment groups. It is safe to call multiple times.
+func (sfa *ShardedFragmentAssembler) Close() {
+	sfa.closeOnce.Do(func() {
+		sfa.lifecycleMu.Lock()
+		sfa.closed = true
 		for i := range sfa.shards {
 			shard := &sfa.shards[i]
 			shard.mu.Lock()
-			cleanupExpiredFragmentGroups(shard.fragments, now)
+			releaseAllFragmentGroups(shard.fragments)
 			shard.mu.Unlock()
 		}
-	}
+		stopCh, doneCh := sfa.stopCh, sfa.doneCh
+		if stopCh != nil {
+			close(stopCh)
+		}
+		sfa.lifecycleMu.Unlock()
+
+		if doneCh != nil {
+			<-doneCh
+		}
+	})
 }
 
 // AddFragment adds a fragment and returns the complete packet if all fragments received.
@@ -362,6 +444,12 @@ func (sfa *ShardedFragmentAssembler) cleanupLoop() {
 func (sfa *ShardedFragmentAssembler) AddFragment(sessionID uint32, fragID uint16, index, total uint8, payload []byte) ([]byte, error) {
 	if err := validateFragmentInput(index, total); err != nil {
 		return nil, err
+	}
+
+	sfa.lifecycleMu.RLock()
+	defer sfa.lifecycleMu.RUnlock()
+	if sfa.closed {
+		return nil, ErrFragmentAssemblerClosed
 	}
 
 	shard := sfa.getShard(fragID)
