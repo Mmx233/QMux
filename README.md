@@ -211,11 +211,11 @@ Run benchmarks yourself:
 
 ```bash
 # Quick speed report
-go test -v -run TestSpeedReport ./cmd/run/...
+go test -v -run '^TestSpeedReport$' ./e2e
 
 # Comprehensive iperf3 benchmark
 # Require iperf3 installed
-go test -v -run TestIperf3 ./cmd/run/...
+go test -v -run '^TestIperf3' ./e2e
 ```
 
 # High Available Architecture
