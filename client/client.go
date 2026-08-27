@@ -2,9 +2,7 @@ package client
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io"
 	"net"
 	"strconv"
 	"sync"
@@ -145,14 +143,17 @@ func (c *Client) acceptStreamsFromConnection(ctx context.Context, sc *ServerConn
 			return
 		}
 
-		go c.handleStream(stream, sc)
+		go c.handleStream(ctx, stream, sc)
 	}
 }
 
 // handleStream handles a single stream from server
-func (c *Client) handleStream(stream *quic.Stream, sc *ServerConnection) {
+func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *ServerConnection) {
+	relayOwnsStream := false
 	defer func() {
-		_ = stream.Close()
+		if !relayOwnsStream {
+			_ = stream.Close()
+		}
 	}()
 
 	// Read NewConn message
@@ -184,17 +185,21 @@ func (c *Client) handleStream(stream *quic.Stream, sc *ServerConnection) {
 		_ = localConn.Close()
 	}()
 
+	tcpConn, ok := localConn.(*net.TCPConn)
+	if !ok {
+		logger.Error().Str("local_type", fmt.Sprintf("%T", localConn)).Msg("unsupported local connection")
+		return
+	}
+
 	// Optimize TCP connection
-	if tc, ok := localConn.(*net.TCPConn); ok {
-		if err := tc.SetNoDelay(true); err != nil {
-			logger.Warn().Err(err).Msg("set TCP_NODELAY failed")
-		}
-		if err := tc.SetReadBuffer(512 * 1024); err != nil {
-			logger.Warn().Err(err).Msg("set read buffer failed")
-		}
-		if err := tc.SetWriteBuffer(512 * 1024); err != nil {
-			logger.Warn().Err(err).Msg("set write buffer failed")
-		}
+	if err := tcpConn.SetNoDelay(true); err != nil {
+		logger.Warn().Err(err).Msg("set TCP_NODELAY failed")
+	}
+	if err := tcpConn.SetReadBuffer(512 * 1024); err != nil {
+		logger.Warn().Err(err).Msg("set read buffer failed")
+	}
+	if err := tcpConn.SetWriteBuffer(512 * 1024); err != nil {
+		logger.Warn().Err(err).Msg("set write buffer failed")
 	}
 
 	c.localConns.Store(msg.ConnID, localConn)
@@ -202,9 +207,51 @@ func (c *Client) handleStream(stream *quic.Stream, sc *ServerConnection) {
 
 	logger.Info().Str("local_addr", localAddr).Msg("connected to local service")
 
-	// Use optimized relay
-	err = protocol.Relay(localConn, stream)
-	if err != nil && !errors.Is(err, io.EOF) {
+	var streamMu sync.Mutex
+	aborted := false
+	abort := sync.OnceFunc(func() {
+		_ = localConn.Close()
+		streamMu.Lock()
+		aborted = true
+		stream.CancelRead(0)
+		stream.CancelWrite(0)
+		streamMu.Unlock()
+	})
+	localToQUICComplete := func(copyErr error) error {
+		if copyErr != nil {
+			abort()
+			return nil
+		}
+		streamMu.Lock()
+		if !aborted {
+			copyErr = stream.Close()
+		}
+		streamMu.Unlock()
+		if copyErr != nil {
+			abort()
+		}
+		return copyErr
+	}
+	quicToLocalComplete := func(copyErr error) error {
+		if copyErr != nil {
+			abort()
+			return nil
+		}
+		copyErr = tcpConn.CloseWrite()
+		if copyErr != nil {
+			abort()
+		}
+		return copyErr
+	}
+
+	relayOwnsStream = true
+	relay := protocol.StartRelay(localConn, stream, localToQUICComplete, quicToLocalComplete)
+	stopAbort := context.AfterFunc(ctx, abort)
+	err = relay.Wait()
+	if !stopAbort() {
+		abort()
+	}
+	if err != nil {
 		logger.Debug().Err(err).Msg("connection closed with error")
 	} else {
 		logger.Debug().Msg("connection closed")

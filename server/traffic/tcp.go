@@ -3,7 +3,6 @@ package traffic
 import (
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"sync"
 	"time"
@@ -36,19 +35,21 @@ func (f *tcpFlow) setStream(stream *quic.Stream) {
 	stream.CancelWrite(trafficStreamCancelCode)
 }
 
-// abort forcefully tears down both relay directions. It is reserved for
-// listener shutdown, where all blocked copy goroutines must be interrupted.
+// abort forcefully tears down both relay directions after a relay failure or
+// listener shutdown.
 func (f *tcpFlow) abort() {
-	_ = f.conn.Close()
-
 	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.aborted {
+		return
+	}
 	f.aborted = true
+	_ = f.conn.Close()
 	stream := f.stream
 	if stream != nil {
 		stream.CancelRead(trafficStreamCancelCode)
 		stream.CancelWrite(trafficStreamCancelCode)
 	}
-	f.mu.Unlock()
 }
 
 // closeSendGracefully serializes FIN with a concurrent Manager abort. Once an
@@ -61,6 +62,19 @@ func (f *tcpFlow) closeSendGracefully() error {
 		return nil
 	}
 	return f.stream.Close()
+}
+
+func (f *tcpFlow) closeTCPWriteGracefully() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.aborted {
+		return nil
+	}
+	conn, ok := f.conn.(interface{ CloseWrite() error })
+	if !ok {
+		return fmt.Errorf("connection does not support TCP CloseWrite")
+	}
+	return conn.CloseWrite()
 }
 
 // bindTCP stages a TCP socket without starting its accept loop.
@@ -184,17 +198,31 @@ func (l *Listener) handleTCPConnection(conn net.Conn) {
 	client.TotalConns.Add(1)
 	defer client.ActiveConns.Add(-1)
 
-	relay := protocol.StartRelay(conn, stream)
-	err = relay.WaitFirst()
-	// Preserve first-completion behavior while allowing data already accepted by
-	// the QUIC send side to finish reliably. Manager shutdown may concurrently
-	// call flow.abort, which also interrupts a flow-controlled stream.Write.
-	_ = conn.Close()
-	stream.CancelRead(trafficStreamCancelCode)
-	_ = relay.Wait()
-	_ = flow.closeSendGracefully()
+	relay := protocol.StartRelay(conn, stream,
+		func(err error) error {
+			if err != nil {
+				flow.abort()
+				return nil
+			}
+			if err = flow.closeSendGracefully(); err != nil {
+				flow.abort()
+			}
+			return err
+		},
+		func(err error) error {
+			if err != nil {
+				flow.abort()
+				return nil
+			}
+			if err = flow.closeTCPWriteGracefully(); err != nil {
+				flow.abort()
+			}
+			return err
+		},
+	)
+	err = relay.Wait()
 
-	if err != nil && !errors.Is(err, io.EOF) {
+	if err != nil {
 		logger.Debug().Err(err).Msg("connection closed with error")
 	} else {
 		logger.Debug().Msg("connection closed")

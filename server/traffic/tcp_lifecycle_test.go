@@ -224,16 +224,14 @@ func startRelayLifecycleManager(
 	return manager, pooledClient
 }
 
-func TestTCPRelayNormalCompletionDeliversPayloadWithFIN(t *testing.T) {
-	testCtx, cancelTest := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancelTest()
-	quicListener, serverConn, peerConn := newRelayLifecycleQUICPair(t, testCtx, 256*1024)
-	registerRelayLifecycleQUICCleanup(t, quicListener, serverConn, peerConn)
-
-	manager, pooledClient := startRelayLifecycleManager(t, quicListener, serverConn, "relay-peer")
-
-	trafficAddr := manager.listeners[0].TCPListener.Addr().String()
-	rawTCPConn, err := net.DialTimeout("tcp", trafficAddr, 3*time.Second)
+func openRelayLifecycleFlow(
+	t *testing.T,
+	ctx context.Context,
+	manager *Manager,
+	peerConn *quic.Conn,
+) (*net.TCPConn, *quic.Stream) {
+	t.Helper()
+	rawTCPConn, err := net.DialTimeout("tcp", manager.listeners[0].TCPListener.Addr().String(), 3*time.Second)
 	if err != nil {
 		t.Fatalf("dial traffic listener: %v", err)
 	}
@@ -247,17 +245,28 @@ func TestTCPRelayNormalCompletionDeliversPayloadWithFIN(t *testing.T) {
 		t.Fatalf("set traffic TCP deadline: %v", err)
 	}
 
-	peerStream, err := peerConn.AcceptStream(testCtx)
+	peerStream, err := peerConn.AcceptStream(ctx)
 	if err != nil {
 		t.Fatalf("accept traffic QUIC stream: %v", err)
 	}
-	if err := peerStream.SetReadDeadline(time.Now().Add(8 * time.Second)); err != nil {
-		t.Fatalf("set peer stream read deadline: %v", err)
+	if err := peerStream.SetDeadline(time.Now().Add(8 * time.Second)); err != nil {
+		t.Fatalf("set peer stream deadline: %v", err)
 	}
 	var newConn protocol.NewConnMsg
 	if err := protocol.ReadTypedMessage(peerStream, protocol.MsgTypeNewConn, &newConn); err != nil {
 		t.Fatalf("read NewConn message: %v", err)
 	}
+	return tcpConn, peerStream
+}
+
+func TestTCPRelayPublicFirstHalfCloseDeliversDelayedResponse(t *testing.T) {
+	testCtx, cancelTest := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelTest()
+	quicListener, serverConn, peerConn := newRelayLifecycleQUICPair(t, testCtx, 256*1024)
+	registerRelayLifecycleQUICCleanup(t, quicListener, serverConn, peerConn)
+
+	manager, pooledClient := startRelayLifecycleManager(t, quicListener, serverConn, "relay-peer")
+	tcpConn, peerStream := openRelayLifecycleFlow(t, testCtx, manager, peerConn)
 	waitForActiveConnections(t, pooledClient, 1)
 
 	payload := bytes.Repeat([]byte("graceful-relay-payload-"), 4096)
@@ -272,12 +281,9 @@ func TestTCPRelayNormalCompletionDeliversPayloadWithFIN(t *testing.T) {
 		t.Fatalf("half-close request TCP write side: %v", err)
 	}
 
-	// The peer keeps its QUIC send side open and doesn't read payload until the
-	// TCP-to-QUIC relay has completed and the handler has emitted FIN.
-	waitForActiveConnections(t, pooledClient, 0)
 	received, err := io.ReadAll(peerStream)
 	if err != nil {
-		t.Fatalf("read request payload after normal relay completion: %v", err)
+		t.Fatalf("read request payload: %v", err)
 	}
 	if !bytes.Equal(received, payload) {
 		gotHash := sha256.Sum256(received)
@@ -291,6 +297,103 @@ func TestTCPRelayNormalCompletionDeliversPayloadWithFIN(t *testing.T) {
 			firstMismatchOffset(received, payload),
 		)
 	}
+	// Cover COR-001's delayed-response case: the handler must stay active while
+	// the peer waits after receiving the request FIN.
+	time.Sleep(100 * time.Millisecond)
+	if active := pooledClient.ActiveConns.Load(); active != 1 {
+		t.Fatalf("active connections before response FIN = %d, want 1", active)
+	}
+
+	response := bytes.Repeat([]byte("delayed-response-payload-"), 4096)
+	written, err = io.Copy(peerStream, bytes.NewReader(response))
+	if err != nil {
+		t.Fatalf("write delayed response: %v", err)
+	}
+	if written != int64(len(response)) {
+		t.Fatalf("response bytes written = %d, want %d", written, len(response))
+	}
+	if err := peerStream.Close(); err != nil {
+		t.Fatalf("half-close response QUIC write side: %v", err)
+	}
+	received, err = io.ReadAll(tcpConn)
+	if err != nil {
+		t.Fatalf("read delayed response: %v", err)
+	}
+	if !bytes.Equal(received, response) {
+		t.Fatalf(
+			"response payload mismatch: got len=%d, want len=%d; first mismatch at byte %d",
+			len(received),
+			len(response),
+			firstMismatchOffset(received, response),
+		)
+	}
+	waitForActiveConnections(t, pooledClient, 0)
+
+	manager.Close()
+	waitManager(t, manager)
+}
+
+func TestTCPRelayPeerFirstHalfCloseKeepsRequestDirectionOpen(t *testing.T) {
+	testCtx, cancelTest := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelTest()
+	quicListener, serverConn, peerConn := newRelayLifecycleQUICPair(t, testCtx, 256*1024)
+	registerRelayLifecycleQUICCleanup(t, quicListener, serverConn, peerConn)
+
+	manager, pooledClient := startRelayLifecycleManager(t, quicListener, serverConn, "peer-first-relay")
+	tcpConn, peerStream := openRelayLifecycleFlow(t, testCtx, manager, peerConn)
+	waitForActiveConnections(t, pooledClient, 1)
+
+	response := []byte("peer-first-response")
+	if _, err := peerStream.Write(response); err != nil {
+		t.Fatalf("write peer-first response: %v", err)
+	}
+	if err := peerStream.Close(); err != nil {
+		t.Fatalf("half-close peer QUIC write side: %v", err)
+	}
+	received, err := io.ReadAll(tcpConn)
+	if err != nil {
+		t.Fatalf("read peer-first response: %v", err)
+	}
+	if !bytes.Equal(received, response) {
+		t.Fatalf("response payload mismatch: got %q, want %q", received, response)
+	}
+	if active := pooledClient.ActiveConns.Load(); active != 1 {
+		t.Fatalf("active connections before request FIN = %d, want 1", active)
+	}
+
+	request := []byte("request-after-peer-fin")
+	if _, err := tcpConn.Write(request); err != nil {
+		t.Fatalf("write request after peer FIN: %v", err)
+	}
+	if err := tcpConn.CloseWrite(); err != nil {
+		t.Fatalf("half-close request TCP write side: %v", err)
+	}
+	received, err = io.ReadAll(peerStream)
+	if err != nil {
+		t.Fatalf("read request after peer FIN: %v", err)
+	}
+	if !bytes.Equal(received, request) {
+		t.Fatalf("request payload mismatch: got %q, want %q", received, request)
+	}
+	waitForActiveConnections(t, pooledClient, 0)
+
+	manager.Close()
+	waitManager(t, manager)
+}
+
+func TestTCPRelayPeerResetAbortsBlockedSibling(t *testing.T) {
+	testCtx, cancelTest := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelTest()
+	quicListener, serverConn, peerConn := newRelayLifecycleQUICPair(t, testCtx, 256*1024)
+	registerRelayLifecycleQUICCleanup(t, quicListener, serverConn, peerConn)
+
+	manager, pooledClient := startRelayLifecycleManager(t, quicListener, serverConn, "reset-relay-peer")
+	_, peerStream := openRelayLifecycleFlow(t, testCtx, manager, peerConn)
+	waitForActiveConnections(t, pooledClient, 1)
+
+	const peerResetCode quic.StreamErrorCode = 42
+	peerStream.CancelWrite(peerResetCode)
+	waitForActiveConnections(t, pooledClient, 0)
 
 	manager.Close()
 	waitManager(t, manager)
