@@ -8,11 +8,13 @@ import (
 )
 
 type fragmentLifecycleHarness struct {
-	add        func() ([]byte, error)
-	close      func()
-	done       <-chan struct{}
-	group      func() *fragmentGroup
-	groupCount func() int
+	add            func() ([]byte, error)
+	close          func()
+	done           <-chan struct{}
+	group          func() *fragmentGroup
+	groupCount     func() int
+	retainedGroups func() int64
+	retainedBytes  func() int64
 }
 
 func fragmentLifecycleHarnesses() map[string]func() fragmentLifecycleHarness {
@@ -26,10 +28,16 @@ func fragmentLifecycleHarnesses() map[string]func() fragmentLifecycleHarness {
 				close: assembler.Close,
 				done:  assembler.doneCh,
 				group: func() *fragmentGroup {
-					return assembler.fragments[7]
+					return assembler.fragments[fragmentKey{sessionID: 1, fragID: 7}]
 				},
 				groupCount: func() int {
 					return len(assembler.fragments)
+				},
+				retainedGroups: func() int64 {
+					return int64(len(assembler.fragments))
+				},
+				retainedBytes: func() int64 {
+					return assembler.retainedBytes
 				},
 			}
 		},
@@ -42,7 +50,8 @@ func fragmentLifecycleHarnesses() map[string]func() fragmentLifecycleHarness {
 				close: assembler.Close,
 				done:  assembler.doneCh,
 				group: func() *fragmentGroup {
-					return assembler.getShard(7).fragments[7]
+					key := fragmentKey{sessionID: 1, fragID: 7}
+					return assembler.getShard(key).fragments[key]
 				},
 				groupCount: func() int {
 					count := 0
@@ -51,6 +60,8 @@ func fragmentLifecycleHarnesses() map[string]func() fragmentLifecycleHarness {
 					}
 					return count
 				},
+				retainedGroups: assembler.retainedGroups.Load,
+				retainedBytes:  assembler.retainedBytes.Load,
 			}
 		},
 	}
@@ -114,8 +125,44 @@ func TestFragmentAssemblerCloseReleasesPendingGroups(t *testing.T) {
 			if got := harness.groupCount(); got != 0 {
 				t.Fatalf("Close left %d pending fragment groups", got)
 			}
+			if groups, bytes := harness.retainedGroups(), harness.retainedBytes(); groups != 0 || bytes != 0 {
+				t.Fatalf("Close retained budget: groups=%d bytes=%d", groups, bytes)
+			}
 			if group.data != nil || group.buffers != nil || group.received != 0 {
 				t.Fatalf("Close retained released group data: data=%v buffers=%v received=%d", group.data, group.buffers, group.received)
+			}
+		})
+	}
+}
+
+func TestFragmentAssemblerAddRacesWithClose(t *testing.T) {
+	for name, newHarness := range fragmentLifecycleHarnesses() {
+		t.Run(name, func(t *testing.T) {
+			harness := newHarness()
+			start := make(chan struct{})
+			var callers sync.WaitGroup
+			for range 32 {
+				callers.Go(func() {
+					<-start
+					_, err := harness.add()
+					if err != nil && !errors.Is(err, ErrFragmentAssemblerClosed) {
+						t.Errorf("AddFragment error = %v", err)
+					}
+				})
+			}
+			callers.Go(func() {
+				<-start
+				harness.close()
+			})
+			close(start)
+			callers.Wait()
+			harness.close()
+
+			if groups, bytes := harness.retainedGroups(), harness.retainedBytes(); groups != 0 || bytes != 0 {
+				t.Fatalf("Add/Close retained budget: groups=%d bytes=%d", groups, bytes)
+			}
+			if got := harness.groupCount(); got != 0 {
+				t.Fatalf("Add/Close left %d groups", got)
 			}
 		})
 	}

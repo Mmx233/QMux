@@ -3,7 +3,9 @@ package protocol
 import (
 	"bytes"
 	"errors"
+	"hash/maphash"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -385,27 +387,34 @@ func TestFragmentAssembler_MissingFragment(t *testing.T) {
 	}
 }
 
-func TestFragmentAssembler_SessionIDMismatch(t *testing.T) {
-	// Test session ID mismatch
-	data := make([]byte, 3000)
+func assertSameFragmentIDDifferentSessions(t *testing.T, add func(uint32, uint16, uint8, uint8, []byte) ([]byte, error)) {
+	t.Helper()
+	const fragID = 17
+	for _, fragment := range []struct {
+		sessionID uint32
+		index     uint8
+		payload   string
+		want      string
+	}{
+		{sessionID: 1, index: 0, payload: "A"},
+		{sessionID: 2, index: 0, payload: "B"},
+		{sessionID: 1, index: 1, payload: "a", want: "Aa"},
+		{sessionID: 2, index: 1, payload: "b", want: "Bb"},
+	} {
+		result, err := add(fragment.sessionID, fragID, fragment.index, 2, []byte(fragment.payload))
+		if err != nil {
+			t.Fatalf("session %d index %d: %v", fragment.sessionID, fragment.index, err)
+		}
+		if string(result) != fragment.want {
+			t.Fatalf("session %d index %d result=%q, want %q", fragment.sessionID, fragment.index, result, fragment.want)
+		}
+	}
+}
 
-	var fragID uint16
-	datagrams, _ := FragmentUDP(12345, data, &fragID, true)
-
+func TestFragmentAssembler_SameFragmentIDDifferentSessions(t *testing.T) {
 	assembler := NewFragmentAssembler()
-
-	// Add first fragment with correct session ID
-	_, _, fID, fIndex, fTotal, payload, _ := ParseUDPDatagram(datagrams[0])
-	if result, err := assembler.AddFragment(12345, fID, fIndex, fTotal, payload); err != nil || result != nil {
-		t.Fatalf("add initial fragment: result=%q, err=%v", result, err)
-	}
-
-	// Try to add second fragment with wrong session ID
-	_, _, fID, fIndex, fTotal, payload, _ = ParseUDPDatagram(datagrams[1])
-	_, err := assembler.AddFragment(99999, fID, fIndex, fTotal, payload)
-	if !errors.Is(err, ErrSessionIDMismatch) {
-		t.Errorf("expected ErrSessionIDMismatch, got %v", err)
-	}
+	defer assembler.Close()
+	assertSameFragmentIDDifferentSessions(t, assembler.AddFragment)
 }
 
 func TestFragmentAssembler_InvalidFragmentIndex(t *testing.T) {
@@ -517,13 +526,13 @@ func BenchmarkFragmentAssembler_Reassemble(b *testing.B) {
 
 func TestCleanupExpiredFragmentGroups(t *testing.T) {
 	now := time.Now()
-	regular := &FragmentAssembler{fragments: make(map[uint16]*fragmentGroup)}
-	sharded := &fragmentShard{fragments: make(map[uint16]*fragmentGroup)}
+	regular := &FragmentAssembler{fragments: make(map[fragmentKey]*fragmentGroup)}
+	sharded := &fragmentShard{fragments: make(map[fragmentKey]*fragmentGroup)}
 
 	tests := []struct {
 		name   string
 		lock   sync.Locker
-		groups map[uint16]*fragmentGroup
+		groups map[fragmentKey]*fragmentGroup
 		pooled bool
 	}{
 		{name: "regular", lock: &regular.mu, groups: regular.fragments},
@@ -533,7 +542,6 @@ func TestCleanupExpiredFragmentGroups(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			expired := &fragmentGroup{
-				sessionID: 12345,
 				total:     2,
 				received:  1,
 				data:      make([][]byte, 2),
@@ -549,23 +557,24 @@ func TestCleanupExpiredFragmentGroups(t *testing.T) {
 			}
 
 			recent := &fragmentGroup{
-				sessionID: 12345,
 				total:     2,
 				received:  1,
 				data:      [][]byte{[]byte("recent"), nil},
 				createdAt: now,
 			}
-			tt.groups[1] = expired
-			tt.groups[2] = recent
+			expiredKey := fragmentKey{sessionID: 12345, fragID: 1}
+			recentKey := fragmentKey{sessionID: 12345, fragID: 2}
+			tt.groups[expiredKey] = expired
+			tt.groups[recentKey] = recent
 
 			tt.lock.Lock()
 			cleanupExpiredFragmentGroups(tt.groups, now)
 			tt.lock.Unlock()
 
-			if _, exists := tt.groups[1]; exists {
+			if _, exists := tt.groups[expiredKey]; exists {
 				t.Error("expected expired fragment group to be deleted")
 			}
-			if got := tt.groups[2]; got != recent {
+			if got := tt.groups[recentKey]; got != recent {
 				t.Fatal("expected recent fragment group to remain unchanged")
 			}
 			assertFragmentGroupReleased(t, expired)
@@ -880,10 +889,6 @@ func TestNewShardedFragmentAssembler_DefaultShardCount(t *testing.T) {
 		t.Fatal("expected non-nil ShardedFragmentAssembler")
 	}
 
-	if sfa.shardCount != DefaultShardCount {
-		t.Errorf("expected shardCount %d, got %d", DefaultShardCount, sfa.shardCount)
-	}
-
 	if len(sfa.shards) != DefaultShardCount {
 		t.Errorf("expected %d shards, got %d", DefaultShardCount, len(sfa.shards))
 	}
@@ -896,8 +901,8 @@ func TestNewShardedFragmentAssembler_NegativeShardCount(t *testing.T) {
 		t.Fatal("expected non-nil ShardedFragmentAssembler")
 	}
 
-	if sfa.shardCount != DefaultShardCount {
-		t.Errorf("expected shardCount %d, got %d", DefaultShardCount, sfa.shardCount)
+	if len(sfa.shards) != DefaultShardCount {
+		t.Errorf("expected shard count %d, got %d", DefaultShardCount, len(sfa.shards))
 	}
 }
 
@@ -909,12 +914,29 @@ func TestNewShardedFragmentAssembler_CustomShardCount(t *testing.T) {
 		t.Fatal("expected non-nil ShardedFragmentAssembler")
 	}
 
-	if sfa.shardCount != uint16(customCount) {
-		t.Errorf("expected shardCount %d, got %d", customCount, sfa.shardCount)
-	}
-
 	if len(sfa.shards) != customCount {
 		t.Errorf("expected %d shards, got %d", customCount, len(sfa.shards))
+	}
+}
+
+func TestNewShardedFragmentAssembler_LargeShardCounts(t *testing.T) {
+	for _, shardCount := range []int{65536, 65537} {
+		t.Run(strconv.Itoa(shardCount), func(t *testing.T) {
+			sfa := NewShardedFragmentAssembler(shardCount)
+			defer sfa.Close()
+			if len(sfa.shards) != shardCount {
+				t.Fatalf("shard count = %d, want %d", len(sfa.shards), shardCount)
+			}
+
+			for sessionID := range uint32(128) {
+				key := fragmentKey{sessionID: sessionID, fragID: 1}
+				index := sfa.shardIndex(key)
+				want := int(maphash.Comparable(sfa.seed, key) % uint64(shardCount))
+				if index != want || sfa.getShard(key) != &sfa.shards[want] {
+					t.Fatalf("key=%+v produced shard %d, want %d", key, index, want)
+				}
+			}
+		})
 	}
 }
 
@@ -934,59 +956,12 @@ func TestShardedFragmentAssembler_GetShard_Deterministic(t *testing.T) {
 	sfa := NewShardedFragmentAssembler(16)
 
 	// Same fragment ID should always return the same shard
-	fragID := uint16(12345)
-	shard1 := sfa.getShard(fragID)
-	shard2 := sfa.getShard(fragID)
+	key := fragmentKey{sessionID: 99, fragID: 12345}
+	shard1 := sfa.getShard(key)
+	shard2 := sfa.getShard(key)
 
 	if shard1 != shard2 {
 		t.Error("getShard should return the same shard for the same fragment ID")
-	}
-}
-
-func TestShardedFragmentAssembler_GetShard_ModuloDistribution(t *testing.T) {
-	// Test that getShard uses modulo correctly
-	shardCount := 16
-	sfa := NewShardedFragmentAssembler(shardCount)
-
-	testCases := []struct {
-		fragID        uint16
-		expectedIndex int
-	}{
-		{0, 0},
-		{1, 1},
-		{15, 15},
-		{16, 0},
-		{17, 1},
-		{32, 0},
-		{100, 100 % shardCount},
-		{65535, 65535 % shardCount},
-	}
-
-	for _, tc := range testCases {
-		shard := sfa.getShard(tc.fragID)
-		expectedShard := &sfa.shards[tc.expectedIndex]
-
-		if shard != expectedShard {
-			t.Errorf("fragID %d: expected shard index %d, got different shard", tc.fragID, tc.expectedIndex)
-		}
-	}
-}
-
-func TestShardedFragmentAssembler_GetShard_AllShardsAccessible(t *testing.T) {
-	// Test that all shards can be accessed via getShard
-	shardCount := 8
-	sfa := NewShardedFragmentAssembler(shardCount)
-
-	accessedShards := make(map[*fragmentShard]bool)
-
-	// Access shards using fragment IDs 0 through shardCount-1
-	for i := range shardCount {
-		shard := sfa.getShard(uint16(i))
-		accessedShards[shard] = true
-	}
-
-	if len(accessedShards) != shardCount {
-		t.Errorf("expected to access %d unique shards, got %d", shardCount, len(accessedShards))
 	}
 }
 
@@ -994,10 +969,10 @@ func TestShardedFragmentAssembler_GetShard_SingleShard(t *testing.T) {
 	// Test with single shard - all fragment IDs should map to the same shard
 	sfa := NewShardedFragmentAssembler(1)
 
-	shard0 := sfa.getShard(0)
-	shard1 := sfa.getShard(1)
-	shard100 := sfa.getShard(100)
-	shard65535 := sfa.getShard(65535)
+	shard0 := sfa.getShard(fragmentKey{})
+	shard1 := sfa.getShard(fragmentKey{sessionID: 1, fragID: 1})
+	shard100 := sfa.getShard(fragmentKey{sessionID: 100, fragID: 100})
+	shard65535 := sfa.getShard(fragmentKey{sessionID: ^uint32(0), fragID: ^uint16(0)})
 
 	if shard0 != shard1 || shard1 != shard100 || shard100 != shard65535 {
 		t.Error("with single shard, all fragment IDs should map to the same shard")
@@ -1121,31 +1096,10 @@ func TestShardedFragmentAssembler_AddFragment_DuplicateFragment(t *testing.T) {
 	}
 }
 
-func TestShardedFragmentAssembler_AddFragment_SessionIDMismatch(t *testing.T) {
-	// Test session ID mismatch
-	data := make([]byte, 3000)
-
-	var fragIDCounter atomic.Uint32
-	results, err := FragmentUDPPooled(12345, data, &fragIDCounter, true)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	defer ReleaseDatagramResults(results)
-
+func TestShardedFragmentAssembler_AddFragment_SameFragmentIDDifferentSessions(t *testing.T) {
 	sfa := NewShardedFragmentAssembler(16)
-
-	// Add first fragment with correct session ID
-	_, _, fID, fIndex, fTotal, payload, _ := ParseUDPDatagram(results[0].Data)
-	if result, err := sfa.AddFragment(12345, fID, fIndex, fTotal, payload); err != nil || result != nil {
-		t.Fatalf("add initial fragment: result=%q, err=%v", result, err)
-	}
-
-	// Try to add second fragment with wrong session ID
-	_, _, fID, fIndex, fTotal, payload, _ = ParseUDPDatagram(results[1].Data)
-	_, err = sfa.AddFragment(99999, fID, fIndex, fTotal, payload)
-	if !errors.Is(err, ErrSessionIDMismatch) {
-		t.Errorf("expected ErrSessionIDMismatch, got %v", err)
-	}
+	defer sfa.Close()
+	assertSameFragmentIDDifferentSessions(t, sfa.AddFragment)
 }
 
 func TestShardedFragmentAssembler_AddFragment_InvalidFragmentIndex(t *testing.T) {
@@ -1199,9 +1153,10 @@ func TestShardedFragmentAssembler_AddFragment_UsesPooledBuffers(t *testing.T) {
 	}
 
 	// Check that the fragment group has tracked buffers
-	shard := sfa.getShard(1)
+	key := fragmentKey{sessionID: 12345, fragID: 1}
+	shard := sfa.getShard(key)
 	shard.mu.Lock()
-	group, exists := shard.fragments[1]
+	group, exists := shard.fragments[key]
 	if !exists {
 		shard.mu.Unlock()
 		t.Fatal("expected fragment group to exist")
@@ -1217,6 +1172,24 @@ func TestShardedFragmentAssembler_AddFragment_UsesPooledBuffers(t *testing.T) {
 		t.Error("expected tracked buffer to be non-nil")
 	}
 	shard.mu.Unlock()
+}
+
+func TestShardedFragmentAssembler_ChargesPooledBufferCapacity(t *testing.T) {
+	shortened := make([]byte, 1, FragmentBufferSize)
+	bufferCapacity := cap(shortened)
+	if retainedBytes := fragmentBufferRetainedBytes(&shortened); retainedBytes != int64(bufferCapacity) {
+		t.Fatalf("shortened buffer retained bytes = %d, want capacity %d", retainedBytes, bufferCapacity)
+	}
+
+	sfa := NewShardedFragmentAssembler(1)
+	sfa.maxBytes = int64(bufferCapacity - 1)
+	defer sfa.Close()
+	if _, err := sfa.AddFragment(1, 1, 0, 2, []byte("x")); !errors.Is(err, ErrFragmentAssemblerFull) {
+		t.Fatalf("capacity-sized pooled charge error = %v", err)
+	}
+	if groups, retainedBytes := sfa.retainedGroups.Load(), sfa.retainedBytes.Load(); groups != 0 || retainedBytes != 0 {
+		t.Fatalf("rejected pooled fragment retained budget: groups=%d bytes=%d", groups, retainedBytes)
+	}
 }
 
 func TestShardedFragmentAssembler_AddFragment_ReturnsBuffersOnCompletion(t *testing.T) {
@@ -1242,9 +1215,10 @@ func TestShardedFragmentAssembler_AddFragment_ReturnsBuffersOnCompletion(t *test
 	}
 
 	// Verify the fragment group was removed from the shard
-	shard := sfa.getShard(1)
+	key := fragmentKey{sessionID: 12345, fragID: 1}
+	shard := sfa.getShard(key)
 	shard.mu.Lock()
-	_, exists := shard.fragments[1]
+	_, exists := shard.fragments[key]
 	shard.mu.Unlock()
 
 	if exists {
@@ -1262,8 +1236,7 @@ func TestShardedFragmentAssembler_AddFragment_ShardIsolation(t *testing.T) {
 	// Test that fragments in different shards don't interfere with each other
 	sfa := NewShardedFragmentAssembler(16)
 
-	// Add fragments with different fragment IDs that map to different shards
-	// fragID 0 -> shard 0, fragID 1 -> shard 1
+	// Add fragments with different fragment identities.
 	_, err := sfa.AddFragment(12345, 0, 0, 2, []byte("frag0-part0"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1275,14 +1248,16 @@ func TestShardedFragmentAssembler_AddFragment_ShardIsolation(t *testing.T) {
 	}
 
 	// Verify both fragment groups exist in their respective shards
-	shard0 := sfa.getShard(0)
+	key0 := fragmentKey{sessionID: 12345, fragID: 0}
+	shard0 := sfa.getShard(key0)
 	shard0.mu.Lock()
-	_, exists0 := shard0.fragments[0]
+	_, exists0 := shard0.fragments[key0]
 	shard0.mu.Unlock()
 
-	shard1 := sfa.getShard(1)
+	key1 := fragmentKey{sessionID: 12345, fragID: 1}
+	shard1 := sfa.getShard(key1)
 	shard1.mu.Lock()
-	_, exists1 := shard1.fragments[1]
+	_, exists1 := shard1.fragments[key1]
 	shard1.mu.Unlock()
 
 	if !exists0 {
@@ -1305,7 +1280,7 @@ func TestShardedFragmentAssembler_AddFragment_ShardIsolation(t *testing.T) {
 
 	// Verify fragment group 1 still exists
 	shard1.mu.Lock()
-	_, exists1 = shard1.fragments[1]
+	_, exists1 = shard1.fragments[key1]
 	shard1.mu.Unlock()
 
 	if !exists1 {
@@ -1345,9 +1320,10 @@ func TestShardedFragmentAssembler_AddFragment_LargePayload(t *testing.T) {
 		t.Fatalf("expected incomplete result, got %d bytes", len(result))
 	}
 
-	shard := sfa.getShard(1)
+	key := fragmentKey{sessionID: 12345, fragID: 1}
+	shard := sfa.getShard(key)
 	shard.mu.Lock()
-	group := shard.fragments[1]
+	group := shard.fragments[key]
 	if group == nil {
 		shard.mu.Unlock()
 		t.Fatal("expected fragment group")
@@ -1355,6 +1331,10 @@ func TestShardedFragmentAssembler_AddFragment_LargePayload(t *testing.T) {
 	if len(group.buffers) != 0 {
 		shard.mu.Unlock()
 		t.Fatalf("large fragment should be directly allocated, got %d pooled buffers", len(group.buffers))
+	}
+	if group.retainedBytes != int64(len(largePayload)) || sfa.retainedBytes.Load() != int64(len(largePayload)) {
+		shard.mu.Unlock()
+		t.Fatalf("large fragment retained bytes = group %d assembler %d, want %d", group.retainedBytes, sfa.retainedBytes.Load(), len(largePayload))
 	}
 	shard.mu.Unlock()
 
@@ -1366,6 +1346,9 @@ func TestShardedFragmentAssembler_AddFragment_LargePayload(t *testing.T) {
 	expected := append(append([]byte(nil), largePayload...), tail...)
 	if !bytes.Equal(result, expected) {
 		t.Error("reassembled data mismatch for large payload")
+	}
+	if groups, retainedBytes := sfa.retainedGroups.Load(), sfa.retainedBytes.Load(); groups != 0 || retainedBytes != 0 {
+		t.Fatalf("completion retained budget: groups=%d bytes=%d", groups, retainedBytes)
 	}
 }
 

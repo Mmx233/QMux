@@ -264,3 +264,66 @@ func TestDecodeAndAssembleUDPDatagram(t *testing.T) {
 		}
 	})
 }
+
+func TestDecodeAndAssembleUDPDatagramSameFragmentIDDifferentSessions(t *testing.T) {
+	type closeAssembler interface {
+		UDPFragmentAssembler
+		Close()
+	}
+	assemblers := map[string]func() closeAssembler{
+		"regular": func() closeAssembler { return NewFragmentAssembler() },
+		"sharded": func() closeAssembler { return NewShardedFragmentAssembler(16) },
+	}
+	firstPayload := bytes.Repeat([]byte("first"), 500)
+	secondPayload := bytes.Repeat([]byte("second"), 500)
+	var firstCounter, secondCounter uint16
+	first, err := FragmentUDP(1, firstPayload, &firstCounter, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := FragmentUDP(2, secondPayload, &secondCounter, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstHeader, err := DecodeUDPDatagram(first[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondHeader, err := DecodeUDPDatagram(second[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstHeader.FragmentID != secondHeader.FragmentID || len(first) != 3 || len(second) != 3 {
+		t.Fatalf("independent counters produced fragment IDs %d/%d and counts %d/%d", firstHeader.FragmentID, secondHeader.FragmentID, len(first), len(second))
+	}
+	sequence := []struct {
+		sessionID uint32
+		wire      []byte
+		want      []byte
+	}{
+		{sessionID: 1, wire: first[2]},
+		{sessionID: 1, wire: first[2]}, // duplicate, out of order
+		{sessionID: 2, wire: second[0]},
+		{sessionID: 2, wire: second[0]}, // duplicate
+		{sessionID: 1, wire: first[0]},
+		{sessionID: 2, wire: second[2]},
+		{sessionID: 1, wire: first[1], want: firstPayload},
+		{sessionID: 2, wire: second[1], want: secondPayload},
+	}
+
+	for name, newAssembler := range assemblers {
+		t.Run(name, func(t *testing.T) {
+			assembler := newAssembler()
+			defer assembler.Close()
+			for i, fragment := range sequence {
+				sessionID, payload, complete, err := DecodeAndAssembleUDPDatagram(fragment.wire, assembler)
+				if err != nil {
+					t.Fatalf("fragment %d: %v", i, err)
+				}
+				if sessionID != fragment.sessionID || complete != (fragment.want != nil) || !bytes.Equal(payload, fragment.want) {
+					t.Fatalf("fragment %d: session=%d payload bytes=%d complete=%v, want session=%d payload bytes=%d", i, sessionID, len(payload), complete, fragment.sessionID, len(fragment.want))
+				}
+			}
+		})
+	}
+}

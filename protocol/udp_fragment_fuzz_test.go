@@ -1,6 +1,9 @@
 package protocol
 
-import "testing"
+import (
+	"hash/maphash"
+	"testing"
+)
 
 func FuzzFragmentAssemblersNeverPanic(f *testing.F) {
 	f.Add([]byte{
@@ -27,13 +30,13 @@ func FuzzFragmentAssemblersNeverPanic(f *testing.F) {
 			sequence = sequence[:4096]
 		}
 
-		regular := &FragmentAssembler{fragments: make(map[uint16]*fragmentGroup)}
+		regular := &FragmentAssembler{fragments: make(map[fragmentKey]*fragmentGroup)}
 		sharded := &ShardedFragmentAssembler{
-			shards:     make([]fragmentShard, 4),
-			shardCount: 4,
+			shards: make([]fragmentShard, 4),
+			seed:   maphash.MakeSeed(),
 		}
 		for i := range sharded.shards {
-			sharded.shards[i].fragments = make(map[uint16]*fragmentGroup)
+			sharded.shards[i].fragments = make(map[fragmentKey]*fragmentGroup)
 		}
 
 		assemblers := []UDPFragmentAssembler{regular, sharded}

@@ -478,210 +478,44 @@ func TestFragmentReassemblyRoundTrip_MinFragmentation_Property(t *testing.T) {
 	})
 }
 
-// Feature: udp-performance-optimization, Property 6: Shard Calculation Determinism
-// *For any* fragment ID and shard count, the shard index SHALL equal `fragID % shardCount`,
-// and the same fragment ID SHALL always map to the same shard.
-// **Validates: Requirements 4.3**
-
-// TestShardCalculationDeterminism_Property verifies that shard calculation is deterministic
-// and follows the formula: shardIndex = fragID % shardCount
 func TestShardCalculationDeterminism_Property(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		// Generate random shard count (1 to 256, covering typical configurations)
 		shardCount := rapid.IntRange(1, 256).Draw(t, "shardCount")
-
-		// Generate random fragment ID (full uint16 range)
-		fragID := rapid.Uint16().Draw(t, "fragID")
-
-		// Create a sharded fragment assembler with the given shard count
-		assembler := NewShardedFragmentAssembler(shardCount)
-
-		// Get the shard for this fragment ID
-		shard := assembler.getShard(fragID)
-
-		// Property 1: Shard index should equal fragID % shardCount
-		// We verify this by checking that the shard pointer matches the expected index
-		expectedIndex := int(fragID) % shardCount
-		expectedShard := &assembler.shards[expectedIndex]
-
-		if shard != expectedShard {
-			t.Errorf("Shard mismatch for fragID=%d, shardCount=%d: expected shard at index %d, got different shard",
-				fragID, shardCount, expectedIndex)
+		key := fragmentKey{
+			sessionID: rapid.Uint32().Draw(t, "sessionID"),
+			fragID:    rapid.Uint16().Draw(t, "fragID"),
 		}
+		assembler := NewShardedFragmentAssembler(shardCount)
+		defer assembler.Close()
 
-		// Property 2: Same fragment ID should always map to the same shard (determinism)
-		// Call getShard multiple times and verify consistency
+		index := assembler.shardIndex(key)
+		shard := assembler.getShard(key)
+		if index < 0 || index >= shardCount || shard != &assembler.shards[index] {
+			t.Fatalf("key=%+v shardCount=%d: invalid shard %d", key, shardCount, index)
+		}
 		for i := range 10 {
-			repeatShard := assembler.getShard(fragID)
+			repeatShard := assembler.getShard(key)
 			if repeatShard != shard {
-				t.Errorf("Non-deterministic shard calculation: fragID=%d returned different shards on call %d",
-					fragID, i+1)
+				t.Fatalf("key=%+v returned different shards on call %d", key, i+1)
 			}
 		}
 	})
 }
 
-// TestShardCalculationDeterminism_DefaultShardCount_Property verifies shard calculation
-// with the default shard count (16).
 func TestShardCalculationDeterminism_DefaultShardCount_Property(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		// Generate random fragment ID
-		fragID := rapid.Uint16().Draw(t, "fragID")
-
-		// Create assembler with default shard count (passing 0 or negative uses default)
+		key := fragmentKey{
+			sessionID: rapid.Uint32().Draw(t, "sessionID"),
+			fragID:    rapid.Uint16().Draw(t, "fragID"),
+		}
 		assembler := NewShardedFragmentAssembler(0)
-
-		// Verify default shard count is 16
-		if assembler.shardCount != DefaultShardCount {
-			t.Errorf("Expected default shard count %d, got %d", DefaultShardCount, assembler.shardCount)
+		defer assembler.Close()
+		if len(assembler.shards) != DefaultShardCount {
+			t.Fatalf("expected default shard count %d, got %d", DefaultShardCount, len(assembler.shards))
 		}
-
-		// Get the shard
-		shard := assembler.getShard(fragID)
-
-		// Property: Shard index should equal fragID % 16
-		expectedIndex := int(fragID) % DefaultShardCount
-		expectedShard := &assembler.shards[expectedIndex]
-
-		if shard != expectedShard {
-			t.Errorf("Shard mismatch for fragID=%d with default shard count: expected index %d",
-				fragID, expectedIndex)
-		}
-	})
-}
-
-// TestShardCalculationDeterminism_Distribution_Property verifies that fragment IDs
-// are distributed across shards according to the modulo formula.
-func TestShardCalculationDeterminism_Distribution_Property(t *testing.T) {
-	rapid.Check(t, func(t *rapid.T) {
-		// Generate random shard count
-		shardCount := rapid.IntRange(1, 64).Draw(t, "shardCount")
-
-		// Generate a batch of random fragment IDs
-		numFragIDs := rapid.IntRange(10, 100).Draw(t, "numFragIDs")
-
-		assembler := NewShardedFragmentAssembler(shardCount)
-
-		// Track which shard each fragment ID maps to
-		for range numFragIDs {
-			fragID := rapid.Uint16().Draw(t, "fragID")
-
-			shard := assembler.getShard(fragID)
-			expectedIndex := int(fragID) % shardCount
-			expectedShard := &assembler.shards[expectedIndex]
-
-			// Property: Every fragment ID should map to the correct shard
-			if shard != expectedShard {
-				t.Errorf("Shard mismatch for fragID=%d, shardCount=%d: expected index %d",
-					fragID, shardCount, expectedIndex)
-			}
-		}
-	})
-}
-
-// TestShardCalculationDeterminism_EdgeCases_Property verifies shard calculation
-// for edge case values of fragment IDs and shard counts.
-func TestShardCalculationDeterminism_EdgeCases_Property(t *testing.T) {
-	rapid.Check(t, func(t *rapid.T) {
-		// Test with shard count of 1 (all fragments go to same shard)
-		assembler1 := NewShardedFragmentAssembler(1)
-		fragID := rapid.Uint16().Draw(t, "fragID")
-
-		shard := assembler1.getShard(fragID)
-		// Property: With shard count 1, all fragments should go to shard 0
-		if shard != &assembler1.shards[0] {
-			t.Errorf("With shardCount=1, fragID=%d should map to shard 0", fragID)
-		}
-
-		// Test with maximum uint16 fragment ID
-		maxFragID := uint16(65535)
-		shardCount := rapid.IntRange(1, 256).Draw(t, "shardCount")
-		assembler2 := NewShardedFragmentAssembler(shardCount)
-
-		shardMax := assembler2.getShard(maxFragID)
-		expectedIndex := int(maxFragID) % shardCount
-		expectedShard := &assembler2.shards[expectedIndex]
-
-		if shardMax != expectedShard {
-			t.Errorf("Shard mismatch for maxFragID=%d, shardCount=%d: expected index %d",
-				maxFragID, shardCount, expectedIndex)
-		}
-
-		// Test with fragment ID 0
-		shard0 := assembler2.getShard(0)
-		if shard0 != &assembler2.shards[0] {
-			t.Error("FragID=0 should always map to shard 0")
-		}
-	})
-}
-
-// TestShardCalculationDeterminism_ConsecutiveFragIDs_Property verifies that
-// consecutive fragment IDs are distributed across shards in a round-robin fashion.
-func TestShardCalculationDeterminism_ConsecutiveFragIDs_Property(t *testing.T) {
-	rapid.Check(t, func(t *rapid.T) {
-		shardCount := rapid.IntRange(2, 32).Draw(t, "shardCount")
-		startFragID := rapid.Uint16().Draw(t, "startFragID")
-
-		assembler := NewShardedFragmentAssembler(shardCount)
-
-		// Check consecutive fragment IDs
-		for i := 0; i < shardCount*2; i++ {
-			fragID := startFragID + uint16(i)
-			shard := assembler.getShard(fragID)
-
-			expectedIndex := int(fragID) % shardCount
-			expectedShard := &assembler.shards[expectedIndex]
-
-			// Property: Consecutive IDs should follow modulo pattern
-			if shard != expectedShard {
-				t.Errorf("Consecutive fragID=%d (start=%d, offset=%d) should map to shard %d",
-					fragID, startFragID, i, expectedIndex)
-			}
-		}
-	})
-}
-
-// TestShardCalculationDeterminism_AcrossAssemblers_Property verifies that
-// different assembler instances with the same shard count produce consistent results.
-func TestShardCalculationDeterminism_AcrossAssemblers_Property(t *testing.T) {
-	rapid.Check(t, func(t *rapid.T) {
-		shardCount := rapid.IntRange(1, 64).Draw(t, "shardCount")
-		fragID := rapid.Uint16().Draw(t, "fragID")
-
-		// Create two separate assemblers with the same shard count
-		assembler1 := NewShardedFragmentAssembler(shardCount)
-		assembler2 := NewShardedFragmentAssembler(shardCount)
-
-		// Get shard indices (not pointers, since they're different instances)
-		shard1 := assembler1.getShard(fragID)
-		shard2 := assembler2.getShard(fragID)
-
-		// Find the index of each shard
-		var index1, index2 int
-		for i := range assembler1.shards {
-			if &assembler1.shards[i] == shard1 {
-				index1 = i
-				break
-			}
-		}
-		for i := range assembler2.shards {
-			if &assembler2.shards[i] == shard2 {
-				index2 = i
-				break
-			}
-		}
-
-		// Property: Same fragID and shardCount should produce same shard index
-		if index1 != index2 {
-			t.Errorf("Different assemblers produced different shard indices for fragID=%d, shardCount=%d: %d vs %d",
-				fragID, shardCount, index1, index2)
-		}
-
-		// Property: Index should match the expected formula
-		expectedIndex := int(fragID) % shardCount
-		if index1 != expectedIndex {
-			t.Errorf("Shard index %d doesn't match expected %d for fragID=%d, shardCount=%d",
-				index1, expectedIndex, fragID, shardCount)
+		index := assembler.shardIndex(key)
+		if index < 0 || index >= DefaultShardCount || assembler.getShard(key) != &assembler.shards[index] {
+			t.Fatalf("key=%+v produced invalid default shard %d", key, index)
 		}
 	})
 }
@@ -818,9 +652,8 @@ func TestConcurrentFragmentCorrectness_Property(t *testing.T) {
 						frag.payload,
 					)
 					if err != nil {
-						// Session ID mismatch can happen if fragment IDs collide
-						// across different packets - this is expected behavior
-						continue
+						t.Errorf("AddFragment packet %d: %v", frag.packetIdx, err)
+						return
 					}
 
 					if result != nil {
@@ -943,6 +776,7 @@ func TestConcurrentFragmentCorrectness_HighContention_Property(t *testing.T) {
 					frag.payload,
 				)
 				if err != nil {
+					t.Errorf("AddFragment index %d: %v", frag.fragIndex, err)
 					return
 				}
 
@@ -1069,6 +903,7 @@ func TestConcurrentFragmentCorrectness_MultiplePacketsSameShard_Property(t *test
 						frag.payload,
 					)
 					if err != nil {
+						t.Errorf("AddFragment packet %d index %d: %v", pktIdx, frag.fragIndex, err)
 						return
 					}
 
@@ -1193,6 +1028,7 @@ func TestConcurrentFragmentCorrectness_DuplicateFragments_Property(t *testing.T)
 					frag.payload,
 				)
 				if err != nil {
+					t.Errorf("AddFragment index %d: %v", frag.fragIndex, err)
 					return
 				}
 
