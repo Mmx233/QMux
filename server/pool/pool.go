@@ -3,6 +3,7 @@ package pool
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -227,7 +228,8 @@ func (p *ConnectionPool) Remove(expected *ClientConn) bool {
 	return true
 }
 
-// Select chooses a client using the load balancer
+// Select chooses a client without capability filtering. Traffic routing should
+// use SelectProtocol.
 func (p *ConnectionPool) Select() (*ClientConn, error) {
 	// Fast path: use cached slice if available (lock-free read)
 	clientsPtr := p.cachedClients.Load()
@@ -246,6 +248,31 @@ func (p *ConnectionPool) Select() (*ClientConn, error) {
 	}
 
 	return p.balancer.Select(clients)
+}
+
+// SelectProtocol chooses a healthy client that supports protocol.
+func (p *ConnectionPool) SelectProtocol(protocol string) (*ClientConn, error) {
+	clientsPtr := p.cachedClients.Load()
+	var clients []*ClientConn
+	if clientsPtr != nil {
+		clients = *clientsPtr
+	} else {
+		clients = p.rebuildClientSlice()
+	}
+	if len(clients) == 0 {
+		return nil, ErrNoClientsAvailable
+	}
+
+	eligible := make([]*ClientConn, 0, len(clients))
+	for _, conn := range clients {
+		if isEligible(conn, protocol) {
+			eligible = append(eligible, conn)
+		}
+	}
+	if len(eligible) == 0 {
+		return nil, ErrNoEligibleClients
+	}
+	return p.balancer.Select(eligible)
 }
 
 // rebuildClientSlice rebuilds the cached client slice from the map
@@ -313,6 +340,27 @@ func (p *ConnectionPool) HealthyCount() int {
 	return count
 }
 
+// EligibleCount returns the number of healthy clients that support protocol.
+func (p *ConnectionPool) EligibleCount(protocol string) int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	count := 0
+	for _, conn := range p.clients {
+		if isEligible(conn, protocol) {
+			count++
+		}
+	}
+	return count
+}
+
+func isEligible(conn *ClientConn, protocol string) bool {
+	if conn == nil || !conn.healthy.Load() || (protocol != "tcp" && protocol != "udp") {
+		return false
+	}
+	return slices.Contains(conn.Metadata.Capabilities, protocol)
+}
+
 // UpdateLastSeen updates the last seen timestamp for the expected client generation.
 // It reports whether expected was still current and the update was applied.
 func (p *ConnectionPool) UpdateLastSeen(expected *ClientConn) bool {
@@ -374,4 +422,5 @@ func (p *ConnectionPool) isCurrentLocked(expected *ClientConn) bool {
 var (
 	ErrNoClientsAvailable = fmt.Errorf("no clients available in pool")
 	ErrNoHealthyClients   = fmt.Errorf("no healthy clients available")
+	ErrNoEligibleClients  = fmt.Errorf("no eligible clients available")
 )

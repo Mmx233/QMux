@@ -188,7 +188,7 @@ func (h *UDPHandler) sendDatagrams(session *UDPSession, data []byte) {
 }
 
 func (h *UDPHandler) createSession(addr *net.UDPAddr) (*UDPSession, error) {
-	client, err := h.pool.Select()
+	client, err := h.pool.SelectProtocol("udp")
 	if err != nil {
 		return nil, fmt.Errorf("select client: %w", err)
 	}

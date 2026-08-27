@@ -108,15 +108,24 @@ func closeTestTCPAndUDP(t *testing.T, tcpListener net.Listener, udpListener *net
 }
 
 func TestManagerEmptyLifecycleAndStableStartErrors(t *testing.T) {
-	manager := NewManager(&config.Server{}, nil, zerolog.Nop())
+	manager := NewManager(nil, nil, zerolog.Nop())
+	if manager.Running() {
+		t.Fatal("new manager reported running")
+	}
 	if err := manager.Start(context.Background()); err != nil {
 		t.Fatalf("start empty manager: %v", err)
+	}
+	if !manager.Running() {
+		t.Fatal("committed manager did not report running")
 	}
 	if err := manager.Start(context.Background()); !errors.Is(err, ErrAlreadyStarted) {
 		t.Fatalf("second Start error = %v, want ErrAlreadyStarted", err)
 	}
 
 	manager.Stop()
+	if manager.Running() {
+		t.Fatal("stopped manager reported running")
+	}
 	manager.Close()
 	waitManager(t, manager)
 	if err := manager.Start(context.Background()); !errors.Is(err, ErrManagerStopped) {
@@ -124,8 +133,31 @@ func TestManagerEmptyLifecycleAndStableStartErrors(t *testing.T) {
 	}
 }
 
+func TestNewManagerSnapshotsListeners(t *testing.T) {
+	fragmentation := true
+	bufferPooling := false
+	conf := &config.Server{Listeners: []config.QuicListener{{
+		QuicAddr:    "quic-original",
+		TrafficAddr: "127.0.0.1:8080",
+		Protocol:    "tcp",
+		UDP: config.UDPConfig{
+			EnableFragmentation: &fragmentation,
+			EnableBufferPooling: &bufferPooling,
+		},
+	}}}
+	manager := NewManager(conf, nil, zerolog.Nop())
+	conf.Listeners[0].QuicAddr = "quic-mutated"
+	fragmentation = false
+	bufferPooling = true
+	if manager.configs[0].QuicAddr != "quic-original" ||
+		!*manager.configs[0].UDP.EnableFragmentation ||
+		*manager.configs[0].UDP.EnableBufferPooling {
+		t.Fatal("manager retained caller-owned listener slice")
+	}
+}
+
 func TestManagerCloseBeforeStartIsTerminal(t *testing.T) {
-	manager := NewManager(&config.Server{}, nil, zerolog.Nop())
+	manager := NewManager(nil, nil, zerolog.Nop())
 	manager.Close()
 	waitManager(t, manager)
 	if err := manager.Start(context.Background()); !errors.Is(err, ErrManagerStopped) {
@@ -149,6 +181,9 @@ func TestManagerContextCancellationInitiatesShutdown(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	cancel()
+	if manager.Running() {
+		t.Fatal("manager with canceled run context reported running")
+	}
 	waitManager(t, manager)
 
 	listener, err := net.Listen("tcp", trafficAddr)
@@ -247,6 +282,9 @@ func TestManagerCancelWhileStartingRollsBackStagedSockets(t *testing.T) {
 	if stateWhileStaged != managerClosing {
 		t.Fatalf("manager state while staged = %v, want managerClosing", stateWhileStaged)
 	}
+	if manager.Running() {
+		t.Fatal("manager reported running while staged shutdown was in progress")
+	}
 	release()
 
 	select {
@@ -306,6 +344,9 @@ func TestManagerWaitJoinsCommittedListenerHandlers(t *testing.T) {
 	<-handlerStarted
 
 	manager.Close()
+	if manager.Running() {
+		t.Fatal("closing manager reported running")
+	}
 	waitAttempted := make(chan struct{})
 	waitDone := make(chan struct{})
 	go func() {
@@ -486,7 +527,7 @@ func TestManagerUDPShutdownClosesHandlerAndAssembler(t *testing.T) {
 }
 
 func TestManagerConcurrentCloseWaitStop(t *testing.T) {
-	manager := NewManager(&config.Server{}, nil, zerolog.Nop())
+	manager := NewManager(nil, nil, zerolog.Nop())
 	if err := manager.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}

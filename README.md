@@ -114,11 +114,16 @@ tls:
 # Start server (on public server)
 qmux run server -c server.yaml
 
+# Optionally expose liveness/readiness on loopback
+qmux run server -c server.yaml --admin-address 127.0.0.1:9090
+
 # Start client (on machine behind NAT)
 qmux run client -c client.yaml
 ```
 
 Now external traffic to `your-server-ip:8080` will be forwarded to your local service on port 3000.
+
+The admin listener is disabled by default and serves `GET /healthyz` and `GET /readyz` when enabled. It has no authentication, so bind it only to loopback or a protected management network. Readiness returns `200 ok` only when every configured route is listening and has an eligible client for each enabled protocol; otherwise it returns `503 not ready`. QMux only reports this state. Any load-balancer or scheduler action remains external, and a business-port blackbox check remains the end-to-end data-path test.
 
 ## Authentication
 

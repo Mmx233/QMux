@@ -203,7 +203,13 @@ func startRelayLifecycleManager(
 	quicAddr := quicListener.Addr().String()
 	connectionPool := pool.New(quicAddr, pool.NewRoundRobinBalancer(), zerolog.Nop())
 	t.Cleanup(connectionPool.Stop)
-	pooledClient := &pool.ClientConn{ID: clientID, Conn: serverConn}
+	pooledClient := &pool.ClientConn{
+		ID:   clientID,
+		Conn: serverConn,
+		Metadata: pool.ClientMetadata{
+			Capabilities: []string{"tcp"},
+		},
+	}
 	if err := connectionPool.Add(pooledClient); err != nil {
 		t.Fatalf("add relay peer to pool: %v", err)
 	}

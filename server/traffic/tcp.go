@@ -155,7 +155,7 @@ func (l *Listener) handleTCPConnection(conn net.Conn) {
 
 	logger.Debug().Msg("new TCP connection")
 
-	client, err := l.Pool.Select()
+	client, err := l.Pool.SelectProtocol("tcp")
 	if err != nil {
 		logger.Error().Err(err).Msg("no available client")
 		return

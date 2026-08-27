@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"slices"
+	"strconv"
 	"sync"
 	"time"
 
@@ -39,6 +40,23 @@ type Server struct {
 	registrationTimeout  time.Duration
 	writeRegistrationAck registrationAckWriter
 	logger               zerolog.Logger
+}
+
+// Snapshot is a point-in-time, value-only view of server readiness.
+type Snapshot struct {
+	Routes []RouteSnapshot
+	Ready  bool
+}
+
+// RouteSnapshot describes one configured traffic route.
+type RouteSnapshot struct {
+	QuicAddr           string
+	TrafficAddr        string
+	Protocol           string
+	Listening          bool
+	TCPEligibleClients int
+	UDPEligibleClients int
+	Ready              bool
 }
 
 type registrationAckWriter func(
@@ -92,29 +110,39 @@ func (s *listenerErrorState) beginShutdown() error {
 
 // New creates a new server
 func New(conf *config.Server) (*Server, error) {
+	if conf == nil {
+		return nil, errors.New("server config is nil")
+	}
+
 	// Apply defaults to ensure all required fields have values
 	conf.ApplyDefaults()
+	if err := validateListeners(conf.Listeners); err != nil {
+		return nil, fmt.Errorf("invalid listeners: %w", err)
+	}
+
+	ownedConfig := *conf
+	ownedConfig.Listeners = cloneListeners(conf.Listeners)
 
 	logger := log.With().Str("com", "server").Logger()
 
 	// Load TLS certificates
-	if err := conf.TLS.LoadCertificates(); err != nil {
+	if err := ownedConfig.TLS.LoadCertificates(); err != nil {
 		return nil, fmt.Errorf("load certificates: %w", err)
 	}
 
 	// Validate auth config
-	if err := conf.Auth.Validate(); err != nil {
+	if err := ownedConfig.Auth.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid auth config: %w", err)
 	}
 
 	// Create authenticator using factory
-	authenticator, err := conf.Auth.CreateAuthenticator()
+	authenticator, err := ownedConfig.Auth.CreateAuthenticator()
 	if err != nil {
 		return nil, fmt.Errorf("create authenticator: %w", err)
 	}
 
 	// Log the auth method being used
-	method := conf.Auth.Method
+	method := ownedConfig.Auth.Method
 	if method == "" {
 		method = "mtls"
 	}
@@ -122,9 +150,9 @@ func New(conf *config.Server) (*Server, error) {
 
 	// Create connection pools for each listener
 	pools := make(map[string]*pool.ConnectionPool) // quicAddr -> pool
-	for _, listener := range conf.Listeners {
+	for _, listener := range ownedConfig.Listeners {
 		var balancer pool.LoadBalancer
-		switch conf.LoadBalancer {
+		switch ownedConfig.LoadBalancer {
 		case "round-robin":
 			balancer = pool.NewRoundRobinBalancer()
 		default:
@@ -139,31 +167,158 @@ func New(conf *config.Server) (*Server, error) {
 			Msg("created connection pool")
 	}
 
-	return &Server{
-		config:               conf,
+	srv := &Server{
+		config:               &ownedConfig,
 		pools:                pools,
 		authenticator:        authenticator,
 		registrationTimeout:  registrationTimeout,
 		writeRegistrationAck: protocol.WriteRegisterAckWithAuth,
 		logger:               logger,
-	}, nil
+	}
+	srv.trafficManager = traffic.NewManager(srv.config, srv.pools, srv.logger)
+	return srv, nil
 }
 
-// Start starts the server
+// validateListeners establishes the route invariants required by readiness.
+// COR-005 owns broader configuration validation.
+func validateListeners(listeners []config.QuicListener) error {
+	if len(listeners) == 0 {
+		return errors.New("at least one listener is required")
+	}
+
+	type socketClaim struct {
+		network string
+		address string
+	}
+	claims := make(map[socketClaim]string, len(listeners)*2)
+	claim := func(network, address, field string) error {
+		// Exact configured strings only; equivalent OS bind aliases still fail transactionally.
+		key := socketClaim{network: network, address: address}
+		if existing, ok := claims[key]; ok {
+			return fmt.Errorf("%s conflicts with %s on %s socket %q", field, existing, network, address)
+		}
+		claims[key] = field
+		return nil
+	}
+
+	for i, listener := range listeners {
+		if err := validateListenerAddress(listener.QuicAddr); err != nil {
+			return fmt.Errorf("listeners[%d].quic_addr: %w", i, err)
+		}
+		if err := validateListenerAddress(listener.TrafficAddr); err != nil {
+			return fmt.Errorf("listeners[%d].traffic_addr: %w", i, err)
+		}
+		switch listener.Protocol {
+		case "tcp", "udp", "both":
+		default:
+			return fmt.Errorf("listeners[%d].protocol must be tcp, udp, or both", i)
+		}
+
+		quicField := fmt.Sprintf("listeners[%d].quic_addr", i)
+		if err := claim("udp", listener.QuicAddr, quicField); err != nil {
+			return err
+		}
+		trafficField := fmt.Sprintf("listeners[%d].traffic_addr", i)
+		if listener.Protocol == "tcp" || listener.Protocol == "both" {
+			if err := claim("tcp", listener.TrafficAddr, trafficField); err != nil {
+				return err
+			}
+		}
+		if listener.Protocol == "udp" || listener.Protocol == "both" {
+			if err := claim("udp", listener.TrafficAddr, trafficField); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func validateListenerAddress(address string) error {
+	if address == "" {
+		return errors.New("address cannot be empty")
+	}
+	_, portText, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("invalid address format %q: %w", address, err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		return fmt.Errorf("invalid port in address %q: %w", address, err)
+	}
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("port must be between 1 and 65535, got %d in address %q", port, address)
+	}
+	return nil
+}
+
+func cloneListeners(listeners []config.QuicListener) []config.QuicListener {
+	cloned := slices.Clone(listeners)
+	for i := range cloned {
+		if value := listeners[i].UDP.EnableFragmentation; value != nil {
+			copied := *value
+			cloned[i].UDP.EnableFragmentation = &copied
+		}
+		if value := listeners[i].UDP.EnableBufferPooling; value != nil {
+			copied := *value
+			cloned[i].UDP.EnableBufferPooling = &copied
+		}
+	}
+	return cloned
+}
+
+// Start creates and runs a server for backward compatibility.
 func Start(ctx context.Context, conf *config.Server) error {
 	srv, err := New(conf)
 	if err != nil {
 		return err
 	}
+	return srv.Start(ctx)
+}
+
+// Start runs the server until cancellation or a component failure.
+func (s *Server) Start(ctx context.Context) error {
 	defer func() {
-		for _, connectionPool := range srv.pools {
+		for _, connectionPool := range s.pools {
 			connectionPool.Stop()
 		}
 	}()
 
-	// Start traffic manager
-	srv.trafficManager = traffic.NewManager(conf, srv.pools, srv.logger)
-	return superviseServer(ctx, srv.trafficManager, conf.Listeners, srv.startListener)
+	return superviseServer(ctx, s.trafficManager, s.config.Listeners, s.startListener)
+}
+
+// Snapshot returns the current route and aggregate readiness state. It is
+// race-free but intentionally not globally linearizable across route pools.
+func (s *Server) Snapshot() Snapshot {
+	listening := s.trafficManager != nil && s.trafficManager.Running()
+	snapshot := Snapshot{
+		Routes: make([]RouteSnapshot, 0, len(s.config.Listeners)),
+		Ready:  len(s.config.Listeners) > 0,
+	}
+	for _, listener := range s.config.Listeners {
+		route := RouteSnapshot{
+			QuicAddr:    listener.QuicAddr,
+			TrafficAddr: listener.TrafficAddr,
+			Protocol:    listener.Protocol,
+			Listening:   listening,
+		}
+		if connectionPool := s.pools[listener.QuicAddr]; connectionPool != nil {
+			switch listener.Protocol {
+			case "tcp":
+				route.TCPEligibleClients = connectionPool.EligibleCount("tcp")
+				route.Ready = listening && route.TCPEligibleClients > 0
+			case "udp":
+				route.UDPEligibleClients = connectionPool.EligibleCount("udp")
+				route.Ready = listening && route.UDPEligibleClients > 0
+			case "both":
+				route.TCPEligibleClients = connectionPool.EligibleCount("tcp")
+				route.UDPEligibleClients = connectionPool.EligibleCount("udp")
+				route.Ready = listening && route.TCPEligibleClients > 0 && route.UDPEligibleClients > 0
+			}
+		}
+		snapshot.Routes = append(snapshot.Routes, route)
+		snapshot.Ready = snapshot.Ready && route.Ready
+	}
+	return snapshot
 }
 
 func superviseServer(

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"sync"
 
 	"github.com/Mmx233/QMux/config"
@@ -38,12 +39,13 @@ const (
 
 // Manager manages traffic listeners.
 type Manager struct {
-	config *config.Server
-	pools  map[string]*pool.ConnectionPool // quicAddr -> pool
-	logger zerolog.Logger
+	configs []config.QuicListener
+	pools   map[string]*pool.ConnectionPool // quicAddr -> pool
+	logger  zerolog.Logger
 
 	mu        sync.Mutex
 	state     managerState
+	runCtx    context.Context
 	listeners []*Listener
 	cancel    context.CancelFunc
 	watchDone chan struct{}
@@ -79,8 +81,22 @@ type Listener struct {
 
 // NewManager creates a new traffic manager.
 func NewManager(conf *config.Server, pools map[string]*pool.ConnectionPool, logger zerolog.Logger) *Manager {
+	var configs []config.QuicListener
+	if conf != nil {
+		configs = slices.Clone(conf.Listeners)
+		for i := range configs {
+			if value := configs[i].UDP.EnableFragmentation; value != nil {
+				copied := *value
+				configs[i].UDP.EnableFragmentation = &copied
+			}
+			if value := configs[i].UDP.EnableBufferPooling; value != nil {
+				copied := *value
+				configs[i].UDP.EnableBufferPooling = &copied
+			}
+		}
+	}
 	return &Manager{
-		config:    conf,
+		configs:   configs,
 		pools:     pools,
 		listeners: make([]*Listener, 0),
 		logger:    logger.With().Str("com", "traffic").Logger(),
@@ -108,6 +124,7 @@ func (m *Manager) Start(ctx context.Context) error {
 		runCtx, cancel := context.WithCancel(ctx)
 		watchDone := make(chan struct{})
 		m.state = managerStarting
+		m.runCtx = runCtx
 		m.cancel = cancel
 		m.watchDone = watchDone
 		m.mu.Unlock()
@@ -124,10 +141,7 @@ func (m *Manager) Start(ctx context.Context) error {
 }
 
 func (m *Manager) start(runCtx context.Context) error {
-	configs := []config.QuicListener(nil)
-	if m.config != nil {
-		configs = m.config.Listeners
-	}
+	configs := m.configs
 	if err := m.validate(configs); err != nil {
 		m.rollback(nil)
 		return err
@@ -184,6 +198,14 @@ func (m *Manager) start(runCtx context.Context) error {
 	}
 	m.logger.Info().Int("count", len(staged)).Msg("all traffic listeners started")
 	return nil
+}
+
+// Running reports whether all traffic listeners were committed and the run
+// context is still active.
+func (m *Manager) Running() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.state == managerRunning && m.runCtx != nil && m.runCtx.Err() == nil
 }
 
 func (m *Manager) validate(configs []config.QuicListener) error {
