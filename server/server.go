@@ -739,6 +739,7 @@ func (s *Server) handleControlStream(
 	quicAddr string,
 ) {
 	ctx, cancel := context.WithCancel(ctx)
+	defer func() { _ = clientConn.Conn.CloseWithError(1, "control stream ended") }()
 
 	logger := s.logger.With().
 		Str("client_id", clientConn.ID).

@@ -119,3 +119,97 @@ func TestTrafficConnectionFatalRetiresRegistrationForSameID(t *testing.T) {
 	default:
 	}
 }
+
+func TestControlStreamTerminalRetiresRegisteredConnection(t *testing.T) {
+	tests := []struct {
+		name      string
+		terminate func(*quic.Stream) error
+	}{
+		{
+			name: "fin",
+			terminate: func(stream *quic.Stream) error {
+				return stream.Close()
+			},
+		},
+		{
+			name: "reset",
+			terminate: func(stream *quic.Stream) error {
+				stream.CancelWrite(91)
+				return nil
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clientCertificate, clientRoots := registrationTestClientCertificate(
+				t,
+				"control-terminal-"+test.name,
+				false,
+				[]x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+			)
+			serverTLS, clientTLS := registrationMTLSTLSConfigs(t, clientRoots, clientCertificate)
+			harness := newRegistrationHarnessWithTLS(t, mtls.New(clientRoots), time.Second, serverTLS, clientTLS)
+			controlStream := registerMTLSClient(t, harness, "control-terminal-client")
+			registered, ok := harness.pool.Get("control-terminal-client")
+			if !ok {
+				t.Fatal("registered generation missing from pool")
+			}
+			select {
+			case <-registered.Conn.Context().Done():
+				t.Fatalf("registered connection closed before control stream termination: %v", context.Cause(registered.Conn.Context()))
+			default:
+			}
+
+			if err := test.terminate(controlStream); err != nil {
+				t.Fatalf("terminate control stream: %v", err)
+			}
+			select {
+			case <-harness.client.Context().Done():
+			case <-time.After(time.Second):
+				t.Fatal("client connection did not close after control stream terminated")
+			}
+			harness.waitForHandler(t)
+			if got := harness.pool.Count(); got != 0 {
+				t.Fatalf("pool Count() after control stream termination = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestStaleControlHeartbeatRetiresOnlyItsGeneration(t *testing.T) {
+	clientCertificate, clientRoots := registrationTestClientCertificate(
+		t,
+		"stale-control-heartbeat",
+		false,
+		[]x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	)
+	serverTLS, clientTLS := registrationMTLSTLSConfigs(t, clientRoots, clientCertificate)
+	harness := newRegistrationHarnessWithTLS(t, mtls.New(clientRoots), time.Second, serverTLS, clientTLS)
+	const clientID = "stale-control-client"
+	controlStream := registerMTLSClient(t, harness, clientID)
+	stale, ok := harness.pool.Get(clientID)
+	if !ok {
+		t.Fatal("registered stale generation missing from pool")
+	}
+	if !harness.pool.Remove(stale) {
+		t.Fatal("remove stale generation before heartbeat failed")
+	}
+	fresh := &pool.ClientConn{ID: clientID}
+	if err := harness.pool.Add(fresh); err != nil {
+		t.Fatalf("add fresh same-ID generation: %v", err)
+	}
+
+	if err := protocol.WriteHeartbeat(controlStream, time.Now().Unix()); err != nil {
+		t.Fatalf("write heartbeat from stale generation: %v", err)
+	}
+	select {
+	case <-harness.client.Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("stale QUIC generation did not close after heartbeat")
+	}
+	harness.waitForHandler(t)
+	got, ok := harness.pool.Get(clientID)
+	if !ok || got != fresh {
+		t.Fatalf("pool generation after stale cleanup = (%p, %v), want fresh %p", got, ok, fresh)
+	}
+}

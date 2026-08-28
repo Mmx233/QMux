@@ -323,12 +323,15 @@ func (m *Manager) complete() {
 	m.doneOnce.Do(func() { close(m.done) })
 }
 
-// Wait joins manager shutdown. It is safe to call concurrently.
+// Wait joins manager shutdown. It is safe to call concurrently. After Close,
+// callers must retire externally owned QUIC generations before Wait so blocked
+// UDP SendDatagram calls can return. Server shutdown provides that ordering.
 func (m *Manager) Wait() {
 	<-m.done
 }
 
-// Stop initiates shutdown and waits for it to complete.
+// Stop initiates shutdown and waits for it to complete. If a UDP SendDatagram
+// is blocked, the same external QUIC retirement precondition as Wait applies.
 func (m *Manager) Stop() {
 	m.Close()
 	m.Wait()
