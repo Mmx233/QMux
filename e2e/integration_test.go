@@ -477,52 +477,72 @@ func TestConcurrentConnections_MTLS(t *testing.T) {
 // TestClientReconnection_MTLS tests client reconnection and failover with mTLS authentication
 func TestClientReconnection_MTLS(t *testing.T) {
 	certDir := generateTestCertificates(t)
-
 	_, localPort := startTCPEchoListener(t)
-
-	// Start QMux server
 	quicPort := getFreePort(t)
 	trafficPort := getFreePort(t)
-
 	serverConfig := newMTLSServerConfig(certDir, "tcp", quicPort, trafficPort, 500*time.Millisecond, time.Second)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
+	timeline := newFaultTimeline(t, "same-ID reconnect")
+	serverRun := startFaultServer(t, ctx, "same-ID server", serverConfig, timeline)
+	defer func() {
+		if err := serverRun.run.stopAndJoin(5 * time.Second); err != nil {
+			t.Errorf("stop same-ID server: %v", err)
+		}
+	}()
 
-	startTestServer(ctx, serverConfig)
-	time.Sleep(500 * time.Millisecond)
-
-	// Start first client
 	clientConfig := newMTLSClientConfig(certDir, "test-client-reconnect", localPort, 500*time.Millisecond, 0, quicPort)
 	c1 := newTestClient(t, clientConfig)
+	c1Run := startFaultClient(ctx, "same-ID client generation 1", c1, timeline)
+	defer func() {
+		if err := c1Run.stopAndJoin(5 * time.Second); err != nil {
+			t.Errorf("stop same-ID client generation 1: %v", err)
+		}
+	}()
 
-	client1Ctx, client1Cancel := context.WithCancel(ctx)
-	startTestClient(client1Ctx, c1)
-	time.Sleep(500 * time.Millisecond)
+	trafficAddr := fmt.Sprintf("127.0.0.1:%d", trafficPort)
+	waitEligibleAndEcho := func(sequence uint64, runs ...*faultRun) {
+		t.Helper()
+		if err := waitForFault(ctx, 10*time.Second, func() string {
+			return fmt.Sprintf("one TCP-eligible client and echo; snapshot=%+v", serverRun.Snapshot())
+		}, func(remaining time.Duration) bool {
+			snapshot := serverRun.Snapshot()
+			return len(snapshot.Routes) == 1 && snapshot.Routes[0].TCPEligibleClients == 1 &&
+				remaining > 0 && probeSequencedTCP(trafficAddr, sequence, min(250*time.Millisecond, remaining)) == nil
+		}, runs...); err != nil {
+			t.Fatalf("same-ID generation did not become usable: %v", err)
+		}
+		phase := "recovery"
+		if sequence == 1 {
+			phase = "baseline"
+		}
+		timeline.add("same-ID %s: snapshot TCP eligible=1, echo %d ok", phase, sequence)
+	}
+	waitEligibleAndEcho(1, serverRun.run, c1Run)
 
-	// Test connection works with first client
-	assertTCPEcho(t, fmt.Sprintf("127.0.0.1:%d", trafficPort), []byte("First client test"))
+	timeline.add("same-ID fault injection: cancel generation 1")
+	c1Run.cancel()
+	if err := c1Run.join(5 * time.Second); err != nil {
+		t.Fatalf("join same-ID client generation 1: %v", err)
+	}
+	if err := waitForFault(ctx, 5*time.Second, func() string {
+		return fmt.Sprintf("zero eligible clients after generation 1 exit; snapshot=%+v", serverRun.Snapshot())
+	}, func(time.Duration) bool {
+		snapshot := serverRun.Snapshot()
+		return len(snapshot.Routes) == 1 && snapshot.Routes[0].TCPEligibleClients == 0
+	}, serverRun.run); err != nil {
+		t.Fatalf("same-ID generation 1 was not retired: %v", err)
+	}
+	timeline.add("same-ID detection: snapshot TCP eligible transitioned 1->0")
 
-	t.Log("First client connection successful")
-
-	// Disconnect first client
-	client1Cancel()
-	time.Sleep(1500 * time.Millisecond) // Wait for health check to mark it unhealthy
-
-	t.Log("First client disconnected")
-
-	// Start second client with same ID
 	c2 := newTestClient(t, clientConfig)
-
-	client2Ctx, client2Cancel := context.WithCancel(ctx)
-	defer client2Cancel()
-	startTestClient(client2Ctx, c2)
-	time.Sleep(500 * time.Millisecond)
-
-	// Test connection works with second client (failover)
-	assertTCPEcho(t, fmt.Sprintf("127.0.0.1:%d", trafficPort), []byte("Second client test"))
-
-	t.Log("Client reconnection and failover successful")
+	c2Run := startFaultClient(ctx, "same-ID client generation 2", c2, timeline)
+	defer func() {
+		if err := c2Run.stopAndJoin(5 * time.Second); err != nil {
+			t.Errorf("stop same-ID client generation 2: %v", err)
+		}
+	}()
+	waitEligibleAndEcho(2, serverRun.run, c2Run)
 }
 
 // getFreePort gets a free port for testing

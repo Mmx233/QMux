@@ -15,20 +15,13 @@ import (
 
 // TestMain ensures no goroutine leaks across all tests in this package
 func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m,
-		// Ignore known background goroutines from dependencies
-		goleak.IgnoreTopFunction("github.com/quic-go/quic-go.(*packetHandlerMap).runCloseQueue"),
-		goleak.IgnoreTopFunction("github.com/quic-go/quic-go.(*receiveStream).readImpl"),
-		goleak.IgnoreTopFunction("github.com/quic-go/quic-go.(*sendStream).Write"),
-	)
+	goleak.VerifyTestMain(m)
 }
 
 // TestServerConnection_Close_NoGoroutineLeak verifies that closing a ServerConnection
 // does not leak goroutines from its internal context.
 func TestServerConnection_Close_NoGoroutineLeak(t *testing.T) {
-	defer goleak.VerifyNone(t,
-		goleak.IgnoreTopFunction("github.com/quic-go/quic-go.(*packetHandlerMap).runCloseQueue"),
-	)
+	defer goleak.VerifyNone(t)
 
 	logger := zerolog.Nop()
 	cache := tls.NewLRUClientSessionCache(0)
@@ -44,9 +37,7 @@ func TestServerConnection_Close_NoGoroutineLeak(t *testing.T) {
 // TestServerConnection_RapidCreateClose_NoLeak tests rapid creation and closure
 // of ServerConnections to ensure no goroutine accumulation.
 func TestServerConnection_RapidCreateClose_NoLeak(t *testing.T) {
-	defer goleak.VerifyNone(t,
-		goleak.IgnoreTopFunction("github.com/quic-go/quic-go.(*packetHandlerMap).runCloseQueue"),
-	)
+	defer goleak.VerifyNone(t)
 
 	logger := zerolog.Nop()
 	cache := tls.NewLRUClientSessionCache(0)
@@ -61,9 +52,7 @@ func TestServerConnection_RapidCreateClose_NoLeak(t *testing.T) {
 // TestConnectionManager_Stop_NoGoroutineLeak verifies that stopping a ConnectionManager
 // properly cleans up all internal goroutines (heartbeat loops, reconnection loops).
 func TestConnectionManager_Stop_NoGoroutineLeak(t *testing.T) {
-	defer goleak.VerifyNone(t,
-		goleak.IgnoreTopFunction("github.com/quic-go/quic-go.(*packetHandlerMap).runCloseQueue"),
-	)
+	defer goleak.VerifyNone(t)
 
 	logger := zerolog.Nop()
 
@@ -89,9 +78,7 @@ func TestConnectionManager_Stop_NoGoroutineLeak(t *testing.T) {
 // TestConnectionManager_CreateDestroy_NoLeak tests multiple create/destroy cycles
 // of ConnectionManager to ensure no goroutine accumulation.
 func TestConnectionManager_CreateDestroy_NoLeak(t *testing.T) {
-	defer goleak.VerifyNone(t,
-		goleak.IgnoreTopFunction("github.com/quic-go/quic-go.(*packetHandlerMap).runCloseQueue"),
-	)
+	defer goleak.VerifyNone(t)
 
 	logger := zerolog.Nop()
 
@@ -134,9 +121,7 @@ func TestSessionCacheManager_NoLeak(t *testing.T) {
 // TestConcurrentConnectionOperations_NoLeak tests concurrent operations
 // on connections to ensure thread-safe cleanup.
 func TestConcurrentConnectionOperations_NoLeak(t *testing.T) {
-	defer goleak.VerifyNone(t,
-		goleak.IgnoreTopFunction("github.com/quic-go/quic-go.(*packetHandlerMap).runCloseQueue"),
-	)
+	defer goleak.VerifyNone(t)
 
 	logger := zerolog.Nop()
 	cache := tls.NewLRUClientSessionCache(0)
@@ -169,9 +154,7 @@ func TestConcurrentConnectionOperations_NoLeak(t *testing.T) {
 // TestConnectionManager_ContextCancellation_NoLeak verifies that context cancellation
 // properly stops all goroutines in ConnectionManager.
 func TestConnectionManager_ContextCancellation_NoLeak(t *testing.T) {
-	defer goleak.VerifyNone(t,
-		goleak.IgnoreTopFunction("github.com/quic-go/quic-go.(*packetHandlerMap).runCloseQueue"),
-	)
+	defer goleak.VerifyNone(t)
 
 	logger := zerolog.Nop()
 
@@ -207,9 +190,7 @@ func TestConnectionManager_ContextCancellation_NoLeak(t *testing.T) {
 // TestServerConnection_StateTransitions_NoLeak verifies state transitions
 // don't cause goroutine leaks.
 func TestServerConnection_StateTransitions_NoLeak(t *testing.T) {
-	defer goleak.VerifyNone(t,
-		goleak.IgnoreTopFunction("github.com/quic-go/quic-go.(*packetHandlerMap).runCloseQueue"),
-	)
+	defer goleak.VerifyNone(t)
 
 	logger := zerolog.Nop()
 	cache := tls.NewLRUClientSessionCache(0)
@@ -231,9 +212,7 @@ func TestServerConnection_StateTransitions_NoLeak(t *testing.T) {
 // goroutines should terminate within a bounded time, and no goroutines should be leaked.
 // **Validates: Requirements 9.1, 9.2, 9.3, 9.7, 9.8**
 func TestGoroutineCleanupOnClose_Property(t *testing.T) {
-	defer goleak.VerifyNone(t,
-		goleak.IgnoreTopFunction("github.com/quic-go/quic-go.(*packetHandlerMap).runCloseQueue"),
-	)
+	defer goleak.VerifyNone(t)
 
 	rapid.Check(t, func(t *rapid.T) {
 		logger := zerolog.Nop()
@@ -300,9 +279,7 @@ func TestGoroutineCleanupOnClose_Property(t *testing.T) {
 // Tests that rapid creation and closure of connections with heartbeat loops doesn't leak goroutines.
 // **Validates: Requirements 9.1, 9.2, 9.3, 9.7, 9.8**
 func TestGoroutineCleanupOnClose_RapidClose_Property(t *testing.T) {
-	defer goleak.VerifyNone(t,
-		goleak.IgnoreTopFunction("github.com/quic-go/quic-go.(*packetHandlerMap).runCloseQueue"),
-	)
+	defer goleak.VerifyNone(t)
 
 	rapid.Check(t, func(t *rapid.T) {
 		logger := zerolog.Nop()
@@ -336,9 +313,7 @@ func TestGoroutineCleanupOnClose_RapidClose_Property(t *testing.T) {
 // Tests that context cancellation properly stops all heartbeat goroutines.
 // **Validates: Requirements 9.1, 9.2, 9.3, 9.7, 9.8**
 func TestGoroutineCleanupOnClose_ContextCancellation_Property(t *testing.T) {
-	defer goleak.VerifyNone(t,
-		goleak.IgnoreTopFunction("github.com/quic-go/quic-go.(*packetHandlerMap).runCloseQueue"),
-	)
+	defer goleak.VerifyNone(t)
 
 	rapid.Check(t, func(t *rapid.T) {
 		logger := zerolog.Nop()

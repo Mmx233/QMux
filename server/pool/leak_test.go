@@ -13,10 +13,7 @@ import (
 
 // TestMain ensures no goroutine leaks across all tests in this package
 func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m,
-		// Ignore known background goroutines from dependencies
-		goleak.IgnoreTopFunction("github.com/quic-go/quic-go.(*packetHandlerMap).runCloseQueue"),
-	)
+	goleak.VerifyTestMain(m)
 }
 
 // TestConnectionPool_Stop_NoGoroutineLeak verifies that stopping a ConnectionPool
