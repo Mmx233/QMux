@@ -81,27 +81,6 @@ func newConnWriteResult(n, size int, err error) (bool, error) {
 	return true, err
 }
 
-func isQUICConnectionError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, net.ErrClosed) {
-		return true
-	}
-	if _, ok := errors.AsType[*net.OpError](err); ok {
-		return true
-	}
-	if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, io.ErrShortWrite) ||
-		errors.Is(err, quic.ErrWriteLimitReached) {
-		return false
-	}
-	if _, streamLimit := errors.AsType[*quic.StreamLimitReachedError](err); streamLimit {
-		return false
-	}
-	_, streamError := errors.AsType[*quic.StreamError](err)
-	return !streamError
-}
-
 // abort forcefully tears down both relay directions after a relay failure or
 // listener shutdown.
 func (f *tcpFlow) abort() {
@@ -307,9 +286,6 @@ func (l *Listener) handleTCPConnection(conn net.Conn, setupDeadline time.Time, r
 			}
 			localAbort := l.ctx.Err() != nil || flow.isAborted()
 			clientLogger.Error().Err(err).Int("attempts", attempts).Msg("open stream failed")
-			if !localAbort && isQUICConnectionError(err) && !l.Pool.MarkUnhealthy(client) {
-				clientLogger.Debug().Msg("ignored stale client stream-open failure")
-			}
 			if localAbort {
 				return
 			}
@@ -326,7 +302,6 @@ func (l *Listener) handleTCPConnection(conn net.Conn, setupDeadline time.Time, r
 		}
 
 		n, writeErr := stream.Write(newConnFrame)
-		validWriteCount := n >= 0 && n <= len(newConnFrame)
 		retry, writeErr := newConnWriteResult(n, len(newConnFrame), writeErr)
 		if writeErr != nil {
 			localAbort := l.ctx.Err() != nil || flow.isAborted()
@@ -340,9 +315,6 @@ func (l *Listener) handleTCPConnection(conn net.Conn, setupDeadline time.Time, r
 				clientLogger.Debug().Err(writeErr).Int("attempts", attempts).Msg("NewConn stream canceled")
 			default:
 				clientLogger.Error().Err(writeErr).Int("attempts", attempts).Msg("send NewConn message failed")
-			}
-			if !localAbort && validWriteCount && isQUICConnectionError(writeErr) && !l.Pool.MarkUnhealthy(client) {
-				clientLogger.Debug().Msg("ignored stale client NewConn write failure")
 			}
 		}
 		if !retry {

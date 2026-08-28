@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -53,31 +52,6 @@ func TestNewConnWriteResult(t *testing.T) {
 				}
 			} else if !errors.Is(err, tt.wantErr) {
 				t.Fatalf("error = %v, want %v", err, tt.wantErr)
-			}
-		})
-	}
-}
-
-func TestIsQUICConnectionError(t *testing.T) {
-	tests := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{name: "closed", err: net.ErrClosed, want: true},
-		{name: "raw network close", err: &net.OpError{Op: "read", Net: "udp", Err: net.ErrClosed}, want: true},
-		{name: "raw network timeout", err: &net.OpError{Op: "write", Net: "udp", Err: os.ErrDeadlineExceeded}, want: true},
-		{name: "transport closed", err: quic.ErrTransportClosed, want: true},
-		{name: "stream limit", err: &quic.StreamLimitReachedError{}},
-		{name: "deadline", err: os.ErrDeadlineExceeded},
-		{name: "stream error", err: &quic.StreamError{}},
-		{name: "short write", err: io.ErrShortWrite},
-		{name: "write limit", err: quic.ErrWriteLimitReached},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := isQUICConnectionError(tt.err); got != tt.want {
-				t.Fatalf("isQUICConnectionError() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -664,25 +638,42 @@ func TestTCPNewConnStreamResetDoesNotPoisonGeneration(t *testing.T) {
 	if held := len(listener.tcpSetupSlots); held != 0 {
 		t.Fatalf("setup permits after NewConn stream reset = %d, want 0", held)
 	}
+
+	tcpConn := startTCPFallbackFlow(t, listener)
+	stream, err := peerConn.AcceptStream(testCtx)
+	if err != nil {
+		t.Fatalf("AcceptStream() for next request error = %v", err)
+	}
+	if err := stream.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set next request read deadline: %v", err)
+	}
+	var newConn protocol.NewConnMsg
+	if err := protocol.ReadTypedMessage(stream, protocol.MsgTypeNewConn, &newConn); err != nil {
+		t.Fatalf("read next request NewConn message: %v", err)
+	}
+	if current, ok := connectionPool.Get(client.ID); !ok || current != client {
+		t.Fatalf("current generation after stream reset = (%p, %v), want (%p, true)", current, ok, client)
+	}
+	waitForTCPAdmissionState(t, client, 1, 1, listener.tcpSetupSlots)
+	stream.CancelRead(trafficStreamCancelCode)
+	stream.CancelWrite(trafficStreamCancelCode)
+	if err := tcpConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("close next TCP flow: %v", err)
+	}
+	waitForActiveConnections(t, client, 0)
 }
 
-func TestTCPNewConnConnectionCloseMarksGenerationUnhealthy(t *testing.T) {
+func TestTCPNewConnConnectionCloseUsesBackup(t *testing.T) {
 	testCtx, cancelTest := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancelTest()
 	setup := startTCPFallbackSetup(t, testCtx, partialNewConnWindow)
-	connectionPool, primary, backup := setup.connectionPool, setup.primary, setup.backup
+	primary, backup := setup.primary, setup.backup
 	listener := setup.listener
 	tcpConn, _, backupStream := openPartialTCPFallback(t, testCtx, setup, func(*quic.Stream) {
 		if err := setup.primaryPeer.CloseWithError(91, "close during NewConn write"); err != nil {
 			t.Fatalf("close peer during NewConn write: %v", err)
 		}
 	})
-	if got := connectionPool.EligibleCount("tcp"); got != 1 {
-		t.Fatalf("eligible clients after NewConn connection close = %d, want 1", got)
-	}
-	if current, ok := connectionPool.Get(primary.ID); !ok || current != primary {
-		t.Fatalf("current generation after NewConn connection close = (%p, %v), want (%p, true)", current, ok, primary)
-	}
 	if active, total := primary.ActiveConns.Load(), primary.TotalConns.Load(); active != 0 || total != 0 {
 		t.Fatalf("connection-close client active/total = %d/%d, want 0/0", active, total)
 	}
@@ -695,7 +686,7 @@ func TestTCPNewConnConnectionCloseMarksGenerationUnhealthy(t *testing.T) {
 	waitForActiveConnections(t, backup, 1)
 }
 
-func TestTCPConnectionScopedOpenFailureMarksExactGenerationUnhealthy(t *testing.T) {
+func TestTCPConnectionScopedOpenFailureUsesBackup(t *testing.T) {
 	testCtx, cancelTest := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelTest()
 	setup := startTCPFallbackSetup(t, testCtx, 256*1024)
@@ -710,9 +701,6 @@ func TestTCPConnectionScopedOpenFailureMarksExactGenerationUnhealthy(t *testing.
 	var newConn protocol.NewConnMsg
 	if err := protocol.ReadTypedMessage(backupStream, protocol.MsgTypeNewConn, &newConn); err != nil {
 		t.Fatalf("read backup NewConn message: %v", err)
-	}
-	if got := setup.connectionPool.EligibleCount("tcp"); got != 1 {
-		t.Fatalf("eligible clients after connection-scoped OpenStream failure = %d, want 1", got)
 	}
 	if active, total := setup.primary.ActiveConns.Load(), setup.primary.TotalConns.Load(); active != 0 || total != 0 {
 		t.Fatalf("failed generation active/total = %d/%d, want 0/0", active, total)
