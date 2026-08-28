@@ -1,8 +1,10 @@
 package traffic
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"sync"
@@ -32,7 +34,7 @@ type tcpFlow struct {
 
 func (f *tcpFlow) setStream(stream *quic.Stream) bool {
 	f.mu.Lock()
-	if !f.aborted {
+	if !f.aborted && f.stream == nil {
 		f.stream = stream
 		f.mu.Unlock()
 		return true
@@ -42,6 +44,16 @@ func (f *tcpFlow) setStream(stream *quic.Stream) bool {
 	stream.CancelRead(trafficStreamCancelCode)
 	stream.CancelWrite(trafficStreamCancelCode)
 	return false
+}
+
+func (f *tcpFlow) detachStream(stream *quic.Stream) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.aborted || f.stream != stream {
+		return false
+	}
+	f.stream = nil
+	return true
 }
 
 func (f *tcpFlow) isAborted() bool {
@@ -54,6 +66,40 @@ func (f *tcpFlow) commitStream(stream *quic.Stream) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return !f.aborted && f.stream == stream
+}
+
+func newConnWriteResult(n, size int, err error) (bool, error) {
+	if n < 0 || n > size {
+		return false, fmt.Errorf("invalid NewConn write count %d for %d-byte frame", n, size)
+	}
+	if n == size {
+		return false, err
+	}
+	if err == nil {
+		err = io.ErrShortWrite
+	}
+	return true, err
+}
+
+func isQUICConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	if _, ok := errors.AsType[*net.OpError](err); ok {
+		return true
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, io.ErrShortWrite) ||
+		errors.Is(err, quic.ErrWriteLimitReached) {
+		return false
+	}
+	if _, streamLimit := errors.AsType[*quic.StreamLimitReachedError](err); streamLimit {
+		return false
+	}
+	_, streamError := errors.AsType[*quic.StreamError](err)
+	return !streamError
 }
 
 // abort forcefully tears down both relay directions after a relay failure or
@@ -191,6 +237,20 @@ func (l *Listener) handleTCPConnection(conn net.Conn, setupDeadline time.Time, r
 		Logger()
 
 	logger.Debug().Msg("new TCP connection")
+	connID := connid.Generate()
+	var frame bytes.Buffer
+	if err := protocol.WriteNewConn(
+		&frame,
+		connID,
+		"tcp",
+		conn.RemoteAddr().String(),
+		l.Addr,
+		time.Now().Unix(),
+	); err != nil {
+		logger.Error().Err(err).Msg("encode NewConn message failed")
+		return
+	}
+	newConnFrame := frame.Bytes()
 
 	admission, err := l.Pool.BeginTCPAdmission()
 	if err != nil {
@@ -205,99 +265,126 @@ func (l *Listener) handleTCPConnection(conn net.Conn, setupDeadline time.Time, r
 	}()
 
 	var (
-		client *pool.ClientConn
-		stream *quic.Stream
+		attempts int
+		client   *pool.ClientConn
+		stream   *quic.Stream
 	)
 	for {
+		if l.ctx.Err() != nil || flow.isAborted() {
+			logger.Debug().Int("attempts", attempts).Msg("TCP setup interrupted by shutdown")
+			return
+		}
 		if !time.Now().Before(setupDeadline) {
-			logger.Debug().Err(os.ErrDeadlineExceeded).Msg("TCP setup deadline reached")
+			logger.Debug().Err(os.ErrDeadlineExceeded).Int("attempts", attempts).Msg("TCP setup deadline reached")
 			return
 		}
 		currentLease, err = admission.Next()
 		if err != nil {
-			logger.Error().Err(err).Msg("select TCP client failed")
+			logger.Error().Err(err).Int("attempts", attempts).Msg("select TCP client failed")
 			return
 		}
 		if currentLease == nil {
-			logger.Debug().Err(errNoTCPStreamCapacity).Msg("TCP setup rejected")
+			logger.Debug().Err(errNoTCPStreamCapacity).Int("attempts", attempts).Msg("TCP setup rejected")
 			return
 		}
+		attempts++
 		client = currentLease.Client()
 		clientLogger := logger.With().Str("client_id", client.ID).Logger()
 		clientLogger.Debug().Msg("selected client")
 
 		stream, err = client.Conn.OpenStream()
-		if err == nil {
+		if err != nil {
+			if !currentLease.Release() {
+				clientLogger.Error().Int("attempts", attempts).Msg("release TCP admission lease failed")
+				flow.abort()
+				return
+			}
+			currentLease = nil
+			stream = nil
+
+			if _, ok := errors.AsType[*quic.StreamLimitReachedError](err); ok {
+				continue
+			}
+			localAbort := l.ctx.Err() != nil || flow.isAborted()
+			clientLogger.Error().Err(err).Int("attempts", attempts).Msg("open stream failed")
+			if !localAbort && isQUICConnectionError(err) && !l.Pool.MarkUnhealthy(client) {
+				clientLogger.Debug().Msg("ignored stale client stream-open failure")
+			}
+			if localAbort {
+				return
+			}
+			continue
+		}
+		if !flow.setStream(stream) {
+			flow.abort()
+			return
+		}
+		if err := stream.SetWriteDeadline(setupDeadline); err != nil {
+			clientLogger.Error().Err(err).Int("attempts", attempts).Msg("set NewConn write deadline failed")
+			flow.abort()
+			return
+		}
+
+		n, writeErr := stream.Write(newConnFrame)
+		validWriteCount := n >= 0 && n <= len(newConnFrame)
+		retry, writeErr := newConnWriteResult(n, len(newConnFrame), writeErr)
+		if writeErr != nil {
+			localAbort := l.ctx.Err() != nil || flow.isAborted()
+			var streamErr *quic.StreamError
+			switch {
+			case localAbort:
+				clientLogger.Debug().Err(writeErr).Int("attempts", attempts).Msg("NewConn write interrupted by shutdown")
+			case errors.Is(writeErr, os.ErrDeadlineExceeded):
+				clientLogger.Error().Err(writeErr).Int("attempts", attempts).Msg("NewConn write deadline reached")
+			case errors.As(writeErr, &streamErr):
+				clientLogger.Debug().Err(writeErr).Int("attempts", attempts).Msg("NewConn stream canceled")
+			default:
+				clientLogger.Error().Err(writeErr).Int("attempts", attempts).Msg("send NewConn message failed")
+			}
+			if !localAbort && validWriteCount && isQUICConnectionError(writeErr) && !l.Pool.MarkUnhealthy(client) {
+				clientLogger.Debug().Msg("ignored stale client NewConn write failure")
+			}
+		}
+		if !retry {
+			if writeErr != nil {
+				flow.abort()
+				return
+			}
 			logger = clientLogger
 			break
 		}
-		if _, ok := errors.AsType[*quic.StreamLimitReachedError](err); ok {
-			currentLease.Release()
-			currentLease = nil
-			stream = nil
-			continue
+		if !flow.detachStream(stream) {
+			flow.abort()
+			return
 		}
-
-		clientLogger.Error().Err(err).Msg("open stream failed")
-		if l.ctx.Err() == nil && !flow.isAborted() && !l.Pool.MarkUnhealthy(client) {
-			clientLogger.Debug().Msg("ignored stale client stream-open failure")
+		stream.CancelRead(trafficStreamCancelCode)
+		stream.CancelWrite(trafficStreamCancelCode)
+		if !currentLease.Release() {
+			clientLogger.Error().Int("attempts", attempts).Msg("release TCP admission lease failed")
+			flow.abort()
+			return
 		}
-		return
-	}
-	if !flow.setStream(stream) {
-		return
-	}
-	if err := stream.SetWriteDeadline(setupDeadline); err != nil {
-		logger.Error().Err(err).Msg("set NewConn write deadline failed")
-		flow.abort()
-		return
-	}
-
-	connID := connid.Generate()
-	err = protocol.WriteNewConn(
-		stream,
-		connID,
-		"tcp",
-		conn.RemoteAddr().String(),
-		l.Addr,
-		time.Now().Unix(),
-	)
-	if err != nil {
-		localAbort := l.ctx.Err() != nil || flow.isAborted()
-		var streamErr *quic.StreamError
-		switch {
-		case localAbort:
-			logger.Debug().Err(err).Msg("NewConn write interrupted by shutdown")
-		case errors.Is(err, os.ErrDeadlineExceeded):
-			logger.Error().Err(err).Msg("NewConn write deadline reached")
-		case errors.As(err, &streamErr):
-			logger.Debug().Err(err).Msg("NewConn stream canceled")
-		default:
-			logger.Error().Err(err).Msg("send NewConn message failed")
-			if !l.Pool.MarkUnhealthy(client) {
-				logger.Debug().Msg("ignored stale client NewConn write failure")
-			}
-		}
-		flow.abort()
-		return
+		currentLease = nil
+		stream = nil
 	}
 	if err := stream.SetWriteDeadline(time.Time{}); err != nil {
-		logger.Error().Err(err).Msg("clear NewConn write deadline failed")
+		logger.Error().Err(err).Int("attempts", attempts).Msg("clear NewConn write deadline failed")
 		flow.abort()
 		return
 	}
 	if !flow.commitStream(stream) {
+		flow.abort()
 		return
 	}
 	if !currentLease.Commit() {
-		logger.Error().Msg("commit TCP admission lease failed")
+		logger.Error().Int("attempts", attempts).Msg("commit TCP admission lease failed")
 		flow.abort()
 		return
 	}
 	releaseSetup()
 	defer func() { _ = flow.closeSendGracefully() }()
 
-	logger.Debug().Uint64("conn_id", connID).Msg("forwarding connection")
+	logger.Debug().Uint64("conn_id", connID).Int("attempts", attempts).Msg("forwarding connection")
 
 	relay := protocol.StartRelay(conn, stream,
 		func(err error) error {

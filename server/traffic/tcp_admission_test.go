@@ -1,10 +1,12 @@
 package traffic
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -16,7 +18,70 @@ import (
 	"github.com/rs/zerolog"
 )
 
-const defaultQUICIncomingStreams = 100
+const (
+	defaultQUICIncomingStreams = 100
+	partialNewConnWindow       = 32 * 1024
+	partialNewConnPrefix       = 4096
+)
+
+func TestNewConnWriteResult(t *testing.T) {
+	writeErr := errors.New("write failed")
+	tests := []struct {
+		name       string
+		n          int
+		err        error
+		wantRetry  bool
+		wantErr    error
+		wantAnyErr bool
+	}{
+		{name: "negative count", n: -1, wantAnyErr: true},
+		{name: "oversized count", n: 11, wantAnyErr: true},
+		{name: "short nil error", n: 4, wantRetry: true, wantErr: io.ErrShortWrite},
+		{name: "partial error", n: 4, err: writeErr, wantRetry: true, wantErr: writeErr},
+		{name: "full success", n: 10},
+		{name: "full error", n: 10, err: writeErr, wantErr: writeErr},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			retry, err := newConnWriteResult(tt.n, 10, tt.err)
+			if retry != tt.wantRetry {
+				t.Fatalf("retry = %v, want %v", retry, tt.wantRetry)
+			}
+			if tt.wantAnyErr {
+				if err == nil {
+					t.Fatal("error = nil, want invalid-count error")
+				}
+			} else if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestIsQUICConnectionError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "closed", err: net.ErrClosed, want: true},
+		{name: "raw network close", err: &net.OpError{Op: "read", Net: "udp", Err: net.ErrClosed}, want: true},
+		{name: "raw network timeout", err: &net.OpError{Op: "write", Net: "udp", Err: os.ErrDeadlineExceeded}, want: true},
+		{name: "transport closed", err: quic.ErrTransportClosed, want: true},
+		{name: "stream limit", err: &quic.StreamLimitReachedError{}},
+		{name: "deadline", err: os.ErrDeadlineExceeded},
+		{name: "stream error", err: &quic.StreamError{}},
+		{name: "short write", err: io.ErrShortWrite},
+		{name: "write limit", err: quic.ErrWriteLimitReached},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isQUICConnectionError(tt.err); got != tt.want {
+				t.Fatalf("isQUICConnectionError() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
 
 func startTCPAdmissionManager(t *testing.T, quicAddr string, connectionPool *pool.ConnectionPool) *Manager {
 	t.Helper()
@@ -34,6 +99,112 @@ func startTCPAdmissionManager(t *testing.T, quicAddr string, connectionPool *poo
 		t.Fatalf("start TCP admission manager: %v", err)
 	}
 	return manager
+}
+
+type tcpFallbackSetup struct {
+	connectionPool          *pool.ConnectionPool
+	primary, backup         *pool.ClientConn
+	listener                *Listener
+	primaryPeer, backupPeer *quic.Conn
+}
+
+func startTCPFallbackSetup(t *testing.T, ctx context.Context, primaryWindow uint64) *tcpFallbackSetup {
+	t.Helper()
+	primaryListener, primaryServer, primaryPeer := newRelayLifecycleQUICPair(t, ctx, primaryWindow)
+	registerRelayLifecycleQUICCleanup(t, primaryListener, primaryServer, primaryPeer)
+	backupListener, backupServer, backupPeer := newRelayLifecycleQUICPair(t, ctx, 256*1024)
+	registerRelayLifecycleQUICCleanup(t, backupListener, backupServer, backupPeer)
+	quicAddr := primaryListener.Addr().String()
+	connectionPool := pool.New(quicAddr, pool.NewLeastConnectionsBalancer(), zerolog.Nop())
+	t.Cleanup(connectionPool.Stop)
+	primary := &pool.ClientConn{ID: "primary", Conn: primaryServer, Metadata: pool.ClientMetadata{Capabilities: []string{"tcp"}}}
+	backup := &pool.ClientConn{ID: "backup", Conn: backupServer, Metadata: pool.ClientMetadata{Capabilities: []string{"tcp"}}}
+	backup.ActiveConns.Store(1)
+	if err := connectionPool.Add(primary); err != nil {
+		t.Fatalf("Add(primary) error = %v", err)
+	}
+	if err := connectionPool.Add(backup); err != nil {
+		t.Fatalf("Add(backup) error = %v", err)
+	}
+	listenerCtx, cancelListener := context.WithCancel(context.Background())
+	listener := &Listener{
+		Addr:          strings.Repeat("destination", 8*1024),
+		Pool:          connectionPool,
+		ctx:           listenerCtx,
+		cancel:        cancelListener,
+		logger:        zerolog.Nop(),
+		flows:         make(map[*tcpFlow]struct{}),
+		tcpSetupSlots: make(chan struct{}, maxPendingTCPSetups),
+	}
+	t.Cleanup(listener.close)
+	return &tcpFallbackSetup{
+		connectionPool: connectionPool,
+		primary:        primary,
+		backup:         backup,
+		listener:       listener,
+		primaryPeer:    primaryPeer,
+		backupPeer:     backupPeer,
+	}
+}
+
+func startTCPFallbackFlow(t *testing.T, listener *Listener) net.Conn {
+	t.Helper()
+	release, ok := acquireTCPSetup(listener.tcpSetupSlots)
+	if !ok {
+		t.Fatal("acquireTCPSetup() = false")
+	}
+	local, remote := net.Pipe()
+	registerTCPAdmissionClose(t, "fallback TCP peer", remote)
+	go listener.handleTCPConnection(local, time.Now().Add(tcpSetupTimeout), release)
+	return remote
+}
+
+func openPartialTCPFallback(
+	t *testing.T,
+	ctx context.Context,
+	setup *tcpFallbackSetup,
+	failPrimary func(*quic.Stream),
+) (net.Conn, *quic.Stream, *quic.Stream) {
+	t.Helper()
+	tcpConn := startTCPFallbackFlow(t, setup.listener)
+	primaryStream, err := setup.primaryPeer.AcceptStream(ctx)
+	if err != nil {
+		t.Fatalf("primary AcceptStream() error = %v", err)
+	}
+	if err := primaryStream.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set primary prefix read deadline: %v", err)
+	}
+	prefix := make([]byte, partialNewConnPrefix)
+	if _, err := io.ReadFull(primaryStream, prefix); err != nil {
+		t.Fatalf("read primary NewConn prefix: %v", err)
+	}
+	failPrimary(primaryStream)
+
+	backupStream, err := setup.backupPeer.AcceptStream(ctx)
+	if err != nil {
+		t.Fatalf("backup AcceptStream() error = %v", err)
+	}
+	if err := backupStream.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set backup NewConn read deadline: %v", err)
+	}
+	var backupFrame bytes.Buffer
+	var newConn protocol.NewConnMsg
+	if err := protocol.ReadTypedMessage(io.TeeReader(backupStream, &backupFrame), protocol.MsgTypeNewConn, &newConn); err != nil {
+		t.Fatalf("read backup NewConn message: %v", err)
+	}
+	if backupFrame.Len() <= partialNewConnWindow+partialNewConnPrefix {
+		t.Fatalf(
+			"NewConn frame length = %d, want > primary ceiling %d + prefix %d",
+			backupFrame.Len(), partialNewConnWindow, partialNewConnPrefix,
+		)
+	}
+	if !bytes.Equal(prefix, backupFrame.Bytes()[:partialNewConnPrefix]) {
+		t.Fatal("backup NewConn frame did not reuse the primary frame prefix")
+	}
+	if newConn.ConnID == 0 {
+		t.Fatal("backup NewConn connID = 0")
+	}
+	return tcpConn, primaryStream, backupStream
 }
 
 func holdDefaultQUICIncomingStreams(t *testing.T, conn *quic.Conn) []*quic.Stream {
@@ -286,6 +457,10 @@ func TestTCPProvisionalStreamAttachmentLosesToLocalShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenStream() error = %v", err)
 	}
+	duplicate, err := serverConn.OpenStream()
+	if err != nil {
+		t.Fatalf("OpenStream(duplicate) error = %v", err)
+	}
 
 	local, remote := net.Pipe()
 	registerTCPAdmissionClose(t, "provisional local peer", remote)
@@ -299,9 +474,18 @@ func TestTCPProvisionalStreamAttachmentLosesToLocalShutdown(t *testing.T) {
 	if !ok {
 		t.Fatal("addTCPFlow() rejected before shutdown")
 	}
+	if !flow.setStream(stream) {
+		t.Fatal("setStream() rejected first provisional stream")
+	}
+	if flow.setStream(duplicate) {
+		t.Fatal("setStream() overwrote an attached provisional stream")
+	}
+	if !flow.commitStream(stream) {
+		t.Fatal("duplicate attachment replaced the first provisional stream")
+	}
 	listener.close()
-	if flow.setStream(stream) {
-		t.Fatal("setStream() committed after listener shutdown")
+	if flow.detachStream(stream) {
+		t.Fatal("detachStream() succeeded after listener shutdown won the race")
 	}
 	localRead := make(chan error, 1)
 	go func() {
@@ -317,35 +501,37 @@ func TestTCPProvisionalStreamAttachmentLosesToLocalShutdown(t *testing.T) {
 		t.Fatal("local TCP peer remained blocked after shutdown")
 	}
 
-	peerStream, err := peerConn.AcceptStream(testCtx)
-	if err != nil {
-		t.Fatalf("AcceptStream() after provisional reset error = %v", err)
-	}
-	if err := peerStream.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		t.Fatalf("set provisional stream read deadline: %v", err)
-	}
-	if _, err := io.ReadAll(peerStream); err == nil {
-		t.Fatal("provisional QUIC stream ended without reset")
-	} else {
-		var streamErr *quic.StreamError
-		if !errors.As(err, &streamErr) || !streamErr.Remote || streamErr.ErrorCode != trafficStreamCancelCode {
-			t.Fatalf("provisional stream read error = %T %v, want remote reset code %d", err, err, trafficStreamCancelCode)
+	for i := range 2 {
+		peerStream, err := peerConn.AcceptStream(testCtx)
+		if err != nil {
+			t.Fatalf("AcceptStream(%d) after provisional reset error = %v", i, err)
 		}
-	}
-	if err := peerStream.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		t.Fatalf("set provisional stream write deadline: %v", err)
-	}
-	writeBuffer := make([]byte, 32*1024)
-	var writeErr error
-	for writeErr == nil {
-		_, writeErr = peerStream.Write(writeBuffer)
-	}
-	var streamErr *quic.StreamError
-	if !errors.As(writeErr, &streamErr) || !streamErr.Remote || streamErr.ErrorCode != trafficStreamCancelCode || streamErr.StreamID != peerStream.StreamID() {
-		t.Fatalf(
-			"provisional stream write error = %T %v, want remote STOP_SENDING for stream %d code %d",
-			writeErr, writeErr, peerStream.StreamID(), trafficStreamCancelCode,
-		)
+		if err := peerStream.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatalf("set provisional stream %d read deadline: %v", i, err)
+		}
+		if _, err := io.ReadAll(peerStream); err == nil {
+			t.Fatalf("provisional QUIC stream %d ended without reset", i)
+		} else {
+			var streamErr *quic.StreamError
+			if !errors.As(err, &streamErr) || !streamErr.Remote || streamErr.ErrorCode != trafficStreamCancelCode {
+				t.Fatalf("provisional stream %d read error = %T %v, want remote reset code %d", i, err, err, trafficStreamCancelCode)
+			}
+		}
+		if err := peerStream.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatalf("set provisional stream %d write deadline: %v", i, err)
+		}
+		writeBuffer := make([]byte, 32*1024)
+		var writeErr error
+		for writeErr == nil {
+			_, writeErr = peerStream.Write(writeBuffer)
+		}
+		var streamErr *quic.StreamError
+		if !errors.As(writeErr, &streamErr) || !streamErr.Remote || streamErr.ErrorCode != trafficStreamCancelCode || streamErr.StreamID != peerStream.StreamID() {
+			t.Fatalf(
+				"provisional stream %d write error = %T %v, want remote STOP_SENDING for stream %d code %d",
+				i, writeErr, writeErr, peerStream.StreamID(), trafficStreamCancelCode,
+			)
+		}
 	}
 }
 
@@ -384,6 +570,73 @@ func TestTCPNewConnDeadlineDoesNotPoisonGeneration(t *testing.T) {
 	}
 }
 
+func TestTCPPartialNewConnResetUsesBackupAndReleasesPrimaryLease(t *testing.T) {
+	testCtx, cancelTest := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancelTest()
+	setup := startTCPFallbackSetup(t, testCtx, partialNewConnWindow)
+	connectionPool, primary, backup := setup.connectionPool, setup.primary, setup.backup
+	listener := setup.listener
+	tcpConn, primaryStream, backupStream := openPartialTCPFallback(t, testCtx, setup, func(stream *quic.Stream) {
+		stream.CancelRead(73)
+	})
+	waitForTCPAdmissionState(t, backup, 2, 1, listener.tcpSetupSlots)
+	if active, total := primary.ActiveConns.Load(), primary.TotalConns.Load(); active != 0 || total != 0 {
+		t.Fatalf("partial primary active/total = %d/%d, want 0/0", active, total)
+	}
+	if got := connectionPool.EligibleCount("tcp"); got != 2 {
+		t.Fatalf("eligible clients after partial stream reset = %d, want 2", got)
+	}
+
+	if err := primaryStream.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set primary reset write deadline: %v", err)
+	}
+	writeBuffer := make([]byte, 32*1024)
+	var writeErr error
+	for writeErr == nil {
+		_, writeErr = primaryStream.Write(writeBuffer)
+	}
+	var streamErr *quic.StreamError
+	if !errors.As(writeErr, &streamErr) || !streamErr.Remote || streamErr.ErrorCode != trafficStreamCancelCode {
+		t.Fatalf("primary write error = %T %v, want remote STOP_SENDING code %d", writeErr, writeErr, trafficStreamCancelCode)
+	}
+
+	backupStream.CancelRead(trafficStreamCancelCode)
+	backupStream.CancelWrite(trafficStreamCancelCode)
+	if err := tcpConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("close backup TCP flow: %v", err)
+	}
+	waitForActiveConnections(t, backup, 1)
+	if !connectionPool.MarkUnhealthy(backup) {
+		t.Fatal("MarkUnhealthy(backup) = false")
+	}
+
+	leases := make([]*pool.TCPLease, 0, 16)
+	for i := range 16 {
+		admission, err := connectionPool.BeginTCPAdmission()
+		if err != nil {
+			t.Fatalf("BeginTCPAdmission(%d) error = %v", i, err)
+		}
+		lease, err := admission.Next()
+		if err != nil || lease == nil {
+			t.Fatalf("primary lease probe %d = (%v, %v), want lease", i, lease, err)
+		}
+		leases = append(leases, lease)
+	}
+	admission, err := connectionPool.BeginTCPAdmission()
+	if err != nil {
+		t.Fatalf("BeginTCPAdmission(17) error = %v", err)
+	}
+	if lease, err := admission.Next(); err != nil || lease != nil {
+		t.Fatalf("17th primary lease probe = (%v, %v), want nil lease", lease, err)
+	}
+	for i, lease := range leases {
+		if !lease.Release() {
+			t.Fatalf("release primary lease probe %d = false", i)
+		}
+	}
+	waitForTCPAdmissionState(t, primary, 0, 0, listener.tcpSetupSlots)
+}
+
 func TestTCPNewConnStreamResetDoesNotPoisonGeneration(t *testing.T) {
 	testCtx, cancelTest := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelTest()
@@ -414,59 +667,61 @@ func TestTCPNewConnStreamResetDoesNotPoisonGeneration(t *testing.T) {
 }
 
 func TestTCPNewConnConnectionCloseMarksGenerationUnhealthy(t *testing.T) {
-	testCtx, cancelTest := context.WithTimeout(context.Background(), 10*time.Second)
+	testCtx, cancelTest := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancelTest()
-	quicListener, serverConn, peerConn := newRelayLifecycleQUICPair(t, testCtx, 32*1024)
-	registerRelayLifecycleQUICCleanup(t, quicListener, serverConn, peerConn)
-
-	connectionPool, client, listener, done := startBlockedNewConn(t, serverConn, "connection-close-client", 3*time.Second)
-	if _, err := peerConn.AcceptStream(testCtx); err != nil {
-		t.Fatalf("AcceptStream() before connection close error = %v", err)
+	setup := startTCPFallbackSetup(t, testCtx, partialNewConnWindow)
+	connectionPool, primary, backup := setup.connectionPool, setup.primary, setup.backup
+	listener := setup.listener
+	tcpConn, _, backupStream := openPartialTCPFallback(t, testCtx, setup, func(*quic.Stream) {
+		if err := setup.primaryPeer.CloseWithError(91, "close during NewConn write"); err != nil {
+			t.Fatalf("close peer during NewConn write: %v", err)
+		}
+	})
+	if got := connectionPool.EligibleCount("tcp"); got != 1 {
+		t.Fatalf("eligible clients after NewConn connection close = %d, want 1", got)
 	}
-	if err := peerConn.CloseWithError(91, "close during NewConn write"); err != nil {
-		t.Fatalf("close peer during NewConn write: %v", err)
+	if current, ok := connectionPool.Get(primary.ID); !ok || current != primary {
+		t.Fatalf("current generation after NewConn connection close = (%p, %v), want (%p, true)", current, ok, primary)
 	}
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("NewConn handler did not stop after peer connection close")
-	}
-	if got := connectionPool.EligibleCount("tcp"); got != 0 {
-		t.Fatalf("eligible clients after NewConn connection close = %d, want 0", got)
-	}
-	if current, ok := connectionPool.Get(client.ID); !ok || current != client {
-		t.Fatalf("current generation after NewConn connection close = (%p, %v), want (%p, true)", current, ok, client)
-	}
-	if active, total := client.ActiveConns.Load(), client.TotalConns.Load(); active != 0 || total != 0 {
+	if active, total := primary.ActiveConns.Load(), primary.TotalConns.Load(); active != 0 || total != 0 {
 		t.Fatalf("connection-close client active/total = %d/%d, want 0/0", active, total)
 	}
-	if held := len(listener.tcpSetupSlots); held != 0 {
-		t.Fatalf("setup permits after NewConn connection close = %d, want 0", held)
+	waitForTCPAdmissionState(t, backup, 2, 1, listener.tcpSetupSlots)
+	backupStream.CancelRead(trafficStreamCancelCode)
+	backupStream.CancelWrite(trafficStreamCancelCode)
+	if err := tcpConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("close backup TCP flow: %v", err)
 	}
+	waitForActiveConnections(t, backup, 1)
 }
 
 func TestTCPConnectionScopedOpenFailureMarksExactGenerationUnhealthy(t *testing.T) {
 	testCtx, cancelTest := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelTest()
-	quicListener, serverConn, peerConn := newRelayLifecycleQUICPair(t, testCtx, 256*1024)
-	registerRelayLifecycleQUICCleanup(t, quicListener, serverConn, peerConn)
-	if err := serverConn.CloseWithError(1, "connection failure"); err != nil {
+	setup := startTCPFallbackSetup(t, testCtx, 256*1024)
+	if err := setup.primary.Conn.CloseWithError(1, "connection failure"); err != nil {
 		t.Fatalf("close selected QUIC generation: %v", err)
 	}
-
-	quicAddr := quicListener.Addr().String()
-	connectionPool := pool.New(quicAddr, pool.NewRoundRobinBalancer(), zerolog.Nop())
-	t.Cleanup(connectionPool.Stop)
-	client := &pool.ClientConn{ID: "failed-generation", Conn: serverConn, Metadata: pool.ClientMetadata{Capabilities: []string{"tcp"}}}
-	if err := connectionPool.Add(client); err != nil {
-		t.Fatalf("Add() error = %v", err)
+	tcpConn := startTCPFallbackFlow(t, setup.listener)
+	backupStream, err := setup.backupPeer.AcceptStream(testCtx)
+	if err != nil {
+		t.Fatalf("backup AcceptStream() error = %v", err)
 	}
-	manager := startTCPAdmissionManager(t, quicAddr, connectionPool)
-	_ = dialRejectedTCP(t, manager.listeners[0].TCPListener.Addr().String())
-	if got := connectionPool.EligibleCount("tcp"); got != 0 {
-		t.Fatalf("eligible clients after connection-scoped OpenStream failure = %d, want 0", got)
+	var newConn protocol.NewConnMsg
+	if err := protocol.ReadTypedMessage(backupStream, protocol.MsgTypeNewConn, &newConn); err != nil {
+		t.Fatalf("read backup NewConn message: %v", err)
 	}
-	if active, total := client.ActiveConns.Load(), client.TotalConns.Load(); active != 0 || total != 0 {
+	if got := setup.connectionPool.EligibleCount("tcp"); got != 1 {
+		t.Fatalf("eligible clients after connection-scoped OpenStream failure = %d, want 1", got)
+	}
+	if active, total := setup.primary.ActiveConns.Load(), setup.primary.TotalConns.Load(); active != 0 || total != 0 {
 		t.Fatalf("failed generation active/total = %d/%d, want 0/0", active, total)
 	}
+	waitForTCPAdmissionState(t, setup.backup, 2, 1, setup.listener.tcpSetupSlots)
+	backupStream.CancelRead(trafficStreamCancelCode)
+	backupStream.CancelWrite(trafficStreamCancelCode)
+	if err := tcpConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("close backup TCP flow: %v", err)
+	}
+	waitForActiveConnections(t, setup.backup, 1)
 }
