@@ -331,7 +331,34 @@ func TestAuthenticatedIncompatibleRegistrationGetsNegativeAck(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tokenauth.New() error = %v", err)
 	}
-	harness := newRegistrationHarness(t, authenticator, time.Second)
+	type ackWrite struct {
+		success              bool
+		serverVersion        string
+		selectedCapabilities []string
+		err                  error
+	}
+	var ackWrites []ackWrite
+	writerFactory := func(_ *pool.ConnectionPool) registrationAckWriter {
+		return func(
+			w io.Writer,
+			success bool,
+			message, serverVersion string,
+			selectedCapabilities []string,
+			selectedAuthScheme string,
+		) error {
+			err := protocol.WriteRegisterAckWithAuth(
+				w, success, message, serverVersion, selectedCapabilities, selectedAuthScheme,
+			)
+			ackWrites = append(ackWrites, ackWrite{
+				success:              success,
+				serverVersion:        serverVersion,
+				selectedCapabilities: selectedCapabilities,
+				err:                  err,
+			})
+			return err
+		}
+	}
+	harness := newRegistrationHarness(t, authenticator, time.Second, writerFactory)
 	stream := harness.openStream(t)
 	version := "1.0"
 	capabilities := []string{protocol.CapabilityUDPWireV2}
@@ -365,6 +392,22 @@ func TestAuthenticatedIncompatibleRegistrationGetsNegativeAck(t *testing.T) {
 		}
 	}
 	harness.waitForHandler(t)
+	if len(ackWrites) != 1 {
+		t.Fatalf("registration Ack writes = %d, want 1", len(ackWrites))
+	}
+	write := ackWrites[0]
+	if write.success {
+		t.Fatal("incompatible registration writer received a success Ack")
+	}
+	if write.serverVersion != protocol.ProtocolVersion {
+		t.Fatalf("negative Ack server version = %q, want %q", write.serverVersion, protocol.ProtocolVersion)
+	}
+	if write.selectedCapabilities != nil {
+		t.Fatalf("negative Ack selected capabilities = %v, want nil", write.selectedCapabilities)
+	}
+	if write.err != nil {
+		t.Fatalf("write negative Ack: %v", write.err)
+	}
 	if got := harness.pool.Count(); got != 0 {
 		t.Fatalf("pool Count() after incompatible registration = %d, want 0", got)
 	}
