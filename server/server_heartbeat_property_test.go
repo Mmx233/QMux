@@ -140,11 +140,11 @@ func TestServerHeartbeatSendingInterval_Property(t *testing.T) {
 	})
 }
 
-// Feature: bidirectional-heartbeat, Property 4: Non-Blocking Heartbeat Send (Server)
-// *For any* heartbeat send operation on the server, the operation should complete
-// within a bounded time regardless of client response.
+// Feature: bidirectional-heartbeat, Property 4: Immediate Mock Heartbeat Write (Server)
+// This checks only the in-memory mock writer's immediate heartbeat encoding path.
+// It does not exercise production control-stream deadline handling.
 // Validates: Requirements 2.2
-func TestServerHeartbeatNonBlocking_Property(t *testing.T) {
+func TestServerImmediateMockHeartbeatWrite_Property(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		// Generate random number of heartbeats to send
 		numHeartbeats := rapid.IntRange(1, 10).Draw(t, "numHeartbeats")

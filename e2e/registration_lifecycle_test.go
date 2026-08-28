@@ -19,6 +19,111 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
+func TestBidirectionalHeartbeatsKeepExactGenerationHealthy(t *testing.T) {
+	const (
+		heartbeatInterval = 20 * time.Millisecond
+		healthTimeout     = 400 * time.Millisecond
+	)
+	certDir := generateTestCertificates(t)
+	_, localPort := startTCPEchoListener(t)
+	quicPort := getFreePort(t)
+	trafficPort := getFreePort(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serverErr := startTestServerReporting(ctx, newMTLSServerConfig(
+		certDir,
+		"tcp",
+		quicPort,
+		trafficPort,
+		heartbeatInterval,
+		healthTimeout,
+	))
+	clientConfig := newMTLSClientConfig(
+		certDir,
+		"lif006-sustained-heartbeats",
+		localPort,
+		heartbeatInterval,
+		healthTimeout,
+		quicPort,
+	)
+	waitForQUICListener(t, ctx, clientConfig, serverErr)
+
+	clientInstance := newTestClient(t, clientConfig)
+	clientDone := make(chan error, 1)
+	go func() { clientDone <- clientInstance.Start(ctx) }()
+	trafficAddress := fmt.Sprintf("127.0.0.1:%d", trafficPort)
+	assertTCPEchoEventually(
+		t,
+		ctx,
+		trafficAddress,
+		[]byte("heartbeat generation before sustained observation"),
+		clientDone,
+		serverErr,
+	)
+
+	serverAddress := clientConfig.Server.Servers[0].Address
+	manager := clientInstance.ConnectionManager()
+	expected := manager.GetConnection(serverAddress)
+	if expected == nil {
+		t.Fatal("registered heartbeat generation was not published")
+	}
+	assertExactGeneration := func() {
+		t.Helper()
+		if current := manager.GetConnection(serverAddress); current != expected {
+			t.Fatalf("current heartbeat generation = %p, want exact %p", current, expected)
+		}
+		if !expected.IsHealthy() || expected.Connection() == nil {
+			t.Fatalf("exact heartbeat generation healthy=%t connection=%p, want true/non-nil",
+				expected.IsHealthy(), expected.Connection())
+		}
+		if healthy, total := clientInstance.HealthyConnectionCount(), clientInstance.TotalConnectionCount(); healthy != 1 || total != 1 {
+			t.Fatalf("heartbeat connection counts = healthy %d, total %d; want 1, 1", healthy, total)
+		}
+	}
+	assertExactGeneration()
+
+	observation := time.NewTimer(2*healthTimeout + 2*heartbeatInterval)
+	defer observation.Stop()
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+observe:
+	for {
+		select {
+		case err := <-clientDone:
+			t.Fatalf("client returned during sustained heartbeats: %v", err)
+		case err := <-serverErr:
+			t.Fatalf("server returned during sustained heartbeats: %v", err)
+		case <-ticker.C:
+			assertExactGeneration()
+		case <-observation.C:
+			break observe
+		case <-ctx.Done():
+			t.Fatalf("heartbeat observation context ended: %v", context.Cause(ctx))
+		}
+	}
+	assertExactGeneration()
+	assertTCPEchoEventually(
+		t,
+		ctx,
+		trafficAddress,
+		[]byte("same heartbeat generation after sustained observation"),
+		clientDone,
+		serverErr,
+	)
+	assertExactGeneration()
+
+	cancel()
+	select {
+	case err := <-clientDone:
+		if err != nil {
+			t.Fatalf("client shutdown after sustained heartbeats failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("client did not stop after sustained heartbeat observation")
+	}
+}
+
 func TestHealthyEndpointPublishesWhileRegistrationPeerStalls(t *testing.T) {
 	certDir := generateTestCertificates(t)
 	_, localPort := startTCPEchoListener(t)

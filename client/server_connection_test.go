@@ -597,11 +597,10 @@ func TestUnhealthyTriggersReconnection_NoFalsePositive_Property(t *testing.T) {
 	})
 }
 
-// Feature: bidirectional-heartbeat, Property 3: Non-Blocking Heartbeat Send (Client)
-// For any heartbeat send operation on the client, the operation should complete within
-// a bounded time (e.g., 100ms) regardless of whether the server responds.
+// Feature: bidirectional-heartbeat, Property 3: Missing Control Stream Fails Within a Bound (Client)
+// A heartbeat send without a control stream should fail immediately.
 // **Validates: Requirements 1.2**
-func TestNonBlockingHeartbeatSend_Property(t *testing.T) {
+func TestHeartbeatSendWithoutControlStreamIsBounded_Property(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		logger := zerolog.Nop()
 		cache := tls.NewLRUClientSessionCache(0)
@@ -625,31 +624,22 @@ func TestNonBlockingHeartbeatSend_Property(t *testing.T) {
 		if err == nil {
 			t.Fatal("SendHeartbeat should return error when no control stream")
 		}
-
-		// Test 2: Verify the method doesn't block waiting for response
-		// We can't easily test with a real stream, but we verify the implementation
-		// by checking that the method returns immediately after write (no read/wait)
-		// This is verified by the code structure - WriteHeartbeat just writes and returns
 	})
 }
 
-// Feature: bidirectional-heartbeat, Property 3: Non-Blocking Heartbeat Send (Client) - With Mock Stream
-// Tests that heartbeat send completes quickly even with a slow writer.
+// Feature: bidirectional-heartbeat, Property 3: Immediate Mock Heartbeat Write (Client)
+// Tests the mock writer's immediate path independently of the production helper.
 // **Validates: Requirements 1.2**
-func TestNonBlockingHeartbeatSend_WithMockStream_Property(t *testing.T) {
+func TestImmediateMockHeartbeatWrite_Property(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		logger := zerolog.Nop()
 		cache := tls.NewLRUClientSessionCache(0)
 		conn := NewServerConnection("server.example.com:8443", "server.example.com", cache, logger)
 
-		// Create a mock stream that writes immediately (simulating non-blocking write)
+		// Create a mock stream whose write method returns immediately.
 		mockStream := &mockControlStream{
 			writeDelay: 0, // No delay - immediate write
 		}
-
-		// Set the control stream using reflection or by making it accessible
-		// For this test, we'll use a different approach - test the protocol.WriteHeartbeat directly
-		// since that's what SendHeartbeat calls
 
 		// Generate number of heartbeat sends (1-10)
 		sendCount := rapid.IntRange(1, 10).Draw(t, "sendCount")
@@ -662,7 +652,7 @@ func TestNonBlockingHeartbeatSend_WithMockStream_Property(t *testing.T) {
 			err := mockStream.WriteHeartbeat()
 			elapsed := time.Since(start)
 
-			// Property: each write should complete within 10ms (very fast for non-blocking)
+			// Property: each immediate mock write should complete within 10ms.
 			if elapsed > 10*time.Millisecond {
 				t.Fatalf("iteration %d: write took %v, expected < 10ms", i, elapsed)
 			}
@@ -693,8 +683,7 @@ func (m *mockControlStream) Write(p []byte) (n int, err error) {
 }
 
 func (m *mockControlStream) Read(_ []byte) (n int, err error) {
-	// Block forever to simulate no response - but we shouldn't reach here
-	// because non-blocking send doesn't wait for response
+	// Block forever to expose an unexpected read from this write-only mock.
 	select {}
 }
 

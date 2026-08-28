@@ -341,7 +341,9 @@ func (sc *ServerConnection) heartbeatLoop(sendInterval time.Duration, controlStr
 		}
 	}(sc.ctx, controlStream, readCh)
 
-	heartbeatDeadline := time.After(sc.healthTimeout)
+	now := time.Now()
+	healthExpiry := now.Add(sc.healthTimeout)
+	heartbeatDeadline := time.After(time.Until(healthExpiry))
 	for {
 		select {
 		case <-sc.ctx.Done():
@@ -349,8 +351,15 @@ func (sc *ServerConnection) heartbeatLoop(sendInterval time.Duration, controlStr
 			return
 
 		case <-sendTicker.C:
-			// Send heartbeat to server
-			if err := sc.sendHeartbeat(controlStream); err != nil {
+			now := time.Now()
+			writeDeadline := now.Add(sendInterval)
+			if healthExpiry.Before(writeDeadline) {
+				writeDeadline = healthExpiry
+			}
+			if !writeDeadline.After(now) {
+				continue
+			}
+			if err := sc.sendHeartbeat(controlStream, writeDeadline); err != nil {
 				sc.logger.Debug().Err(err).Msg("heartbeat send failed, exiting loop")
 				return
 			}
@@ -370,7 +379,8 @@ func (sc *ServerConnection) heartbeatLoop(sendInterval time.Duration, controlStr
 				// Update last received timestamp and reset deadline
 				sc.UpdateLastReceivedFromServer()
 				sc.logger.Debug().Msg("heartbeat received from server")
-				heartbeatDeadline = time.After(sc.healthTimeout)
+				healthExpiry = time.Now().Add(sc.healthTimeout)
+				heartbeatDeadline = time.After(time.Until(healthExpiry))
 			} else {
 				// Route non-heartbeat messages to handler
 				if nonHeartbeatHandler != nil {
@@ -608,15 +618,19 @@ func (sc *ServerConnection) acceptRegisterAckWithAuth(ack protocol.RegisterAckMs
 	return protocol.ValidateRegisterAckWithAuth(ack, expectedAuthScheme)
 }
 
-// SendHeartbeat sends a heartbeat message on the control stream.
-// This is a non-blocking operation that does not wait for any response.
+// SendHeartbeat sends a heartbeat message on the control stream with a health-timeout deadline.
+// It must not run concurrently with the active heartbeat loop.
 // On success, the connection is marked healthy. On failure, it's marked unhealthy
 // and reconnection is triggered if a callback is set.
 func (sc *ServerConnection) SendHeartbeat() error {
-	return sc.sendHeartbeat(sc.controlStream.Load())
+	timeout := sc.healthTimeout
+	if timeout <= 0 {
+		timeout = config.DefaultHealthTimeout
+	}
+	return sc.sendHeartbeat(sc.controlStream.Load(), time.Now().Add(timeout))
 }
 
-func (sc *ServerConnection) sendHeartbeat(controlStream *quic.Stream) error {
+func (sc *ServerConnection) sendHeartbeat(controlStream *quic.Stream, deadline time.Time) error {
 	if controlStream == nil {
 		// No control stream is a failure condition - mark unhealthy (Requirement 1.3)
 		sc.MarkUnhealthy()
@@ -631,9 +645,11 @@ func (sc *ServerConnection) sendHeartbeat(controlStream *quic.Stream) error {
 		return fmt.Errorf("no control stream")
 	}
 
-	// Non-blocking write - does not wait for any response (Requirement 1.2)
-	// The heartbeat message contains a Unix timestamp (Requirement 1.4)
-	err := protocol.WriteHeartbeat(controlStream, time.Now().Unix())
+	err := controlStream.SetWriteDeadline(deadline)
+	if err == nil {
+		// The heartbeat message contains a Unix timestamp (Requirement 1.4).
+		err = protocol.WriteHeartbeat(controlStream, time.Now().Unix())
+	}
 	if err != nil {
 		// Mark connection as unhealthy on write error (Requirement 1.3)
 		sc.MarkUnhealthy()

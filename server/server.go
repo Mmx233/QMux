@@ -781,7 +781,9 @@ func (s *Server) handleControlStream(
 		<-readerDone
 	}()
 
-	heartbeatDeadline := time.After(s.config.HealthTimeout)
+	now := time.Now()
+	healthExpiry := now.Add(s.config.HealthTimeout)
+	heartbeatDeadline := time.After(time.Until(healthExpiry))
 	for {
 		select {
 		case <-ctx.Done():
@@ -792,12 +794,24 @@ func (s *Server) handleControlStream(
 			return
 
 		case <-heartBeatTicker.C:
-			// Send heartbeat to client
-			if err := protocol.WriteHeartbeat(clientConn.ControlStream, time.Now().Unix()); err != nil {
+			now := time.Now()
+			writeDeadline := now.Add(s.config.HeartbeatInterval)
+			if healthExpiry.Before(writeDeadline) {
+				writeDeadline = healthExpiry
+			}
+			if !writeDeadline.After(now) {
+				continue
+			}
+			err := clientConn.ControlStream.SetWriteDeadline(writeDeadline)
+			if err == nil {
+				err = protocol.WriteHeartbeat(clientConn.ControlStream, now.Unix())
+			}
+			if err != nil {
 				logger.Debug().Err(err).Msg("failed to send heartbeat to client")
 				if !poolInst.MarkUnhealthy(clientConn) {
 					logger.Debug().Msg("ignored stale heartbeat write failure")
 				}
+				_ = clientConn.Conn.CloseWithError(1, "heartbeat write failed")
 				return
 			}
 			logger.Debug().Msg("heartbeat sent to client")
@@ -814,7 +828,8 @@ func (s *Server) handleControlStream(
 					return
 				}
 				logger.Debug().Msg("heartbeat received from client")
-				heartbeatDeadline = time.After(s.config.HealthTimeout)
+				healthExpiry = time.Now().Add(s.config.HealthTimeout)
+				heartbeatDeadline = time.After(time.Until(healthExpiry))
 			}
 
 		case <-heartbeatDeadline:

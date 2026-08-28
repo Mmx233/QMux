@@ -521,8 +521,11 @@ func TestMTLSHandshakeRejectsUnverifiedClientCertificates(t *testing.T) {
 type registrationHarness struct {
 	client      *quic.Conn
 	serverConn  *quic.Conn
+	server      *Server
+	listener    *quic.Listener
 	pool        *pool.ConnectionPool
 	slots       chan struct{}
+	ctx         context.Context
 	cancel      context.CancelFunc
 	handlerDone <-chan struct{}
 }
@@ -560,13 +563,38 @@ func newRegistrationHarnessWithTLS(
 	serverTLS, clientTLS *tls.Config,
 	ackWriterFactories ...func(*pool.ConnectionPool) registrationAckWriter,
 ) *registrationHarness {
+	return newRegistrationHarnessWithTLSAndQUIC(
+		t,
+		authenticator,
+		timeout,
+		serverTLS,
+		clientTLS,
+		&config.Server{
+			HeartbeatInterval: time.Hour,
+			HealthTimeout:     2 * time.Hour,
+		},
+		&quic.Config{},
+		&quic.Config{},
+		ackWriterFactories...,
+	)
+}
+
+func newRegistrationHarnessWithTLSAndQUIC(
+	t *testing.T,
+	authenticator serverauth.Auth,
+	timeout time.Duration,
+	serverTLS, clientTLS *tls.Config,
+	serverConfig *config.Server,
+	serverQUIC, clientQUIC *quic.Config,
+	ackWriterFactories ...func(*pool.ConnectionPool) registrationAckWriter,
+) *registrationHarness {
 	t.Helper()
 	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
 	if err != nil {
 		t.Fatalf("listen UDP: %v", err)
 	}
 	transport := &quic.Transport{Conn: udpConn}
-	listener, err := transport.Listen(serverTLS, &quic.Config{})
+	listener, err := transport.Listen(serverTLS, serverQUIC)
 	if err != nil {
 		_ = udpConn.Close()
 		t.Fatalf("listen QUIC: %v", err)
@@ -596,7 +624,7 @@ func newRegistrationHarnessWithTLS(
 		_ = udpConn.Close()
 	})
 	dialCtx, cancelDial := context.WithTimeout(ctx, 2*time.Second)
-	client, err := quic.DialAddr(dialCtx, listener.Addr().String(), clientTLS, &quic.Config{})
+	client, err := quic.DialAddr(dialCtx, listener.Addr().String(), clientTLS, clientQUIC)
 	cancelDial()
 	if err != nil {
 		t.Fatalf("dial QUIC: %v", err)
@@ -612,10 +640,7 @@ func newRegistrationHarnessWithTLS(
 
 	connectionPool := pool.New(registrationTestAddress, pool.NewRoundRobinBalancer(), zerolog.Nop())
 	server := &Server{
-		config: &config.Server{
-			HeartbeatInterval: time.Hour,
-			HealthTimeout:     2 * time.Hour,
-		},
+		config:              serverConfig,
 		pools:               map[string]*pool.ConnectionPool{registrationTestAddress: connectionPool},
 		authenticator:       authenticator,
 		registrationTimeout: timeout,
@@ -641,22 +666,68 @@ func newRegistrationHarnessWithTLS(
 	harness := &registrationHarness{
 		client:      client,
 		serverConn:  serverConn,
+		server:      server,
+		listener:    listener,
 		pool:        connectionPool,
 		slots:       slots,
+		ctx:         ctx,
 		cancel:      cancel,
 		handlerDone: handlerDone,
 	}
 	t.Cleanup(func() {
-		_ = client.CloseWithError(0, "test complete")
+		_ = harness.client.CloseWithError(0, "test complete")
 		cancel()
 		select {
-		case <-handlerDone:
+		case <-harness.handlerDone:
 		case <-time.After(2 * time.Second):
 			t.Error("server connection handler did not stop")
 		}
 		connectionPool.Stop()
 	})
 	return harness
+}
+
+func (h *registrationHarness) reconnect(t *testing.T, clientTLS *tls.Config, clientQUIC *quic.Config) {
+	t.Helper()
+	accepted := make(chan *quic.Conn, 1)
+	acceptErr := make(chan error, 1)
+	go func() {
+		conn, err := h.listener.Accept(h.ctx)
+		if err != nil {
+			acceptErr <- err
+			return
+		}
+		accepted <- conn
+	}()
+	dialCtx, cancelDial := context.WithTimeout(h.ctx, 2*time.Second)
+	client, err := quic.DialAddr(dialCtx, h.listener.Addr().String(), clientTLS, clientQUIC)
+	cancelDial()
+	if err != nil {
+		t.Fatalf("reconnect QUIC: %v", err)
+	}
+	var serverConn *quic.Conn
+	select {
+	case serverConn = <-accepted:
+	case err := <-acceptErr:
+		_ = client.CloseWithError(0, "reconnect accept failed")
+		t.Fatalf("accept reconnected QUIC: %v", err)
+	case <-time.After(2 * time.Second):
+		_ = client.CloseWithError(0, "reconnect accept timeout")
+		t.Fatal("accept reconnected QUIC timed out")
+	}
+	permit, ok := acquirePendingRegistration(h.slots)
+	if !ok {
+		_ = client.CloseWithError(0, "registration capacity unavailable")
+		t.Fatal("acquire reconnect registration permit failed")
+	}
+	handlerDone := make(chan struct{})
+	go func() {
+		defer close(handlerDone)
+		h.server.handleConnection(h.ctx, serverConn, registrationTestAddress, permit)
+	}()
+	h.client = client
+	h.serverConn = serverConn
+	h.handlerDone = handlerDone
 }
 
 func (h *registrationHarness) openStream(t *testing.T) *quic.Stream {
@@ -673,7 +744,7 @@ func (h *registrationHarness) openStream(t *testing.T) *quic.Stream {
 	return stream
 }
 
-func registerMTLSClient(t *testing.T, harness *registrationHarness, clientID string) {
+func registerMTLSClient(t *testing.T, harness *registrationHarness, clientID string) *quic.Stream {
 	t.Helper()
 	stream := harness.openStream(t)
 	if err := protocol.WriteRegister(
@@ -692,6 +763,7 @@ func registerMTLSClient(t *testing.T, harness *registrationHarness, clientID str
 		t.Fatalf("ValidateRegisterAckWithAuth() error = %v", err)
 	}
 	eventually(t, time.Second, func() bool { return harness.pool.Count() == 1 })
+	return stream
 }
 
 func (h *registrationHarness) waitForHandler(t *testing.T) {
