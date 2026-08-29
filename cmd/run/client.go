@@ -2,10 +2,10 @@ package run
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/Mmx233/QMux/client"
 	"github.com/Mmx233/QMux/config"
@@ -20,9 +20,6 @@ var (
 		Args:  cobra.NoArgs,
 		RunE:  runClient,
 	}
-
-	reconnectDelay    = 5 * time.Second
-	maxReconnectDelay = 60 * time.Second
 )
 
 func runClient(_ *cobra.Command, _ []string) error {
@@ -35,67 +32,27 @@ func runClient(_ *cobra.Command, _ []string) error {
 		return err
 	}
 
-	// Create context with cancellation
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	c, err := client.New(cfg)
+	if err != nil {
+		return err
+	}
 
-	// Setup signal handling
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	if cause := context.Cause(ctx); cause != nil {
+		err = cause
+	} else {
+		logger.Info().Msg("starting QMux client")
+		err = c.Start(ctx)
+	}
 
-	// Start client with automatic reconnection (for K8s HA)
-	go func() {
-		currentDelay := reconnectDelay
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
+	if cause := context.Cause(ctx); cause != nil && errors.Is(err, cause) {
+		err = nil
+	}
+	if err != nil {
+		return err
+	}
 
-			logger.Info().Msg("starting QMux client")
-
-			// Create new client instance
-			c, err := client.New(cfg)
-			if err != nil {
-				logger.Error().Err(err).Msg("failed to create client")
-				time.Sleep(currentDelay)
-				// Exponential backoff
-				currentDelay *= 2
-				if currentDelay > maxReconnectDelay {
-					currentDelay = maxReconnectDelay
-				}
-				continue
-			}
-
-			// Start client
-			if err := c.Start(ctx); err != nil {
-				if ctx.Err() != nil {
-					// Context cancelled, exit gracefully
-					return
-				}
-				logger.Error().Err(err).Msg("client stopped with error, reconnecting")
-				time.Sleep(currentDelay)
-				// Exponential backoff
-				currentDelay *= 2
-				if currentDelay > maxReconnectDelay {
-					currentDelay = maxReconnectDelay
-				}
-				continue
-			}
-
-			// Reset delay on successful connection
-			currentDelay = reconnectDelay
-		}
-	}()
-
-	// Wait for shutdown signal
-	sig := <-sigCh
-	logger.Info().Str("signal", sig.String()).Msg("received shutdown signal")
-	cancel()
-
-	// Give some time for graceful shutdown
-	time.Sleep(time.Second)
 	logger.Info().Msg("client stopped")
 	return nil
 }
