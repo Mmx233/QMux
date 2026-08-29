@@ -14,12 +14,13 @@ import (
 
 // ConnectionPool manages client connections for a QUIC listener
 type ConnectionPool struct {
-	mu           sync.RWMutex
-	clients      map[string]*ClientConn // clientID -> selectable connection
-	reservations map[string]*Reservation
-	quicAddr     string       // QUIC listen address this pool serves
-	balancer     LoadBalancer // Load balancing strategy
-	logger       zerolog.Logger
+	mu              sync.RWMutex
+	clients         map[string]*ClientConn // clientID -> selectable connection
+	reservations    map[string]*Reservation
+	quicAddr        string       // QUIC listen address this pool serves
+	balancer        LoadBalancer // Load balancing strategy
+	logger          zerolog.Logger
+	udpSessionLimit int64
 
 	// Cached client slice to avoid allocation on Select
 	// Using atomic.Pointer for lock-free reads on the hot path
@@ -44,6 +45,7 @@ type ClientConn struct {
 	ActiveConns atomic.Int64
 	TotalConns  atomic.Uint64
 	tcpPending  atomic.Int64
+	udpSessions atomic.Int64
 
 	// Health
 	healthy atomic.Bool
@@ -94,7 +96,10 @@ const (
 	tcpLeaseReleased
 )
 
-const maxPendingTCPSetupsPerClient = 16
+const (
+	maxPendingTCPSetupsPerClient    = 16
+	defaultUDPSessionsPerGeneration = 256
+)
 
 // ClientMetadata contains client information
 type ClientMetadata struct {
@@ -302,6 +307,66 @@ func (p *ConnectionPool) SelectProtocol(protocol string) (*ClientConn, error) {
 		return nil, ErrNoEligibleClients
 	}
 	return p.balancer.Select(eligible)
+}
+
+// ReserveUDP selects and reserves one exact current UDP generation.
+func (p *ConnectionPool) ReserveUDP() (*ClientConn, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if len(p.clients) == 0 {
+		return nil, ErrNoClientsAvailable
+	}
+	limit := p.udpSessionLimit
+	if limit <= 0 {
+		limit = defaultUDPSessionsPerGeneration
+	}
+	eligible := make([]*ClientConn, 0, len(p.clients))
+	hasEligible := false
+	for _, conn := range p.clients {
+		if !isEligible(conn, "udp") {
+			continue
+		}
+		hasEligible = true
+		if conn.udpSessions.Load() < limit {
+			eligible = append(eligible, conn)
+		}
+	}
+	if !hasEligible {
+		return nil, ErrNoEligibleClients
+	}
+	if len(eligible) == 0 {
+		return nil, ErrUDPGenerationCapacity
+	}
+
+	selected, err := p.balancer.Select(eligible)
+	if err != nil {
+		return nil, err
+	}
+	if slices.Index(eligible, selected) < 0 {
+		return nil, fmt.Errorf("load balancer selected a client outside the UDP candidate set")
+	}
+	selected.udpSessions.Add(1)
+	return selected, nil
+}
+
+// ReleaseUDP releases one reservation from the exact generation pointer.
+func (p *ConnectionPool) ReleaseUDP(conn *ClientConn) bool {
+	if conn == nil {
+		return false
+	}
+	if conn.udpSessions.Add(-1) < 0 {
+		conn.udpSessions.Add(1)
+		return false
+	}
+	return true
+}
+
+// IsCurrentEligible reports whether conn is still the exact selectable generation.
+func (p *ConnectionPool) IsCurrentEligible(conn *ClientConn, protocol string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.isCurrentLocked(conn) && isEligible(conn, protocol)
 }
 
 // BeginTCPAdmission snapshots eligible generations. Generations added later are
@@ -576,7 +641,8 @@ func (p *ConnectionPool) isCurrentLocked(expected *ClientConn) bool {
 
 // Errors
 var (
-	ErrNoClientsAvailable = fmt.Errorf("no clients available in pool")
-	ErrNoHealthyClients   = fmt.Errorf("no healthy clients available")
-	ErrNoEligibleClients  = fmt.Errorf("no eligible clients available")
+	ErrNoClientsAvailable    = fmt.Errorf("no clients available in pool")
+	ErrNoHealthyClients      = fmt.Errorf("no healthy clients available")
+	ErrNoEligibleClients     = fmt.Errorf("no eligible clients available")
+	ErrUDPGenerationCapacity = fmt.Errorf("all eligible UDP generations are at capacity")
 )

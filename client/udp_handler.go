@@ -18,13 +18,73 @@ const (
 	// Session timeout for inactive UDP sessions
 	udpSessionTimeout = 5 * time.Minute
 	// Cleanup interval for expired sessions
-	udpCleanupInterval  = 30 * time.Second
-	udpSocketBufferSize = 4 * 1024 * 1024
+	udpCleanupInterval           = 30 * time.Second
+	udpSocketBufferSize          = 4 * 1024 * 1024
+	defaultClientUDPSessionLimit = 256
 )
+
+var errClientUDPSessionLimit = errors.New("client UDP session limit reached")
 
 func setUDPSocketBuffer(logger zerolog.Logger, name string, setter func(int) error) {
 	if err := setter(udpSocketBufferSize); err != nil {
 		logger.Warn().Err(err).Msg("set UDP " + name + " buffer failed")
+	}
+}
+
+type udpSessionBudget struct {
+	slots            chan struct{}
+	permitsHeld      atomic.Int64
+	publishedActive  atomic.Int64
+	maxPermitsHeld   atomic.Int64
+	limitDrops       atomic.Uint64
+	accountingFaults atomic.Uint64
+}
+
+func newUDPSessionBudget(limit int) *udpSessionBudget {
+	if limit <= 0 {
+		limit = defaultClientUDPSessionLimit
+	}
+	return &udpSessionBudget{slots: make(chan struct{}, limit)}
+}
+
+func (b *udpSessionBudget) acquire() (func(), bool) {
+	select {
+	case b.slots <- struct{}{}:
+		held := b.permitsHeld.Add(1)
+		updateUDPMax(&b.maxPermitsHeld, held)
+		return sync.OnceFunc(func() {
+			select {
+			case <-b.slots:
+				if b.permitsHeld.Add(-1) < 0 {
+					b.permitsHeld.Add(1)
+					b.accountingFaults.Add(1)
+				}
+			default:
+				b.accountingFaults.Add(1)
+			}
+		}), true
+	default:
+		b.limitDrops.Add(1)
+		return nil, false
+	}
+}
+
+func (b *udpSessionBudget) publish() {
+	b.publishedActive.Add(1)
+}
+
+func (b *udpSessionBudget) unpublish() {
+	if b.publishedActive.Add(-1) < 0 {
+		b.publishedActive.Add(1)
+		b.accountingFaults.Add(1)
+	}
+}
+
+func updateUDPMax(counter *atomic.Int64, value int64) {
+	for current := counter.Load(); value > current; current = counter.Load() {
+		if counter.CompareAndSwap(current, value) {
+			return
+		}
 	}
 }
 
@@ -51,18 +111,20 @@ type UDPHandler struct {
 	// Sessions indexed by session ID
 	sessions sync.Map // uint32 -> *UDPSession
 
-	localHost           string
-	localPort           int
-	enableFragmentation bool
-	logger              zerolog.Logger
-	ctx                 context.Context
-	cancel              context.CancelFunc
-	lifecycleMu         sync.Mutex
-	started             bool
-	closed              bool
-	closeOnce           sync.Once
-	fixedWG             sync.WaitGroup
-	readerWG            sync.WaitGroup
+	localHost            string
+	localPort            int
+	enableFragmentation  bool
+	logger               zerolog.Logger
+	ctx                  context.Context
+	cancel               context.CancelFunc
+	lifecycleMu          sync.Mutex
+	started              bool
+	closed               bool
+	closeOnce            sync.Once
+	fixedWG              sync.WaitGroup
+	readerWG             sync.WaitGroup
+	sessionBudget        *udpSessionBudget
+	beforeSessionPublish func()
 
 	// Fragment assembler for reassembling fragmented packets (sharded for reduced lock contention)
 	fragmentAssembler *protocol.ShardedFragmentAssembler
@@ -70,12 +132,26 @@ type UDPHandler struct {
 
 // NewUDPHandler creates a new UDP handler
 func NewUDPHandler(localHost string, localPort int, enableFragmentation bool, logger zerolog.Logger) *UDPHandler {
+	return newUDPHandler(localHost, localPort, enableFragmentation, logger, newUDPSessionBudget(0))
+}
+
+func newUDPHandler(
+	localHost string,
+	localPort int,
+	enableFragmentation bool,
+	logger zerolog.Logger,
+	budget *udpSessionBudget,
+) *UDPHandler {
+	if budget == nil {
+		budget = newUDPSessionBudget(0)
+	}
 	return &UDPHandler{
 		localHost:           localHost,
 		localPort:           localPort,
 		enableFragmentation: enableFragmentation,
 		logger:              logger.With().Str("component", "udp_handler").Logger(),
 		fragmentAssembler:   protocol.NewShardedFragmentAssembler(protocol.DefaultShardCount),
+		sessionBudget:       budget,
 	}
 }
 
@@ -113,10 +189,8 @@ func (h *UDPHandler) Stop() {
 			cancel()
 		}
 		h.fragmentAssembler.Close()
-		h.sessions.Range(func(key, _ any) bool {
-			if sessionI, loaded := h.sessions.LoadAndDelete(key); loaded {
-				_ = sessionI.(*UDPSession).localConn.Close()
-			}
+		h.sessions.Range(func(_, value any) bool {
+			h.closeSession(value.(*UDPSession))
 			return true
 		})
 	})
@@ -124,7 +198,8 @@ func (h *UDPHandler) Stop() {
 
 func (h *UDPHandler) wait() {
 	// Join the sole reader producer before its readers. The caller must first
-	// close the owning QUIC connection because SendDatagram has no context.
+	// close the owning QUIC connection because SendDatagram has no context;
+	// otherwise a blocked reader also retains its shared-budget permit.
 	h.fixedWG.Wait()
 	h.readerWG.Wait()
 }
@@ -164,6 +239,9 @@ func (h *UDPHandler) receiveDatagrams(quicConn *quic.Conn) {
 		// Get or create session
 		session, err := h.getOrCreateSession(sessionID, quicConn)
 		if err != nil {
+			if errors.Is(err, errClientUDPSessionLimit) {
+				continue
+			}
 			h.logger.Error().Err(err).Uint32("session_id", sessionID).Msg("get session failed")
 			continue
 		}
@@ -173,7 +251,7 @@ func (h *UDPHandler) receiveDatagrams(quicConn *quic.Conn) {
 		// Forward to local service
 		if _, err := session.localConn.Write(payload); err != nil {
 			h.logger.Debug().Err(err).Uint32("session_id", sessionID).Msg("write to local failed")
-			h.closeSession(sessionID)
+			h.closeSession(session)
 			continue
 		}
 	}
@@ -185,6 +263,16 @@ func (h *UDPHandler) getOrCreateSession(sessionID uint32, quicConn *quic.Conn) (
 	if sessionI, ok := h.sessions.Load(sessionID); ok {
 		return sessionI.(*UDPSession), nil
 	}
+	releasePermit, ok := h.sessionBudget.acquire()
+	if !ok {
+		return nil, errClientUDPSessionLimit
+	}
+	creatorOwnsPermit := true
+	defer func() {
+		if creatorOwnsPermit {
+			releasePermit()
+		}
+	}()
 
 	// Slow path: create new session
 	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(h.localHost, strconv.Itoa(h.localPort)))
@@ -207,6 +295,9 @@ func (h *UDPHandler) getOrCreateSession(sessionID uint32, quicConn *quic.Conn) (
 		quicConn:  quicConn,
 	}
 	session.updateLastActive()
+	if h.beforeSessionPublish != nil {
+		h.beforeSessionPublish()
+	}
 
 	h.lifecycleMu.Lock()
 	if !h.started || h.closed || h.ctx.Err() != nil {
@@ -222,7 +313,9 @@ func (h *UDPHandler) getOrCreateSession(sessionID uint32, quicConn *quic.Conn) (
 		_ = localConn.Close()
 		return actual.(*UDPSession), nil
 	}
+	h.sessionBudget.publish()
 	h.readerWG.Add(1)
+	creatorOwnsPermit = false
 	h.lifecycleMu.Unlock()
 
 	h.logger.Debug().Uint32("session_id", sessionID).Str("local_addr", addr.String()).Msg("UDP session created")
@@ -230,6 +323,8 @@ func (h *UDPHandler) getOrCreateSession(sessionID uint32, quicConn *quic.Conn) (
 	// Start reading responses from local service
 	go func() {
 		defer h.readerWG.Done()
+		defer releasePermit()
+		defer h.closeSession(session)
 		h.readLocalResponses(session)
 	}()
 
@@ -256,7 +351,7 @@ func (h *UDPHandler) readLocalResponses(session *UDPSession) {
 					// Timeout - check if session is still active
 					if session.isExpired(udpSessionTimeout) {
 						protocol.PutReadBuffer(bufPtr)
-						h.closeSession(session.id)
+						h.closeSession(session)
 						return
 					}
 					protocol.PutReadBuffer(bufPtr)
@@ -264,7 +359,7 @@ func (h *UDPHandler) readLocalResponses(session *UDPSession) {
 				}
 				h.logger.Debug().Err(err).Uint32("session_id", session.id).Msg("read from local failed")
 				protocol.PutReadBuffer(bufPtr)
-				h.closeSession(session.id)
+				h.closeSession(session)
 				return
 			}
 		}
@@ -285,7 +380,7 @@ func (h *UDPHandler) readLocalResponses(session *UDPSession) {
 				h.logger.Debug().Err(err).Uint32("session_id", session.id).Msg("send datagram failed")
 				protocol.ReleaseDatagramResults(datagrams)
 				protocol.PutReadBuffer(bufPtr)
-				h.closeSession(session.id)
+				h.closeSession(session)
 				return
 			}
 		}
@@ -298,12 +393,13 @@ func (h *UDPHandler) readLocalResponses(session *UDPSession) {
 }
 
 // closeSession closes a UDP session
-func (h *UDPHandler) closeSession(sessionID uint32) {
-	if sessionI, ok := h.sessions.LoadAndDelete(sessionID); ok {
-		session := sessionI.(*UDPSession)
-		_ = session.localConn.Close()
-		h.logger.Debug().Uint32("session_id", sessionID).Msg("UDP session closed")
+func (h *UDPHandler) closeSession(session *UDPSession) {
+	if !h.sessions.CompareAndDelete(session.id, session) {
+		return
 	}
+	_ = session.localConn.Close()
+	h.sessionBudget.unpublish()
+	h.logger.Debug().Uint32("session_id", session.id).Msg("UDP session closed")
 }
 
 // cleanupLoop periodically cleans up expired sessions
@@ -320,7 +416,7 @@ func (h *UDPHandler) cleanupLoop() {
 				session := value.(*UDPSession)
 				if session.isExpired(udpSessionTimeout) {
 					h.logger.Debug().Uint32("session_id", session.id).Msg("cleaning up expired UDP session")
-					h.closeSession(session.id)
+					h.closeSession(session)
 				}
 				return true
 			})

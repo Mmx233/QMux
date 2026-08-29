@@ -310,7 +310,12 @@ func TestClientRetiresOneHundredExactGenerationsAndNoSuccessor(t *testing.T) {
 		Host: "127.0.0.1",
 		Port: backend.LocalAddr().(*net.UDPAddr).Port,
 	}
-	client := &Client{config: cm.config, connMgr: cm, logger: zerolog.Nop()}
+	client := &Client{
+		config:    cm.config,
+		connMgr:   cm,
+		udpBudget: newUDPSessionBudget(0),
+		logger:    zerolog.Nop(),
+	}
 	runCtx, cancelRun := context.WithCancel(context.Background())
 	client.wg.Go(func() { client.handleNewConnections(runCtx) })
 	t.Cleanup(func() {

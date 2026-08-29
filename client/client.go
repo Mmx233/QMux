@@ -29,6 +29,7 @@ type Client struct {
 	connMgr     *ConnectionManager
 	udpHandlers sync.Map // serverAddr -> *UDPHandler
 	localConns  sync.Map // connID -> net.Conn
+	udpBudget   *udpSessionBudget
 	logger      zerolog.Logger
 
 	lifecycleMu  sync.Mutex
@@ -62,9 +63,10 @@ func New(conf *config.Client) (*Client, error) {
 	}
 
 	return &Client{
-		config:  conf,
-		connMgr: connMgr,
-		logger:  logger,
+		config:    conf,
+		connMgr:   connMgr,
+		udpBudget: newUDPSessionBudget(0),
+		logger:    logger,
 	}, nil
 }
 
@@ -133,11 +135,12 @@ func (c *Client) handleNewConnections(ctx context.Context) {
 
 			conn := sc.Connection()
 			if conn != nil {
-				udpHandler := NewUDPHandler(
+				udpHandler := newUDPHandler(
 					c.config.Local.Host,
 					c.config.Local.Port,
 					c.config.UDP.IsFragmentationEnabled(),
 					c.logger,
+					c.udpBudget,
 				)
 				udpHandler.Start(ctx, conn)
 				previousI, replaced := c.udpHandlers.Swap(sc.ServerAddr(), udpHandler)

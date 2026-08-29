@@ -565,6 +565,9 @@ func TestUDPSenderBlackholeIsolationAndManagerRetirement(t *testing.T) {
 	if remainingSessions != 0 {
 		t.Fatalf("UDP sessions after Manager.Wait = %d, want 0", remainingSessions)
 	}
+	if held, slots, faults := handler.sessionStats.held.Load(), len(handler.sessionSlots), handler.sessionStats.accountingFaults.Load(); held != 0 || slots != 0 || faults != 0 {
+		t.Fatalf("UDP admission after Manager.Wait = (%d held, %d slots, %d faults), want zero", held, slots, faults)
+	}
 }
 
 func TestUDPSenderRegistryUsesExactGeneration(t *testing.T) {

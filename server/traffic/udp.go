@@ -16,19 +16,23 @@ import (
 )
 
 const (
-	udpSessionTimeout         = 5 * time.Minute
-	udpCleanupInterval        = 30 * time.Second
-	maxUDPSenderQueuedFrames  = 256
-	maxUDPSenderQueuedBacking = 512 << 10
+	udpSessionTimeout             = 5 * time.Minute
+	udpCleanupInterval            = 30 * time.Second
+	defaultUDPSessionsPerListener = 1024
+	maxUDPSenderQueuedFrames      = 256
+	maxUDPSenderQueuedBacking     = 512 << 10
 )
+
+var errUDPListenerCapacity = errors.New("UDP listener session capacity reached")
 
 // UDPSession represents a UDP session using QUIC datagrams.
 type UDPSession struct {
-	id            uint32
-	clientAddr    *net.UDPAddr
-	lastActive    atomic.Int64
-	client        *pool.ClientConn
-	fragIDCounter atomic.Uint32
+	id               uint32
+	clientAddr       *net.UDPAddr
+	lastActive       atomic.Int64
+	client           *pool.ClientConn
+	fragIDCounter    atomic.Uint32
+	releaseAdmission func()
 }
 
 func (s *UDPSession) updateLastActive() {
@@ -73,6 +77,14 @@ type udpSenderStats struct {
 	maxQueuedBytes   atomic.Int64
 }
 
+type udpSessionStats struct {
+	listenerCapacityDrops   atomic.Uint64
+	generationCapacityDrops atomic.Uint64
+	held                    atomic.Int64
+	highWater               atomic.Int64
+	accountingFaults        atomic.Uint64
+}
+
 type udpEnqueueResult uint8
 
 const (
@@ -95,9 +107,12 @@ type UDPHandler struct {
 	cancel              context.CancelFunc
 
 	nextSessionID atomic.Uint32
+	sessionSlots  chan struct{}
+	sessionStats  udpSessionStats
 
-	fragmentAssembler *protocol.ShardedFragmentAssembler
-	closeOnce         sync.Once
+	fragmentAssembler   *protocol.ShardedFragmentAssembler
+	closeOnce           sync.Once
+	afterSessionPublish func()
 
 	// lifecycleMu is the worker registry gate. Once closed is set, no new
 	// session, receiver, or sender can be registered, making the wait groups safe to join.
@@ -142,6 +157,13 @@ func (l *Listener) bindUDP() error {
 func (l *Listener) startUDPHandler() {
 	conn := l.UDPConn.(*net.UDPConn)
 	ctx, cancel := context.WithCancel(l.ctx)
+	if l.udpSessionSlots == nil {
+		limit := l.udpSessionLimit
+		if limit <= 0 {
+			limit = defaultUDPSessionsPerListener
+		}
+		l.udpSessionSlots = make(chan struct{}, limit)
+	}
 	handler := &UDPHandler{
 		pool:                l.Pool,
 		packetConn:          conn,
@@ -150,6 +172,7 @@ func (l *Listener) startUDPHandler() {
 		logger:              l.logger,
 		ctx:                 ctx,
 		cancel:              cancel,
+		sessionSlots:        l.udpSessionSlots,
 		fragmentAssembler:   protocol.NewShardedFragmentAssembler(protocol.DefaultShardCount),
 		receivers:           make(map[*quic.Conn]struct{}),
 		senders:             make(map[*pool.ClientConn]*udpSender),
@@ -205,6 +228,9 @@ func (h *UDPHandler) processPacket(data []byte, addr *net.UDPAddr) {
 
 	session, err := h.createSession(addr)
 	if err != nil {
+		if errors.Is(err, errUDPListenerCapacity) || errors.Is(err, pool.ErrUDPGenerationCapacity) {
+			return
+		}
 		if h.ctx.Err() == nil && (errors.Is(err, pool.ErrNoClientsAvailable) ||
 			errors.Is(err, pool.ErrNoEligibleClients) || errors.Is(err, pool.ErrNoHealthyClients)) {
 			h.senderStats.noEligibleDrops.Add(1)
@@ -255,15 +281,31 @@ func (h *UDPHandler) sendDatagrams(session *UDPSession, data []byte) {
 }
 
 func (h *UDPHandler) createSession(addr *net.UDPAddr) (*UDPSession, error) {
-	client, err := h.pool.SelectProtocol("udp")
-	if err != nil {
-		return nil, fmt.Errorf("select client: %w", err)
+	if !h.acquireSessionSlot() {
+		return nil, errUDPListenerCapacity
 	}
 
+	client, err := h.pool.ReserveUDP()
+	if err != nil {
+		h.releaseSessionSlot()
+		if errors.Is(err, pool.ErrUDPGenerationCapacity) {
+			h.sessionStats.generationCapacityDrops.Add(1)
+		}
+		return nil, fmt.Errorf("reserve UDP client: %w", err)
+	}
+	releaseAdmission := h.newSessionAdmissionRelease(client)
+	creatorOwnsAdmission := true
+	defer func() {
+		if creatorOwnsAdmission {
+			releaseAdmission()
+		}
+	}()
+
 	session := &UDPSession{
-		id:         h.nextSessionID.Add(1),
-		clientAddr: addr,
-		client:     client,
+		id:               h.nextSessionID.Add(1),
+		clientAddr:       addr,
+		client:           client,
+		releaseAdmission: releaseAdmission,
 	}
 	session.updateLastActive()
 
@@ -272,20 +314,35 @@ func (h *UDPHandler) createSession(addr *net.UDPAddr) (*UDPSession, error) {
 		h.lifecycleMu.Unlock()
 		return nil, context.Canceled
 	}
-	h.sessions.Store(addr.String(), session)
+	actual, loaded := h.sessions.LoadOrStore(addr.String(), session)
+	if loaded {
+		h.lifecycleMu.Unlock()
+		actualSession := actual.(*UDPSession)
+		actualSession.updateLastActive()
+		return actualSession, nil
+	}
 	h.sessionsByID.Store(session.id, session)
 	client.ActiveConns.Add(1)
 	client.TotalConns.Add(1)
 
-	_, receiverExists := h.receivers[client.Conn]
-	if !receiverExists {
-		h.receivers[client.Conn] = struct{}{}
+	quicConn := client.Conn
+	_, receiverExists := h.receivers[quicConn]
+	if quicConn != nil && !receiverExists {
+		h.receivers[quicConn] = struct{}{}
 		h.receiverWG.Add(1)
 	}
+	creatorOwnsAdmission = false
 	h.lifecycleMu.Unlock()
 
-	if !receiverExists {
-		go h.receiveDatagrams(client.Conn)
+	if h.afterSessionPublish != nil {
+		h.afterSessionPublish()
+	}
+	if quicConn != nil && !receiverExists {
+		go h.receiveDatagrams(quicConn)
+	}
+	if h.ctx.Err() != nil || !h.pool.IsCurrentEligible(client, "udp") || quicConn == nil || quicConn.Context().Err() != nil {
+		h.closeSession(session)
+		return nil, fmt.Errorf("selected UDP client retired: %w", pool.ErrNoEligibleClients)
 	}
 
 	h.logger.Debug().
@@ -294,6 +351,42 @@ func (h *UDPHandler) createSession(addr *net.UDPAddr) (*UDPSession, error) {
 		Str("client_id", client.ID).
 		Msg("UDP session created")
 	return session, nil
+}
+
+func (h *UDPHandler) acquireSessionSlot() bool {
+	select {
+	case h.sessionSlots <- struct{}{}:
+		held := h.sessionStats.held.Add(1)
+		updateAtomicMax(&h.sessionStats.highWater, held)
+		return true
+	default:
+		h.sessionStats.listenerCapacityDrops.Add(1)
+		return false
+	}
+}
+
+func (h *UDPHandler) releaseSessionSlot() bool {
+	select {
+	case <-h.sessionSlots:
+		if h.sessionStats.held.Add(-1) < 0 {
+			h.sessionStats.held.Add(1)
+			h.sessionStats.accountingFaults.Add(1)
+			return false
+		}
+		return true
+	default:
+		h.sessionStats.accountingFaults.Add(1)
+		return false
+	}
+}
+
+func (h *UDPHandler) newSessionAdmissionRelease(client *pool.ClientConn) func() {
+	return sync.OnceFunc(func() {
+		h.releaseSessionSlot()
+		if !h.pool.ReleaseUDP(client) {
+			h.sessionStats.accountingFaults.Add(1)
+		}
+	})
 }
 
 func datagramBackingBytes(datagrams []protocol.DatagramResult) int64 {
@@ -533,7 +626,13 @@ func (h *UDPHandler) closeSession(session *UDPSession) {
 		return
 	}
 	h.sessionsByID.CompareAndDelete(session.id, session)
-	session.client.ActiveConns.Add(-1)
+	if session.client.ActiveConns.Add(-1) < 0 {
+		session.client.ActiveConns.Add(1)
+		h.sessionStats.accountingFaults.Add(1)
+	}
+	if session.releaseAdmission != nil {
+		session.releaseAdmission()
+	}
 
 	h.logger.Debug().
 		Str("addr", key).

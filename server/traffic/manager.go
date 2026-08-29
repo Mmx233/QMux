@@ -73,11 +73,13 @@ type Listener struct {
 	fixedWG   sync.WaitGroup
 	handlerWG sync.WaitGroup
 
-	flowsMu       sync.Mutex
-	flowsClosing  bool
-	flows         map[*tcpFlow]struct{}
-	tcpSetupSlots chan struct{}
-	udpHandler    *UDPHandler
+	flowsMu         sync.Mutex
+	flowsClosing    bool
+	flows           map[*tcpFlow]struct{}
+	tcpSetupSlots   chan struct{}
+	udpSessionLimit int
+	udpSessionSlots chan struct{}
+	udpHandler      *UDPHandler
 }
 
 // NewManager creates a new traffic manager.
