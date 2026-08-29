@@ -2,6 +2,7 @@ package traffic
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -473,29 +474,34 @@ func TestUDPSenderBlackholeIsolationAndManagerRetirement(t *testing.T) {
 		t.Fatalf("hot sender high-water backing = %d, limit %d", got, maxUDPSenderQueuedBacking)
 	}
 
-	coldEcho := echoOneUDPDatagram(ctx, coldPair.peer)
 	coldPayload := []byte("cold-generation-echo")
-	if err := coldPublic.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		t.Fatalf("set cold public UDP deadline: %v", err)
-	}
-	if _, err := coldPublic.Write(coldPayload); err != nil {
-		t.Fatalf("write cold public UDP packet: %v", err)
-	}
 	response := make([]byte, 256)
-	n, err := coldPublic.Read(response)
-	if err != nil {
-		t.Fatalf("read cold public UDP response: %v", err)
-	}
-	if got := string(response[:n]); got != string(coldPayload) {
-		t.Fatalf("cold public UDP response = %q, want %q", got, coldPayload)
-	}
-	select {
-	case err := <-coldEcho:
-		if err != nil {
-			t.Fatal(err)
+	for coldDeadline := time.Now().Add(5 * time.Second); ; {
+		probeCtx, cancelProbe := context.WithCancel(ctx)
+		coldEcho := echoOneUDPDatagram(probeCtx, coldPair.peer)
+		if err := coldPublic.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+			cancelProbe()
+			t.Fatalf("set cold public UDP deadline: %v", err)
 		}
-	case <-ctx.Done():
-		t.Fatalf("cold QUIC echo did not finish: %v", context.Cause(ctx))
+		if _, err := coldPublic.Write(coldPayload); err != nil {
+			cancelProbe()
+			t.Fatalf("write cold public UDP packet: %v", err)
+		}
+		n, readErr := coldPublic.Read(response)
+		cancelProbe()
+		echoErr := <-coldEcho
+		if echoErr != nil && !errors.Is(echoErr, context.Canceled) && !errors.Is(echoErr, context.DeadlineExceeded) {
+			t.Fatal(echoErr)
+		}
+		if readErr == nil {
+			if got := string(response[:n]); got != string(coldPayload) {
+				t.Fatalf("cold public UDP response = %q, want %q", got, coldPayload)
+			}
+			break
+		}
+		if netErr, ok := readErr.(net.Error); !ok || !netErr.Timeout() || time.Now().After(coldDeadline) {
+			t.Fatalf("read cold public UDP response: %v", readErr)
+		}
 	}
 
 	parkDeadline := time.Now().Add(5 * time.Second)

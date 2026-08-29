@@ -446,6 +446,11 @@ func TestTCPDefaultQUICStreamLimitRejectsWithoutPoisoningGeneration(t *testing.T
 		t.Fatalf("saturated client active/total = %d/%d, want 0/0", active, total)
 	}
 	snapshot := manager.listeners[0].tcpAdmission.snapshot()
+	deadline := time.Now().Add(time.Second)
+	for (snapshot.SetupCurrent != 0 || tcpTerminalTotal(snapshot) != 1) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+		snapshot = manager.listeners[0].tcpAdmission.snapshot()
+	}
 	if snapshot.Attempts != 1 || snapshot.StreamLimitAttempts != 1 || snapshot.Retries != 0 ||
 		snapshot.PeerStreamLimit != 1 || snapshot.GenerationCapacity != 0 ||
 		snapshot.SetupFailure != 0 || tcpTerminalTotal(snapshot) != 1 {

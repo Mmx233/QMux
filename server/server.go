@@ -693,6 +693,7 @@ func (s *Server) handleConnection(
 		logger.Error().Err(err).Msg("send ack failed")
 		return
 	}
+	registrationPermit.Release()
 	if err := poolInst.Commit(reservation); err != nil {
 		logger.Error().Err(err).Msg("commit pool entry failed")
 		return
@@ -713,7 +714,6 @@ func (s *Server) handleConnection(
 		return
 	}
 	registrationSucceeded = true
-	registrationPermit.Release()
 
 	s.handleControlStream(ctx, poolInst, clientConn, quicAddr)
 }
