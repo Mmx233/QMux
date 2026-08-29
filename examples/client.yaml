@@ -26,32 +26,32 @@ local:
 # QUIC settings (optional - defaults are used if not specified)
 quic:
   # Initial stream receive window size in bytes
-  # initialstreamreceivewindow: 524288
+  # initial_stream_receive_window: 524288
 
   # Maximum stream receive window size in bytes
-  # maxstreamreceivewindow: 6291456
+  # max_stream_receive_window: 6291456
 
   # Initial connection receive window size in bytes
-  # initialconnectionreceivewindow: 1048576
+  # initial_connection_receive_window: 1048576
 
   # Maximum connection receive window size in bytes
-  # maxconnectionreceivewindow: 15728640
+  # max_connection_receive_window: 15728640
 
   # Maximum number of incoming streams
-  # maxincomingstreams: 100
+  # max_incoming_streams: 100
 
   # Keep-alive period for the connection
-  # keepaliveperiod: 30s
+  # keep_alive_period: 30s
 
   # Timeout for the handshake to complete
-  # handshakeidletimeout: 10s
+  # handshake_idle_timeout: 10s
 
   # Maximum idle timeout before connection is closed
-  # maxidletimeout: 5m
+  # max_idle_timeout: 5m
 
   # Reserved QUIC 0-RTT setting. QMux does not currently send authentication,
   # registration, or tunnel side effects as early application data.
-  # allow0rtt: false
+  # allow_0rtt: false
 
 # UDP settings (optional - defaults are used if not specified)
 udp:

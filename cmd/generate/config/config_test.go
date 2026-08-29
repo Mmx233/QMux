@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/Mmx233/QMux/config"
@@ -19,6 +20,7 @@ import (
 func TestServerConfigTemplateFields(t *testing.T) {
 	content, err := examples.ServerConfig()
 	require.NoError(t, err, "failed to load server config template")
+	assertCanonicalQUICKeys(t, string(content))
 
 	var cfg config.Server
 	decoder := yaml.NewDecoder(bytes.NewReader(content))
@@ -57,6 +59,7 @@ func TestServerConfigTemplateFields(t *testing.T) {
 func TestClientConfigTemplateFields(t *testing.T) {
 	content, err := examples.ClientConfig()
 	require.NoError(t, err, "failed to load client config template")
+	assertCanonicalQUICKeys(t, string(content))
 
 	var cfg config.Client
 	decoder := yaml.NewDecoder(bytes.NewReader(content))
@@ -80,4 +83,26 @@ func TestClientConfigTemplateFields(t *testing.T) {
 	// Verify defaults match config/defaults.go
 	assert.Equal(t, config.DefaultHeartbeatInterval, cfg.HeartbeatInterval,
 		"heartbeat_interval should match DefaultHeartbeatInterval")
+}
+
+func assertCanonicalQUICKeys(t *testing.T, content string) {
+	t.Helper()
+	canonical := []string{
+		"initial_stream_receive_window", "max_stream_receive_window",
+		"initial_connection_receive_window", "max_connection_receive_window",
+		"max_incoming_streams", "keep_alive_period", "handshake_idle_timeout",
+		"max_idle_timeout", "allow_0rtt",
+	}
+	legacy := []string{
+		"initialstreamreceivewindow", "maxstreamreceivewindow",
+		"initialconnectionreceivewindow", "maxconnectionreceivewindow",
+		"maxincomingstreams", "keepaliveperiod", "handshakeidletimeout",
+		"maxidletimeout", "allow0rtt",
+	}
+	for _, key := range canonical {
+		assert.Contains(t, content, key+":", "template should contain canonical QUIC key")
+	}
+	for _, key := range legacy {
+		assert.False(t, strings.Contains(content, key+":"), "template should not contain legacy QUIC key %q", key)
+	}
 }

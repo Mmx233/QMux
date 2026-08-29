@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -72,6 +73,179 @@ port: not closed`
 	if !strings.Contains(err.Error(), "parse config") {
 		t.Errorf("expected error to contain 'parse config', got: %v", err)
 	}
+}
+
+func TestLoadConfigRejectsUnknownField(t *testing.T) {
+	path := writeTestConfig(t, "name: test\nunknown: true\n")
+
+	_, err := LoadConfig[testConfig](path)
+	if err == nil || !strings.Contains(err.Error(), "field unknown not found") {
+		t.Fatalf("LoadConfig error = %v, want unknown field error", err)
+	}
+}
+
+func TestLoadConfigRejectsMultipleDocuments(t *testing.T) {
+	path := writeTestConfig(t, "name: first\n---\nname: second\n")
+
+	_, err := LoadConfig[testConfig](path)
+	if err == nil || !strings.Contains(err.Error(), "multiple YAML documents") {
+		t.Fatalf("LoadConfig error = %v, want multiple document error", err)
+	}
+}
+
+func TestLoadClientConfigCanonicalQUIC(t *testing.T) {
+	want := testQuicConfig()
+	path := writeTestConfig(t, `client_id: test-client
+server:
+  servers:
+    - address: "server.example.com:8443"
+      server_name: "server.example.com"
+local:
+  host: "127.0.0.1"
+  port: 8080
+quic:
+  initial_stream_receive_window: 1024
+  max_stream_receive_window: 2048
+  initial_connection_receive_window: 4096
+  max_connection_receive_window: 8192
+  max_incoming_streams: 42
+  keep_alive_period: 13s
+  handshake_idle_timeout: 7s
+  max_idle_timeout: 31s
+  allow_0rtt: true
+tls:
+  ca_cert_file: "ca.pem"
+  client_cert_file: "client.pem"
+  client_key_file: "client-key.pem"
+`)
+
+	cfg, err := LoadClientConfig(path)
+	if err != nil {
+		t.Fatalf("LoadClientConfig: %v", err)
+	}
+	if cfg.Quic != want {
+		t.Fatalf("QUIC config = %+v, want %+v", cfg.Quic, want)
+	}
+	assertQUICRuntime(t, cfg.Quic, want)
+
+	roundTripQUIC(t, cfg, func(got *Client) Quic { return got.Quic }, want)
+}
+
+func TestLoadServerConfigCanonicalQUIC(t *testing.T) {
+	want := testQuicConfig()
+	path := writeTestConfig(t, `listeners:
+  - quic_addr: "0.0.0.0:8443"
+    traffic_addr: "0.0.0.0:8080"
+    protocol: "both"
+    initial_stream_receive_window: 1024
+    max_stream_receive_window: 2048
+    initial_connection_receive_window: 4096
+    max_connection_receive_window: 8192
+    max_incoming_streams: 42
+    keep_alive_period: 13s
+    handshake_idle_timeout: 7s
+    max_idle_timeout: 31s
+    allow_0rtt: true
+`)
+
+	cfg, err := LoadServerConfig(path)
+	if err != nil {
+		t.Fatalf("LoadServerConfig: %v", err)
+	}
+	if len(cfg.Listeners) != 1 || cfg.Listeners[0].Quic != want {
+		t.Fatalf("listeners = %+v, want one listener with QUIC %+v", cfg.Listeners, want)
+	}
+	assertQUICRuntime(t, cfg.Listeners[0].Quic, want)
+
+	roundTripQUIC(t, cfg, func(got *Server) Quic { return got.Listeners[0].Quic }, want)
+}
+
+func TestLoadConfigRejectsLegacyQUICKeys(t *testing.T) {
+	legacy := []struct {
+		key   string
+		value string
+	}{
+		{"initialstreamreceivewindow", "1024"},
+		{"maxstreamreceivewindow", "2048"},
+		{"initialconnectionreceivewindow", "4096"},
+		{"maxconnectionreceivewindow", "8192"},
+		{"maxincomingstreams", "42"},
+		{"keepaliveperiod", "13s"},
+		{"handshakeidletimeout", "7s"},
+		{"maxidletimeout", "31s"},
+		{"allow0rtt", "true"},
+	}
+
+	for _, field := range legacy {
+		t.Run("client_"+field.key, func(t *testing.T) {
+			path := writeTestConfig(t, fmt.Sprintf("quic:\n  %s: %s\n", field.key, field.value))
+			_, err := LoadConfig[Client](path)
+			if err == nil || !strings.Contains(err.Error(), field.key) {
+				t.Fatalf("LoadConfig error = %v, want rejection for %s", err, field.key)
+			}
+		})
+		t.Run("server_"+field.key, func(t *testing.T) {
+			path := writeTestConfig(t, fmt.Sprintf("listeners:\n  - %s: %s\n", field.key, field.value))
+			_, err := LoadConfig[Server](path)
+			if err == nil || !strings.Contains(err.Error(), field.key) {
+				t.Fatalf("LoadConfig error = %v, want rejection for %s", err, field.key)
+			}
+		})
+	}
+}
+
+func testQuicConfig() Quic {
+	return Quic{
+		InitialStreamReceiveWindow:     1024,
+		MaxStreamReceiveWindow:         2048,
+		InitialConnectionReceiveWindow: 4096,
+		MaxConnectionReceiveWindow:     8192,
+		MaxIncomingStreams:             42,
+		KeepAlivePeriod:                13 * time.Second,
+		HandshakeIdleTimeout:           7 * time.Second,
+		MaxIdleTimeout:                 31 * time.Second,
+		Allow0RTT:                      true,
+	}
+}
+
+func assertQUICRuntime(t *testing.T, source, want Quic) {
+	t.Helper()
+	got := source.GetConfig()
+	if got.InitialStreamReceiveWindow != want.InitialStreamReceiveWindow ||
+		got.MaxStreamReceiveWindow != want.MaxStreamReceiveWindow ||
+		got.InitialConnectionReceiveWindow != want.InitialConnectionReceiveWindow ||
+		got.MaxConnectionReceiveWindow != want.MaxConnectionReceiveWindow ||
+		got.MaxIncomingStreams != want.MaxIncomingStreams ||
+		got.KeepAlivePeriod != want.KeepAlivePeriod ||
+		got.HandshakeIdleTimeout != want.HandshakeIdleTimeout ||
+		got.MaxIdleTimeout != want.MaxIdleTimeout ||
+		got.Allow0RTT != want.Allow0RTT {
+		t.Fatalf("runtime QUIC config = %+v, want values from %+v", got, want)
+	}
+}
+
+func roundTripQUIC[T any](t *testing.T, source *T, get func(*T) Quic, want Quic) {
+	t.Helper()
+	data, err := yaml.Marshal(source)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	loaded, err := LoadConfig[T](writeTestConfig(t, string(data)))
+	if err != nil {
+		t.Fatalf("round-trip config: %v", err)
+	}
+	if got := get(loaded); got != want {
+		t.Fatalf("round-trip QUIC config = %+v, want %+v", got, want)
+	}
+}
+
+func writeTestConfig(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("write test config: %v", err)
+	}
+	return path
 }
 
 // Property-based test for round-trip consistency

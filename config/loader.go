@@ -1,15 +1,16 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/rs/zerolog/log"
 	"gopkg.in/yaml.v3"
 )
 
-// LoadConfig reads a YAML configuration file and unmarshals it into the specified type.
-// T must be a struct type that can be unmarshaled from YAML.
+// LoadConfig reads exactly one YAML document into the specified type and rejects unknown fields.
 func LoadConfig[T any](path string) (*T, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -17,8 +18,18 @@ func LoadConfig[T any](path string) (*T, error) {
 	}
 
 	var cfg T
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&cfg); err != nil && err != io.EOF {
 		return nil, fmt.Errorf("parse config: %w", err)
+	}
+
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err != nil {
+			return nil, fmt.Errorf("parse config: %w", err)
+		}
+		return nil, fmt.Errorf("parse config: multiple YAML documents are not allowed")
 	}
 
 	return &cfg, nil

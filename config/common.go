@@ -25,16 +25,18 @@ func (l Listen) GetIP() (net.IP, error) {
 	return ip, nil
 }
 
+// Quic is nested under client quic and inlined in each server listener in YAML.
 type Quic struct {
-	InitialStreamReceiveWindow     uint64
-	MaxStreamReceiveWindow         uint64
-	InitialConnectionReceiveWindow uint64
-	MaxConnectionReceiveWindow     uint64
-	MaxIncomingStreams             int64
-	KeepAlivePeriod                time.Duration
-	HandshakeIdleTimeout           time.Duration
-	MaxIdleTimeout                 time.Duration
-	Allow0RTT                      bool
+	InitialStreamReceiveWindow     uint64        `yaml:"initial_stream_receive_window"`
+	MaxStreamReceiveWindow         uint64        `yaml:"max_stream_receive_window"`
+	InitialConnectionReceiveWindow uint64        `yaml:"initial_connection_receive_window"`
+	MaxConnectionReceiveWindow     uint64        `yaml:"max_connection_receive_window"`
+	MaxIncomingStreams             int64         `yaml:"max_incoming_streams"`
+	KeepAlivePeriod                time.Duration `yaml:"keep_alive_period"`
+	HandshakeIdleTimeout           time.Duration `yaml:"handshake_idle_timeout"`
+	MaxIdleTimeout                 time.Duration `yaml:"max_idle_timeout"`
+	// Allow0RTT is passed to quic-go; QMux currently does not use 0-RTT application data.
+	Allow0RTT bool `yaml:"allow_0rtt"`
 }
 
 func (q Quic) GetConfig() *quic.Config {

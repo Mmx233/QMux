@@ -67,9 +67,8 @@ func TestServerAuth_YAMLParsing_EmptyMethod(t *testing.T) {
 func TestServerAuth_YAMLParsing_FullServerConfig(t *testing.T) {
 	// Test parsing full server config with auth section
 	content := `listeners:
-  - host: "0.0.0.0"
-    port: 8443
-    traffic_port: 8080
+  - quic_addr: "0.0.0.0:8443"
+    traffic_addr: "0.0.0.0:8080"
     protocol: "tcp"
 auth:
   method: "mtls"
@@ -88,6 +87,9 @@ tls:
 	}
 	if server.Auth.CACertFile != "./certs/ca.crt" {
 		t.Errorf("expected Auth.CACertFile './certs/ca.crt', got %q", server.Auth.CACertFile)
+	}
+	if len(server.Listeners) != 1 || server.Listeners[0].QuicAddr != "0.0.0.0:8443" || server.Listeners[0].TrafficAddr != "0.0.0.0:8080" {
+		t.Fatalf("unexpected listener: %+v", server.Listeners)
 	}
 }
 
