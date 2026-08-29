@@ -92,10 +92,6 @@ func NewManager(conf *config.Server, pools map[string]*pool.ConnectionPool, logg
 				copied := *value
 				configs[i].UDP.EnableFragmentation = &copied
 			}
-			if value := configs[i].UDP.EnableBufferPooling; value != nil {
-				copied := *value
-				configs[i].UDP.EnableBufferPooling = &copied
-			}
 		}
 	}
 	return &Manager{

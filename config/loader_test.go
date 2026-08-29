@@ -194,6 +194,85 @@ func TestLoadConfigRejectsLegacyQUICKeys(t *testing.T) {
 	}
 }
 
+func TestLoadConfigRejectsRemovedUDPKeys(t *testing.T) {
+	removed := []struct {
+		key   string
+		value string
+	}{
+		{"fragment_assembler_shards", "16"},
+		{"enable_buffer_pooling", "true"},
+		{"read_buffer_size", "65535"},
+		{"datagram_buffer_size", "1200"},
+	}
+
+	for _, field := range removed {
+		for _, target := range []struct {
+			name    string
+			content string
+			load    func(string) error
+		}{
+			{"client", fmt.Sprintf("udp:\n  %s: %s\n", field.key, field.value), func(path string) error {
+				_, err := LoadConfig[Client](path)
+				return err
+			}},
+			{"server", fmt.Sprintf("listeners:\n  - udp:\n      %s: %s\n", field.key, field.value), func(path string) error {
+				_, err := LoadConfig[Server](path)
+				return err
+			}},
+		} {
+			t.Run(target.name+"_"+field.key, func(t *testing.T) {
+				err := target.load(writeTestConfig(t, target.content))
+				if err == nil || !strings.Contains(err.Error(), field.key) {
+					t.Fatalf("LoadConfig error = %v, want rejection for %s", err, field.key)
+				}
+			})
+		}
+	}
+}
+
+func TestLoadConfigUDPFragmentation(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		for _, target := range []struct {
+			name    string
+			content string
+			load    func(string) (UDPConfig, error)
+		}{
+			{"client", fmt.Sprintf("udp:\n  enable_fragmentation: %t\n", enabled), func(path string) (UDPConfig, error) {
+				cfg, err := LoadConfig[Client](path)
+				if err != nil {
+					return UDPConfig{}, err
+				}
+				return cfg.UDP, nil
+			}},
+			{"server", fmt.Sprintf("listeners:\n  - udp:\n      enable_fragmentation: %t\n", enabled), func(path string) (UDPConfig, error) {
+				cfg, err := LoadConfig[Server](path)
+				if err != nil {
+					return UDPConfig{}, err
+				}
+				return cfg.Listeners[0].UDP, nil
+			}},
+		} {
+			t.Run(fmt.Sprintf("%s_%t", target.name, enabled), func(t *testing.T) {
+				udp, err := target.load(writeTestConfig(t, target.content))
+				if err != nil {
+					t.Fatalf("LoadConfig: %v", err)
+				}
+				if udp.EnableFragmentation == nil || *udp.EnableFragmentation != enabled {
+					t.Fatalf("enable_fragmentation = %v, want %t", udp.EnableFragmentation, enabled)
+				}
+			})
+		}
+	}
+
+	cfg, err := LoadConfig[Client](writeTestConfig(t, "{}\n"))
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if !cfg.UDP.IsFragmentationEnabled() {
+		t.Fatal("omitted enable_fragmentation did not default to true")
+	}
+}
+
 func testQuicConfig() Quic {
 	return Quic{
 		InitialStreamReceiveWindow:     1024,

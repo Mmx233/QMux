@@ -135,23 +135,19 @@ func TestManagerEmptyLifecycleAndStableStartErrors(t *testing.T) {
 
 func TestNewManagerSnapshotsListeners(t *testing.T) {
 	fragmentation := true
-	bufferPooling := false
 	conf := &config.Server{Listeners: []config.QuicListener{{
 		QuicAddr:    "quic-original",
 		TrafficAddr: "127.0.0.1:8080",
 		Protocol:    "tcp",
 		UDP: config.UDPConfig{
 			EnableFragmentation: &fragmentation,
-			EnableBufferPooling: &bufferPooling,
 		},
 	}}}
 	manager := NewManager(conf, nil, zerolog.Nop())
 	conf.Listeners[0].QuicAddr = "quic-mutated"
 	fragmentation = false
-	bufferPooling = true
 	if manager.configs[0].QuicAddr != "quic-original" ||
-		!*manager.configs[0].UDP.EnableFragmentation ||
-		*manager.configs[0].UDP.EnableBufferPooling {
+		!*manager.configs[0].UDP.EnableFragmentation {
 		t.Fatal("manager retained caller-owned listener slice")
 	}
 }

@@ -21,6 +21,7 @@ func TestServerConfigTemplateFields(t *testing.T) {
 	content, err := examples.ServerConfig()
 	require.NoError(t, err, "failed to load server config template")
 	assertCanonicalQUICKeys(t, string(content))
+	assertUDPTemplateKeys(t, string(content))
 
 	var cfg config.Server
 	decoder := yaml.NewDecoder(bytes.NewReader(content))
@@ -49,6 +50,10 @@ func TestServerConfigTemplateFields(t *testing.T) {
 		"heartbeat_interval should match DefaultHeartbeatInterval")
 	assert.Equal(t, config.DefaultHealthTimeout, cfg.HealthTimeout,
 		"health_timeout should match DefaultHealthTimeout")
+
+	uncommented := decodeUncommentedUDP[config.Server](t, string(content))
+	require.NotNil(t, uncommented.Listeners[0].UDP.EnableFragmentation)
+	assert.True(t, *uncommented.Listeners[0].UDP.EnableFragmentation)
 }
 
 // TestClientConfigTemplateFields verifies that the embedded client.yaml template:
@@ -60,6 +65,7 @@ func TestClientConfigTemplateFields(t *testing.T) {
 	content, err := examples.ClientConfig()
 	require.NoError(t, err, "failed to load client config template")
 	assertCanonicalQUICKeys(t, string(content))
+	assertUDPTemplateKeys(t, string(content))
 
 	var cfg config.Client
 	decoder := yaml.NewDecoder(bytes.NewReader(content))
@@ -83,6 +89,10 @@ func TestClientConfigTemplateFields(t *testing.T) {
 	// Verify defaults match config/defaults.go
 	assert.Equal(t, config.DefaultHeartbeatInterval, cfg.HeartbeatInterval,
 		"heartbeat_interval should match DefaultHeartbeatInterval")
+
+	uncommented := decodeUncommentedUDP[config.Client](t, string(content))
+	require.NotNil(t, uncommented.UDP.EnableFragmentation)
+	assert.True(t, *uncommented.UDP.EnableFragmentation)
 }
 
 func assertCanonicalQUICKeys(t *testing.T, content string) {
@@ -105,4 +115,30 @@ func assertCanonicalQUICKeys(t *testing.T, content string) {
 	for _, key := range legacy {
 		assert.False(t, strings.Contains(content, key+":"), "template should not contain legacy QUIC key %q", key)
 	}
+}
+
+func assertUDPTemplateKeys(t *testing.T, content string) {
+	t.Helper()
+	if !strings.Contains(content, "enable_fragmentation:") {
+		t.Error("template should contain enable_fragmentation")
+	}
+	for _, key := range []string{"fragment_assembler_shards", "enable_buffer_pooling", "read_buffer_size", "datagram_buffer_size"} {
+		if strings.Contains(content, key+":") {
+			t.Errorf("template should not contain removed UDP key %q", key)
+		}
+	}
+}
+
+func decodeUncommentedUDP[T any](t *testing.T, content string) T {
+	t.Helper()
+	const commented = "# enable_fragmentation: true"
+	if strings.Count(content, commented) != 1 {
+		t.Fatalf("template should contain one commented enable_fragmentation setting")
+	}
+	content = strings.Replace(content, commented, "enable_fragmentation: true", 1)
+	var cfg T
+	decoder := yaml.NewDecoder(strings.NewReader(content))
+	decoder.KnownFields(true)
+	require.NoError(t, decoder.Decode(&cfg), "uncommented enable_fragmentation should strict-decode")
+	return cfg
 }

@@ -20,12 +20,6 @@ const (
 	// DefaultMaxIdleTimeout is the default QUIC connection idle timeout
 	DefaultMaxIdleTimeout = 5 * time.Minute
 
-	// DefaultReadBufferSize is the default size for UDP read buffers (max UDP packet size)
-	DefaultReadBufferSize = 65535
-
-	// DefaultDatagramBufferSize is the default size for QUIC datagram buffers
-	DefaultDatagramBufferSize = 1200
-
 	// DefaultLoadBalancer is the default load balancing algorithm
 	DefaultLoadBalancer = "least-connections"
 )

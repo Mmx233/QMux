@@ -258,10 +258,6 @@ func cloneListeners(listeners []config.QuicListener) []config.QuicListener {
 			copied := *value
 			cloned[i].UDP.EnableFragmentation = &copied
 		}
-		if value := listeners[i].UDP.EnableBufferPooling; value != nil {
-			copied := *value
-			cloned[i].UDP.EnableBufferPooling = &copied
-		}
 	}
 	return cloned
 }

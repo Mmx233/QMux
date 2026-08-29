@@ -64,25 +64,6 @@ type UDPConfig struct {
 	// QUIC datagrams and reassembled on the other side.
 	// Default: true
 	EnableFragmentation *bool `yaml:"enable_fragmentation"`
-
-	// FragmentAssemblerShards is the number of shards for the fragment assembler.
-	// Higher values reduce lock contention but use more memory.
-	// Default: 16
-	FragmentAssemblerShards int `yaml:"fragment_assembler_shards"`
-
-	// EnableBufferPooling enables buffer pooling for UDP operations.
-	// Default: true
-	EnableBufferPooling *bool `yaml:"enable_buffer_pooling"`
-
-	// ReadBufferSize is the size of the UDP read buffer in bytes.
-	// This should be large enough to receive any UDP packet.
-	// Default: 65535 (maximum UDP packet size)
-	ReadBufferSize int `yaml:"read_buffer_size"`
-
-	// DatagramBufferSize is the size of QUIC datagram buffers in bytes.
-	// This is typically set to the QUIC max datagram size.
-	// Default: 1200
-	DatagramBufferSize int `yaml:"datagram_buffer_size"`
 }
 
 // IsFragmentationEnabled returns whether UDP fragmentation is enabled.
@@ -92,42 +73,4 @@ func (u *UDPConfig) IsFragmentationEnabled() bool {
 		return true // Default enabled
 	}
 	return *u.EnableFragmentation
-}
-
-// GetFragmentAssemblerShards returns the configured shard count or default
-func (u *UDPConfig) GetFragmentAssemblerShards() int {
-	if u.FragmentAssemblerShards <= 0 {
-		return 16
-	}
-	return u.FragmentAssemblerShards
-}
-
-// IsBufferPoolingEnabled returns whether buffer pooling is enabled
-func (u *UDPConfig) IsBufferPoolingEnabled() bool {
-	if u.EnableBufferPooling == nil {
-		return true // Default enabled
-	}
-	return *u.EnableBufferPooling
-}
-
-// GetReadBufferSize returns the configured read buffer size or default
-func (u *UDPConfig) GetReadBufferSize() int {
-	if u.ReadBufferSize <= 0 {
-		return DefaultReadBufferSize
-	}
-	return u.ReadBufferSize
-}
-
-// GetDatagramBufferSize returns the configured datagram buffer size or default
-func (u *UDPConfig) GetDatagramBufferSize() int {
-	if u.DatagramBufferSize <= 0 {
-		return DefaultDatagramBufferSize
-	}
-	return u.DatagramBufferSize
-}
-
-// GetFragmentBufferSize returns the fragment buffer size calculated from datagram size.
-// Fragment buffer = datagram size - 9 bytes (fragment header)
-func (u *UDPConfig) GetFragmentBufferSize() int {
-	return u.GetDatagramBufferSize() - 9
 }

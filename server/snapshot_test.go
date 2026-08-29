@@ -69,31 +69,27 @@ func TestNewValidatesListenersBeforeCertificates(t *testing.T) {
 
 func TestCloneListenersOwnsBooleanPointers(t *testing.T) {
 	fragmentation := true
-	pooling := false
 	original := []config.QuicListener{
 		{
 			QuicAddr: "127.0.0.1:8443",
 			UDP: config.UDPConfig{
 				EnableFragmentation: &fragmentation,
-				EnableBufferPooling: &pooling,
 			},
 		},
 		{QuicAddr: "127.0.0.1:8444"},
 	}
 
 	cloned := cloneListeners(original)
-	if cloned[0].UDP.EnableFragmentation == original[0].UDP.EnableFragmentation ||
-		cloned[0].UDP.EnableBufferPooling == original[0].UDP.EnableBufferPooling {
+	if cloned[0].UDP.EnableFragmentation == original[0].UDP.EnableFragmentation {
 		t.Fatal("clone retained caller-owned boolean pointers")
 	}
-	if cloned[1].UDP.EnableFragmentation != nil || cloned[1].UDP.EnableBufferPooling != nil {
+	if cloned[1].UDP.EnableFragmentation != nil {
 		t.Fatal("clone did not preserve nil boolean pointers")
 	}
 
 	fragmentation = false
-	pooling = true
 	original[0].QuicAddr = "mutated"
-	if !*cloned[0].UDP.EnableFragmentation || *cloned[0].UDP.EnableBufferPooling || cloned[0].QuicAddr != "127.0.0.1:8443" {
+	if !*cloned[0].UDP.EnableFragmentation || cloned[0].QuicAddr != "127.0.0.1:8443" {
 		t.Fatal("caller mutation changed cloned listeners")
 	}
 }
