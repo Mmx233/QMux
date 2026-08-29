@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"errors"
 	"sync"
 	"testing"
 )
@@ -89,7 +90,7 @@ func TestTCPAdmissionPendingBoundConcurrentAndStaleLease(t *testing.T) {
 				return
 			}
 			lease, err := admission.Next()
-			if err != nil {
+			if err != nil && !errors.Is(err, ErrTCPGenerationCapacity) {
 				t.Errorf("Next() error = %v", err)
 				return
 			}
@@ -131,6 +132,65 @@ func TestTCPAdmissionPendingBoundConcurrentAndStaleLease(t *testing.T) {
 	if stale.tcpPending.Load() != 0 || stale.ActiveConns.Load() != 0 || current.tcpPending.Load() != 0 || current.ActiveConns.Load() != 0 {
 		t.Fatalf("final stale pending/active=%d/%d current pending/active=%d/%d, want all zero", stale.tcpPending.Load(), stale.ActiveConns.Load(), current.tcpPending.Load(), current.ActiveConns.Load())
 	}
+}
+
+func TestTCPAdmissionExhaustionReasons(t *testing.T) {
+	p := New("test", NewLeastConnectionsBalancer(), newTestLogger())
+	defer p.Stop()
+	client := addTCPAdmissionClient(t, p, "client", "tcp")
+
+	capacity, err := p.BeginTCPAdmission()
+	if err != nil {
+		t.Fatalf("BeginTCPAdmission(capacity) error = %v", err)
+	}
+	client.tcpPending.Store(maxPendingTCPSetupsPerClient)
+	if lease, err := capacity.Next(); lease != nil || !errors.Is(err, ErrTCPGenerationCapacity) {
+		t.Fatalf("capacity Next() = (%v, %v), want ErrTCPGenerationCapacity", lease, err)
+	}
+
+	client.tcpPending.Store(0)
+	stale, err := p.BeginTCPAdmission()
+	if err != nil {
+		t.Fatalf("BeginTCPAdmission(stale) error = %v", err)
+	}
+	if !p.Remove(client) {
+		t.Fatal("Remove(stale client) = false")
+	}
+	if lease, err := stale.Next(); lease != nil || err != nil {
+		t.Fatalf("stale Next() = (%v, %v), want nil exhaustion", lease, err)
+	}
+	client = addTCPAdmissionClient(t, p, "client", "tcp")
+
+	unavailable, err := p.BeginTCPAdmission()
+	if err != nil {
+		t.Fatalf("BeginTCPAdmission(unavailable) error = %v", err)
+	}
+	if !p.MarkUnhealthy(client) {
+		t.Fatal("MarkUnhealthy(client) = false")
+	}
+	if lease, err := unavailable.Next(); lease != nil || err != nil {
+		t.Fatalf("unavailable Next() = (%v, %v), want nil exhaustion", lease, err)
+	}
+
+	if !p.MarkHealthy(client) {
+		t.Fatal("MarkHealthy(client) = false")
+	}
+	cursor, err := p.BeginTCPAdmission()
+	if err != nil {
+		t.Fatalf("BeginTCPAdmission(cursor) error = %v", err)
+	}
+	lease, err := cursor.Next()
+	if err != nil || lease == nil {
+		t.Fatalf("first cursor Next() = (%v, %v), want lease", lease, err)
+	}
+	if !lease.Release() {
+		t.Fatal("Release(cursor lease) = false")
+	}
+	client.tcpPending.Store(maxPendingTCPSetupsPerClient)
+	if lease, err := cursor.Next(); lease != nil || err != nil {
+		t.Fatalf("exhausted cursor Next() = (%v, %v), want nil exhaustion", lease, err)
+	}
+	client.tcpPending.Store(0)
 }
 
 func TestTCPAdmissionLeastConnectionsSelectionAndReservationAreAtomic(t *testing.T) {

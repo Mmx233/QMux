@@ -394,8 +394,9 @@ func (p *ConnectionPool) BeginTCPAdmission() (*TCPAdmission, error) {
 
 // Next reserves the next still-current candidate. The first call selects and
 // reserves under one pool lock; later calls walk the same snapshot without
-// invoking the balancer again. A nil lease means the snapshot is exhausted or
-// every remaining generation is saturated.
+// invoking the balancer again. ErrTCPGenerationCapacity means at least one
+// remaining current generation was saturated; a nil lease means the snapshot
+// was otherwise exhausted.
 func (a *TCPAdmission) Next() (*TCPLease, error) {
 	if a == nil || a.pool == nil {
 		return nil, nil
@@ -431,16 +432,23 @@ func (a *TCPAdmission) Next() (*TCPLease, error) {
 		return nil, a.balanceErr
 	}
 
+	atCapacity := false
 	for a.next < len(a.candidates) {
 		conn := a.candidates[a.next]
 		a.next++
 
-		if a.pool.isCurrentLocked(conn) &&
-			isEligible(conn, "tcp") &&
-			conn.tcpPending.Load() < maxPendingTCPSetupsPerClient {
-			conn.tcpPending.Add(1)
-			return &TCPLease{pool: a.pool, conn: conn, state: tcpLeasePending}, nil
+		if !a.pool.isCurrentLocked(conn) || !isEligible(conn, "tcp") {
+			continue
 		}
+		if conn.tcpPending.Load() >= maxPendingTCPSetupsPerClient {
+			atCapacity = true
+			continue
+		}
+		conn.tcpPending.Add(1)
+		return &TCPLease{pool: a.pool, conn: conn, state: tcpLeasePending}, nil
+	}
+	if atCapacity {
+		return nil, ErrTCPGenerationCapacity
 	}
 	return nil, nil
 }
@@ -644,5 +652,6 @@ var (
 	ErrNoClientsAvailable    = fmt.Errorf("no clients available in pool")
 	ErrNoHealthyClients      = fmt.Errorf("no healthy clients available")
 	ErrNoEligibleClients     = fmt.Errorf("no eligible clients available")
+	ErrTCPGenerationCapacity = fmt.Errorf("all eligible TCP generations are at setup capacity")
 	ErrUDPGenerationCapacity = fmt.Errorf("all eligible UDP generations are at capacity")
 )

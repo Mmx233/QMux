@@ -56,6 +56,7 @@ type RouteSnapshot struct {
 	Listening          bool
 	TCPEligibleClients int
 	UDPEligibleClients int
+	TCPAdmission       traffic.TCPAdmissionSnapshot
 	Ready              bool
 }
 
@@ -286,16 +287,23 @@ func (s *Server) Start(ctx context.Context) error {
 // race-free but intentionally not globally linearizable across route pools.
 func (s *Server) Snapshot() Snapshot {
 	listening := s.trafficManager != nil && s.trafficManager.Running()
+	var tcpAdmission []traffic.TCPAdmissionSnapshot
+	if s.trafficManager != nil {
+		tcpAdmission = s.trafficManager.TCPAdmissionSnapshots()
+	}
 	snapshot := Snapshot{
 		Routes: make([]RouteSnapshot, 0, len(s.config.Listeners)),
 		Ready:  len(s.config.Listeners) > 0,
 	}
-	for _, listener := range s.config.Listeners {
+	for i, listener := range s.config.Listeners {
 		route := RouteSnapshot{
 			QuicAddr:    listener.QuicAddr,
 			TrafficAddr: listener.TrafficAddr,
 			Protocol:    listener.Protocol,
 			Listening:   listening,
+		}
+		if i < len(tcpAdmission) {
+			route.TCPAdmission = tcpAdmission[i]
 		}
 		if connectionPool := s.pools[listener.QuicAddr]; connectionPool != nil {
 			switch listener.Protocol {

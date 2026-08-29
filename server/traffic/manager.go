@@ -77,6 +77,7 @@ type Listener struct {
 	flowsClosing    bool
 	flows           map[*tcpFlow]struct{}
 	tcpSetupSlots   chan struct{}
+	tcpAdmission    tcpAdmissionStats
 	udpSessionLimit int
 	udpSessionSlots chan struct{}
 	udpHandler      *UDPHandler
@@ -205,6 +206,24 @@ func (m *Manager) Running() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.state == managerRunning && m.runCtx != nil && m.runCtx.Err() == nil
+}
+
+// TCPAdmissionSnapshots returns value-only TCP admission state aligned with
+// the configured listener order.
+func (m *Manager) TCPAdmissionSnapshots() []TCPAdmissionSnapshot {
+	m.mu.Lock()
+	listeners := slices.Clone(m.listeners)
+	count := len(m.configs)
+	m.mu.Unlock()
+
+	snapshots := make([]TCPAdmissionSnapshot, count)
+	for i, listener := range listeners {
+		if i == count {
+			break
+		}
+		snapshots[i] = listener.tcpAdmission.snapshot()
+	}
+	return snapshots
 }
 
 func (m *Manager) validate(configs []config.QuicListener) error {

@@ -1,9 +1,11 @@
 package server
 
 import (
+	"net"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Mmx233/QMux/config"
 	"github.com/Mmx233/QMux/server/pool"
@@ -192,6 +194,90 @@ func TestSnapshotConcurrentHealthUpdates(t *testing.T) {
 		}
 	})
 	wg.Wait()
+}
+
+func TestSnapshotCopiesTCPAdmissionDuringConcurrentReads(t *testing.T) {
+	address := freeSnapshotTCPAddress(t)
+	listeners := []config.QuicListener{{QuicAddr: "route", TrafficAddr: address, Protocol: "tcp"}}
+	srv := newSnapshotTestServer(t, listeners)
+	if err := srv.trafficManager.Start(t.Context()); err != nil {
+		t.Fatalf("start traffic manager: %v", err)
+	}
+	defer srv.trafficManager.Stop()
+
+	dialSnapshotRejectedTCP(t, address)
+	waitForSnapshotUnavailable(t, srv, 1)
+	first := srv.Snapshot()
+	if got := first.Routes[0].TCPAdmission; got.Unavailable != 1 || got.SetupCurrent != 0 || got.ActiveCurrent != 0 {
+		t.Fatalf("first TCP admission snapshot = %+v", got)
+	}
+
+	dialSnapshotRejectedTCP(t, address)
+	waitForSnapshotUnavailable(t, srv, 2)
+	if got := first.Routes[0].TCPAdmission.Unavailable; got != 1 {
+		t.Fatalf("previous value snapshot changed to unavailable=%d, want 1", got)
+	}
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for range 1_000 {
+			snapshot := srv.Snapshot()
+			if len(snapshot.Routes) != 1 {
+				t.Errorf("route snapshots = %d, want 1", len(snapshot.Routes))
+				return
+			}
+		}
+	})
+	wg.Go(func() {
+		for range 32 {
+			dialSnapshotRejectedTCP(t, address)
+		}
+	})
+	wg.Wait()
+	waitForSnapshotUnavailable(t, srv, 34)
+	if got := srv.Snapshot().Routes[0].TCPAdmission; got.SetupCurrent != 0 || got.ActiveCurrent != 0 || got.Unavailable != 34 {
+		t.Fatalf("final TCP admission snapshot = %+v", got)
+	}
+}
+
+func freeSnapshotTCPAddress(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("allocate snapshot TCP address: %v", err)
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatalf("release snapshot TCP address: %v", err)
+	}
+	return address
+}
+
+func dialSnapshotRejectedTCP(t *testing.T, address string) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", address, time.Second)
+	if err != nil {
+		t.Fatalf("dial snapshot TCP listener: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set snapshot TCP deadline: %v", err)
+	}
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("unavailable snapshot TCP connection remained open")
+	}
+}
+
+func waitForSnapshotUnavailable(t *testing.T, srv *Server, want uint64) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := srv.Snapshot().Routes[0].TCPAdmission.Unavailable; got == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("TCP unavailable terminals = %d, want %d", srv.Snapshot().Routes[0].TCPAdmission.Unavailable, want)
 }
 
 func newSnapshotTestServer(t *testing.T, listeners []config.QuicListener) *Server {
