@@ -144,12 +144,14 @@ func TestTCPAdmissionCapacityBurstRecovery(t *testing.T) {
 		}
 		snapshot = waitSTAB007Settled(t, serverRun, stab007HeldFlows, 15*time.Second)
 		accepted := stab007TerminalTotal(snapshot) - stab007TerminalTotal(before)
+		listenerCapacity := snapshot.ListenerCapacity - before.ListenerCapacity
 		peerLimit := snapshot.PeerStreamLimit - before.PeerStreamLimit
 		generationCapacity := snapshot.GenerationCapacity - before.GenerationCapacity
 		if connected != extra || verified != 0 || accepted != uint64(extra) ||
-			peerLimit+generationCapacity != uint64(extra) || workload == 101 && (peerLimit != 1 || generationCapacity != 0) {
-			t.Fatalf("workload %d extra connected/verified/terminal/peer-limit/generation-capacity = %d/%d/%d/%d/%d, want %d/0/%d/reconciled; snapshot=%+v",
-				workload, connected, verified, accepted, peerLimit, generationCapacity, extra, extra, snapshot)
+			listenerCapacity+peerLimit+generationCapacity != uint64(extra) ||
+			workload == 101 && (listenerCapacity != 0 || peerLimit != 1 || generationCapacity != 0) {
+			t.Fatalf("workload %d extra connected/verified/terminal/listener/peer-limit/generation-capacity = %d/%d/%d/%d/%d/%d, want %d/0/%d/reconciled; snapshot=%+v",
+				workload, connected, verified, accepted, listenerCapacity, peerLimit, generationCapacity, extra, extra, snapshot)
 		}
 		result.Points = append(result.Points, sampleSTAB007Point(t, sampler, resourceProcess,
 			workload, stab007HeldFlows+connected, stab007HeldFlows+verified, extra-connected, snapshot))
