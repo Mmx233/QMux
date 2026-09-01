@@ -14,6 +14,20 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
+type causeObservedContext struct {
+	context.Context
+	observed chan<- struct{}
+}
+
+func (c causeObservedContext) Value(key any) any {
+	// context.Cause reads Value only after Shutdown selects the caller cancellation.
+	select {
+	case c.observed <- struct{}{}:
+	default:
+	}
+	return c.Context.Value(key)
+}
+
 func acceptanceRuntime(t *testing.T, c *Client, address string) *connectionRuntime {
 	t.Helper()
 	var found *connectionRuntime
@@ -278,7 +292,11 @@ func TestShutdownBlockedDrainWriteCallerArbitration(t *testing.T) {
 	wantB := errors.New("caller B deadline")
 	ctxB, cancelB := context.WithCancelCause(context.Background())
 	cancelB(wantB)
-	callerBDone := callClientLifecycle(func() error { return c.Shutdown(ctxB) })
+	callerBSelected := make(chan struct{}, 1)
+	callerBDone := callClientLifecycle(func() error {
+		return c.Shutdown(causeObservedContext{Context: ctxB, observed: callerBSelected})
+	})
+	awaitLifecycle(t, callerBSelected, "caller B cancellation selection")
 	close(releaseWrite)
 
 	if err := awaitClientLifecycle(t, backgroundDone, "background Shutdown arbitration"); !errors.Is(err, wantA) {

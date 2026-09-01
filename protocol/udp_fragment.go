@@ -48,13 +48,6 @@ var (
 	ErrFragmentationDisabled   = errors.New("fragmentation disabled, packet too large")
 )
 
-// ErrSessionIDMismatch is retained for source compatibility.
-//
-// Deprecated: fragment groups are keyed by session ID; this error is retained for compatibility.
-//
-//goland:noinspection GoUnusedGlobalVariable
-var ErrSessionIDMismatch = errors.New("session ID mismatch")
-
 // UDPDatagram is a validated UDP wire v2 datagram.
 // Payload aliases the input passed to DecodeUDPDatagram.
 type UDPDatagram struct {
@@ -728,16 +721,6 @@ func DecodeUDPDatagram(dgram []byte) (UDPDatagram, error) {
 	default:
 		return UDPDatagram{}, ErrUnknownDatagramType
 	}
-}
-
-// ParseUDPDatagram is the compatibility adapter for the original tuple API.
-// New code should use DecodeUDPDatagram so fields cannot be confused at call sites.
-func ParseUDPDatagram(dgram []byte) (uint32, bool, uint16, uint8, uint8, []byte, error) {
-	parsed, err := DecodeUDPDatagram(dgram)
-	if err != nil {
-		return 0, false, 0, 0, 0, nil, err
-	}
-	return parsed.SessionID, parsed.IsFragmented, parsed.FragmentID, parsed.FragmentIndex, parsed.FragmentTotal, parsed.Payload, nil
 }
 
 // DecodeAndAssembleUDPDatagram validates a UDP wire v2 datagram and, when needed,

@@ -198,11 +198,6 @@ func ReadTypedMessageLimited(r io.Reader, expectedType byte, msg any, maxPayload
 	return DecodeMessage(payload, msg)
 }
 
-// WriteRegister writes a registration message
-func WriteRegister(w io.Writer, clientID, version string, capabilities []string) error {
-	return WriteRegisterWithAuth(w, clientID, version, capabilities, nil)
-}
-
 // WriteRegisterWithAuth writes a registration message with an optional
 // authentication proof.
 func WriteRegisterWithAuth(w io.Writer, clientID, version string, capabilities []string, auth *RegisterAuth) error {
@@ -213,11 +208,6 @@ func WriteRegisterWithAuth(w io.Writer, clientID, version string, capabilities [
 		Auth:         auth,
 	}
 	return WriteMessage(w, MsgTypeRegister, msg)
-}
-
-// WriteRegisterAck writes a registration acknowledgment
-func WriteRegisterAck(w io.Writer, success bool, message, serverVersion string, selectedCapabilities []string) error {
-	return WriteRegisterAckWithAuth(w, success, message, serverVersion, selectedCapabilities, "")
 }
 
 // WriteRegisterAckWithAuth writes a registration acknowledgment that echoes

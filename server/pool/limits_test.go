@@ -212,8 +212,8 @@ func TestTCPGenerationLimitsReasonsPhasesAndRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginTCPAdmission(over-cap) error = %v", err)
 	}
-	if lease, err := admission.Next(); lease != nil || !errors.Is(err, ErrTCPGenerationConnectionCapacity) || !errors.Is(err, ErrTCPGenerationCapacity) || errors.Is(err, ErrTCPGenerationSetupCapacity) {
-		t.Fatalf("Next(over-cap) = (%v, %v), want connection-capacity umbrella", lease, err)
+	if lease, err := admission.Next(); lease != nil || !errors.Is(err, ErrTCPGenerationConnectionCapacity) || errors.Is(err, ErrTCPGenerationSetupCapacity) {
+		t.Fatalf("Next(over-cap) = (%v, %v), want connection capacity", lease, err)
 	}
 	if got := p.Snapshot().TCPConnectionsPerGeneration; got != (LimitSnapshot{Current: 2, HighWater: 2, Limit: 2, CapacityDrops: 1}) {
 		t.Fatalf("TCP connections = %+v", got)
@@ -240,8 +240,8 @@ func TestTCPGenerationLimitsReasonsPhasesAndRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginTCPAdmission(setup-cap) error = %v", err)
 	}
-	if lease, err := setupAdmission.Next(); lease != nil || !errors.Is(err, ErrTCPGenerationSetupCapacity) || !errors.Is(err, ErrTCPGenerationCapacity) || errors.Is(err, ErrTCPGenerationConnectionCapacity) {
-		t.Fatalf("Next(setup-cap) = (%v, %v), want setup-capacity umbrella", lease, err)
+	if lease, err := setupAdmission.Next(); lease != nil || !errors.Is(err, ErrTCPGenerationSetupCapacity) || errors.Is(err, ErrTCPGenerationConnectionCapacity) {
+		t.Fatalf("Next(setup-cap) = (%v, %v), want setup capacity", lease, err)
 	}
 	if got := setupPool.Snapshot().PendingTCPSetupsPerGeneration; got != (LimitSnapshot{Current: 1, HighWater: 1, Limit: 1, CapacityDrops: 1}) {
 		t.Fatalf("pending TCP setups = %+v", got)

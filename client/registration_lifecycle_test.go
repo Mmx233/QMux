@@ -257,12 +257,13 @@ func assertLifecycleUnpublished(t *testing.T, cm *ConnectionManager) {
 }
 
 func writeSuccessfulLifecycleAck(stream *quic.Stream) error {
-	return protocol.WriteRegisterAck(
+	return protocol.WriteRegisterAckWithAuth(
 		stream,
 		true,
 		"registered",
 		protocol.ProtocolVersion,
 		config.DefaultCapabilities,
+		"",
 	)
 }
 
@@ -684,12 +685,13 @@ func TestRegistrationLifecycleStopInterruptsStalledAck(t *testing.T) {
 	serverDone := peer.serveRegistration(func(_ *quic.Conn, stream *quic.Stream, _ protocol.RegisterMsg) error {
 		close(ready)
 		<-releaseAck
-		_ = protocol.WriteRegisterAck(
+		_ = protocol.WriteRegisterAckWithAuth(
 			stream,
 			true,
 			"late acknowledgment",
 			protocol.ProtocolVersion,
 			config.DefaultCapabilities,
+			"",
 		)
 		close(ackAttempted)
 		return nil
@@ -754,12 +756,13 @@ func TestRegistrationLifecycleTruncatedAckClosesAttemptAndRedials(t *testing.T) 
 			firstDone := peer.serveRegistration(func(conn *quic.Conn, stream *quic.Stream, _ protocol.RegisterMsg) error {
 				accepted <- conn
 				var wire bytes.Buffer
-				if err := protocol.WriteRegisterAck(
+				if err := protocol.WriteRegisterAckWithAuth(
 					&wire,
 					true,
 					"registered",
 					protocol.ProtocolVersion,
 					config.DefaultCapabilities,
+					"",
 				); err != nil {
 					return err
 				}
@@ -1064,12 +1067,13 @@ func TestRegistrationLifecycleRepeatedFailuresCloseProvisionalConnections(t *tes
 		accepted := make(chan *quic.Conn, 1)
 		serverDone := peer.serveRegistration(func(conn *quic.Conn, stream *quic.Stream, _ protocol.RegisterMsg) error {
 			accepted <- conn
-			if err := protocol.WriteRegisterAck(
+			if err := protocol.WriteRegisterAckWithAuth(
 				stream,
 				false,
 				"test rejection",
 				protocol.ProtocolVersion,
 				nil,
+				"",
 			); err != nil {
 				return err
 			}

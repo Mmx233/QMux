@@ -28,13 +28,14 @@ func TestTrafficConnectionFatalRetiresRegistrationForSameID(t *testing.T) {
 	const clientID = "retired-client-id"
 	registerTCPClient := func() {
 		controlStream := harness.openStream(t)
-		if err := protocol.WriteRegister(
+		if err := protocol.WriteRegisterWithAuth(
 			controlStream,
 			clientID,
 			protocol.ProtocolVersion,
 			[]string{"tcp", protocol.CapabilityUDPWireV2},
+			nil,
 		); err != nil {
-			t.Fatalf("WriteRegister() error = %v", err)
+			t.Fatalf("WriteRegisterWithAuth() error = %v", err)
 		}
 		var ack protocol.RegisterAckMsg
 		if err := protocol.ReadTypedMessage(controlStream, protocol.MsgTypeRegisterAck, &ack); err != nil {
@@ -217,9 +218,9 @@ func TestStaleControlHeartbeatRetiresOnlyItsGeneration(t *testing.T) {
 func registerDrainClient(t *testing.T, harness *registrationHarness, clientID string) *quic.Stream {
 	t.Helper()
 	stream := harness.openStream(t)
-	if err := protocol.WriteRegister(stream, clientID, protocol.ProtocolVersion,
-		[]string{"tcp", protocol.CapabilityUDPWireV2, protocol.CapabilityTCPDrainV1}); err != nil {
-		t.Fatalf("WriteRegister() error = %v", err)
+	if err := protocol.WriteRegisterWithAuth(stream, clientID, protocol.ProtocolVersion,
+		[]string{"tcp", protocol.CapabilityUDPWireV2, protocol.CapabilityTCPDrainV1}, nil); err != nil {
+		t.Fatalf("WriteRegisterWithAuth() error = %v", err)
 	}
 	var ack protocol.RegisterAckMsg
 	if err := protocol.ReadTypedMessage(stream, protocol.MsgTypeRegisterAck, &ack); err != nil {

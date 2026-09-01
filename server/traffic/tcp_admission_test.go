@@ -3,7 +3,6 @@ package traffic
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -303,33 +302,6 @@ func tcpTerminalTotal(snapshot TCPAdmissionSnapshot) uint64 {
 	return snapshot.Committed + snapshot.FlowCapacity + snapshot.ListenerCapacity + snapshot.Unavailable +
 		snapshot.GenerationConnectionCapacity + snapshot.GenerationSetupCapacity + snapshot.PeerStreamLimit +
 		snapshot.Deadline + snapshot.SetupFailure + snapshot.Canceled
-}
-
-func TestTCPAdmissionSnapshotGenerationCapacityCompatibility(t *testing.T) {
-	var stats tcpAdmissionStats
-	stats.finish(tcpTerminalGenerationConnectionCapacity)
-	stats.finish(tcpTerminalGenerationConnectionCapacity)
-	stats.finish(tcpTerminalGenerationSetupCapacity)
-
-	snapshot := stats.snapshot()
-	// Verify the deprecated aggregate remains compatible with the split fields.
-	//goland:noinspection GoDeprecation
-	if snapshot.GenerationConnectionCapacity != 2 || snapshot.GenerationSetupCapacity != 1 ||
-		snapshot.GenerationCapacity != 3 {
-		t.Fatalf("generation capacity snapshot = %+v, want split 2/1 and aggregate 3", snapshot)
-	}
-
-	data, err := json.Marshal(snapshot)
-	if err != nil {
-		t.Fatalf("marshal TCP admission snapshot: %v", err)
-	}
-	var fields map[string]uint64
-	if err := json.Unmarshal(data, &fields); err != nil {
-		t.Fatalf("unmarshal TCP admission snapshot: %v", err)
-	}
-	if value, ok := fields["GenerationCapacity"]; !ok || value != 3 {
-		t.Fatalf("GenerationCapacity JSON field = (%d, %v), want (3, true): %s", value, ok, data)
-	}
 }
 
 func TestTCPFlowSnapshotTracksOwnedSockets(t *testing.T) {

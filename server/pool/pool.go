@@ -616,9 +616,8 @@ func (p *ConnectionPool) BeginTCPAdmission() (*TCPAdmission, error) {
 
 // Next reserves the next still-current candidate. The first call selects and
 // reserves under one pool lock; later calls walk the same snapshot without
-// invoking the balancer again. ErrTCPGenerationCapacity wraps the exact total
-// connection or pending-setup limit reached; a nil lease means the snapshot was
-// otherwise exhausted.
+// invoking the balancer again. A nil lease means the snapshot was otherwise
+// exhausted.
 func (a *TCPAdmission) Next() (*TCPLease, error) {
 	if a == nil || a.pool == nil {
 		return nil, nil
@@ -950,8 +949,7 @@ var (
 	ErrAccountingFault                 = fmt.Errorf("connection pool accounting fault")
 	ErrPendingRegistrationCapacity     = fmt.Errorf("pending client registration capacity reached")
 	ErrClientGenerationCapacity        = fmt.Errorf("client generation capacity reached")
-	ErrTCPGenerationCapacity           = fmt.Errorf("all eligible TCP generations are at capacity")
-	ErrTCPGenerationConnectionCapacity = fmt.Errorf("%w: connection limit reached", ErrTCPGenerationCapacity)
-	ErrTCPGenerationSetupCapacity      = fmt.Errorf("%w: pending setup limit reached", ErrTCPGenerationCapacity)
+	ErrTCPGenerationConnectionCapacity = fmt.Errorf("all eligible TCP generations are at connection capacity")
+	ErrTCPGenerationSetupCapacity      = fmt.Errorf("all eligible TCP generations are at pending setup capacity")
 	ErrUDPGenerationCapacity           = fmt.Errorf("all eligible UDP generations are at capacity")
 )

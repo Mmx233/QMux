@@ -731,13 +731,14 @@ func (h *registrationHarness) openStream(t *testing.T) *quic.Stream {
 func registerMTLSClient(t *testing.T, harness *registrationHarness, clientID string) *quic.Stream {
 	t.Helper()
 	stream := harness.openStream(t)
-	if err := protocol.WriteRegister(
+	if err := protocol.WriteRegisterWithAuth(
 		stream,
 		clientID,
 		protocol.ProtocolVersion,
 		[]string{protocol.CapabilityUDPWireV2},
+		nil,
 	); err != nil {
-		t.Fatalf("WriteRegister() error = %v", err)
+		t.Fatalf("WriteRegisterWithAuth() error = %v", err)
 	}
 	var ack protocol.RegisterAckMsg
 	if err := protocol.ReadTypedMessage(stream, protocol.MsgTypeRegisterAck, &ack); err != nil {

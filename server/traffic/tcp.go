@@ -26,28 +26,22 @@ var errNoTCPStreamCapacity = errors.New("no TCP stream capacity")
 
 // TCPAdmissionSnapshot is a point-in-time, value-only view of one listener's
 // TCP setup and relay admission state.
-//
-//goland:noinspection GoDeprecation
 type TCPAdmissionSnapshot struct {
-	FlowLimit           int64
-	FlowCurrent         int64
-	FlowHighWater       int64
-	SetupLimit          int64
-	SetupCurrent        int64
-	SetupHighWater      int64
-	ActiveCurrent       int64
-	ActiveHighWater     int64
-	Attempts            uint64
-	Retries             uint64
-	StreamLimitAttempts uint64
-	Committed           uint64
-	FlowCapacity        uint64
-	ListenerCapacity    uint64
-	Unavailable         uint64
-	// GenerationCapacity remains for public and JSON compatibility.
-	//
-	// Deprecated: use GenerationConnectionCapacity and GenerationSetupCapacity.
-	GenerationCapacity           uint64
+	FlowLimit                    int64
+	FlowCurrent                  int64
+	FlowHighWater                int64
+	SetupLimit                   int64
+	SetupCurrent                 int64
+	SetupHighWater               int64
+	ActiveCurrent                int64
+	ActiveHighWater              int64
+	Attempts                     uint64
+	Retries                      uint64
+	StreamLimitAttempts          uint64
+	Committed                    uint64
+	FlowCapacity                 uint64
+	ListenerCapacity             uint64
+	Unavailable                  uint64
 	GenerationConnectionCapacity uint64
 	GenerationSetupCapacity      uint64
 	PeerStreamLimit              uint64
@@ -97,10 +91,6 @@ type tcpAdmissionStats struct {
 func (s *tcpAdmissionStats) snapshot() TCPAdmissionSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	generationConnectionCapacity := s.generationConnectionCapacity.Load()
-	generationSetupCapacity := s.generationSetupCapacity.Load()
-	// Preserve the deprecated aggregate for public and JSON compatibility.
-	//goland:noinspection GoDeprecation
 	return TCPAdmissionSnapshot{
 		FlowCurrent:                  s.flowCurrent.Load(),
 		FlowHighWater:                s.flowHighWater.Load(),
@@ -115,9 +105,8 @@ func (s *tcpAdmissionStats) snapshot() TCPAdmissionSnapshot {
 		FlowCapacity:                 s.flowCapacity.Load(),
 		ListenerCapacity:             s.listenerCapacity.Load(),
 		Unavailable:                  s.unavailable.Load(),
-		GenerationCapacity:           generationConnectionCapacity + generationSetupCapacity,
-		GenerationConnectionCapacity: generationConnectionCapacity,
-		GenerationSetupCapacity:      generationSetupCapacity,
+		GenerationConnectionCapacity: s.generationConnectionCapacity.Load(),
+		GenerationSetupCapacity:      s.generationSetupCapacity.Load(),
 		PeerStreamLimit:              s.peerStreamLimit.Load(),
 		Deadline:                     s.deadline.Load(),
 		SetupFailure:                 s.setupFailure.Load(),

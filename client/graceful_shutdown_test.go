@@ -73,8 +73,8 @@ func TestClientShutdownUnsupportedPeerSendsNoDrain(t *testing.T) {
 	peer := newLifecycleStartPeer(t)
 	drainSeen := make(chan struct{}, 1)
 	serverDone := peer.serveRegistration(func(conn *quic.Conn, stream *quic.Stream, _ protocol.RegisterMsg) error {
-		if err := protocol.WriteRegisterAck(stream, true, "registered", protocol.ProtocolVersion,
-			[]string{"tcp", "udp", protocol.CapabilityUDPWireV2}); err != nil {
+		if err := protocol.WriteRegisterAckWithAuth(stream, true, "registered", protocol.ProtocolVersion,
+			[]string{"tcp", "udp", protocol.CapabilityUDPWireV2}, ""); err != nil {
 			return err
 		}
 		for {
@@ -326,8 +326,8 @@ func TestShutdownIsolatesUnsupportedPeerWhileSupportedPeerDrains(t *testing.T) {
 	unsupportedDrain := make(chan struct{}, 1)
 	unsupportedClosed := make(chan struct{})
 	unsupportedDone := unsupportedPeer.serveRegistration(func(conn *quic.Conn, stream *quic.Stream, _ protocol.RegisterMsg) error {
-		if err := protocol.WriteRegisterAck(stream, true, "registered", protocol.ProtocolVersion,
-			[]string{"tcp", "udp", protocol.CapabilityUDPWireV2}); err != nil {
+		if err := protocol.WriteRegisterAckWithAuth(stream, true, "registered", protocol.ProtocolVersion,
+			[]string{"tcp", "udp", protocol.CapabilityUDPWireV2}, ""); err != nil {
 			return err
 		}
 		for {

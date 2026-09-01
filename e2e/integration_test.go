@@ -124,7 +124,10 @@ func assertTCPEcho(t testing.TB, addr string, data []byte) {
 
 func startTestServer(ctx context.Context, cfg *config.Server) {
 	go func() {
-		_ = server.Start(ctx, cfg)
+		srv, err := server.New(cfg)
+		if err == nil {
+			_ = srv.Start(ctx)
+		}
 	}()
 }
 
@@ -137,7 +140,11 @@ func startTestClient(ctx context.Context, c *client.Client) {
 func startTestServerReporting(ctx context.Context, cfg *config.Server) <-chan error {
 	errCh := make(chan error, 1)
 	go func() {
-		if err := server.Start(ctx, cfg); err != nil && !errors.Is(err, context.Canceled) {
+		srv, err := server.New(cfg)
+		if err == nil {
+			err = srv.Start(ctx)
+		}
+		if err != nil && !errors.Is(err, context.Canceled) {
 			errCh <- err
 		}
 	}()

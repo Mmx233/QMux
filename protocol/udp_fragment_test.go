@@ -133,20 +133,20 @@ func TestFragmentUDP_SmallPacket(t *testing.T) {
 	}
 
 	// Parse and verify
-	sessionID, isFragmented, _, _, _, payload, err := ParseUDPDatagram(datagrams[0])
+	parsed, err := DecodeUDPDatagram(datagrams[0])
 	if err != nil {
 		t.Fatalf("parse error: %v", err)
 	}
 
-	if sessionID != 12345 {
-		t.Errorf("expected session ID 12345, got %d", sessionID)
+	if parsed.SessionID != 12345 {
+		t.Errorf("expected session ID 12345, got %d", parsed.SessionID)
 	}
 
-	if isFragmented {
+	if parsed.IsFragmented {
 		t.Error("small packet should not be fragmented")
 	}
 
-	if !bytes.Equal(payload, data) {
+	if !bytes.Equal(parsed.Payload, data) {
 		t.Error("payload mismatch")
 	}
 }
@@ -158,24 +158,24 @@ func assertFragmentsReassemble(t *testing.T, datagrams [][]byte, expected []byte
 	var result []byte
 
 	for i, datagram := range datagrams {
-		sessionID, isFragmented, fragID, fragIndex, fragTotal, payload, err := ParseUDPDatagram(datagram)
+		parsed, err := DecodeUDPDatagram(datagram)
 		if err != nil {
 			t.Fatalf("parse error on fragment %d: %v", i, err)
 		}
-		if sessionID != 12345 {
-			t.Errorf("fragment %d: expected session ID 12345, got %d", i, sessionID)
+		if parsed.SessionID != 12345 {
+			t.Errorf("fragment %d: expected session ID 12345, got %d", i, parsed.SessionID)
 		}
-		if !isFragmented {
+		if !parsed.IsFragmented {
 			t.Errorf("fragment %d: expected fragmented flag", i)
 		}
-		if int(fragTotal) != len(datagrams) {
-			t.Errorf("fragment %d: expected total %d, got %d", i, len(datagrams), fragTotal)
+		if int(parsed.FragmentTotal) != len(datagrams) {
+			t.Errorf("fragment %d: expected total %d, got %d", i, len(datagrams), parsed.FragmentTotal)
 		}
-		if int(fragIndex) != i {
-			t.Errorf("fragment %d: expected index %d, got %d", i, i, fragIndex)
+		if int(parsed.FragmentIndex) != i {
+			t.Errorf("fragment %d: expected index %d, got %d", i, i, parsed.FragmentIndex)
 		}
 
-		result, err = assembler.AddFragment(sessionID, fragID, fragIndex, fragTotal, payload)
+		result, err = assembler.AddFragment(parsed.SessionID, parsed.FragmentID, parsed.FragmentIndex, parsed.FragmentTotal, parsed.Payload)
 		if err != nil {
 			t.Fatalf("add fragment error: %v", err)
 		}
@@ -240,12 +240,12 @@ func TestFragmentUDP_MaxSize(t *testing.T) {
 		t.Fatalf("expected 1 datagram for max unfragmented size, got %d", len(datagrams))
 	}
 
-	_, isFragmented, _, _, _, payload, _ := ParseUDPDatagram(datagrams[0])
-	if isFragmented {
+	parsed, _ := DecodeUDPDatagram(datagrams[0])
+	if parsed.IsFragmented {
 		t.Error("packet at max unfragmented size should not be fragmented")
 	}
 
-	if !bytes.Equal(payload, data) {
+	if !bytes.Equal(parsed.Payload, data) {
 		t.Error("payload mismatch")
 	}
 }
@@ -272,8 +272,8 @@ func TestFragmentUDP_JustOverMaxSize(t *testing.T) {
 	var result []byte
 
 	for _, dgram := range datagrams {
-		sessionID, _, fID, fIndex, fTotal, payload, _ := ParseUDPDatagram(dgram)
-		result, _ = assembler.AddFragment(sessionID, fID, fIndex, fTotal, payload)
+		parsed, _ := DecodeUDPDatagram(dgram)
+		result, _ = assembler.AddFragment(parsed.SessionID, parsed.FragmentID, parsed.FragmentIndex, parsed.FragmentTotal, parsed.Payload)
 	}
 
 	if !bytes.Equal(result, data) {
@@ -296,9 +296,9 @@ func TestFragmentAssembler_OutOfOrder(t *testing.T) {
 	var result []byte
 
 	for _, datagram := range slices.Backward(datagrams) {
-		_, _, fID, fIndex, fTotal, payload, _ := ParseUDPDatagram(datagram)
+		parsed, _ := DecodeUDPDatagram(datagram)
 		var err error
-		result, err = assembler.AddFragment(12345, fID, fIndex, fTotal, payload)
+		result, err = assembler.AddFragment(12345, parsed.FragmentID, parsed.FragmentIndex, parsed.FragmentTotal, parsed.Payload)
 		if err != nil {
 			t.Fatalf("add fragment error: %v", err)
 		}
@@ -343,14 +343,14 @@ func TestFragmentAssembler_DuplicateFragment(t *testing.T) {
 	assembler := NewFragmentAssembler()
 
 	// Add first fragment twice
-	_, _, fID, fIndex, fTotal, payload, _ := ParseUDPDatagram(datagrams[0])
-	assertDuplicateFragmentIgnored(t, assembler.AddFragment, 12345, fID, fIndex, fTotal, payload)
+	parsed, _ := DecodeUDPDatagram(datagrams[0])
+	assertDuplicateFragmentIgnored(t, assembler.AddFragment, 12345, parsed.FragmentID, parsed.FragmentIndex, parsed.FragmentTotal, parsed.Payload)
 
 	// Add remaining fragments
 	var result []byte
 	for i := 1; i < len(datagrams); i++ {
-		_, _, fID, fIndex, fTotal, payload, _ := ParseUDPDatagram(datagrams[i])
-		result, _ = assembler.AddFragment(12345, fID, fIndex, fTotal, payload)
+		parsed, _ := DecodeUDPDatagram(datagrams[i])
+		result, _ = assembler.AddFragment(12345, parsed.FragmentID, parsed.FragmentIndex, parsed.FragmentTotal, parsed.Payload)
 	}
 
 	if result == nil {
@@ -379,8 +379,8 @@ func TestFragmentAssembler_MissingFragment(t *testing.T) {
 		if i == 1 {
 			continue // Skip this fragment
 		}
-		_, _, fID, fIndex, fTotal, payload, _ := ParseUDPDatagram(dgram)
-		result, _ := assembler.AddFragment(12345, fID, fIndex, fTotal, payload)
+		parsed, _ := DecodeUDPDatagram(dgram)
+		result, _ := assembler.AddFragment(12345, parsed.FragmentID, parsed.FragmentIndex, parsed.FragmentTotal, parsed.Payload)
 		if result != nil {
 			t.Error("should not complete with missing fragment")
 		}
@@ -449,8 +449,8 @@ func TestFragmentAssembler_Timeout(t *testing.T) {
 	assembler.mu.Unlock()
 }
 
-func TestParseUDPDatagram_TooShort(t *testing.T) {
-	_, _, _, _, _, _, err := ParseUDPDatagram([]byte{1, 2, 3})
+func TestDecodeUDPDatagram_TooShort(t *testing.T) {
+	_, err := DecodeUDPDatagram([]byte{1, 2, 3})
 	if !errors.Is(err, ErrDatagramTooShort) {
 		t.Errorf("expected ErrDatagramTooShort, got %v", err)
 	}
@@ -518,8 +518,8 @@ func BenchmarkFragmentAssembler_Reassemble(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		assembler := NewFragmentAssembler()
 		for _, dgram := range datagrams {
-			_, _, fID, fIndex, fTotal, payload, _ := ParseUDPDatagram(dgram)
-			_, _ = assembler.AddFragment(12345, fID, fIndex, fTotal, payload)
+			parsed, _ := DecodeUDPDatagram(dgram)
+			_, _ = assembler.AddFragment(12345, parsed.FragmentID, parsed.FragmentIndex, parsed.FragmentTotal, parsed.Payload)
 		}
 	}
 }
@@ -610,20 +610,20 @@ func TestFragmentUDPPooled_SmallPacket(t *testing.T) {
 	}
 
 	// Parse and verify
-	sessionID, isFragmented, _, _, _, payload, err := ParseUDPDatagram(results[0].Data)
+	parsed, err := DecodeUDPDatagram(results[0].Data)
 	if err != nil {
 		t.Fatalf("parse error: %v", err)
 	}
 
-	if sessionID != 12345 {
-		t.Errorf("expected session ID 12345, got %d", sessionID)
+	if parsed.SessionID != 12345 {
+		t.Errorf("expected session ID 12345, got %d", parsed.SessionID)
 	}
 
-	if isFragmented {
+	if parsed.IsFragmented {
 		t.Error("small packet should not be fragmented")
 	}
 
-	if !bytes.Equal(payload, data) {
+	if !bytes.Equal(parsed.Payload, data) {
 		t.Error("payload mismatch")
 	}
 }
@@ -686,12 +686,12 @@ func TestFragmentUDPPooled_MaxSize(t *testing.T) {
 		t.Fatalf("expected 1 result for max unfragmented size, got %d", len(results))
 	}
 
-	_, isFragmented, _, _, _, payload, _ := ParseUDPDatagram(results[0].Data)
-	if isFragmented {
+	parsed, _ := DecodeUDPDatagram(results[0].Data)
+	if parsed.IsFragmented {
 		t.Error("packet at max unfragmented size should not be fragmented")
 	}
 
-	if !bytes.Equal(payload, data) {
+	if !bytes.Equal(parsed.Payload, data) {
 		t.Error("payload mismatch")
 	}
 }
@@ -719,8 +719,8 @@ func TestFragmentUDPPooled_JustOverMaxSize(t *testing.T) {
 	var result []byte
 
 	for _, r := range results {
-		sessionID, _, fID, fIndex, fTotal, payload, _ := ParseUDPDatagram(r.Data)
-		result, _ = assembler.AddFragment(sessionID, fID, fIndex, fTotal, payload)
+		parsed, _ := DecodeUDPDatagram(r.Data)
+		result, _ = assembler.AddFragment(parsed.SessionID, parsed.FragmentID, parsed.FragmentIndex, parsed.FragmentTotal, parsed.Payload)
 	}
 
 	if !bytes.Equal(result, data) {
@@ -753,7 +753,7 @@ func TestFragmentUDPPooled_AtomicCounterIncrement(t *testing.T) {
 	defer ReleaseDatagramResults(results1)
 
 	// Get fragment ID from first result
-	_, _, fragID1, _, _, _, _ := ParseUDPDatagram(results1[0].Data)
+	first, _ := DecodeUDPDatagram(results1[0].Data)
 
 	// Second call
 	results2, err := FragmentUDPPooled(12345, data, &fragIDCounter, true)
@@ -763,15 +763,15 @@ func TestFragmentUDPPooled_AtomicCounterIncrement(t *testing.T) {
 	defer ReleaseDatagramResults(results2)
 
 	// Get fragment ID from second result
-	_, _, fragID2, _, _, _, _ := ParseUDPDatagram(results2[0].Data)
+	second, _ := DecodeUDPDatagram(results2[0].Data)
 
 	// Fragment IDs should be different and incrementing
-	if fragID1 == fragID2 {
-		t.Errorf("expected different fragment IDs, both got %d", fragID1)
+	if first.FragmentID == second.FragmentID {
+		t.Errorf("expected different fragment IDs, both got %d", first.FragmentID)
 	}
 
-	if fragID2 != fragID1+1 {
-		t.Errorf("expected fragID2 (%d) to be fragID1+1 (%d)", fragID2, fragID1+1)
+	if second.FragmentID != first.FragmentID+1 {
+		t.Errorf("expected fragID2 (%d) to be fragID1+1 (%d)", second.FragmentID, first.FragmentID+1)
 	}
 }
 
@@ -796,21 +796,21 @@ func TestFragmentUDPPooled_EmptyData(t *testing.T) {
 	}
 
 	// Parse and verify
-	sessionID, isFragmented, _, _, _, payload, err := ParseUDPDatagram(results[0].Data)
+	parsed, err := DecodeUDPDatagram(results[0].Data)
 	if err != nil {
 		t.Fatalf("parse error: %v", err)
 	}
 
-	if sessionID != 12345 {
-		t.Errorf("expected session ID 12345, got %d", sessionID)
+	if parsed.SessionID != 12345 {
+		t.Errorf("expected session ID 12345, got %d", parsed.SessionID)
 	}
 
-	if isFragmented {
+	if parsed.IsFragmented {
 		t.Error("empty packet should not be fragmented")
 	}
 
-	if len(payload) != 0 {
-		t.Errorf("expected empty payload, got %d bytes", len(payload))
+	if len(parsed.Payload) != 0 {
+		t.Errorf("expected empty payload, got %d bytes", len(parsed.Payload))
 	}
 }
 
@@ -1001,12 +1001,12 @@ func TestShardedFragmentAssembler_AddFragment_InOrder(t *testing.T) {
 	var result []byte
 
 	for i, r := range results {
-		sessionID, _, fID, fIndex, fTotal, payload, err := ParseUDPDatagram(r.Data)
+		parsed, err := DecodeUDPDatagram(r.Data)
 		if err != nil {
 			t.Fatalf("parse error on fragment %d: %v", i, err)
 		}
 
-		result, err = sfa.AddFragment(sessionID, fID, fIndex, fTotal, payload)
+		result, err = sfa.AddFragment(parsed.SessionID, parsed.FragmentID, parsed.FragmentIndex, parsed.FragmentTotal, parsed.Payload)
 		if err != nil {
 			t.Fatalf("add fragment error: %v", err)
 		}
@@ -1044,8 +1044,8 @@ func TestShardedFragmentAssembler_AddFragment_OutOfOrder(t *testing.T) {
 
 	// Receive in reverse order
 	for _, datagram := range slices.Backward(results) {
-		_, _, fID, fIndex, fTotal, payload, _ := ParseUDPDatagram(datagram.Data)
-		result, err = sfa.AddFragment(12345, fID, fIndex, fTotal, payload)
+		parsed, _ := DecodeUDPDatagram(datagram.Data)
+		result, err = sfa.AddFragment(12345, parsed.FragmentID, parsed.FragmentIndex, parsed.FragmentTotal, parsed.Payload)
 		if err != nil {
 			t.Fatalf("add fragment error: %v", err)
 		}
@@ -1077,14 +1077,14 @@ func TestShardedFragmentAssembler_AddFragment_DuplicateFragment(t *testing.T) {
 	sfa := NewShardedFragmentAssembler(16)
 
 	// Add first fragment twice
-	_, _, fID, fIndex, fTotal, payload, _ := ParseUDPDatagram(results[0].Data)
-	assertDuplicateFragmentIgnored(t, sfa.AddFragment, 12345, fID, fIndex, fTotal, payload)
+	parsed, _ := DecodeUDPDatagram(results[0].Data)
+	assertDuplicateFragmentIgnored(t, sfa.AddFragment, 12345, parsed.FragmentID, parsed.FragmentIndex, parsed.FragmentTotal, parsed.Payload)
 
 	// Add remaining fragments
 	var result []byte
 	for i := 1; i < len(results); i++ {
-		_, _, fID, fIndex, fTotal, payload, _ := ParseUDPDatagram(results[i].Data)
-		result, _ = sfa.AddFragment(12345, fID, fIndex, fTotal, payload)
+		parsed, _ := DecodeUDPDatagram(results[i].Data)
+		result, _ = sfa.AddFragment(12345, parsed.FragmentID, parsed.FragmentIndex, parsed.FragmentTotal, parsed.Payload)
 	}
 
 	if result == nil {
@@ -1133,8 +1133,8 @@ func TestShardedFragmentAssembler_AddFragment_MissingFragment(t *testing.T) {
 		if i == 1 {
 			continue // Skip this fragment
 		}
-		_, _, fID, fIndex, fTotal, payload, _ := ParseUDPDatagram(r.Data)
-		result, _ := sfa.AddFragment(12345, fID, fIndex, fTotal, payload)
+		parsed, _ := DecodeUDPDatagram(r.Data)
+		result, _ := sfa.AddFragment(12345, parsed.FragmentID, parsed.FragmentIndex, parsed.FragmentTotal, parsed.Payload)
 		if result != nil {
 			t.Error("should not complete with missing fragment")
 		}
@@ -1369,8 +1369,8 @@ func BenchmarkShardedFragmentAssembler_AddFragment(b *testing.B) {
 	}
 	frags := make([]parsedFrag, len(results))
 	for i, r := range results {
-		sessionID, _, fID, fIndex, fTotal, payload, _ := ParseUDPDatagram(r.Data)
-		frags[i] = parsedFrag{sessionID, fID, fIndex, fTotal, payload}
+		parsed, _ := DecodeUDPDatagram(r.Data)
+		frags[i] = parsedFrag{parsed.SessionID, parsed.FragmentID, parsed.FragmentIndex, parsed.FragmentTotal, parsed.Payload}
 	}
 
 	b.ResetTimer()
@@ -1393,8 +1393,8 @@ func BenchmarkShardedFragmentAssembler_Reassemble(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		sfa := NewShardedFragmentAssembler(16)
 		for _, dgram := range datagrams {
-			_, _, fID, fIndex, fTotal, payload, _ := ParseUDPDatagram(dgram)
-			_, _ = sfa.AddFragment(12345, fID, fIndex, fTotal, payload)
+			parsed, _ := DecodeUDPDatagram(dgram)
+			_, _ = sfa.AddFragment(12345, parsed.FragmentID, parsed.FragmentIndex, parsed.FragmentTotal, parsed.Payload)
 		}
 	}
 }
@@ -1429,12 +1429,12 @@ func makeConcurrentBenchmarkFragmentSets(tb testing.TB) [][]concurrentBenchmarkF
 			defer ReleaseDatagramResults(results)
 			fragments := make([]concurrentBenchmarkFragment, len(results))
 			for i, result := range results {
-				sessionID, _, fragID, fragIndex, fragTotal, payload, err := ParseUDPDatagram(result.Data)
+				parsed, err := DecodeUDPDatagram(result.Data)
 				if err != nil {
 					tb.Fatalf("parse benchmark set %d fragment %d: %v", setIdx, i, err)
 				}
-				payloadCopy := append([]byte(nil), payload...)
-				fragments[i] = concurrentBenchmarkFragment{sessionID, fragID, fragIndex, fragTotal, payloadCopy}
+				payloadCopy := append([]byte(nil), parsed.Payload...)
+				fragments[i] = concurrentBenchmarkFragment{parsed.SessionID, parsed.FragmentID, parsed.FragmentIndex, parsed.FragmentTotal, payloadCopy}
 			}
 			fragmentSets[setIdx] = fragments
 		}()

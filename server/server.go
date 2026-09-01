@@ -289,15 +289,6 @@ func cloneListeners(listeners []config.QuicListener) []config.QuicListener {
 	return cloned
 }
 
-// Start creates and runs a server for backward compatibility.
-func Start(ctx context.Context, conf *config.Server) error {
-	srv, err := New(conf)
-	if err != nil {
-		return err
-	}
-	return srv.Start(ctx)
-}
-
 // Start runs the server until cancellation or a component failure.
 func (s *Server) Start(ctx context.Context) error {
 	defer func() {

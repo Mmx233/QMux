@@ -647,13 +647,6 @@ func (sc *ServerConnection) waitControl() {
 
 // --- Connection Lifecycle Methods ---
 
-// Register sends an mTLS registration message to the server and waits for acknowledgment.
-// It is retained as the source-compatible wrapper for callers using the default
-// authentication mode.
-func (sc *ServerConnection) Register(ctx context.Context, clientID string) error {
-	return sc.RegisterWithAuth(ctx, clientID, config.ClientAuth{Method: config.ClientAuthMethodMTLS})
-}
-
 // RegisterWithAuth sends a registration message to the server and waits for acknowledgment.
 // The context governs opening the stream, writing the registration, and reading and
 // validating the acknowledgment. A Background context has no registration deadline;
@@ -807,10 +800,6 @@ func registrationIOError(ctx context.Context, operation string, err error) error
 		return fmt.Errorf("%s: %w: %w", operation, context.DeadlineExceeded, err)
 	}
 	return fmt.Errorf("%s: %w", operation, err)
-}
-
-func (sc *ServerConnection) acceptRegisterAck(ack protocol.RegisterAckMsg) error {
-	return protocol.ValidateRegisterAck(ack)
 }
 
 func (sc *ServerConnection) acceptRegisterAckWithAuth(ack protocol.RegisterAckMsg, expectedAuthScheme string) error {

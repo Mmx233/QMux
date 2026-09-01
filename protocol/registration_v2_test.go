@@ -58,7 +58,7 @@ func TestValidateRegisterAckCompatibilityMatrix(t *testing.T) {
 func TestWriteRegisterAckIncludesNegotiation(t *testing.T) {
 	var wire bytes.Buffer
 	wantCaps := []string{"tcp", CapabilityUDPWireV2}
-	if err := WriteRegisterAck(&wire, true, "registered", ProtocolVersion, wantCaps); err != nil {
+	if err := WriteRegisterAckWithAuth(&wire, true, "registered", ProtocolVersion, wantCaps, ""); err != nil {
 		t.Fatal(err)
 	}
 

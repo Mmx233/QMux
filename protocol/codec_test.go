@@ -293,7 +293,7 @@ func BenchmarkDecodeMessage(b *testing.B) {
 
 // BenchmarkTypedMessages benchmarks each typed message writer function
 func BenchmarkTypedMessages(b *testing.B) {
-	b.Run("WriteRegister", func(b *testing.B) {
+	b.Run("WriteRegisterWithAuth", func(b *testing.B) {
 		var buf bytes.Buffer
 		buf.Grow(256)
 
@@ -302,8 +302,8 @@ func BenchmarkTypedMessages(b *testing.B) {
 
 		for i := 0; i < b.N; i++ {
 			buf.Reset()
-			if err := WriteRegister(&buf, "client-12345", ProtocolVersion, config.DefaultCapabilities); err != nil {
-				b.Fatalf("WriteRegister failed: %v", err)
+			if err := WriteRegisterWithAuth(&buf, "client-12345", ProtocolVersion, config.DefaultCapabilities, nil); err != nil {
+				b.Fatalf("WriteRegisterWithAuth failed: %v", err)
 			}
 		}
 	})

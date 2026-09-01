@@ -88,12 +88,13 @@ func TestTokenRegistrationRequiresExactSchemeEcho(t *testing.T) {
 		if err := verifyTokenRegistration(conn, registration); err != nil {
 			return err
 		}
-		return protocol.WriteRegisterAck(
+		return protocol.WriteRegisterAckWithAuth(
 			stream,
 			true,
 			"registered without a scheme echo",
 			protocol.ProtocolVersion,
 			config.DefaultCapabilities,
+			"",
 		)
 	})
 

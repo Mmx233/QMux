@@ -7,45 +7,6 @@ import (
 	"testing"
 )
 
-func TestLegacyRegistrationWritersPreserveWireBytes(t *testing.T) {
-	tests := []struct {
-		name    string
-		msgType byte
-		payload string
-		write   func(*bytes.Buffer) error
-	}{
-		{
-			name:    "register",
-			msgType: MsgTypeRegister,
-			payload: `{"ClientID":"client-a","Version":"2.0","Capabilities":["tcp","udp-wire-v2"]}`,
-			write: func(w *bytes.Buffer) error {
-				return WriteRegister(w, "client-a", "2.0", []string{"tcp", "udp-wire-v2"})
-			},
-		},
-		{
-			name:    "ack",
-			msgType: MsgTypeRegisterAck,
-			payload: `{"Success":true,"Message":"registered","ServerVersion":"2.0","SelectedCapabilities":["tcp","udp-wire-v2"]}`,
-			write: func(w *bytes.Buffer) error {
-				return WriteRegisterAck(w, true, "registered", "2.0", []string{"tcp", "udp-wire-v2"})
-			},
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			var got bytes.Buffer
-			if err := test.write(&got); err != nil {
-				t.Fatalf("write message: %v", err)
-			}
-			want := frame(test.msgType, []byte(test.payload))
-			if !bytes.Equal(got.Bytes(), want) {
-				t.Fatalf("wire changed\n got: %s\nwant: %s", got.Bytes()[5:], want[5:])
-			}
-		})
-	}
-}
-
 func TestAdditiveAuthFieldsRemainDecoderCompatible(t *testing.T) {
 	t.Run("register", func(t *testing.T) {
 		var wire bytes.Buffer

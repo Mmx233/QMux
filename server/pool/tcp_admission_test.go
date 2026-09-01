@@ -180,7 +180,7 @@ func TestTCPAdmissionPendingBoundConcurrentAndStaleLease(t *testing.T) {
 				return
 			}
 			lease, err := admission.Next()
-			if err != nil && !errors.Is(err, ErrTCPGenerationCapacity) {
+			if err != nil && !errors.Is(err, ErrTCPGenerationSetupCapacity) {
 				t.Errorf("Next() error = %v", err)
 				return
 			}

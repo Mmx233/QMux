@@ -29,18 +29,18 @@ func reassemblePropertyResults(t *rapid.T, sessionID uint32, results []DatagramR
 	assembler := NewFragmentAssembler()
 	var reassembled []byte
 	for _, i := range order {
-		parsedSessionID, isFragmented, fragID, fragIndex, fragTotal, payload, err := ParseUDPDatagram(results[i].Data)
+		parsed, err := DecodeUDPDatagram(results[i].Data)
 		if err != nil {
-			t.Fatalf("ParseUDPDatagram failed for fragment %d: %v", i, err)
+			t.Fatalf("DecodeUDPDatagram failed for fragment %d: %v", i, err)
 		}
-		if !isFragmented {
+		if !parsed.IsFragmented {
 			t.Errorf("Fragment %d is not marked as fragmented", i)
 		}
-		if checkSession && parsedSessionID != sessionID {
-			t.Errorf("Fragment %d has session ID %d, expected %d", i, parsedSessionID, sessionID)
+		if checkSession && parsed.SessionID != sessionID {
+			t.Errorf("Fragment %d has session ID %d, expected %d", i, parsed.SessionID, sessionID)
 		}
 
-		assembled, err := assembler.AddFragment(parsedSessionID, fragID, fragIndex, fragTotal, payload)
+		assembled, err := assembler.AddFragment(parsed.SessionID, parsed.FragmentID, parsed.FragmentIndex, parsed.FragmentTotal, parsed.Payload)
 		if err != nil {
 			t.Fatalf("AddFragment failed for fragment %d: %v", i, err)
 		}
@@ -94,10 +94,10 @@ func collectConcurrentFragmentIDs(
 						continue
 					}
 					if len(results) > 0 {
-						_, isFragmented, fragID, _, _, _, parseErr := ParseUDPDatagram(results[0].Data)
-						if parseErr == nil && isFragmented {
+						parsed, parseErr := DecodeUDPDatagram(results[0].Data)
+						if parseErr == nil && parsed.IsFragmented {
 							mu.Lock()
-							collected[counterIndex] = append(collected[counterIndex], fragID)
+							collected[counterIndex] = append(collected[counterIndex], parsed.FragmentID)
 							mu.Unlock()
 						}
 					}
@@ -590,24 +590,24 @@ func TestConcurrentFragmentCorrectness_Property(t *testing.T) {
 
 		for pktIdx, pkt := range packets {
 			for _, result := range pkt.results {
-				parsedSessionID, isFragmented, fragID, fragIndex, fragTotal, payload, err := ParseUDPDatagram(result.Data)
+				parsed, err := DecodeUDPDatagram(result.Data)
 				if err != nil {
-					t.Fatalf("ParseUDPDatagram failed: %v", err)
+					t.Fatalf("DecodeUDPDatagram failed: %v", err)
 				}
-				if !isFragmented {
+				if !parsed.IsFragmented {
 					t.Fatal("Expected fragmented packet")
 				}
 
 				// Make a copy of payload since we'll release the buffers
-				payloadCopy := make([]byte, len(payload))
-				copy(payloadCopy, payload)
+				payloadCopy := make([]byte, len(parsed.Payload))
+				copy(payloadCopy, parsed.Payload)
 
 				allFragments = append(allFragments, fragmentInfo{
 					packetIdx: pktIdx,
-					sessionID: parsedSessionID,
-					fragID:    fragID,
-					fragIndex: fragIndex,
-					fragTotal: fragTotal,
+					sessionID: parsed.SessionID,
+					fragID:    parsed.FragmentID,
+					fragIndex: parsed.FragmentIndex,
+					fragTotal: parsed.FragmentTotal,
 					payload:   payloadCopy,
 				})
 			}
@@ -732,22 +732,22 @@ func TestConcurrentFragmentCorrectness_HighContention_Property(t *testing.T) {
 		fragments := make([]fragmentInfo, len(results))
 
 		for i, result := range results {
-			_, isFragmented, fragID, fragIndex, fragTotal, payload, err := ParseUDPDatagram(result.Data)
+			parsed, err := DecodeUDPDatagram(result.Data)
 			if err != nil {
-				t.Fatalf("ParseUDPDatagram failed: %v", err)
+				t.Fatalf("DecodeUDPDatagram failed: %v", err)
 			}
-			if !isFragmented {
+			if !parsed.IsFragmented {
 				t.Fatal("Expected fragmented packet")
 			}
 
 			// Copy payload before releasing buffers
-			payloadCopy := make([]byte, len(payload))
-			copy(payloadCopy, payload)
+			payloadCopy := make([]byte, len(parsed.Payload))
+			copy(payloadCopy, parsed.Payload)
 
 			fragments[i] = fragmentInfo{
-				fragID:    fragID,
-				fragIndex: fragIndex,
-				fragTotal: fragTotal,
+				fragID:    parsed.FragmentID,
+				fragIndex: parsed.FragmentIndex,
+				fragTotal: parsed.FragmentTotal,
 				payload:   payloadCopy,
 			}
 		}
@@ -855,13 +855,13 @@ func TestConcurrentFragmentCorrectness_MultiplePacketsSameShard_Property(t *test
 			}
 
 			for _, result := range results {
-				_, _, fragID, fragIndex, fragTotal, payload, err := ParseUDPDatagram(result.Data)
+				parsed, err := DecodeUDPDatagram(result.Data)
 				if err != nil {
-					t.Fatalf("ParseUDPDatagram failed: %v", err)
+					t.Fatalf("DecodeUDPDatagram failed: %v", err)
 				}
 
-				payloadCopy := make([]byte, len(payload))
-				copy(payloadCopy, payload)
+				payloadCopy := make([]byte, len(parsed.Payload))
+				copy(payloadCopy, parsed.Payload)
 
 				packets[i].fragments = append(packets[i].fragments, struct {
 					fragID    uint16
@@ -869,9 +869,9 @@ func TestConcurrentFragmentCorrectness_MultiplePacketsSameShard_Property(t *test
 					fragTotal uint8
 					payload   []byte
 				}{
-					fragID:    fragID,
-					fragIndex: fragIndex,
-					fragTotal: fragTotal,
+					fragID:    parsed.FragmentID,
+					fragIndex: parsed.FragmentIndex,
+					fragTotal: parsed.FragmentTotal,
 					payload:   payloadCopy,
 				})
 			}
@@ -977,18 +977,18 @@ func TestConcurrentFragmentCorrectness_DuplicateFragments_Property(t *testing.T)
 		fragments := make([]fragmentInfo, len(results))
 
 		for i, result := range results {
-			_, _, fragID, fragIndex, fragTotal, payload, err := ParseUDPDatagram(result.Data)
+			parsed, err := DecodeUDPDatagram(result.Data)
 			if err != nil {
-				t.Fatalf("ParseUDPDatagram failed: %v", err)
+				t.Fatalf("DecodeUDPDatagram failed: %v", err)
 			}
 
-			payloadCopy := make([]byte, len(payload))
-			copy(payloadCopy, payload)
+			payloadCopy := make([]byte, len(parsed.Payload))
+			copy(payloadCopy, parsed.Payload)
 
 			fragments[i] = fragmentInfo{
-				fragID:    fragID,
-				fragIndex: fragIndex,
-				fragTotal: fragTotal,
+				fragID:    parsed.FragmentID,
+				fragIndex: parsed.FragmentIndex,
+				fragTotal: parsed.FragmentTotal,
 				payload:   payloadCopy,
 			}
 		}
