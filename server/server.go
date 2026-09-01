@@ -8,7 +8,6 @@ import (
 	"io"
 	"net"
 	"slices"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -207,10 +206,9 @@ func New(conf *config.Server) (*Server, error) {
 		return nil, errors.New("server config is nil")
 	}
 
-	// Apply defaults to ensure all required fields have values
 	conf.ApplyDefaults()
-	if err := validateListeners(conf.Listeners); err != nil {
-		return nil, fmt.Errorf("invalid listeners: %w", err)
+	if err := conf.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid server config: %w", err)
 	}
 
 	ownedConfig := *conf
@@ -221,11 +219,6 @@ func New(conf *config.Server) (*Server, error) {
 	// Load TLS certificates
 	if err := ownedConfig.TLS.LoadCertificates(); err != nil {
 		return nil, fmt.Errorf("load certificates: %w", err)
-	}
-
-	// Validate auth config
-	if err := ownedConfig.Auth.Validate(); err != nil {
-		return nil, fmt.Errorf("invalid auth config: %w", err)
 	}
 
 	// Create authenticator using factory
@@ -283,81 +276,6 @@ func poolLimitsFromCapacity(capacity config.ListenerCapacity) pool.Limits {
 		MaxPendingTCPSetupsPerGeneration: int64(capacity.MaxPendingTCPSetupsPerGeneration),
 		MaxUDPSessionsPerGeneration:      int64(capacity.MaxUDPSessionsPerGeneration),
 	}
-}
-
-// validateListeners establishes the route invariants required by readiness.
-// COR-005 owns broader configuration validation.
-func validateListeners(listeners []config.QuicListener) error {
-	if len(listeners) == 0 {
-		return errors.New("at least one listener is required")
-	}
-
-	type socketClaim struct {
-		network string
-		address string
-	}
-	claims := make(map[socketClaim]string, len(listeners)*2)
-	claim := func(network, address, field string) error {
-		// Exact configured strings only; equivalent OS bind aliases still fail transactionally.
-		key := socketClaim{network: network, address: address}
-		if existing, ok := claims[key]; ok {
-			return fmt.Errorf("%s conflicts with %s on %s socket %q", field, existing, network, address)
-		}
-		claims[key] = field
-		return nil
-	}
-
-	for i, listener := range listeners {
-		if err := listener.Capacity.Validate(fmt.Sprintf("listeners[%d].capacity", i)); err != nil {
-			return err
-		}
-		if err := validateListenerAddress(listener.QuicAddr); err != nil {
-			return fmt.Errorf("listeners[%d].quic_addr: %w", i, err)
-		}
-		if err := validateListenerAddress(listener.TrafficAddr); err != nil {
-			return fmt.Errorf("listeners[%d].traffic_addr: %w", i, err)
-		}
-		switch listener.Protocol {
-		case "tcp", "udp", "both":
-		default:
-			return fmt.Errorf("listeners[%d].protocol must be tcp, udp, or both", i)
-		}
-
-		quicField := fmt.Sprintf("listeners[%d].quic_addr", i)
-		if err := claim("udp", listener.QuicAddr, quicField); err != nil {
-			return err
-		}
-		trafficField := fmt.Sprintf("listeners[%d].traffic_addr", i)
-		if listener.Protocol == "tcp" || listener.Protocol == "both" {
-			if err := claim("tcp", listener.TrafficAddr, trafficField); err != nil {
-				return err
-			}
-		}
-		if listener.Protocol == "udp" || listener.Protocol == "both" {
-			if err := claim("udp", listener.TrafficAddr, trafficField); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func validateListenerAddress(address string) error {
-	if address == "" {
-		return errors.New("address cannot be empty")
-	}
-	_, portText, err := net.SplitHostPort(address)
-	if err != nil {
-		return fmt.Errorf("invalid address format %q: %w", address, err)
-	}
-	port, err := strconv.Atoi(portText)
-	if err != nil {
-		return fmt.Errorf("invalid port in address %q: %w", address, err)
-	}
-	if port < 1 || port > 65535 {
-		return fmt.Errorf("port must be between 1 and 65535, got %d in address %q", port, address)
-	}
-	return nil
 }
 
 func cloneListeners(listeners []config.QuicListener) []config.QuicListener {

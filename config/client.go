@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	sharedtoken "github.com/Mmx233/QMux/auth/token"
@@ -73,13 +74,30 @@ func (c *Client) ApplyDefaults() {
 }
 
 // Validate validates the client configuration.
-// It checks that HealthTimeout is greater than HeartbeatInterval.
 func (c *Client) Validate() error {
 	if err := c.Capacity.Validate("capacity"); err != nil {
 		return err
 	}
+	if err := c.Server.Validate(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(c.Local.Host) == "" {
+		return errors.New("local.host is required")
+	}
+	if c.Local.Port < 1 || c.Local.Port > 65535 {
+		return fmt.Errorf("local.port must be between 1 and 65535, got %d", c.Local.Port)
+	}
+	if c.HeartbeatInterval <= 0 {
+		return errors.New("heartbeat_interval must be positive")
+	}
+	if c.HealthTimeout <= 0 {
+		return errors.New("health_timeout must be positive")
+	}
 	if c.HealthTimeout <= c.HeartbeatInterval {
 		return fmt.Errorf("health_timeout (%v) must be greater than heartbeat_interval (%v)", c.HealthTimeout, c.HeartbeatInterval)
+	}
+	if err := c.Quic.Validate("quic"); err != nil {
+		return err
 	}
 	if err := c.Auth.Validate(); err != nil {
 		return fmt.Errorf("auth: %w", err)
@@ -180,6 +198,8 @@ func (t *ClientTLS) Validate(authMethod string) error {
 		if t.ClientKeyFile == "" {
 			return errors.New("client_key_file is required for mTLS authentication")
 		}
+	} else if (t.ClientCertFile == "") != (t.ClientKeyFile == "") {
+		return errors.New("client_cert_file and client_key_file must be provided together")
 	}
 	return nil
 }
@@ -251,15 +271,13 @@ func ValidateAddress(addr string) error {
 func (cs *ClientServer) Validate() error {
 	servers := cs.GetServers()
 
-	// Validate server count
 	if len(servers) < MinServers {
-		return fmt.Errorf("at least %d server address must be provided", MinServers)
+		return fmt.Errorf("server.servers: at least %d address must be provided", MinServers)
 	}
 
-	// Validate each server address
 	for i, server := range servers {
 		if err := ValidateAddress(server.Address); err != nil {
-			return fmt.Errorf("server[%d]: %w", i, err)
+			return fmt.Errorf("server.servers[%d].address: %w", i, err)
 		}
 	}
 

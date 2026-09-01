@@ -89,16 +89,23 @@ type DSendSnapshot struct {
 
 // New creates a new client
 func New(conf *config.Client) (*Client, error) {
-	// Apply defaults to ensure all required fields have values
-	conf.ApplyDefaults()
-	if err := conf.Validate(); err != nil {
-		return nil, fmt.Errorf("invalid client config: %w", err)
+	if conf == nil {
+		return nil, errors.New("client config is nil")
 	}
 
+	conf.ApplyDefaults()
 	logger := log.With().
 		Str("com", "client").
 		Str("client_id", conf.ClientID).
 		Logger()
+	deduplicated, hasDuplicates := conf.Server.DeduplicateServers()
+	if hasDuplicates {
+		conf.Server.Servers = deduplicated
+		logger.Warn().Msg("duplicate server addresses detected and removed")
+	}
+	if err := conf.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid client config: %w", err)
+	}
 
 	// Load the credentials required by the selected authentication mode.
 	if err := conf.LoadCredentials(); err != nil {

@@ -26,7 +26,9 @@ func TestClientAuthDefaultsToMTLS(t *testing.T) {
 
 func TestClientAuthValidationAndConditionalCertificates(t *testing.T) {
 	validMTLS := Client{
-		Auth: ClientAuth{Method: ClientAuthMethodMTLS},
+		Server: ClientServer{Servers: []ServerEndpoint{{Address: "server.example.com:8443"}}},
+		Local:  LocalService{Host: "127.0.0.1", Port: 8080},
+		Auth:   ClientAuth{Method: ClientAuthMethodMTLS},
 		TLS: ClientTLS{
 			CACertFile:     "ca.pem",
 			ClientCertFile: "client.pem",
@@ -173,6 +175,9 @@ server:
   servers:
     - address: "server.example.com:8443"
       server_name: "server.example.com"
+local:
+  host: "127.0.0.1"
+  port: 8080
 auth:
   method: token
   token: "0123456789abcdef"
@@ -227,6 +232,7 @@ func TestLoadClientConfigRejectsAuthMisconfiguration(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			content := "client_id: test-client\n" +
 				"server:\n  servers:\n    - address: server.example.com:8443\n" +
+				"local:\n  host: 127.0.0.1\n  port: 8080\n" +
 				"auth:\n" + test.authYAML +
 				"tls:\n" + test.tlsYAML
 			path := filepath.Join(t.TempDir(), "client.yaml")

@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -78,6 +79,10 @@ type clientEndpointPhases struct {
 
 // NewConnectionManager creates a new ConnectionManager instance.
 func NewConnectionManager(cfg *config.Client, logger zerolog.Logger) (*ConnectionManager, error) {
+	if cfg == nil {
+		return nil, errors.New("client config is nil")
+	}
+
 	// Validate and deduplicate servers
 	hasDuplicates, err := cfg.Server.ValidateAndDeduplicate()
 	if err != nil {

@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"crypto/tls"
+	"strings"
 	"testing"
 	"time"
 
@@ -228,6 +229,9 @@ func TestCalculateBackoff_Negative(t *testing.T) {
 // Unit test: NewConnectionManager validates configuration
 func TestNewConnectionManager_ValidatesConfig(t *testing.T) {
 	logger := zerolog.Nop()
+	if _, err := NewConnectionManager(nil, logger); err == nil || !strings.Contains(err.Error(), "client config is nil") {
+		t.Fatalf("NewConnectionManager(nil) error = %v", err)
+	}
 
 	// Test with empty servers - should fail
 	cfg := &config.Client{
@@ -240,6 +244,24 @@ func TestNewConnectionManager_ValidatesConfig(t *testing.T) {
 	_, err := NewConnectionManager(cfg, logger)
 	if err == nil {
 		t.Error("expected error for empty server configuration")
+	}
+}
+
+func TestConnectionManagerStartValidatesSemanticsBeforeCredentials(t *testing.T) {
+	cfg := &config.Client{
+		Server:            config.ClientServer{Servers: []config.ServerEndpoint{{Address: "server.example.com:8443"}}},
+		HeartbeatInterval: time.Second,
+		HealthTimeout:     2 * time.Second,
+	}
+	cm, err := NewConnectionManager(cfg, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cm.Stop() })
+
+	err = cm.Start(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "local.host") || strings.Contains(err.Error(), "credentials") {
+		t.Fatalf("Start error = %v, want local.host before credentials", err)
 	}
 }
 

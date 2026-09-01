@@ -13,52 +13,11 @@ import (
 	"github.com/rs/zerolog"
 )
 
-func TestValidateListeners(t *testing.T) {
-	base := []config.QuicListener{{
-		QuicAddr:    "127.0.0.1:8443",
-		TrafficAddr: "127.0.0.1:8080",
-		Protocol:    "tcp",
-	}}
-	tests := []struct {
-		name      string
-		listeners []config.QuicListener
-		wantErr   bool
-	}{
-		{name: "valid", listeners: base},
-		{name: "wildcard host", listeners: []config.QuicListener{{QuicAddr: ":8443", TrafficAddr: ":8080", Protocol: "both"}}},
-		{name: "tcp and udp share address", listeners: []config.QuicListener{
-			{QuicAddr: "127.0.0.1:8443", TrafficAddr: "127.0.0.1:8080", Protocol: "tcp"},
-			{QuicAddr: "127.0.0.1:8444", TrafficAddr: "127.0.0.1:8080", Protocol: "udp"},
-		}},
-		{name: "zero listeners", wantErr: true},
-		{name: "invalid QUIC address", listeners: []config.QuicListener{{QuicAddr: "bad", TrafficAddr: "127.0.0.1:8080", Protocol: "tcp"}}, wantErr: true},
-		{name: "invalid traffic address", listeners: []config.QuicListener{{QuicAddr: "127.0.0.1:8443", TrafficAddr: "127.0.0.1:0", Protocol: "tcp"}}, wantErr: true},
-		{name: "invalid protocol", listeners: []config.QuicListener{{QuicAddr: "127.0.0.1:8443", TrafficAddr: "127.0.0.1:8080", Protocol: ""}}, wantErr: true},
-		{name: "duplicate QUIC address", listeners: []config.QuicListener{
-			{QuicAddr: "127.0.0.1:8443", TrafficAddr: "127.0.0.1:8080", Protocol: "tcp"},
-			{QuicAddr: "127.0.0.1:8443", TrafficAddr: "127.0.0.1:8081", Protocol: "tcp"},
-		}, wantErr: true},
-		{name: "overlapping traffic socket", listeners: []config.QuicListener{
-			{QuicAddr: "127.0.0.1:8443", TrafficAddr: "127.0.0.1:8080", Protocol: "tcp"},
-			{QuicAddr: "127.0.0.1:8444", TrafficAddr: "127.0.0.1:8080", Protocol: "both"},
-		}, wantErr: true},
-		{name: "QUIC overlaps UDP traffic", listeners: []config.QuicListener{
-			{QuicAddr: "127.0.0.1:8443", TrafficAddr: "127.0.0.1:8080", Protocol: "tcp"},
-			{QuicAddr: "127.0.0.1:8444", TrafficAddr: "127.0.0.1:8443", Protocol: "udp"},
-		}, wantErr: true},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			err := validateListeners(test.listeners)
-			if (err != nil) != test.wantErr {
-				t.Fatalf("validateListeners() error = %v, wantErr %v", err, test.wantErr)
-			}
-		})
-	}
-}
-
 func TestNewValidatesListenersBeforeCertificates(t *testing.T) {
+	if _, err := New(nil); err == nil || !strings.Contains(err.Error(), "server config is nil") {
+		t.Fatalf("New(nil) error = %v", err)
+	}
+
 	_, err := New(&config.Server{Listeners: []config.QuicListener{{
 		QuicAddr:    "127.0.0.1:8443",
 		TrafficAddr: "127.0.0.1:8080",

@@ -5,7 +5,9 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"net"
 	"os"
+	"strconv"
 	"time"
 
 	sharedtoken "github.com/Mmx233/QMux/auth/token"
@@ -214,4 +216,108 @@ func (s *Server) ApplyDefaults() {
 	if s.LoadBalancer == "" {
 		s.LoadBalancer = DefaultLoadBalancer
 	}
+}
+
+// Validate validates the complete server configuration after defaults are applied.
+func (s *Server) Validate() error {
+	if len(s.Listeners) == 0 {
+		return errors.New("listeners must contain at least one listener")
+	}
+
+	type socketClaim struct {
+		network string
+		address string
+	}
+	claims := make(map[socketClaim]string, len(s.Listeners)*2)
+	claim := func(network, address, field string) error {
+		key := socketClaim{network: network, address: address}
+		if existing, ok := claims[key]; ok {
+			return fmt.Errorf("%s conflicts with %s on %s socket %q", field, existing, network, address)
+		}
+		claims[key] = field
+		return nil
+	}
+
+	for i, listener := range s.Listeners {
+		path := fmt.Sprintf("listeners[%d]", i)
+		if err := listener.Capacity.Validate(path + ".capacity"); err != nil {
+			return err
+		}
+		if err := validateListenerAddress(listener.QuicAddr); err != nil {
+			return fmt.Errorf("%s.quic_addr: %w", path, err)
+		}
+		if err := validateListenerAddress(listener.TrafficAddr); err != nil {
+			return fmt.Errorf("%s.traffic_addr: %w", path, err)
+		}
+		switch listener.Protocol {
+		case "tcp", "udp", "both":
+		default:
+			return fmt.Errorf("%s.protocol must be tcp, udp, or both", path)
+		}
+		if err := listener.Quic.Validate(path); err != nil {
+			return err
+		}
+
+		quicField := path + ".quic_addr"
+		if err := claim("udp", listener.QuicAddr, quicField); err != nil {
+			return err
+		}
+		trafficField := path + ".traffic_addr"
+		if listener.Protocol == "tcp" || listener.Protocol == "both" {
+			if err := claim("tcp", listener.TrafficAddr, trafficField); err != nil {
+				return err
+			}
+		}
+		if listener.Protocol == "udp" || listener.Protocol == "both" {
+			if err := claim("udp", listener.TrafficAddr, trafficField); err != nil {
+				return err
+			}
+		}
+	}
+
+	switch s.LoadBalancer {
+	case "least-connections", "round-robin":
+	default:
+		return fmt.Errorf("load_balancer must be least-connections or round-robin, got %q", s.LoadBalancer)
+	}
+	if s.HeartbeatInterval <= 0 {
+		return errors.New("heartbeat_interval must be positive")
+	}
+	if s.HealthTimeout <= 0 {
+		return errors.New("health_timeout must be positive")
+	}
+	if s.HealthTimeout <= s.HeartbeatInterval {
+		return fmt.Errorf("health_timeout (%v) must be greater than heartbeat_interval (%v)", s.HealthTimeout, s.HeartbeatInterval)
+	}
+	if s.TLS.ServerCertFile == "" {
+		return errors.New("tls.server_cert_file is required")
+	}
+	if s.TLS.ServerKeyFile == "" {
+		return errors.New("tls.server_key_file is required")
+	}
+	if s.TLS.SessionTicketEncryptionKeyRotationInterval < 0 {
+		return errors.New("tls.session_ticket_encryption_key_rotation_interval must not be negative")
+	}
+	if err := s.Auth.Validate(); err != nil {
+		return fmt.Errorf("auth: %w", err)
+	}
+	return nil
+}
+
+func validateListenerAddress(address string) error {
+	if address == "" {
+		return errors.New("address cannot be empty")
+	}
+	_, portText, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("invalid address format %q: %w", address, err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		return fmt.Errorf("invalid port in address %q: %w", address, err)
+	}
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("port must be between 1 and 65535, got %d in address %q", port, address)
+	}
+	return nil
 }

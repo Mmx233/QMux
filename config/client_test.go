@@ -200,6 +200,8 @@ func TestConfigurationValidation_Property(t *testing.T) {
 		healthTimeout := time.Duration(healthTimeoutSec) * time.Second
 
 		client := &Client{
+			Server:            ClientServer{Servers: []ServerEndpoint{{Address: "server.example.com:8443"}}},
+			Local:             LocalService{Host: "127.0.0.1", Port: 8080},
 			HeartbeatInterval: heartbeatInterval,
 			HealthTimeout:     healthTimeout,
 			TLS: ClientTLS{

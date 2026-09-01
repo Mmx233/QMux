@@ -6,10 +6,14 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/quicvarint"
 )
 
 const (
 	EnvPrefix = "QMUX_"
+
+	// Match quic-go's maxStreams clamp instead of silently accepting a truncated value.
+	maxIncomingStreams = int64(1 << 60)
 )
 
 type Listen struct {
@@ -37,6 +41,53 @@ type Quic struct {
 	MaxIdleTimeout                 time.Duration `yaml:"max_idle_timeout"`
 	// Allow0RTT is passed to quic-go; QMux currently does not use 0-RTT application data.
 	Allow0RTT bool `yaml:"allow_0rtt"`
+}
+
+// Validate rejects values that quic-go or QUIC can't represent safely.
+func (q Quic) Validate(path string) error {
+	durations := []struct {
+		name  string
+		value time.Duration
+	}{
+		{"keep_alive_period", q.KeepAlivePeriod},
+		{"handshake_idle_timeout", q.HandshakeIdleTimeout},
+		{"max_idle_timeout", q.MaxIdleTimeout},
+	}
+	for _, duration := range durations {
+		if duration.value < 0 {
+			return fmt.Errorf("%s.%s must not be negative", path, duration.name)
+		}
+	}
+	if q.HandshakeIdleTimeout > time.Duration(quicvarint.Max) {
+		return fmt.Errorf("%s.handshake_idle_timeout must not exceed %s", path, time.Duration(quicvarint.Max))
+	}
+	if q.MaxIncomingStreams < 0 || q.MaxIncomingStreams > maxIncomingStreams {
+		return fmt.Errorf("%s.max_incoming_streams must be between 0 and %d", path, maxIncomingStreams)
+	}
+
+	windows := []struct {
+		name  string
+		value uint64
+	}{
+		{"initial_stream_receive_window", q.InitialStreamReceiveWindow},
+		{"max_stream_receive_window", q.MaxStreamReceiveWindow},
+		{"initial_connection_receive_window", q.InitialConnectionReceiveWindow},
+		{"max_connection_receive_window", q.MaxConnectionReceiveWindow},
+	}
+	for _, window := range windows {
+		if window.value > quicvarint.Max {
+			return fmt.Errorf("%s.%s must not exceed %d", path, window.name, uint64(quicvarint.Max))
+		}
+	}
+	if q.InitialStreamReceiveWindow != 0 && q.MaxStreamReceiveWindow != 0 &&
+		q.InitialStreamReceiveWindow > q.MaxStreamReceiveWindow {
+		return fmt.Errorf("%s.initial_stream_receive_window must not exceed %s.max_stream_receive_window", path, path)
+	}
+	if q.InitialConnectionReceiveWindow != 0 && q.MaxConnectionReceiveWindow != 0 &&
+		q.InitialConnectionReceiveWindow > q.MaxConnectionReceiveWindow {
+		return fmt.Errorf("%s.initial_connection_receive_window must not exceed %s.max_connection_receive_window", path, path)
+	}
+	return nil
 }
 
 func (q Quic) GetConfig() *quic.Config {

@@ -35,19 +35,16 @@ func LoadConfig[T any](path string) (*T, error) {
 	return &cfg, nil
 }
 
-// LoadServerConfig reads a server YAML configuration file and applies defaults.
+// LoadServerConfig reads, defaults, and validates a server YAML configuration file.
 func LoadServerConfig(path string) (*Server, error) {
 	cfg, err := LoadConfig[Server](path)
 	if err != nil {
 		return nil, err
 	}
 
-	// Apply default values
 	cfg.ApplyDefaults()
-	for i := range cfg.Listeners {
-		if err := cfg.Listeners[i].Capacity.Validate(fmt.Sprintf("listeners[%d].capacity", i)); err != nil {
-			return nil, err
-		}
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("server configuration validation failed: %w", err)
 	}
 
 	return cfg, nil
@@ -63,16 +60,11 @@ func LoadClientConfig(path string) (*Client, error) {
 		return nil, err
 	}
 
-	// Apply default values (including ClientID generation)
 	cfg.ApplyDefaults()
 
-	// Validate and deduplicate server configuration
-	hasDuplicates, err := cfg.Server.ValidateAndDeduplicate()
-	if err != nil {
-		return nil, fmt.Errorf("server configuration validation failed: %w", err)
-	}
-
+	deduplicated, hasDuplicates := cfg.Server.DeduplicateServers()
 	if hasDuplicates {
+		cfg.Server.Servers = deduplicated
 		logger.Warn().Msg("duplicate server addresses detected and removed from configuration")
 	}
 	if err := cfg.Validate(); err != nil {

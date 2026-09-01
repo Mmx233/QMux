@@ -53,6 +53,42 @@ func newClientLifecycleClient(t *testing.T, clientID string, endpoint config.Ser
 	return c
 }
 
+func TestNewRejectsNilAndSemanticErrorsBeforeCredentials(t *testing.T) {
+	if _, err := New(nil); err == nil || !strings.Contains(err.Error(), "client config is nil") {
+		t.Fatalf("New(nil) error = %v", err)
+	}
+
+	_, err := New(&config.Client{Server: config.ClientServer{Servers: []config.ServerEndpoint{{
+		Address: "server.example.com:8443",
+	}}}})
+	if err == nil || !strings.Contains(err.Error(), "local.host") || strings.Contains(err.Error(), "credentials") {
+		t.Fatalf("New(invalid) error = %v, want local.host before credentials", err)
+	}
+}
+
+func TestNewDeduplicatesBeforeCredentialIO(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing.pem")
+	conf := &config.Client{
+		Server: config.ClientServer{Servers: []config.ServerEndpoint{
+			{Address: "server.example.com:8443", ServerName: "first.example.com"},
+			{Address: "server.example.com:8443", ServerName: "duplicate.example.com"},
+		}},
+		Local: config.LocalService{Host: "127.0.0.1", Port: 8080},
+		TLS: config.ClientTLS{
+			CACertFile:     missing,
+			ClientCertFile: missing,
+			ClientKeyFile:  missing,
+		},
+	}
+
+	if _, err := New(conf); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("New error = %v, want missing credential", err)
+	}
+	if len(conf.Server.Servers) != 1 || conf.Server.Servers[0].ServerName != "first.example.com" {
+		t.Fatalf("deduplicated servers = %+v, want first endpoint", conf.Server.Servers)
+	}
+}
+
 func stallClientLifecycleRegistration(peer *lifecyclePeer) (<-chan struct{}, <-chan error) {
 	ready := make(chan struct{})
 	done := peer.serveRegistration(func(conn *quic.Conn, _ *quic.Stream, _ protocol.RegisterMsg) error {

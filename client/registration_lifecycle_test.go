@@ -523,6 +523,7 @@ func TestRegistrationLifecycleStartAttemptDeadlineSchedulesFreshReconnect(t *tes
 	cm, err := NewConnectionManager(&config.Client{
 		ClientID: "start-deadline-reconnect",
 		Server:   config.ClientServer{Servers: []config.ServerEndpoint{endpoint}},
+		Local:    config.LocalService{Host: "127.0.0.1", Port: 1},
 		Quic: config.Quic{
 			HandshakeIdleTimeout: 10 * time.Second,
 			MaxIdleTimeout:       30 * time.Second,
@@ -631,6 +632,7 @@ func TestConnectionManagerStartPublishesSeventeenEndpointsBeforeDrain(t *testing
 	cm, err := NewConnectionManager(&config.Client{
 		ClientID: "seventeen-endpoints",
 		Server:   config.ClientServer{Servers: endpoints},
+		Local:    config.LocalService{Host: "127.0.0.1", Port: 1},
 		Quic: config.Quic{
 			HandshakeIdleTimeout: 10 * time.Second,
 			MaxIdleTimeout:       30 * time.Second,

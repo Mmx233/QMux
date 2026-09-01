@@ -93,6 +93,24 @@ func TestLoadConfigRejectsMultipleDocuments(t *testing.T) {
 	}
 }
 
+func TestTypedLoadersAddSemanticValidation(t *testing.T) {
+	clientPath := writeTestConfig(t, "{}\n")
+	if _, err := LoadConfig[Client](clientPath); err != nil {
+		t.Fatalf("generic client load: %v", err)
+	}
+	if _, err := LoadClientConfig(clientPath); err == nil || !strings.Contains(err.Error(), "server.servers:") {
+		t.Fatalf("typed client load error = %v, want server.servers path", err)
+	}
+
+	serverPath := writeTestConfig(t, "{}\n")
+	if _, err := LoadConfig[Server](serverPath); err != nil {
+		t.Fatalf("generic server load: %v", err)
+	}
+	if _, err := LoadServerConfig(serverPath); err == nil || !strings.Contains(err.Error(), "listeners") {
+		t.Fatalf("typed server load error = %v, want listeners path", err)
+	}
+}
+
 func TestLoadClientConfigCanonicalQUIC(t *testing.T) {
 	want := testQuicConfig()
 	path := writeTestConfig(t, `client_id: test-client
@@ -146,6 +164,12 @@ func TestLoadServerConfigCanonicalQUIC(t *testing.T) {
     handshake_idle_timeout: 7s
     max_idle_timeout: 31s
     allow_0rtt: true
+auth:
+  method: token
+  token: "0123456789abcdef"
+tls:
+  server_cert_file: "server.pem"
+  server_key_file: "server-key.pem"
 `)
 
 	cfg, err := LoadServerConfig(path)
@@ -162,7 +186,10 @@ func TestLoadServerConfigCanonicalQUIC(t *testing.T) {
 
 func TestLoadConfigCapacity(t *testing.T) {
 	serverPath := writeTestConfig(t, `listeners:
-  - capacity:
+  - quic_addr: "127.0.0.1:8443"
+    traffic_addr: "127.0.0.1:8080"
+    protocol: tcp
+    capacity:
       max_client_generations: 1
       max_pending_registrations: 2
       max_tcp_connections: 3
@@ -171,6 +198,12 @@ func TestLoadConfigCapacity(t *testing.T) {
       max_pending_tcp_setups_per_generation: 6
       max_udp_sessions: 7
       max_udp_sessions_per_generation: 8
+auth:
+  method: token
+  token: "0123456789abcdef"
+tls:
+  server_cert_file: "server.pem"
+  server_key_file: "server-key.pem"
 `)
 	serverConfig, err := LoadServerConfig(serverPath)
 	if err != nil {
@@ -687,7 +720,7 @@ server:
     - address: "server2.example.com:8443"
       server_name: "server2.example.com"
     - address: "server1.example.com:8443"
-      server_name: "server1.example.com"
+      server_name: "shadow.example.com"
 local:
   host: "127.0.0.1"
   port: 8080
@@ -710,6 +743,9 @@ tls:
 	servers := cfg.Server.GetServers()
 	if len(servers) != 2 {
 		t.Fatalf("expected 2 servers after deduplication, got %d", len(servers))
+	}
+	if servers[0].ServerName != "server1.example.com" {
+		t.Fatalf("duplicate owner = %q, want first server name", servers[0].ServerName)
 	}
 
 	// Verify unique addresses
