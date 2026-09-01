@@ -49,10 +49,6 @@ listeners:
     # Maximum idle timeout before connection is closed
     # max_idle_timeout: 5m
 
-    # Reserved QUIC 0-RTT setting. QMux does not currently accept authentication,
-    # registration, or tunnel side effects as early application data.
-    # allow_0rtt: false
-
     # UDP settings (optional - defaults are used if not specified)
     udp:
       # Enable automatic fragmentation of large UDP packets

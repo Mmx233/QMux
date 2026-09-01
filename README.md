@@ -184,8 +184,6 @@ tls:
 
 The token itself is never sent over the wire. After the TLS 1.3 handshake completes, the client sends an HMAC-SHA512 registration proof bound to that connection through the TLS exporter. The client still validates the server certificate using `ca_cert_file`, while token mode neither requires nor sends a client certificate. A proof captured from one connection cannot authenticate another connection, including a resumed TLS session.
 
-QMux does not currently send authentication, registration, or tunnel side effects as QUIC 0-RTT application data. The `allow_0rtt` setting remains disabled by default and does not enable early QMux application messages; replay-safe application-level 0-RTT semantics are not implemented yet.
-
 # Performance
 
 ## Test Environment

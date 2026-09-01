@@ -130,7 +130,6 @@ quic:
   keep_alive_period: 13s
   handshake_idle_timeout: 7s
   max_idle_timeout: 31s
-  allow_0rtt: true
 tls:
   ca_cert_file: "ca.pem"
   client_cert_file: "client.pem"
@@ -163,7 +162,6 @@ func TestLoadServerConfigCanonicalQUIC(t *testing.T) {
     keep_alive_period: 13s
     handshake_idle_timeout: 7s
     max_idle_timeout: 31s
-    allow_0rtt: true
 auth:
   method: token
   token: "0123456789abcdef"
@@ -312,8 +310,8 @@ func TestLoadConfigRejectsCapacityKeysInWrongScope(t *testing.T) {
 	}
 }
 
-func TestLoadConfigRejectsLegacyQUICKeys(t *testing.T) {
-	legacy := []struct {
+func TestLoadConfigRejectsRemovedAndLegacyQUICKeys(t *testing.T) {
+	unsupported := []struct {
 		key   string
 		value string
 	}{
@@ -325,10 +323,11 @@ func TestLoadConfigRejectsLegacyQUICKeys(t *testing.T) {
 		{"keepaliveperiod", "13s"},
 		{"handshakeidletimeout", "7s"},
 		{"maxidletimeout", "31s"},
+		{"allow_0rtt", "true"},
 		{"allow0rtt", "true"},
 	}
 
-	for _, field := range legacy {
+	for _, field := range unsupported {
 		t.Run("client_"+field.key, func(t *testing.T) {
 			path := writeTestConfig(t, fmt.Sprintf("quic:\n  %s: %s\n", field.key, field.value))
 			_, err := LoadConfig[Client](path)
@@ -435,7 +434,6 @@ func testQuicConfig() Quic {
 		KeepAlivePeriod:                13 * time.Second,
 		HandshakeIdleTimeout:           7 * time.Second,
 		MaxIdleTimeout:                 31 * time.Second,
-		Allow0RTT:                      true,
 	}
 }
 
@@ -449,8 +447,7 @@ func assertQUICRuntime(t *testing.T, source, want Quic) {
 		got.MaxIncomingStreams != want.MaxIncomingStreams ||
 		got.KeepAlivePeriod != want.KeepAlivePeriod ||
 		got.HandshakeIdleTimeout != want.HandshakeIdleTimeout ||
-		got.MaxIdleTimeout != want.MaxIdleTimeout ||
-		got.Allow0RTT != want.Allow0RTT {
+		got.MaxIdleTimeout != want.MaxIdleTimeout {
 		t.Fatalf("runtime QUIC config = %+v, want values from %+v", got, want)
 	}
 }

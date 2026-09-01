@@ -39,8 +39,6 @@ type Quic struct {
 	KeepAlivePeriod                time.Duration `yaml:"keep_alive_period"`
 	HandshakeIdleTimeout           time.Duration `yaml:"handshake_idle_timeout"`
 	MaxIdleTimeout                 time.Duration `yaml:"max_idle_timeout"`
-	// Allow0RTT is passed to quic-go; QMux currently does not use 0-RTT application data.
-	Allow0RTT bool `yaml:"allow_0rtt"`
 }
 
 // Validate rejects values that quic-go or QUIC can't represent safely.
@@ -103,7 +101,6 @@ func (q Quic) GetConfig() *quic.Config {
 		KeepAlivePeriod:                q.KeepAlivePeriod,
 		HandshakeIdleTimeout:           q.HandshakeIdleTimeout,
 		MaxIdleTimeout:                 q.MaxIdleTimeout,
-		Allow0RTT:                      q.Allow0RTT,
 		EnableDatagrams:                true,
 	}
 }

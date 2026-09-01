@@ -112,19 +112,19 @@ func assertCanonicalQUICKeys(t *testing.T, content string) {
 		"initial_stream_receive_window", "max_stream_receive_window",
 		"initial_connection_receive_window", "max_connection_receive_window",
 		"max_incoming_streams", "keep_alive_period", "handshake_idle_timeout",
-		"max_idle_timeout", "allow_0rtt",
+		"max_idle_timeout",
 	}
-	legacy := []string{
+	forbidden := []string{
 		"initialstreamreceivewindow", "maxstreamreceivewindow",
 		"initialconnectionreceivewindow", "maxconnectionreceivewindow",
 		"maxincomingstreams", "keepaliveperiod", "handshakeidletimeout",
-		"maxidletimeout", "allow0rtt",
+		"maxidletimeout", "allow_0rtt", "allow0rtt",
 	}
 	for _, key := range canonical {
 		assert.Contains(t, content, key+":", "template should contain canonical QUIC key")
 	}
-	for _, key := range legacy {
-		assert.False(t, strings.Contains(content, key+":"), "template should not contain legacy QUIC key %q", key)
+	for _, key := range forbidden {
+		assert.False(t, strings.Contains(content, key+":"), "template should not contain forbidden QUIC key %q", key)
 	}
 }
 
