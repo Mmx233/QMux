@@ -34,7 +34,9 @@ func newCapacitySnapshotManager(t *testing.T, endpoints ...string) *ConnectionMa
 }
 
 func newCapacitySnapshotConnection(endpoint string) *ServerConnection {
-	return NewServerConnection(endpoint, "snapshot.test", tls.NewLRUClientSessionCache(1), zerolog.Nop())
+	sc := NewServerConnection(endpoint, "snapshot.test", tls.NewLRUClientSessionCache(1), zerolog.Nop())
+	sc.controlOnce.Do(func() {})
+	return sc
 }
 
 func TestClientCapacityMapsToProcessUDPSessionBudget(t *testing.T) {
