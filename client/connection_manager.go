@@ -41,6 +41,7 @@ type ConnectionManager struct {
 	// this gate before canceling attempts so a late acknowledgment cannot commit.
 	publishMu sync.Mutex
 	closed    bool
+	endpoints []clientEndpointPhases
 
 	// Internal test seam; the production default remains fixed and is not config.
 	attemptTimeout time.Duration
@@ -52,6 +53,27 @@ type ConnectionManager struct {
 	// NewConns delivers newly established ServerConnections (initial + reconnected)
 	// to the Client layer for stream acceptance and UDP handler setup.
 	NewConns chan *ServerConnection
+}
+
+type clientGenerationPhase uint8
+
+const (
+	clientGenerationNone clientGenerationPhase = iota
+	clientGenerationHandshaking
+	clientGenerationPending
+	clientGenerationRegistered
+	clientGenerationRetiring
+	clientGenerationDone
+)
+
+type clientEndpointPhases struct {
+	endpoint            string
+	handshaking         int64
+	pending             int64
+	registered          int64
+	retiring            int64
+	generationHighWater int64
+	accountingFaults    uint64
 }
 
 // NewConnectionManager creates a new ConnectionManager instance.
@@ -75,7 +97,10 @@ func NewConnectionManager(cfg *config.Client, logger zerolog.Logger) (*Connectio
 		cancel:         cancel,
 		attemptTimeout: defaultConnectionAttemptTimeout,
 		reconnecting:   make(map[string]bool),
-		NewConns:       make(chan *ServerConnection, 16),
+		NewConns:       make(chan *ServerConnection, max(16, len(cfg.Server.GetServers()))),
+	}
+	for _, endpoint := range cfg.Server.GetServers() {
+		cm.endpoints = append(cm.endpoints, clientEndpointPhases{endpoint: endpoint.Address})
 	}
 
 	return cm, nil
@@ -178,10 +203,16 @@ func (cm *ConnectionManager) connectAndRegister(ctx context.Context, endpoint co
 		cm.sessionCaches.GetOrCreate(endpoint.Address),
 		cm.logger,
 	)
+	cm.publishMu.Lock()
+	cm.trackGenerationLocked(sc, clientGenerationHandshaking)
+	cm.publishMu.Unlock()
 	if err := sc.Connect(attemptCtx, cm.baseTLSConfig, cm.quicConfig); err != nil {
 		_ = sc.Close()
 		return nil, err
 	}
+	cm.publishMu.Lock()
+	cm.moveGenerationLocked(sc, clientGenerationHandshaking, clientGenerationPending)
+	cm.publishMu.Unlock()
 	if err := sc.RegisterWithAuth(attemptCtx, cm.config.ClientID, cm.config.Auth); err != nil {
 		_ = sc.Close()
 		return nil, err
@@ -208,6 +239,14 @@ func (cm *ConnectionManager) publishServerConnection(ctx context.Context, sc *Se
 		cm.publishMu.Unlock()
 		return false
 	}
+	if sc.capacityPhase == clientGenerationNone {
+		cm.trackGenerationLocked(sc, clientGenerationPending)
+	}
+	if sc.capacityPhase != clientGenerationPending {
+		cm.generationFaultLocked(sc)
+		cm.publishMu.Unlock()
+		return false
+	}
 
 	sc.SetHealthConfig(cm.config.HealthTimeout)
 	sc.SetReconnectCallback(func(serverAddr string) {
@@ -215,6 +254,10 @@ func (cm *ConnectionManager) publishServerConnection(ctx context.Context, sc *Se
 	})
 	sc.MarkHealthy()
 	previousI, replaced := cm.connections.Swap(sc.ServerAddr(), sc)
+	cm.moveGenerationLocked(sc, clientGenerationPending, clientGenerationRegistered)
+	if replaced && previousI != sc {
+		cm.detachGenerationLocked(previousI.(*ServerConnection))
+	}
 	cm.publishMu.Unlock()
 	// Keep this Close before delivery: the consumer's old stopAndWait relies on
 	// closing its owning QUIC connection to unblock context-free SendDatagram.
@@ -248,6 +291,9 @@ func (cm *ConnectionManager) publishServerConnection(ctx context.Context, sc *Se
 func (cm *ConnectionManager) rollbackPublication(sc *ServerConnection) {
 	cm.publishMu.Lock()
 	removed := cm.connections.CompareAndDelete(sc.ServerAddr(), sc)
+	if removed {
+		cm.detachGenerationLocked(sc)
+	}
 	cm.publishMu.Unlock()
 	if removed {
 		sc.MarkUnhealthy()
@@ -334,6 +380,7 @@ func (cm *ConnectionManager) reconnectionLoop(ctx context.Context, serverAddr st
 			cm.publishMu.Unlock()
 			return
 		}
+		cm.detachGenerationLocked(expected)
 		cm.publishMu.Unlock()
 		_ = expected.Close()
 	} else {
@@ -415,8 +462,10 @@ func (cm *ConnectionManager) Stop() error {
 	cm.publishMu.Lock()
 	var published []*ServerConnection
 	cm.connections.Range(func(key, value any) bool {
-		published = append(published, value.(*ServerConnection))
+		sc := value.(*ServerConnection)
+		published = append(published, sc)
 		cm.connections.Delete(key)
+		cm.detachGenerationLocked(sc)
 		return true
 	})
 	cm.publishMu.Unlock()
@@ -434,6 +483,116 @@ func (cm *ConnectionManager) Stop() error {
 
 	cm.logger.Info().Msg("connection manager stopped")
 	return nil
+}
+
+func (cm *ConnectionManager) trackGenerationLocked(sc *ServerConnection, phase clientGenerationPhase) {
+	if sc.capacityPhase != clientGenerationNone {
+		cm.generationFaultLocked(sc)
+		return
+	}
+	for i := range cm.endpoints {
+		if cm.endpoints[i].endpoint == sc.ServerAddr() {
+			sc.capacityEndpoint = i
+			sc.capacityPhase = phase
+			cm.addGenerationLocked(sc, phase, 1)
+			if !sc.setOnClosed(func() { cm.generationClosed(sc) }) {
+				cm.generationClosedLocked(sc)
+			}
+			return
+		}
+	}
+}
+
+func (cm *ConnectionManager) moveGenerationLocked(sc *ServerConnection, from, to clientGenerationPhase) {
+	if sc.capacityPhase != from {
+		cm.generationFaultLocked(sc)
+		return
+	}
+	cm.addGenerationLocked(sc, from, -1)
+	sc.capacityPhase = to
+	cm.addGenerationLocked(sc, to, 1)
+}
+
+func (cm *ConnectionManager) detachGenerationLocked(sc *ServerConnection) {
+	if sc.capacityPhase == clientGenerationNone {
+		cm.trackGenerationLocked(sc, clientGenerationRegistered)
+	}
+	if sc.capacityPhase == clientGenerationRetiring || sc.capacityPhase == clientGenerationDone {
+		return
+	}
+	cm.moveGenerationLocked(sc, clientGenerationRegistered, clientGenerationRetiring)
+}
+
+func (cm *ConnectionManager) generationClosed(sc *ServerConnection) {
+	cm.publishMu.Lock()
+	defer cm.publishMu.Unlock()
+	cm.generationClosedLocked(sc)
+}
+
+func (cm *ConnectionManager) generationClosedLocked(sc *ServerConnection) {
+	switch sc.capacityPhase {
+	case clientGenerationHandshaking, clientGenerationPending, clientGenerationRetiring:
+		cm.addGenerationLocked(sc, sc.capacityPhase, -1)
+		sc.capacityPhase = clientGenerationDone
+	case clientGenerationRegistered:
+		cm.generationFaultLocked(sc)
+		cm.addGenerationLocked(sc, clientGenerationRegistered, -1)
+		sc.capacityPhase = clientGenerationDone
+	case clientGenerationNone, clientGenerationDone:
+	}
+}
+
+func (cm *ConnectionManager) addGenerationLocked(sc *ServerConnection, phase clientGenerationPhase, delta int64) {
+	if sc.capacityEndpoint < 0 || sc.capacityEndpoint >= len(cm.endpoints) {
+		return
+	}
+	endpoint := &cm.endpoints[sc.capacityEndpoint]
+	var counter *int64
+	switch phase {
+	case clientGenerationHandshaking:
+		counter = &endpoint.handshaking
+	case clientGenerationPending:
+		counter = &endpoint.pending
+	case clientGenerationRegistered:
+		counter = &endpoint.registered
+	case clientGenerationRetiring:
+		counter = &endpoint.retiring
+	default:
+		return
+	}
+	if *counter+delta < 0 {
+		endpoint.accountingFaults++
+		return
+	}
+	*counter += delta
+	if total := endpoint.handshaking + endpoint.pending + endpoint.registered + endpoint.retiring; total > endpoint.generationHighWater {
+		endpoint.generationHighWater = total
+	}
+}
+
+func (cm *ConnectionManager) generationFaultLocked(sc *ServerConnection) {
+	if sc.capacityEndpoint >= 0 && sc.capacityEndpoint < len(cm.endpoints) {
+		cm.endpoints[sc.capacityEndpoint].accountingFaults++
+	}
+}
+
+func (cm *ConnectionManager) endpointSnapshot() []EndpointSnapshot {
+	cm.publishMu.Lock()
+	defer cm.publishMu.Unlock()
+	snapshot := make([]EndpointSnapshot, len(cm.endpoints))
+	for i := range cm.endpoints {
+		endpoint := &cm.endpoints[i]
+		snapshot[i] = EndpointSnapshot{
+			Endpoint:            endpoint.endpoint,
+			Handshaking:         endpoint.handshaking,
+			Pending:             endpoint.pending,
+			Registered:          endpoint.registered,
+			Retiring:            endpoint.retiring,
+			GenerationHighWater: endpoint.generationHighWater,
+			AccountingFaults:    endpoint.accountingFaults,
+		}
+	}
+	return snapshot
 }
 
 // GetAllConnections returns all server connections.

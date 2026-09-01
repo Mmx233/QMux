@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"sync"
@@ -14,13 +15,21 @@ import (
 
 // ConnectionPool manages client connections for a QUIC listener
 type ConnectionPool struct {
-	mu              sync.RWMutex
-	clients         map[string]*ClientConn // clientID -> selectable connection
-	reservations    map[string]*Reservation
-	quicAddr        string       // QUIC listen address this pool serves
-	balancer        LoadBalancer // Load balancing strategy
-	logger          zerolog.Logger
-	udpSessionLimit int64
+	mu                   sync.RWMutex
+	clients              map[string]*ClientConn // clientID -> selectable connection
+	reservations         map[string]*Reservation
+	retiring             map[*ClientConn]*Retirement
+	serverPending        int64
+	accountingFaults     uint64
+	limits               Limits
+	pendingRegistrations capacityState
+	clientGenerations    capacityState
+	tcpConnections       capacityState
+	pendingTCPSetups     capacityState
+	udpSessions          capacityState
+	quicAddr             string       // QUIC listen address this pool serves
+	balancer             LoadBalancer // Load balancing strategy
+	logger               zerolog.Logger
 
 	// Cached client slice to avoid allocation on Select
 	// Using atomic.Pointer for lock-free reads on the hot path
@@ -45,6 +54,7 @@ type ClientConn struct {
 	ActiveConns atomic.Int64
 	TotalConns  atomic.Uint64
 	tcpPending  atomic.Int64
+	tcpActive   atomic.Int64
 	udpSessions atomic.Int64
 
 	// Health
@@ -72,8 +82,7 @@ type TCPLease struct {
 	state tcpLeaseState
 }
 
-// Reservation holds an unpublished client generation while registration is
-// acknowledged. A reservation belongs to exactly one pool and client pointer.
+// Reservation holds one accepted connection from pending through registration.
 type Reservation struct {
 	pool *ConnectionPool
 	conn *ClientConn
@@ -82,8 +91,17 @@ type Reservation struct {
 	state atomic.Uint32
 }
 
+// Retirement holds an exact generation out of selection until owner cleanup
+// and all traffic leases finish.
+type Retirement struct {
+	pool *ConnectionPool
+	conn *ClientConn
+	done bool
+}
+
 const (
 	reservationPending uint32 = iota
+	reservationReserved
 	reservationCommitted
 	reservationAborted
 )
@@ -97,9 +115,42 @@ const (
 )
 
 const (
-	maxPendingTCPSetupsPerClient    = 16
-	defaultUDPSessionsPerGeneration = 256
+	defaultMaxClientGenerations             int64 = 16
+	defaultMaxPendingRegistrations          int64 = 128
+	defaultMaxTCPConnectionsPerGeneration   int64 = 100
+	defaultMaxPendingTCPSetupsPerGeneration int64 = 16
+	defaultMaxUDPSessionsPerGeneration      int64 = 256
 )
+
+// Limits are immutable capacity bounds owned by one QUIC listener pool.
+// NewWithLimits callers must pass positive, fully defaulted values.
+type Limits struct {
+	MaxClientGenerations             int64
+	MaxPendingRegistrations          int64
+	MaxTCPConnectionsPerGeneration   int64
+	MaxPendingTCPSetupsPerGeneration int64
+	MaxUDPSessionsPerGeneration      int64
+}
+
+type capacityState struct {
+	highWater int64
+	drops     uint64
+}
+
+func (s *capacityState) observe(current int64) {
+	if current > s.highWater {
+		s.highWater = current
+	}
+}
+
+func (s *capacityState) snapshot(current, limit int64) LimitSnapshot {
+	return LimitSnapshot{
+		Current:       current,
+		HighWater:     max(current, s.highWater),
+		Limit:         limit,
+		CapacityDrops: s.drops,
+	}
+}
 
 // ClientMetadata contains client information
 type ClientMetadata struct {
@@ -108,12 +159,55 @@ type ClientMetadata struct {
 	Labels       map[string]string // For future filtering
 }
 
+// LimitSnapshot reports one capacity owner's current and lifetime counters.
+type LimitSnapshot struct {
+	Current       int64
+	HighWater     int64
+	Limit         int64
+	CapacityDrops uint64
+}
+
+// CapacitySnapshot is a point-in-time, value-only view of generation and
+// traffic accounting for one QUIC listener.
+type CapacitySnapshot struct {
+	ServerPending                 int64
+	Reservations                  int
+	Registered                    int
+	ServerRetiring                int
+	TCPPending                    int64
+	TCPActive                     int64
+	UDPSessions                   int64
+	AccountingFaults              uint64
+	PendingRegistrations          LimitSnapshot
+	ClientGenerations             LimitSnapshot
+	TCPConnectionsPerGeneration   LimitSnapshot
+	PendingTCPSetupsPerGeneration LimitSnapshot
+	UDPSessionsPerGeneration      LimitSnapshot
+}
+
 // New creates a new connection pool
 func New(quicAddr string, balancer LoadBalancer, logger zerolog.Logger) *ConnectionPool {
+	return NewWithLimits(quicAddr, balancer, logger, defaultLimits())
+}
+
+func defaultLimits() Limits {
+	return Limits{
+		MaxClientGenerations:             defaultMaxClientGenerations,
+		MaxPendingRegistrations:          defaultMaxPendingRegistrations,
+		MaxTCPConnectionsPerGeneration:   defaultMaxTCPConnectionsPerGeneration,
+		MaxPendingTCPSetupsPerGeneration: defaultMaxPendingTCPSetupsPerGeneration,
+		MaxUDPSessionsPerGeneration:      defaultMaxUDPSessionsPerGeneration,
+	}
+}
+
+// NewWithLimits creates a connection pool with immutable capacity limits.
+func NewWithLimits(quicAddr string, balancer LoadBalancer, logger zerolog.Logger, limits Limits) *ConnectionPool {
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &ConnectionPool{
 		clients:      make(map[string]*ClientConn),
 		reservations: make(map[string]*Reservation),
+		retiring:     make(map[*ClientConn]*Retirement),
+		limits:       limits,
 		quicAddr:     quicAddr,
 		balancer:     balancer,
 		logger:       logger.With().Str("quic_addr", quicAddr).Logger(),
@@ -149,33 +243,85 @@ func (p *ConnectionPool) Add(conn *ClientConn) error {
 	return nil
 }
 
+// BeginPending starts accounting for one accepted, post-handshake server
+// connection before its registration identity is known.
+func (p *ConnectionPool) BeginPending() *Reservation {
+	reservation, _ := p.beginPending()
+	return reservation
+}
+
+func (p *ConnectionPool) beginPending() (*Reservation, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.accountingFaults != 0 {
+		return nil, ErrAccountingFault
+	}
+	if p.serverPending >= p.limits.MaxPendingRegistrations {
+		p.pendingRegistrations.drops++
+		return nil, ErrPendingRegistrationCapacity
+	}
+	p.serverPending++
+	p.pendingRegistrations.observe(p.serverPending)
+	return &Reservation{pool: p}, nil
+}
+
 // Reserve atomically claims conn.ID without making conn selectable. Current
 // and pending registrations share the same ID namespace. A successful
 // reservation does not consume conn as a generation until Commit succeeds.
 func (p *ConnectionPool) Reserve(conn *ClientConn) (*Reservation, error) {
+	reservation, err := p.beginPending()
+	if err != nil {
+		return nil, err
+	}
+	if err := reservation.Reserve(conn); err != nil {
+		p.Abort(reservation)
+		return nil, err
+	}
+	return reservation, nil
+}
+
+// Reserve binds an accepted pending connection to an exact client generation.
+func (r *Reservation) Reserve(conn *ClientConn) error {
+	if r == nil || r.pool == nil {
+		return fmt.Errorf("invalid pool reservation")
+	}
 	if conn == nil {
-		return nil, fmt.Errorf("client connection is nil")
+		return fmt.Errorf("client connection is nil")
 	}
 	if conn.ID == "" {
-		return nil, fmt.Errorf("client ID is empty")
+		return fmt.Errorf("client ID is empty")
 	}
 
+	p := r.pool
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if r.state.Load() != reservationPending {
+		return fmt.Errorf("client reservation is no longer pending")
+	}
+	if p.accountingFaults != 0 {
+		return ErrAccountingFault
+	}
 	if _, exists := p.clients[conn.ID]; exists {
-		return nil, fmt.Errorf("client %s already exists in pool", conn.ID)
+		return fmt.Errorf("client %s already exists in pool", conn.ID)
 	}
 	if _, exists := p.reservations[conn.ID]; exists {
-		return nil, fmt.Errorf("client %s already has a pending registration", conn.ID)
+		return fmt.Errorf("client %s already has a pending registration", conn.ID)
 	}
 	if conn.added.Load() {
-		return nil, fmt.Errorf("client connection %s was already added to a pool", conn.ID)
+		return fmt.Errorf("client connection %s was already added to a pool", conn.ID)
+	}
+	if p.clientGenerationCountLocked() >= p.limits.MaxClientGenerations {
+		p.clientGenerations.drops++
+		return ErrClientGenerationCapacity
 	}
 
-	reservation := &Reservation{pool: p, conn: conn, id: conn.ID}
-	p.reservations[conn.ID] = reservation
-	return reservation, nil
+	r.conn = conn
+	r.id = conn.ID
+	r.state.Store(reservationReserved)
+	p.reservations[conn.ID] = r
+	p.clientGenerations.observe(p.clientGenerationCountLocked())
+	return nil
 }
 
 // Commit publishes the exact generation held by reservation. It consumes the
@@ -189,8 +335,11 @@ func (p *ConnectionPool) Commit(reservation *Reservation) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if reservation.state.Load() != reservationPending || p.reservations[reservation.id] != reservation {
+	if reservation.state.Load() != reservationReserved || p.reservations[reservation.id] != reservation {
 		return fmt.Errorf("client reservation is no longer pending")
+	}
+	if p.accountingFaults != 0 {
+		return ErrAccountingFault
 	}
 	if reservation.conn == nil || reservation.conn.ID != reservation.id {
 		return fmt.Errorf("reserved client ID changed before commit")
@@ -205,6 +354,7 @@ func (p *ConnectionPool) Commit(reservation *Reservation) error {
 	reservation.conn.healthy.Store(true)
 	p.clients[reservation.id] = reservation.conn
 	delete(p.reservations, reservation.id)
+	p.serverPending--
 	reservation.state.Store(reservationCommitted)
 
 	// Invalidate cache by setting to nil
@@ -230,26 +380,34 @@ func (p *ConnectionPool) Abort(reservation *Reservation) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if reservation.state.Load() != reservationPending || p.reservations[reservation.id] != reservation {
+	state := reservation.state.Load()
+	if state != reservationPending && state != reservationReserved {
 		return false
 	}
-	delete(p.reservations, reservation.id)
+	if state == reservationReserved {
+		if p.reservations[reservation.id] != reservation {
+			return false
+		}
+		delete(p.reservations, reservation.id)
+	}
+	p.serverPending--
 	reservation.state.Store(reservationAborted)
 	return true
 }
 
-// Remove removes the expected client generation from the pool.
-// It reports whether expected was still current and the removal was applied.
-func (p *ConnectionPool) Remove(expected *ClientConn) bool {
+// BeginRetire removes the exact current generation from selection and holds it
+// in retiring accounting until Done. Repeated or stale calls are harmless.
+func (p *ConnectionPool) BeginRetire(expected *ClientConn) *Retirement {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if !p.isCurrentLocked(expected) {
-		return false
+		return nil
 	}
-
 	expected.healthy.Store(false)
 	delete(p.clients, expected.ID)
+	retirement := &Retirement{pool: p, conn: expected}
+	p.retiring[expected] = retirement
 	p.cachedClients.Store(nil)
 
 	p.logger.Info().
@@ -257,9 +415,41 @@ func (p *ConnectionPool) Remove(expected *ClientConn) bool {
 		Time("registered_at", expected.RegisteredAt).
 		Int64("active_conns", expected.ActiveConns.Load()).
 		Uint64("total_conns", expected.TotalConns.Load()).
-		Msg("client removed from pool")
+		Msg("client retiring from pool")
+	return retirement
+}
 
+// Done idempotently completes retirement of the exact generation.
+func (r *Retirement) Done() bool {
+	if r == nil || r.pool == nil {
+		return false
+	}
+	r.pool.mu.Lock()
+	defer r.pool.mu.Unlock()
+	if r.done || r.pool.retiring[r.conn] != r {
+		return false
+	}
+	r.done = true
+	r.pool.finalizeRetirementLocked(r.conn)
 	return true
+}
+
+func (p *ConnectionPool) finalizeRetirementLocked(conn *ClientConn) {
+	retirement := p.retiring[conn]
+	if retirement != nil && retirement.done && conn.tcpPending.Load() == 0 &&
+		conn.tcpActive.Load() == 0 && conn.udpSessions.Load() == 0 {
+		delete(p.retiring, conn)
+	}
+}
+
+// Remove removes the expected client generation from the pool.
+// It reports whether expected was still current and the removal was applied.
+func (p *ConnectionPool) Remove(expected *ClientConn) bool {
+	retirement := p.BeginRetire(expected)
+	if retirement == nil {
+		return false
+	}
+	return retirement.Done()
 }
 
 // Select chooses a client without capability filtering. Traffic routing should
@@ -314,12 +504,11 @@ func (p *ConnectionPool) ReserveUDP() (*ClientConn, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if p.accountingFaults != 0 {
+		return nil, ErrAccountingFault
+	}
 	if len(p.clients) == 0 {
 		return nil, ErrNoClientsAvailable
-	}
-	limit := p.udpSessionLimit
-	if limit <= 0 {
-		limit = defaultUDPSessionsPerGeneration
 	}
 	eligible := make([]*ClientConn, 0, len(p.clients))
 	hasEligible := false
@@ -328,7 +517,7 @@ func (p *ConnectionPool) ReserveUDP() (*ClientConn, error) {
 			continue
 		}
 		hasEligible = true
-		if conn.udpSessions.Load() < limit {
+		if conn.udpSessions.Load() < p.limits.MaxUDPSessionsPerGeneration {
 			eligible = append(eligible, conn)
 		}
 	}
@@ -336,6 +525,7 @@ func (p *ConnectionPool) ReserveUDP() (*ClientConn, error) {
 		return nil, ErrNoEligibleClients
 	}
 	if len(eligible) == 0 {
+		p.udpSessions.drops++
 		return nil, ErrUDPGenerationCapacity
 	}
 
@@ -346,7 +536,8 @@ func (p *ConnectionPool) ReserveUDP() (*ClientConn, error) {
 	if slices.Index(eligible, selected) < 0 {
 		return nil, fmt.Errorf("load balancer selected a client outside the UDP candidate set")
 	}
-	selected.udpSessions.Add(1)
+	current := selected.udpSessions.Add(1)
+	p.udpSessions.observe(current)
 	return selected, nil
 }
 
@@ -355,10 +546,14 @@ func (p *ConnectionPool) ReleaseUDP(conn *ClientConn) bool {
 	if conn == nil {
 		return false
 	}
-	if conn.udpSessions.Add(-1) < 0 {
-		conn.udpSessions.Add(1)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if conn.udpSessions.Load() <= 0 {
+		p.accountingFaults++
 		return false
 	}
+	conn.udpSessions.Add(-1)
+	p.finalizeRetirementLocked(conn)
 	return true
 }
 
@@ -375,6 +570,9 @@ func (p *ConnectionPool) BeginTCPAdmission() (*TCPAdmission, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if p.accountingFaults != 0 {
+		return nil, ErrAccountingFault
+	}
 	if len(p.clients) == 0 {
 		return nil, ErrNoClientsAvailable
 	}
@@ -394,9 +592,9 @@ func (p *ConnectionPool) BeginTCPAdmission() (*TCPAdmission, error) {
 
 // Next reserves the next still-current candidate. The first call selects and
 // reserves under one pool lock; later calls walk the same snapshot without
-// invoking the balancer again. ErrTCPGenerationCapacity means at least one
-// remaining current generation was saturated; a nil lease means the snapshot
-// was otherwise exhausted.
+// invoking the balancer again. ErrTCPGenerationCapacity wraps the exact total
+// connection or pending-setup limit reached; a nil lease means the snapshot was
+// otherwise exhausted.
 func (a *TCPAdmission) Next() (*TCPLease, error) {
 	if a == nil || a.pool == nil {
 		return nil, nil
@@ -404,13 +602,16 @@ func (a *TCPAdmission) Next() (*TCPLease, error) {
 
 	a.pool.mu.Lock()
 	defer a.pool.mu.Unlock()
+	if a.pool.accountingFaults != 0 {
+		return nil, ErrAccountingFault
+	}
 	if !a.balanced {
 		a.balanced = true
 		eligible := make([]*ClientConn, 0, len(a.candidates))
 		for _, conn := range a.candidates {
 			if a.pool.isCurrentLocked(conn) &&
 				isEligible(conn, "tcp") &&
-				conn.tcpPending.Load() < maxPendingTCPSetupsPerClient {
+				a.pool.tcpCapacityErrorLocked(conn) == nil {
 				eligible = append(eligible, conn)
 			}
 		}
@@ -432,7 +633,8 @@ func (a *TCPAdmission) Next() (*TCPLease, error) {
 		return nil, a.balanceErr
 	}
 
-	atCapacity := false
+	atConnectionCapacity := false
+	atSetupCapacity := false
 	for a.next < len(a.candidates) {
 		conn := a.candidates[a.next]
 		a.next++
@@ -440,17 +642,39 @@ func (a *TCPAdmission) Next() (*TCPLease, error) {
 		if !a.pool.isCurrentLocked(conn) || !isEligible(conn, "tcp") {
 			continue
 		}
-		if conn.tcpPending.Load() >= maxPendingTCPSetupsPerClient {
-			atCapacity = true
+		capacityErr := a.pool.tcpCapacityErrorLocked(conn)
+		if errors.Is(capacityErr, ErrTCPGenerationConnectionCapacity) {
+			atConnectionCapacity = true
 			continue
 		}
-		conn.tcpPending.Add(1)
+		if errors.Is(capacityErr, ErrTCPGenerationSetupCapacity) {
+			atSetupCapacity = true
+			continue
+		}
+		pending := conn.tcpPending.Add(1)
+		a.pool.pendingTCPSetups.observe(pending)
+		a.pool.tcpConnections.observe(pending + conn.tcpActive.Load())
 		return &TCPLease{pool: a.pool, conn: conn, state: tcpLeasePending}, nil
 	}
-	if atCapacity {
-		return nil, ErrTCPGenerationCapacity
+	if atConnectionCapacity {
+		a.pool.tcpConnections.drops++
+		return nil, ErrTCPGenerationConnectionCapacity
+	}
+	if atSetupCapacity {
+		a.pool.pendingTCPSetups.drops++
+		return nil, ErrTCPGenerationSetupCapacity
 	}
 	return nil, nil
+}
+
+func (p *ConnectionPool) tcpCapacityErrorLocked(conn *ClientConn) error {
+	if conn.tcpPending.Load()+conn.tcpActive.Load() >= p.limits.MaxTCPConnectionsPerGeneration {
+		return ErrTCPGenerationConnectionCapacity
+	}
+	if conn.tcpPending.Load() >= p.limits.MaxPendingTCPSetupsPerGeneration {
+		return ErrTCPGenerationSetupCapacity
+	}
+	return nil
 }
 
 // Client returns the exact generation held by the lease.
@@ -474,6 +698,7 @@ func (l *TCPLease) Commit() bool {
 
 	// Lock-free load balancing may briefly overcount, but must never undercount.
 	l.conn.ActiveConns.Add(1)
+	l.conn.tcpActive.Add(1)
 	l.conn.TotalConns.Add(1)
 	l.conn.tcpPending.Add(-1)
 	l.state = tcpLeaseActive
@@ -493,11 +718,56 @@ func (l *TCPLease) Release() bool {
 		l.conn.tcpPending.Add(-1)
 	case tcpLeaseActive:
 		l.conn.ActiveConns.Add(-1)
+		l.conn.tcpActive.Add(-1)
 	case tcpLeaseReleased:
 		return false
 	}
 	l.state = tcpLeaseReleased
+	l.pool.finalizeRetirementLocked(l.conn)
 	return true
+}
+
+// Snapshot returns generation and traffic counters, including exact
+// generations held in retirement.
+func (p *ConnectionPool) Snapshot() CapacitySnapshot {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	clientGenerations := p.clientGenerationCountLocked()
+	snapshot := CapacitySnapshot{
+		ServerPending:        p.serverPending,
+		Reservations:         len(p.reservations),
+		Registered:           len(p.clients),
+		ServerRetiring:       len(p.retiring),
+		AccountingFaults:     p.accountingFaults,
+		PendingRegistrations: p.pendingRegistrations.snapshot(p.serverPending, p.limits.MaxPendingRegistrations),
+		ClientGenerations:    p.clientGenerations.snapshot(clientGenerations, p.limits.MaxClientGenerations),
+	}
+	var maxTCPConnections, maxPendingTCPSetups, maxUDPSessions int64
+	add := func(conn *ClientConn) {
+		tcpPending := conn.tcpPending.Load()
+		tcpActive := conn.tcpActive.Load()
+		udpSessions := conn.udpSessions.Load()
+		snapshot.TCPPending += tcpPending
+		snapshot.TCPActive += tcpActive
+		snapshot.UDPSessions += udpSessions
+		maxTCPConnections = max(maxTCPConnections, tcpPending+tcpActive)
+		maxPendingTCPSetups = max(maxPendingTCPSetups, tcpPending)
+		maxUDPSessions = max(maxUDPSessions, udpSessions)
+	}
+	for _, conn := range p.clients {
+		add(conn)
+	}
+	for conn := range p.retiring {
+		add(conn)
+	}
+	snapshot.TCPConnectionsPerGeneration = p.tcpConnections.snapshot(maxTCPConnections, p.limits.MaxTCPConnectionsPerGeneration)
+	snapshot.PendingTCPSetupsPerGeneration = p.pendingTCPSetups.snapshot(maxPendingTCPSetups, p.limits.MaxPendingTCPSetupsPerGeneration)
+	snapshot.UDPSessionsPerGeneration = p.udpSessions.snapshot(maxUDPSessions, p.limits.MaxUDPSessionsPerGeneration)
+	return snapshot
+}
+
+func (p *ConnectionPool) clientGenerationCountLocked() int64 {
+	return int64(len(p.reservations) + len(p.clients) + len(p.retiring))
 }
 
 // rebuildClientSlice rebuilds the cached client slice from the map
@@ -649,9 +919,14 @@ func (p *ConnectionPool) isCurrentLocked(expected *ClientConn) bool {
 
 // Errors
 var (
-	ErrNoClientsAvailable    = fmt.Errorf("no clients available in pool")
-	ErrNoHealthyClients      = fmt.Errorf("no healthy clients available")
-	ErrNoEligibleClients     = fmt.Errorf("no eligible clients available")
-	ErrTCPGenerationCapacity = fmt.Errorf("all eligible TCP generations are at setup capacity")
-	ErrUDPGenerationCapacity = fmt.Errorf("all eligible UDP generations are at capacity")
+	ErrNoClientsAvailable              = fmt.Errorf("no clients available in pool")
+	ErrNoHealthyClients                = fmt.Errorf("no healthy clients available")
+	ErrNoEligibleClients               = fmt.Errorf("no eligible clients available")
+	ErrAccountingFault                 = fmt.Errorf("connection pool accounting fault")
+	ErrPendingRegistrationCapacity     = fmt.Errorf("pending client registration capacity reached")
+	ErrClientGenerationCapacity        = fmt.Errorf("client generation capacity reached")
+	ErrTCPGenerationCapacity           = fmt.Errorf("all eligible TCP generations are at capacity")
+	ErrTCPGenerationConnectionCapacity = fmt.Errorf("%w: connection limit reached", ErrTCPGenerationCapacity)
+	ErrTCPGenerationSetupCapacity      = fmt.Errorf("%w: pending setup limit reached", ErrTCPGenerationCapacity)
+	ErrUDPGenerationCapacity           = fmt.Errorf("all eligible UDP generations are at capacity")
 )

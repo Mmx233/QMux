@@ -13,6 +13,17 @@ listeners:
     # Protocol to accept: "tcp", "udp", or "both"
     protocol: "both"
 
+    # Capacity limits for this listener. Omit a field or set it to 0 to use its default.
+    capacity:
+      max_client_generations: 16
+      max_pending_registrations: 128
+      max_tcp_connections: 128
+      max_pending_tcp_setups: 128
+      max_tcp_connections_per_generation: 100
+      max_pending_tcp_setups_per_generation: 16
+      max_udp_sessions: 1024
+      max_udp_sessions_per_generation: 256
+
     # QUIC settings (optional - defaults are used if not specified)
     # Initial stream receive window size in bytes
     # initial_stream_receive_window: 524288

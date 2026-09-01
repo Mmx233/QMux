@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Mmx233/QMux/config"
 	"github.com/Mmx233/QMux/protocol"
 	"github.com/quic-go/quic-go"
 	"github.com/rs/zerolog"
@@ -74,8 +75,8 @@ func assertNoUDPSessions(t *testing.T, handler *UDPHandler) {
 }
 
 func TestUDPSessionBudgetBoundsSharedHandlersBeforeDial(t *testing.T) {
-	if got := cap(newUDPSessionBudget(0).slots); got != defaultClientUDPSessionLimit {
-		t.Fatalf("default UDP session limit = %d, want %d", got, defaultClientUDPSessionLimit)
+	if got := cap(newUDPSessionBudget(0).slots); got != config.DefaultMaxLocalUDPSessions {
+		t.Fatalf("default UDP session limit = %d, want %d", got, config.DefaultMaxLocalUDPSessions)
 	}
 
 	budget := newUDPSessionBudget(1)
@@ -104,6 +105,34 @@ func TestUDPSessionBudgetBoundsSharedHandlersBeforeDial(t *testing.T) {
 	release()
 	if held, faults := budget.permitsHeld.Load(), budget.accountingFaults.Load(); held != 0 || faults != 0 {
 		t.Fatalf("released UDP budget = %d held/%d faults, want zero", held, faults)
+	}
+}
+
+func TestUDPSessionBudgetAccountingFaultFailsClosedAndDrainsExisting(t *testing.T) {
+	budget := newUDPSessionBudget(2)
+	release, ok := budget.acquire()
+	if !ok {
+		t.Fatal("initial UDP session budget acquisition failed")
+	}
+	budget.publish()
+	budget.mu.Lock()
+	budget.accountingFaults.Add(1)
+	budget.mu.Unlock()
+
+	before := budget.snapshot()
+	if rejectedRelease, ok := budget.acquire(); ok || rejectedRelease != nil {
+		t.Fatal("UDP session budget acquisition succeeded after accounting fault")
+	}
+	after := budget.snapshot()
+	if after.CapacityDrops != before.CapacityDrops || after.Current != 1 || after.Permits != 1 {
+		t.Fatalf("fault rejection snapshot = %+v, want one existing session and no capacity drop", after)
+	}
+
+	budget.unpublish()
+	release()
+	final := budget.snapshot()
+	if final.Current != 0 || final.Permits != 0 || final.AccountingFaults != 1 || final.CapacityDrops != 0 {
+		t.Fatalf("drained fault snapshot = %+v, want zero current/permits, one fault, and no capacity drops", final)
 	}
 }
 
@@ -264,6 +293,9 @@ func TestUDPHandlerStopJoinsBlockedReceiveSessionAndAssembler(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create active UDP session: %v", err)
 	}
+	if got := handler.dsendStats.load().Workers; got != 1 {
+		t.Fatalf("Dsend workers = %d, want 1", got)
+	}
 	if _, err := handler.getOrCreateSession(8, clientConn); !errors.Is(err, errClientUDPSessionLimit) {
 		t.Fatalf("create UDP session over cap error = %v, want errClientUDPSessionLimit", err)
 	}
@@ -293,6 +325,9 @@ func TestUDPHandlerStopJoinsBlockedReceiveSessionAndAssembler(t *testing.T) {
 	awaitUDPHandler(t, waitDone, "UDP handler fixed loops and session reader")
 
 	assertNoUDPSessions(t, handler)
+	if got := handler.dsendStats.load().Workers; got != 0 {
+		t.Fatalf("stopped Dsend workers = %d, want 0", got)
+	}
 	if _, err := handler.fragmentAssembler.AddFragment(7, 4, 0, 2, []byte("closed")); !errors.Is(err, protocol.ErrFragmentAssemblerClosed) {
 		t.Fatalf("assembler after Stop error = %v, want ErrFragmentAssemblerClosed", err)
 	}

@@ -14,15 +14,40 @@ import (
 )
 
 type Client struct {
-	ClientID          string        `yaml:"client_id"`
-	Server            ClientServer  `yaml:"server"`
-	Local             LocalService  `yaml:"local"`
-	Quic              Quic          `yaml:"quic"`
-	TLS               ClientTLS     `yaml:"tls"`
-	Auth              ClientAuth    `yaml:"auth"`
-	UDP               UDPConfig     `yaml:"udp"`
-	HeartbeatInterval time.Duration `yaml:"heartbeat_interval"` // Heartbeat interval, default 30s
-	HealthTimeout     time.Duration `yaml:"health_timeout"`     // Health timeout for received heartbeats, default 90s
+	ClientID          string         `yaml:"client_id"`
+	Server            ClientServer   `yaml:"server"`
+	Local             LocalService   `yaml:"local"`
+	Quic              Quic           `yaml:"quic"`
+	TLS               ClientTLS      `yaml:"tls"`
+	Auth              ClientAuth     `yaml:"auth"`
+	UDP               UDPConfig      `yaml:"udp"`
+	Capacity          ClientCapacity `yaml:"capacity"`
+	HeartbeatInterval time.Duration  `yaml:"heartbeat_interval"` // Heartbeat interval, default 30s
+	HealthTimeout     time.Duration  `yaml:"health_timeout"`     // Health timeout for received heartbeats, default 90s
+}
+
+// ClientCapacity bounds resources shared by the client process.
+type ClientCapacity struct {
+	MaxLocalUDPSessions int `yaml:"max_local_udp_sessions"`
+}
+
+// ApplyDefaults fills omitted or explicitly zero capacity limits.
+//
+//goland:noinspection GoMixedReceiverTypes
+func (c *ClientCapacity) ApplyDefaults() {
+	if c.MaxLocalUDPSessions == 0 {
+		c.MaxLocalUDPSessions = DefaultMaxLocalUDPSessions
+	}
+}
+
+// Validate rejects negative limits. Zero means use the default.
+//
+//goland:noinspection GoMixedReceiverTypes
+func (c ClientCapacity) Validate(path string) error {
+	if c.MaxLocalUDPSessions < 0 {
+		return fmt.Errorf("%s.max_local_udp_sessions must not be negative", path)
+	}
+	return nil
 }
 
 // EnsureClientID generates a UUID for ClientID if it is empty.
@@ -38,6 +63,7 @@ func (c *Client) EnsureClientID() {
 func (c *Client) ApplyDefaults() {
 	c.EnsureClientID()
 	c.Auth.ApplyDefaults()
+	c.Capacity.ApplyDefaults()
 	if c.HeartbeatInterval == 0 {
 		c.HeartbeatInterval = DefaultHeartbeatInterval
 	}
@@ -49,6 +75,9 @@ func (c *Client) ApplyDefaults() {
 // Validate validates the client configuration.
 // It checks that HealthTimeout is greater than HeartbeatInterval.
 func (c *Client) Validate() error {
+	if err := c.Capacity.Validate("capacity"); err != nil {
+		return err
+	}
 	if c.HealthTimeout <= c.HeartbeatInterval {
 		return fmt.Errorf("health_timeout (%v) must be greater than heartbeat_interval (%v)", c.HealthTimeout, c.HeartbeatInterval)
 	}
@@ -187,10 +216,7 @@ func (t *ClientTLS) LoadCertificates() error {
 	return t.LoadClientKeyPair()
 }
 
-const (
-	MinServers = 1
-	MaxServers = 10
-)
+const MinServers = 1
 
 // ValidateAddress validates that an address is in valid host:port format.
 // Returns an error if the address is invalid.
@@ -228,9 +254,6 @@ func (cs *ClientServer) Validate() error {
 	// Validate server count
 	if len(servers) < MinServers {
 		return fmt.Errorf("at least %d server address must be provided", MinServers)
-	}
-	if len(servers) > MaxServers {
-		return fmt.Errorf("maximum %d server addresses allowed, got %d", MaxServers, len(servers))
 	}
 
 	// Validate each server address

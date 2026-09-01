@@ -16,9 +16,10 @@ func addUDPAdmissionClient(t *testing.T, p *ConnectionPool, id string) *ClientCo
 }
 
 func TestUDPAdmissionCapAndReleaseUnderflow(t *testing.T) {
-	p := New("test", NewRoundRobinBalancer(), newTestLogger())
+	limits := defaultLimits()
+	limits.MaxUDPSessionsPerGeneration = 2
+	p := NewWithLimits("test", NewRoundRobinBalancer(), newTestLogger(), limits)
 	defer p.Stop()
-	p.udpSessionLimit = 2
 	client := addUDPAdmissionClient(t, p, "client")
 
 	for i := range 2 {
@@ -29,6 +30,9 @@ func TestUDPAdmissionCapAndReleaseUnderflow(t *testing.T) {
 	}
 	if _, err := p.ReserveUDP(); !errors.Is(err, ErrUDPGenerationCapacity) {
 		t.Fatalf("ReserveUDP(cap+1) error = %v, want ErrUDPGenerationCapacity", err)
+	}
+	if got := p.Snapshot().UDPSessionsPerGeneration; got != (LimitSnapshot{Current: 2, HighWater: 2, Limit: 2, CapacityDrops: 1}) {
+		t.Fatalf("UDP session snapshot = %+v", got)
 	}
 	if got := client.udpSessions.Load(); got != 2 {
 		t.Fatalf("held UDP sessions = %d, want 2", got)
@@ -42,22 +46,24 @@ func TestUDPAdmissionCapAndReleaseUnderflow(t *testing.T) {
 	if got := client.udpSessions.Load(); got != 0 {
 		t.Fatalf("UDP sessions after underflow compensation = %d, want 0", got)
 	}
+	if got := p.Snapshot().UDPSessionsPerGeneration; got.Current != 0 || got.HighWater != 2 || got.CapacityDrops != 1 {
+		t.Fatalf("UDP session snapshot after release = %+v", got)
+	}
 }
 
-func TestUDPAdmissionNonPositiveLimitUsesDefault(t *testing.T) {
-	for _, limit := range []int64{0, -1} {
-		p := New("test", NewRoundRobinBalancer(), newTestLogger())
-		p.udpSessionLimit = limit
-		client := addUDPAdmissionClient(t, p, "client")
-		client.udpSessions.Store(defaultUDPSessionsPerGeneration - 1)
+func TestUDPAdmissionLimitIsImmutable(t *testing.T) {
+	limits := defaultLimits()
+	limits.MaxUDPSessionsPerGeneration = 1
+	p := NewWithLimits("test", NewRoundRobinBalancer(), newTestLogger(), limits)
+	defer p.Stop()
+	limits.MaxUDPSessionsPerGeneration = 2
+	client := addUDPAdmissionClient(t, p, "client")
 
-		if selected, err := p.ReserveUDP(); err != nil || selected != client {
-			t.Fatalf("limit %d ReserveUDP(default cap) = (%p, %v), want client %p", limit, selected, err, client)
-		}
-		if _, err := p.ReserveUDP(); !errors.Is(err, ErrUDPGenerationCapacity) {
-			t.Fatalf("limit %d ReserveUDP(default cap+1) error = %v", limit, err)
-		}
-		p.Stop()
+	if selected, err := p.ReserveUDP(); err != nil || selected != client {
+		t.Fatalf("ReserveUDP(cap) = (%p, %v), want client %p", selected, err, client)
+	}
+	if _, err := p.ReserveUDP(); !errors.Is(err, ErrUDPGenerationCapacity) {
+		t.Fatalf("ReserveUDP(cap+1) error = %v, want ErrUDPGenerationCapacity", err)
 	}
 }
 
@@ -70,9 +76,10 @@ func TestUDPAdmissionSelectsAvailableAlternative(t *testing.T) {
 		{name: "least-connections", new: func() LoadBalancer { return NewLeastConnectionsBalancer() }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			p := New("test", test.new(), newTestLogger())
+			limits := defaultLimits()
+			limits.MaxUDPSessionsPerGeneration = 1
+			p := NewWithLimits("test", test.new(), newTestLogger(), limits)
 			defer p.Stop()
-			p.udpSessionLimit = 1
 			first := addUDPAdmissionClient(t, p, "first")
 			second := addUDPAdmissionClient(t, p, "second")
 
@@ -98,9 +105,11 @@ func TestUDPAdmissionSelectsAvailableAlternative(t *testing.T) {
 }
 
 func TestUDPAdmissionConcurrentNoOvershoot(t *testing.T) {
-	p := New("test", NewLeastConnectionsBalancer(), newTestLogger())
+	const limit int64 = 8
+	limits := defaultLimits()
+	limits.MaxUDPSessionsPerGeneration = limit
+	p := NewWithLimits("test", NewLeastConnectionsBalancer(), newTestLogger(), limits)
 	defer p.Stop()
-	p.udpSessionLimit = 8
 	client := addUDPAdmissionClient(t, p, "client")
 
 	const workers = 128
@@ -129,15 +138,15 @@ func TestUDPAdmissionConcurrentNoOvershoot(t *testing.T) {
 		t.Errorf("ReserveUDP() unexpected error = %v", err)
 	}
 
-	held := make([]*ClientConn, 0, p.udpSessionLimit)
+	held := make([]*ClientConn, 0, limit)
 	for selected := range reserved {
 		held = append(held, selected)
 	}
-	if got := len(held); got != int(p.udpSessionLimit) {
-		t.Fatalf("successful reservations = %d, want %d", got, p.udpSessionLimit)
+	if got := len(held); got != int(limit) {
+		t.Fatalf("successful reservations = %d, want %d", got, limit)
 	}
-	if got := client.udpSessions.Load(); got != p.udpSessionLimit {
-		t.Fatalf("generation high water = %d, want %d", got, p.udpSessionLimit)
+	if got := client.udpSessions.Load(); got != limit {
+		t.Fatalf("generation high water = %d, want %d", got, limit)
 	}
 	for _, selected := range held {
 		if !p.ReleaseUDP(selected) {

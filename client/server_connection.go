@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -77,6 +78,16 @@ type ServerConnection struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	closeOnce sync.Once
+	closeMu   sync.Mutex
+	closed    bool
+	closeErr  error
+	onClosed  func()
+
+	// Protected by the owning ConnectionManager.publishMu.
+	capacityEndpoint int
+	capacityPhase    clientGenerationPhase
 }
 
 // NewServerConnection creates a new ServerConnection instance.
@@ -86,9 +97,10 @@ func NewServerConnection(serverAddr, serverName string, sessionCache tls.ClientS
 	ctx, cancel := context.WithCancel(context.Background())
 
 	sc := &ServerConnection{
-		serverAddr:   serverAddr,
-		serverName:   serverName,
-		sessionCache: sessionCache,
+		serverAddr:       serverAddr,
+		serverName:       serverName,
+		sessionCache:     sessionCache,
+		capacityEndpoint: -1,
 		logger: logger.With().
 			Str("server_addr", serverAddr).
 			Logger(),
@@ -688,25 +700,41 @@ func (sc *ServerConnection) AcceptStream(ctx context.Context) (*quic.Stream, err
 // Close gracefully closes the connection.
 // Active streams can continue until they complete or fail naturally.
 func (sc *ServerConnection) Close() error {
-	sc.cancel()
+	sc.closeOnce.Do(func() {
+		sc.cancel()
 
-	// Close control stream first
-	if controlStream := sc.controlStream.Swap(nil); controlStream != nil {
-		_ = controlStream.Close()
+		if controlStream := sc.controlStream.Swap(nil); controlStream != nil {
+			_ = controlStream.Close()
+		}
+
+		sc.state.Store(int32(StateDisconnected))
+		sc.healthy.Store(false)
+
+		if conn := sc.conn.Swap(nil); conn != nil {
+			sc.closeErr = conn.CloseWithError(0, "shutdown")
+			sc.logger.Info().Msg("connection closed")
+		}
+
+		sc.closeMu.Lock()
+		sc.closed = true
+		onClosed := sc.onClosed
+		sc.closeMu.Unlock()
+		if onClosed != nil {
+			onClosed()
+		}
+	})
+	return sc.closeErr
+}
+
+func (sc *ServerConnection) setOnClosed(onClosed func()) bool {
+	sc.closeMu.Lock()
+	if !sc.closed {
+		sc.onClosed = onClosed
+		sc.closeMu.Unlock()
+		return true
 	}
-
-	// Always mark as disconnected and unhealthy
-	sc.state.Store(int32(StateDisconnected))
-	sc.healthy.Store(false)
-
-	// Close QUIC connection if exists
-	if conn := sc.conn.Swap(nil); conn != nil {
-		err := conn.CloseWithError(0, "shutdown")
-		sc.logger.Info().Msg("connection closed")
-		return err
-	}
-
-	return nil
+	sc.closeMu.Unlock()
+	return false
 }
 
 // ServerConnectionInfo provides connection status information for monitoring.

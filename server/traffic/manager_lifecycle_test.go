@@ -139,6 +139,7 @@ func TestNewManagerSnapshotsListeners(t *testing.T) {
 		QuicAddr:    "quic-original",
 		TrafficAddr: "127.0.0.1:8080",
 		Protocol:    "tcp",
+		Capacity:    config.ListenerCapacity{MaxTCPConnections: 7},
 		UDP: config.UDPConfig{
 			EnableFragmentation: &fragmentation,
 		},
@@ -149,6 +150,14 @@ func TestNewManagerSnapshotsListeners(t *testing.T) {
 	if manager.configs[0].QuicAddr != "quic-original" ||
 		!*manager.configs[0].UDP.EnableFragmentation {
 		t.Fatal("manager retained caller-owned listener slice")
+	}
+	if got := manager.configs[0].Capacity; got.MaxTCPConnections != 7 ||
+		got.MaxPendingTCPSetups != config.DefaultMaxPendingTCPSetups ||
+		got.MaxUDPSessions != config.DefaultMaxUDPSessions {
+		t.Fatalf("manager cloned/defaulted listener capacity = %+v", got)
+	}
+	if conf.Listeners[0].Capacity.MaxPendingTCPSetups != 0 || conf.Listeners[0].Capacity.MaxUDPSessions != 0 {
+		t.Fatal("manager defaulting mutated caller-owned listener capacity")
 	}
 }
 

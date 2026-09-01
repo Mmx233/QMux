@@ -28,11 +28,79 @@ type Server struct {
 }
 
 type QuicListener struct {
-	QuicAddr    string `yaml:"quic_addr"`    // Address for QUIC control connections (e.g., "0.0.0.0:8443")
-	TrafficAddr string `yaml:"traffic_addr"` // Address for forwarded traffic (e.g., "0.0.0.0:8080")
-	Protocol    string `yaml:"protocol"`     // "tcp", "udp", or "both"
+	QuicAddr    string           `yaml:"quic_addr"`    // Address for QUIC control connections (e.g., "0.0.0.0:8443")
+	TrafficAddr string           `yaml:"traffic_addr"` // Address for forwarded traffic (e.g., "0.0.0.0:8080")
+	Protocol    string           `yaml:"protocol"`     // "tcp", "udp", or "both"
+	Capacity    ListenerCapacity `yaml:"capacity"`
 	Quic        `yaml:",inline"`
 	UDP         UDPConfig `yaml:"udp"` // UDP-specific configuration
+}
+
+// ListenerCapacity bounds resources owned by one server listener.
+type ListenerCapacity struct {
+	MaxClientGenerations             int `yaml:"max_client_generations"`
+	MaxPendingRegistrations          int `yaml:"max_pending_registrations"`
+	MaxTCPConnections                int `yaml:"max_tcp_connections"`
+	MaxPendingTCPSetups              int `yaml:"max_pending_tcp_setups"`
+	MaxTCPConnectionsPerGeneration   int `yaml:"max_tcp_connections_per_generation"`
+	MaxPendingTCPSetupsPerGeneration int `yaml:"max_pending_tcp_setups_per_generation"`
+	MaxUDPSessions                   int `yaml:"max_udp_sessions"`
+	MaxUDPSessionsPerGeneration      int `yaml:"max_udp_sessions_per_generation"`
+}
+
+// ApplyDefaults fills omitted or explicitly zero capacity limits.
+//
+//goland:noinspection GoMixedReceiverTypes
+func (c *ListenerCapacity) ApplyDefaults() {
+	if c.MaxClientGenerations == 0 {
+		c.MaxClientGenerations = DefaultMaxClientGenerations
+	}
+	if c.MaxPendingRegistrations == 0 {
+		c.MaxPendingRegistrations = DefaultMaxPendingRegistrations
+	}
+	if c.MaxTCPConnections == 0 {
+		c.MaxTCPConnections = DefaultMaxTCPConnections
+	}
+	if c.MaxPendingTCPSetups == 0 {
+		c.MaxPendingTCPSetups = DefaultMaxPendingTCPSetups
+	}
+	if c.MaxTCPConnectionsPerGeneration == 0 {
+		c.MaxTCPConnectionsPerGeneration = DefaultMaxTCPConnectionsPerGeneration
+	}
+	if c.MaxPendingTCPSetupsPerGeneration == 0 {
+		c.MaxPendingTCPSetupsPerGeneration = DefaultMaxPendingTCPSetupsPerGeneration
+	}
+	if c.MaxUDPSessions == 0 {
+		c.MaxUDPSessions = DefaultMaxUDPSessions
+	}
+	if c.MaxUDPSessionsPerGeneration == 0 {
+		c.MaxUDPSessionsPerGeneration = DefaultMaxUDPSessionsPerGeneration
+	}
+}
+
+// Validate rejects negative limits. Zero means use the default.
+//
+//goland:noinspection GoMixedReceiverTypes
+func (c ListenerCapacity) Validate(path string) error {
+	limits := []struct {
+		name  string
+		value int
+	}{
+		{"max_client_generations", c.MaxClientGenerations},
+		{"max_pending_registrations", c.MaxPendingRegistrations},
+		{"max_tcp_connections", c.MaxTCPConnections},
+		{"max_pending_tcp_setups", c.MaxPendingTCPSetups},
+		{"max_tcp_connections_per_generation", c.MaxTCPConnectionsPerGeneration},
+		{"max_pending_tcp_setups_per_generation", c.MaxPendingTCPSetupsPerGeneration},
+		{"max_udp_sessions", c.MaxUDPSessions},
+		{"max_udp_sessions_per_generation", c.MaxUDPSessionsPerGeneration},
+	}
+	for _, limit := range limits {
+		if limit.value < 0 {
+			return fmt.Errorf("%s.%s must not be negative", path, limit.name)
+		}
+	}
+	return nil
 }
 
 type ServerAuth struct {
@@ -134,6 +202,9 @@ func (t *ServerTLS) LoadCertificates() error {
 // ApplyDefaults applies default values to zero-value fields.
 // It sets HeartbeatInterval and HealthTimeout if not specified.
 func (s *Server) ApplyDefaults() {
+	for i := range s.Listeners {
+		s.Listeners[i].Capacity.ApplyDefaults()
+	}
 	if s.HeartbeatInterval == 0 {
 		s.HeartbeatInterval = DefaultHeartbeatInterval
 	}

@@ -66,7 +66,7 @@ func TestHeartbeatWriteStallRetiresExactServerGeneration(t *testing.T) {
 					select {
 					case <-harness.client.Context().Done():
 						heartbeatSenderDone <- nil
-					default:
+					case <-time.After(time.Second):
 						heartbeatSenderDone <- err
 					}
 					return

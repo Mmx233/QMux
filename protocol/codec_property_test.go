@@ -15,6 +15,7 @@ import (
 // TestJSONDecodeAllocationReduction_Property verifies that JSON decoding allocations
 // are within acceptable bounds for message types.
 func TestJSONDecodeAllocationReduction_Property(t *testing.T) {
+	skipAllocationCheckUnderRace(t)
 	rapid.Check(t, func(t *rapid.T) {
 		// Generate random RegisterMsg
 		clientID := rapid.StringMatching(`[a-z0-9-]{5,20}`).Draw(t, "clientID")
@@ -57,6 +58,7 @@ func TestJSONDecodeAllocationReduction_Property(t *testing.T) {
 
 // TestNewConnMsgDecodeAllocation_Property verifies NewConnMsg decode allocations
 func TestNewConnMsgDecodeAllocation_Property(t *testing.T) {
+	skipAllocationCheckUnderRace(t)
 	rapid.Check(t, func(t *rapid.T) {
 		// Generate random NewConnMsg
 		connID := rapid.Uint64().Draw(t, "connID")
@@ -113,6 +115,7 @@ func TestNewConnMsgDecodeAllocation_Property(t *testing.T) {
 
 // TestHeartbeatMsgDecodeAllocation_Property verifies HeartbeatMsg decode allocations
 func TestHeartbeatMsgDecodeAllocation_Property(t *testing.T) {
+	skipAllocationCheckUnderRace(t)
 	rapid.Check(t, func(t *rapid.T) {
 		// Generate random HeartbeatMsg
 		timestamp := rapid.Int64().Draw(t, "timestamp")
@@ -148,6 +151,7 @@ func TestHeartbeatMsgDecodeAllocation_Property(t *testing.T) {
 // TestCodecAllocationEfficiency_Property verifies that WriteMessage and ReadMessage
 // produce minimal allocations through buffer pooling.
 func TestCodecAllocationEfficiency_Property(t *testing.T) {
+	skipAllocationCheckUnderRace(t)
 	rapid.Check(t, func(t *rapid.T) {
 		// Generate random message payload
 		payloadSize := rapid.IntRange(10, 1000).Draw(t, "payloadSize")

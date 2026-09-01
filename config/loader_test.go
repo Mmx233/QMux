@@ -160,6 +160,125 @@ func TestLoadServerConfigCanonicalQUIC(t *testing.T) {
 	roundTripQUIC(t, cfg, func(got *Server) Quic { return got.Listeners[0].Quic }, want)
 }
 
+func TestLoadConfigCapacity(t *testing.T) {
+	serverPath := writeTestConfig(t, `listeners:
+  - capacity:
+      max_client_generations: 1
+      max_pending_registrations: 2
+      max_tcp_connections: 3
+      max_pending_tcp_setups: 4
+      max_tcp_connections_per_generation: 5
+      max_pending_tcp_setups_per_generation: 6
+      max_udp_sessions: 7
+      max_udp_sessions_per_generation: 8
+`)
+	serverConfig, err := LoadServerConfig(serverPath)
+	if err != nil {
+		t.Fatalf("LoadServerConfig: %v", err)
+	}
+	wantServer := ListenerCapacity{
+		MaxClientGenerations:             1,
+		MaxPendingRegistrations:          2,
+		MaxTCPConnections:                3,
+		MaxPendingTCPSetups:              4,
+		MaxTCPConnectionsPerGeneration:   5,
+		MaxPendingTCPSetupsPerGeneration: 6,
+		MaxUDPSessions:                   7,
+		MaxUDPSessionsPerGeneration:      8,
+	}
+	if got := serverConfig.Listeners[0].Capacity; got != wantServer {
+		t.Fatalf("server capacity = %+v, want %+v", got, wantServer)
+	}
+
+	clientPath := writeTestConfig(t, "capacity:\n  max_local_udp_sessions: 9\n")
+	clientConfig, err := LoadConfig[Client](clientPath)
+	if err != nil {
+		t.Fatalf("LoadConfig[Client]: %v", err)
+	}
+	if got := clientConfig.Capacity.MaxLocalUDPSessions; got != 9 {
+		t.Fatalf("client max local UDP sessions = %d, want 9", got)
+	}
+
+	data, err := yaml.Marshal(serverConfig)
+	if err != nil {
+		t.Fatalf("marshal server capacity: %v", err)
+	}
+	roundTrip, err := LoadConfig[Server](writeTestConfig(t, string(data)))
+	if err != nil {
+		t.Fatalf("round-trip server capacity: %v", err)
+	}
+	if got := roundTrip.Listeners[0].Capacity; got != wantServer {
+		t.Fatalf("round-trip server capacity = %+v, want %+v", got, wantServer)
+	}
+}
+
+func TestLoadConfigRejectsNegativeCapacity(t *testing.T) {
+	serverPath := writeTestConfig(t, `listeners:
+  - capacity:
+      max_udp_sessions: -1
+`)
+	if _, err := LoadServerConfig(serverPath); err == nil ||
+		!strings.Contains(err.Error(), "listeners[0].capacity.max_udp_sessions must not be negative") {
+		t.Fatalf("LoadServerConfig error = %v, want full capacity path", err)
+	}
+
+	clientPath := writeTestConfig(t, `client_id: test-client
+server:
+  servers:
+    - address: "server.example.com:8443"
+      server_name: "server.example.com"
+local:
+  host: "127.0.0.1"
+  port: 8080
+capacity:
+  max_local_udp_sessions: -1
+tls:
+  ca_cert_file: "ca.pem"
+  client_cert_file: "client.pem"
+  client_key_file: "client-key.pem"
+`)
+	if _, err := LoadClientConfig(clientPath); err == nil ||
+		!strings.Contains(err.Error(), "capacity.max_local_udp_sessions must not be negative") {
+		t.Fatalf("LoadClientConfig error = %v, want full capacity path", err)
+	}
+}
+
+func TestLoadConfigRejectsCapacityKeysInWrongScope(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		field   string
+		load    func(string) error
+	}{
+		{
+			name:    "client server-only key",
+			content: "capacity:\n  max_udp_sessions: 1\n",
+			field:   "max_udp_sessions",
+			load: func(path string) error {
+				_, err := LoadConfig[Client](path)
+				return err
+			},
+		},
+		{
+			name:    "server client-only key",
+			content: "listeners:\n  - capacity:\n      max_local_udp_sessions: 1\n",
+			field:   "max_local_udp_sessions",
+			load: func(path string) error {
+				_, err := LoadConfig[Server](path)
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := test.load(writeTestConfig(t, test.content))
+			if err == nil || !strings.Contains(err.Error(), test.field) {
+				t.Fatalf("LoadConfig error = %v, want rejection for %s", err, test.field)
+			}
+		})
+	}
+}
+
 func TestLoadConfigRejectsLegacyQUICKeys(t *testing.T) {
 	legacy := []struct {
 		key   string
@@ -497,21 +616,23 @@ local:
 	}
 }
 
-// Test validation error for too many servers
-// Validates: Requirements 1.3
-func TestLoadClientConfig_TooManyServers(t *testing.T) {
-	// Create config with 11 servers (exceeds max of 10)
+// Test that a client can use the 16 endpoints required by the capacity envelope.
+func TestLoadClientConfig_SixteenServers(t *testing.T) {
 	content := `client_id: test-client
 server:
   servers:
 `
-	for i := range 11 {
+	for i := range 16 {
 		content += fmt.Sprintf("    - address: \"server%c.example.com:8443\"\n", 'a'+i)
 		content += fmt.Sprintf("      server_name: \"server%c.example.com\"\n", 'a'+i)
 	}
 	content += `local:
   host: "127.0.0.1"
   port: 8080
+tls:
+  ca_cert_file: "ca.pem"
+  client_cert_file: "client.pem"
+  client_key_file: "client-key.pem"
 `
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.yaml")
@@ -519,12 +640,12 @@ server:
 		t.Fatalf("failed to write test config: %v", err)
 	}
 
-	_, err := LoadClientConfig(configPath)
-	if err == nil {
-		t.Fatal("expected error for too many servers, got nil")
+	cfg, err := LoadClientConfig(configPath)
+	if err != nil {
+		t.Fatalf("load client config: %v", err)
 	}
-	if !strings.Contains(err.Error(), "maximum") {
-		t.Errorf("expected error about maximum servers, got: %v", err)
+	if got := len(cfg.Server.GetServers()); got != 16 {
+		t.Fatalf("server count = %d, want 16", got)
 	}
 }
 

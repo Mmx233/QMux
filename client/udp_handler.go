@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Mmx233/QMux/config"
 	"github.com/Mmx233/QMux/protocol"
 	"github.com/quic-go/quic-go"
 	"github.com/rs/zerolog"
@@ -18,9 +19,8 @@ const (
 	// Session timeout for inactive UDP sessions
 	udpSessionTimeout = 5 * time.Minute
 	// Cleanup interval for expired sessions
-	udpCleanupInterval           = 30 * time.Second
-	udpSocketBufferSize          = 4 * 1024 * 1024
-	defaultClientUDPSessionLimit = 256
+	udpCleanupInterval  = 30 * time.Second
+	udpSocketBufferSize = 4 * 1024 * 1024
 )
 
 var errClientUDPSessionLimit = errors.New("client UDP session limit reached")
@@ -32,6 +32,7 @@ func setUDPSocketBuffer(logger zerolog.Logger, name string, setter func(int) err
 }
 
 type udpSessionBudget struct {
+	mu               sync.Mutex
 	slots            chan struct{}
 	permitsHeld      atomic.Int64
 	publishedActive  atomic.Int64
@@ -40,19 +41,76 @@ type udpSessionBudget struct {
 	accountingFaults atomic.Uint64
 }
 
+func (b *udpSessionBudget) snapshot() UDPSessionSnapshot {
+	if b == nil {
+		return UDPSessionSnapshot{}
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return UDPSessionSnapshot{
+		Current:          b.publishedActive.Load(),
+		Permits:          b.permitsHeld.Load(),
+		HighWater:        b.maxPermitsHeld.Load(),
+		Limit:            int64(cap(b.slots)),
+		CapacityDrops:    b.limitDrops.Load(),
+		AccountingFaults: b.accountingFaults.Load(),
+	}
+}
+
+type clientDsendStats struct {
+	mu       sync.Mutex
+	snapshot DSendSnapshot
+}
+
+func (s *clientDsendStats) releaseDatagrams(datagrams []protocol.DatagramResult, items, backing int64) {
+	s.mu.Lock()
+	protocol.ReleaseDatagramResults(datagrams)
+	s.snapshot.OwnedItems -= items
+	s.snapshot.OwnedBacking -= backing
+	s.mu.Unlock()
+}
+
+func (s *clientDsendStats) worker(delta int64) {
+	s.mu.Lock()
+	s.snapshot.Workers += delta
+	s.mu.Unlock()
+}
+
+func (s *clientDsendStats) sendError() {
+	s.mu.Lock()
+	s.snapshot.SendErrors++
+	s.mu.Unlock()
+}
+
+func (s *clientDsendStats) load() DSendSnapshot {
+	if s == nil {
+		return DSendSnapshot{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.snapshot
+}
+
 func newUDPSessionBudget(limit int) *udpSessionBudget {
 	if limit <= 0 {
-		limit = defaultClientUDPSessionLimit
+		limit = config.DefaultMaxLocalUDPSessions
 	}
 	return &udpSessionBudget{slots: make(chan struct{}, limit)}
 }
 
 func (b *udpSessionBudget) acquire() (func(), bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.accountingFaults.Load() != 0 {
+		return nil, false
+	}
 	select {
 	case b.slots <- struct{}{}:
 		held := b.permitsHeld.Add(1)
 		updateUDPMax(&b.maxPermitsHeld, held)
 		return sync.OnceFunc(func() {
+			b.mu.Lock()
+			defer b.mu.Unlock()
 			select {
 			case <-b.slots:
 				if b.permitsHeld.Add(-1) < 0 {
@@ -70,10 +128,14 @@ func (b *udpSessionBudget) acquire() (func(), bool) {
 }
 
 func (b *udpSessionBudget) publish() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.publishedActive.Add(1)
 }
 
 func (b *udpSessionBudget) unpublish() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if b.publishedActive.Add(-1) < 0 {
 		b.publishedActive.Add(1)
 		b.accountingFaults.Add(1)
@@ -125,6 +187,9 @@ type UDPHandler struct {
 	readerWG             sync.WaitGroup
 	sessionBudget        *udpSessionBudget
 	beforeSessionPublish func()
+	dsendStats           *clientDsendStats
+	done                 chan struct{}
+	doneOnce             sync.Once
 
 	// Fragment assembler for reassembling fragmented packets (sharded for reduced lock contention)
 	fragmentAssembler *protocol.ShardedFragmentAssembler
@@ -141,9 +206,14 @@ func newUDPHandler(
 	enableFragmentation bool,
 	logger zerolog.Logger,
 	budget *udpSessionBudget,
+	dsendStats ...*clientDsendStats,
 ) *UDPHandler {
 	if budget == nil {
 		budget = newUDPSessionBudget(0)
+	}
+	stats := &clientDsendStats{}
+	if len(dsendStats) > 0 && dsendStats[0] != nil {
+		stats = dsendStats[0]
 	}
 	return &UDPHandler{
 		localHost:           localHost,
@@ -152,6 +222,8 @@ func newUDPHandler(
 		logger:              logger.With().Str("component", "udp_handler").Logger(),
 		fragmentAssembler:   protocol.NewShardedFragmentAssembler(protocol.DefaultShardCount),
 		sessionBudget:       budget,
+		dsendStats:          stats,
+		done:                make(chan struct{}),
 	}
 }
 
@@ -175,6 +247,10 @@ func (h *UDPHandler) Start(ctx context.Context, quicConn *quic.Conn) {
 		defer h.fixedWG.Done()
 		h.cleanupLoop()
 	}()
+	go func() {
+		h.wait()
+		h.doneOnce.Do(func() { close(h.done) })
+	}()
 }
 
 // Stop stops the UDP handler
@@ -193,6 +269,9 @@ func (h *UDPHandler) Stop() {
 			h.closeSession(value.(*UDPSession))
 			return true
 		})
+		if !h.started {
+			h.doneOnce.Do(func() { close(h.done) })
+		}
 	})
 }
 
@@ -315,6 +394,7 @@ func (h *UDPHandler) getOrCreateSession(sessionID uint32, quicConn *quic.Conn) (
 	}
 	h.sessionBudget.publish()
 	h.readerWG.Add(1)
+	h.dsendStats.worker(1)
 	creatorOwnsPermit = false
 	h.lifecycleMu.Unlock()
 
@@ -323,6 +403,7 @@ func (h *UDPHandler) getOrCreateSession(sessionID uint32, quicConn *quic.Conn) (
 	// Start reading responses from local service
 	go func() {
 		defer h.readerWG.Done()
+		defer h.dsendStats.worker(-1)
 		defer releasePermit()
 		defer h.closeSession(session)
 		h.readLocalResponses(session)
@@ -367,7 +448,7 @@ func (h *UDPHandler) readLocalResponses(session *UDPSession) {
 		session.updateLastActive()
 
 		// Fragment and send datagrams using pooled fragmentation (no mutex needed - atomic counter)
-		datagrams, err := protocol.FragmentUDPPooled(session.id, buf[:n], &session.fragIDCounter, h.enableFragmentation)
+		datagrams, err := h.fragmentDatagrams(session.id, buf[:n], &session.fragIDCounter)
 
 		if err != nil {
 			h.logger.Debug().Err(err).Uint32("session_id", session.id).Int("size", n).Msg("fragment UDP failed")
@@ -375,21 +456,62 @@ func (h *UDPHandler) readLocalResponses(session *UDPSession) {
 			continue
 		}
 
-		for _, dgram := range datagrams {
-			if err := session.quicConn.SendDatagram(dgram.Data); err != nil {
-				h.logger.Debug().Err(err).Uint32("session_id", session.id).Msg("send datagram failed")
-				protocol.ReleaseDatagramResults(datagrams)
-				protocol.PutReadBuffer(bufPtr)
-				h.closeSession(session)
-				return
-			}
+		if err := h.sendDatagrams(datagrams, session.quicConn.SendDatagram); err != nil {
+			h.logger.Debug().Err(err).Uint32("session_id", session.id).Msg("send datagram failed")
+			protocol.PutReadBuffer(bufPtr)
+			h.closeSession(session)
+			return
 		}
-
-		// Return datagram buffers to pool after sending
-		protocol.ReleaseDatagramResults(datagrams)
 		// Return read buffer to pool after processing
 		protocol.PutReadBuffer(bufPtr)
 	}
+}
+
+func (h *UDPHandler) fragmentDatagrams(sessionID uint32, payload []byte, counter *atomic.Uint32) ([]protocol.DatagramResult, error) {
+	h.dsendStats.mu.Lock()
+	defer h.dsendStats.mu.Unlock()
+	datagrams, err := protocol.FragmentUDPPooled(sessionID, payload, counter, h.enableFragmentation)
+	if err != nil {
+		h.dsendStats.snapshot.FragmentDrops++
+		return nil, err
+	}
+	h.dsendStats.snapshot.OwnedItems += int64(len(datagrams))
+	h.dsendStats.snapshot.OwnedBacking += datagramBackingBytes(datagrams)
+	h.dsendStats.snapshot.OwnedItemsHighWater = max(
+		h.dsendStats.snapshot.OwnedItemsHighWater,
+		h.dsendStats.snapshot.OwnedItems,
+	)
+	h.dsendStats.snapshot.OwnedBackingHighWater = max(
+		h.dsendStats.snapshot.OwnedBackingHighWater,
+		h.dsendStats.snapshot.OwnedBacking,
+	)
+	return datagrams, nil
+}
+
+func (h *UDPHandler) sendDatagrams(datagrams []protocol.DatagramResult, send func([]byte) error) error {
+	items, backing := int64(len(datagrams)), datagramBackingBytes(datagrams)
+	defer func() {
+		h.dsendStats.releaseDatagrams(datagrams, items, backing)
+	}()
+	for i := range datagrams {
+		if err := send(datagrams[i].Data); err != nil {
+			h.dsendStats.sendError()
+			return err
+		}
+	}
+	return nil
+}
+
+func datagramBackingBytes(datagrams []protocol.DatagramResult) int64 {
+	var total int64
+	for i := range datagrams {
+		if datagrams[i].Buffer != nil {
+			total += int64(cap(*datagrams[i].Buffer))
+		} else {
+			total += int64(len(datagrams[i].Data))
+		}
+	}
+	return total
 }
 
 // closeSession closes a UDP session

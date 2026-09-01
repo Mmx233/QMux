@@ -76,10 +76,11 @@ type Listener struct {
 	flowsMu         sync.Mutex
 	flowsClosing    bool
 	flows           map[*tcpFlow]struct{}
+	tcpFlowLimit    int
+	tcpSetupLimit   int
 	tcpSetupSlots   chan struct{}
 	tcpAdmission    tcpAdmissionStats
 	udpSessionLimit int
-	udpSessionSlots chan struct{}
 	udpHandler      *UDPHandler
 }
 
@@ -89,6 +90,7 @@ func NewManager(conf *config.Server, pools map[string]*pool.ConnectionPool, logg
 	if conf != nil {
 		configs = slices.Clone(conf.Listeners)
 		for i := range configs {
+			configs[i].Capacity.ApplyDefaults()
 			if value := configs[i].UDP.EnableFragmentation; value != nil {
 				copied := *value
 				configs[i].UDP.EnableFragmentation = &copied
@@ -221,14 +223,37 @@ func (m *Manager) TCPAdmissionSnapshots() []TCPAdmissionSnapshot {
 		if i == count {
 			break
 		}
-		snapshots[i] = listener.tcpAdmission.snapshot()
+		snapshots[i] = listener.tcpAdmissionSnapshot()
+	}
+	return snapshots
+}
+
+// UDPAdmissionSnapshots returns value-only UDP admission state aligned with
+// the configured listener order. Non-UDP listeners retain the zero value.
+func (m *Manager) UDPAdmissionSnapshots() []UDPAdmissionSnapshot {
+	m.mu.Lock()
+	listeners := slices.Clone(m.listeners)
+	count := len(m.configs)
+	m.mu.Unlock()
+
+	snapshots := make([]UDPAdmissionSnapshot, count)
+	for i, listener := range listeners {
+		if i == count {
+			break
+		}
+		if listener.udpHandler != nil {
+			snapshots[i] = listener.udpHandler.snapshot()
+		}
 	}
 	return snapshots
 }
 
 func (m *Manager) validate(configs []config.QuicListener) error {
 	udpRoutes := make(map[string]struct{})
-	for _, listenerConf := range configs {
+	for i, listenerConf := range configs {
+		if err := listenerConf.Capacity.Validate(fmt.Sprintf("listeners[%d].capacity", i)); err != nil {
+			return err
+		}
 		if m.pools[listenerConf.QuicAddr] == nil {
 			return fmt.Errorf("%w for QUIC address %q", ErrMissingPool, listenerConf.QuicAddr)
 		}
@@ -254,7 +279,10 @@ func (m *Manager) newListener(ctx context.Context, listenerConf config.QuicListe
 		ctx:                 listenerCtx,
 		cancel:              listenerCancel,
 		flows:               make(map[*tcpFlow]struct{}),
-		tcpSetupSlots:       make(chan struct{}, maxPendingTCPSetups),
+		tcpFlowLimit:        listenerConf.Capacity.MaxTCPConnections,
+		tcpSetupLimit:       listenerConf.Capacity.MaxPendingTCPSetups,
+		tcpSetupSlots:       make(chan struct{}, listenerConf.Capacity.MaxPendingTCPSetups),
+		udpSessionLimit:     listenerConf.Capacity.MaxUDPSessions,
 		logger: m.logger.With().
 			Str("traffic_addr", listenerConf.TrafficAddr).
 			Str("quic_addr", listenerConf.QuicAddr).

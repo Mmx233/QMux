@@ -44,6 +44,11 @@ func LoadServerConfig(path string) (*Server, error) {
 
 	// Apply default values
 	cfg.ApplyDefaults()
+	for i := range cfg.Listeners {
+		if err := cfg.Listeners[i].Capacity.Validate(fmt.Sprintf("listeners[%d].capacity", i)); err != nil {
+			return nil, err
+		}
+	}
 
 	return cfg, nil
 }

@@ -144,14 +144,24 @@ func TestTCPAdmissionCapacityBurstRecovery(t *testing.T) {
 		}
 		snapshot = waitSTAB007Settled(t, serverRun, stab007HeldFlows, 15*time.Second)
 		accepted := stab007TerminalTotal(snapshot) - stab007TerminalTotal(before)
+		flowCapacity := snapshot.FlowCapacity - before.FlowCapacity
 		listenerCapacity := snapshot.ListenerCapacity - before.ListenerCapacity
+		unavailable := snapshot.Unavailable - before.Unavailable
+		generationConnectionCapacity := snapshot.GenerationConnectionCapacity - before.GenerationConnectionCapacity
+		generationSetupCapacity := snapshot.GenerationSetupCapacity - before.GenerationSetupCapacity
 		peerLimit := snapshot.PeerStreamLimit - before.PeerStreamLimit
-		generationCapacity := snapshot.GenerationCapacity - before.GenerationCapacity
+		deadline := snapshot.Deadline - before.Deadline
+		setupFailure := snapshot.SetupFailure - before.SetupFailure
+		canceled := snapshot.Canceled - before.Canceled
+		committed := snapshot.Committed - before.Committed
 		if connected != extra || verified != 0 || accepted != uint64(extra) ||
-			listenerCapacity+peerLimit+generationCapacity != uint64(extra) ||
-			workload == 101 && (listenerCapacity != 0 || peerLimit != 1 || generationCapacity != 0) {
-			t.Fatalf("workload %d extra connected/verified/terminal/listener/peer-limit/generation-capacity = %d/%d/%d/%d/%d/%d, want %d/0/%d/reconciled; snapshot=%+v",
-				workload, connected, verified, accepted, listenerCapacity, peerLimit, generationCapacity, extra, extra, snapshot)
+			flowCapacity+generationConnectionCapacity != uint64(extra) ||
+			listenerCapacity != 0 || unavailable != 0 || generationSetupCapacity != 0 || peerLimit != 0 ||
+			deadline != 0 || setupFailure != 0 || canceled != 0 || committed != 0 ||
+			workload == 101 && (flowCapacity != 0 || generationConnectionCapacity != 1) {
+			t.Fatalf("workload %d extra connected/verified/terminal/flow-capacity/generation-connection-capacity = %d/%d/%d/%d/%d, want %d/0/%d/reconciled; other terminal deltas listener/unavailable/generation-setup/peer-limit/deadline/setup-failure/canceled/committed = %d/%d/%d/%d/%d/%d/%d/%d, want all zero; snapshot=%+v",
+				workload, connected, verified, accepted, flowCapacity, generationConnectionCapacity, extra, extra,
+				listenerCapacity, unavailable, generationSetupCapacity, peerLimit, deadline, setupFailure, canceled, committed, snapshot)
 		}
 		result.Points = append(result.Points, sampleSTAB007Point(t, sampler, resourceProcess,
 			workload, stab007HeldFlows+connected, stab007HeldFlows+verified, extra-connected, snapshot))
@@ -314,8 +324,9 @@ func waitSTAB007Settled(t *testing.T, run *faultServerRun, active int64, timeout
 }
 
 func stab007TerminalTotal(snapshot traffic.TCPAdmissionSnapshot) uint64 {
-	return snapshot.Committed + snapshot.ListenerCapacity + snapshot.Unavailable + snapshot.GenerationCapacity +
-		snapshot.PeerStreamLimit + snapshot.Deadline + snapshot.SetupFailure + snapshot.Canceled
+	return snapshot.Committed + snapshot.FlowCapacity + snapshot.ListenerCapacity + snapshot.Unavailable +
+		snapshot.GenerationConnectionCapacity + snapshot.GenerationSetupCapacity + snapshot.PeerStreamLimit +
+		snapshot.Deadline + snapshot.SetupFailure + snapshot.Canceled
 }
 
 func waitSTAB007Goroutines(t *testing.T, baseline int, timeout time.Duration) {

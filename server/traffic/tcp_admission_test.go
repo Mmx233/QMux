@@ -3,6 +3,7 @@ package traffic
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -58,12 +59,22 @@ func TestNewConnWriteResult(t *testing.T) {
 }
 
 func startTCPAdmissionManager(t *testing.T, quicAddr string, connectionPool *pool.ConnectionPool) *Manager {
+	return startTCPAdmissionManagerWithCapacity(t, quicAddr, connectionPool, config.ListenerCapacity{})
+}
+
+func startTCPAdmissionManagerWithCapacity(
+	t *testing.T,
+	quicAddr string,
+	connectionPool *pool.ConnectionPool,
+	capacity config.ListenerCapacity,
+) *Manager {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	manager := NewManager(&config.Server{Listeners: []config.QuicListener{{
 		QuicAddr:    quicAddr,
 		TrafficAddr: "127.0.0.1:0",
 		Protocol:    "tcp",
+		Capacity:    capacity,
 	}}}, map[string]*pool.ConnectionPool{quicAddr: connectionPool}, zerolog.Nop())
 	t.Cleanup(func() {
 		cancel()
@@ -108,7 +119,9 @@ func startTCPFallbackSetup(t *testing.T, ctx context.Context, primaryWindow uint
 		cancel:        cancelListener,
 		logger:        zerolog.Nop(),
 		flows:         make(map[*tcpFlow]struct{}),
-		tcpSetupSlots: make(chan struct{}, maxPendingTCPSetups),
+		tcpFlowLimit:  config.DefaultMaxTCPConnections,
+		tcpSetupLimit: config.DefaultMaxPendingTCPSetups,
+		tcpSetupSlots: make(chan struct{}, config.DefaultMaxPendingTCPSetups),
 	}
 	t.Cleanup(listener.close)
 	return &tcpFallbackSetup{
@@ -129,7 +142,11 @@ func startTCPFallbackFlow(t *testing.T, listener *Listener) net.Conn {
 	}
 	local, remote := net.Pipe()
 	registerTCPAdmissionClose(t, "fallback TCP peer", remote)
-	go listener.handleTCPConnection(local, time.Now().Add(tcpSetupTimeout), release)
+	flow, ok := listener.addTCPFlow(local)
+	if !ok {
+		t.Fatal("addTCPFlow() = false")
+	}
+	go listener.handleTCPConnection(flow, time.Now().Add(tcpSetupTimeout), release)
 	return remote
 }
 
@@ -258,7 +275,9 @@ func startBlockedNewConn(
 		cancel:        cancelListener,
 		logger:        zerolog.Nop(),
 		flows:         make(map[*tcpFlow]struct{}),
-		tcpSetupSlots: make(chan struct{}, maxPendingTCPSetups),
+		tcpFlowLimit:  config.DefaultMaxTCPConnections,
+		tcpSetupLimit: config.DefaultMaxPendingTCPSetups,
+		tcpSetupSlots: make(chan struct{}, config.DefaultMaxPendingTCPSetups),
 	}
 	release, ok := listener.acquireTCPSetup()
 	if !ok {
@@ -268,15 +287,154 @@ func startBlockedNewConn(
 	registerTCPAdmissionClose(t, "blocked NewConn peer", remote)
 	done := make(chan struct{})
 	go func() {
-		listener.handleTCPConnection(local, time.Now().Add(setupTimeout), release)
+		flow, ok := listener.addTCPFlow(local)
+		if !ok {
+			t.Error("addTCPFlow() = false")
+			close(done)
+			return
+		}
+		listener.handleTCPConnection(flow, time.Now().Add(setupTimeout), release)
 		close(done)
 	}()
 	return connectionPool, client, listener, done
 }
 
 func tcpTerminalTotal(snapshot TCPAdmissionSnapshot) uint64 {
-	return snapshot.Committed + snapshot.ListenerCapacity + snapshot.Unavailable +
-		snapshot.GenerationCapacity + snapshot.PeerStreamLimit + snapshot.Deadline + snapshot.SetupFailure + snapshot.Canceled
+	return snapshot.Committed + snapshot.FlowCapacity + snapshot.ListenerCapacity + snapshot.Unavailable +
+		snapshot.GenerationConnectionCapacity + snapshot.GenerationSetupCapacity + snapshot.PeerStreamLimit +
+		snapshot.Deadline + snapshot.SetupFailure + snapshot.Canceled
+}
+
+func TestTCPAdmissionSnapshotGenerationCapacityCompatibility(t *testing.T) {
+	var stats tcpAdmissionStats
+	stats.finish(tcpTerminalGenerationConnectionCapacity)
+	stats.finish(tcpTerminalGenerationConnectionCapacity)
+	stats.finish(tcpTerminalGenerationSetupCapacity)
+
+	snapshot := stats.snapshot()
+	if snapshot.GenerationConnectionCapacity != 2 || snapshot.GenerationSetupCapacity != 1 ||
+		snapshot.GenerationCapacity != 3 {
+		t.Fatalf("generation capacity snapshot = %+v, want split 2/1 and aggregate 3", snapshot)
+	}
+
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatalf("marshal TCP admission snapshot: %v", err)
+	}
+	var fields map[string]uint64
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatalf("unmarshal TCP admission snapshot: %v", err)
+	}
+	if value, ok := fields["GenerationCapacity"]; !ok || value != 3 {
+		t.Fatalf("GenerationCapacity JSON field = (%d, %v), want (3, true): %s", value, ok, data)
+	}
+}
+
+func TestTCPFlowSnapshotTracksOwnedSockets(t *testing.T) {
+	listener := &Listener{flows: make(map[*tcpFlow]struct{}), tcpFlowLimit: 2, tcpSetupLimit: 3}
+	first, firstPeer := net.Pipe()
+	second, secondPeer := net.Pipe()
+	rejected, rejectedPeer := net.Pipe()
+	replacement, replacementPeer := net.Pipe()
+	t.Cleanup(func() {
+		_ = first.Close()
+		_ = firstPeer.Close()
+		_ = second.Close()
+		_ = secondPeer.Close()
+		_ = rejected.Close()
+		_ = rejectedPeer.Close()
+		_ = replacement.Close()
+		_ = replacementPeer.Close()
+	})
+
+	firstFlow, ok := listener.addTCPFlow(first)
+	if !ok {
+		t.Fatal("add first TCP flow = false")
+	}
+	secondFlow, ok := listener.addTCPFlow(second)
+	if !ok {
+		t.Fatal("add second TCP flow = false")
+	}
+	if flow, ok := listener.addTCPFlow(rejected); ok || flow != nil {
+		t.Fatal("add flow above configured limit succeeded")
+	}
+	if firstFlow.isAborted() || secondFlow.isAborted() {
+		t.Fatal("rejecting cap+1 aborted an existing flow")
+	}
+	if snapshot := listener.tcpAdmissionSnapshot(); snapshot.FlowLimit != 2 || snapshot.SetupLimit != 3 ||
+		snapshot.FlowCurrent != 2 || snapshot.FlowHighWater != 2 || snapshot.FlowCapacity != 1 ||
+		tcpTerminalTotal(snapshot) != 1 {
+		t.Fatalf("saturated flow snapshot = %+v, want limits 2/3, owned 2/2, and one flow-capacity terminal", snapshot)
+	}
+
+	listener.removeTCPFlow(firstFlow)
+	listener.removeTCPFlow(firstFlow)
+	replacementFlow, ok := listener.addTCPFlow(replacement)
+	if !ok {
+		t.Fatal("add replacement flow after release = false")
+	}
+	if snapshot := listener.tcpAdmissionSnapshot(); snapshot.FlowCurrent != 2 || snapshot.FlowHighWater != 2 ||
+		snapshot.FlowCapacity != 1 {
+		t.Fatalf("flow snapshot after recovery = %+v, want current/high-water 2/2 and one rejection", snapshot)
+	}
+	listener.removeTCPFlow(replacementFlow)
+	if snapshot := listener.tcpAdmissionSnapshot(); snapshot.FlowCurrent != 1 || snapshot.FlowHighWater != 2 {
+		t.Fatalf("flow snapshot after idempotent removal = current:%d high-water:%d, want 1/2", snapshot.FlowCurrent, snapshot.FlowHighWater)
+	}
+
+	listener.removeTCPFlow(secondFlow)
+	if snapshot := listener.tcpAdmissionSnapshot(); snapshot.FlowCurrent != 0 || snapshot.FlowHighWater != 2 {
+		t.Fatalf("final flow snapshot = current:%d high-water:%d, want 0/2", snapshot.FlowCurrent, snapshot.FlowHighWater)
+	}
+}
+
+func TestTCPFlowCounterMatchesOwnedMapDuringTransitions(t *testing.T) {
+	listener := &Listener{flows: make(map[*tcpFlow]struct{}), tcpFlowLimit: 1}
+	local, peer := net.Pipe()
+	t.Cleanup(func() {
+		_ = local.Close()
+		_ = peer.Close()
+	})
+
+	done := make(chan struct{})
+	errCh := make(chan string, 1)
+	go func() {
+		defer close(done)
+		for range 10_000 {
+			flow, ok := listener.addTCPFlow(local)
+			if !ok {
+				errCh <- "addTCPFlow() rejected below limit"
+				return
+			}
+			listener.removeTCPFlow(flow)
+		}
+	}()
+
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case message := <-errCh:
+			t.Fatal(message)
+		case <-done:
+			if snapshot := listener.tcpAdmissionSnapshot(); snapshot.FlowCurrent != 0 || snapshot.FlowHighWater != 1 {
+				t.Fatalf("final flow snapshot = %+v, want current/high-water 0/1", snapshot)
+			}
+			return
+		case <-deadline.C:
+			t.Fatal("flow transition check timed out")
+		default:
+			listener.tcpAdmission.mu.Lock()
+			listener.flowsMu.Lock()
+			current := listener.tcpAdmission.flowCurrent.Load()
+			owned := int64(len(listener.flows))
+			listener.flowsMu.Unlock()
+			listener.tcpAdmission.mu.Unlock()
+			if current != owned || current < 0 || current > 1 {
+				t.Fatalf("flow current/map = %d/%d, want equal within 0..1", current, owned)
+			}
+		}
+	}
 }
 
 func waitForTCPAdmissionState(
@@ -316,40 +474,43 @@ func TestTCPSetupPermitSaturationRejectsAndRecovers(t *testing.T) {
 	if err := connectionPool.Add(client); err != nil {
 		t.Fatalf("Add() error = %v", err)
 	}
-	manager := startTCPAdmissionManager(t, quicAddr, connectionPool)
+	manager := startTCPAdmissionManagerWithCapacity(t, quicAddr, connectionPool, config.ListenerCapacity{
+		MaxTCPConnections:   3,
+		MaxPendingTCPSetups: 2,
+	})
 	listener := manager.listeners[0]
 
-	releases := make([]func(), 0, maxPendingTCPSetups)
-	for range maxPendingTCPSetups {
-		release, ok := listener.acquireTCPSetup()
+	permits := make([]*tcpSetupPermit, 0, listener.tcpSetupLimit)
+	for range listener.tcpSetupLimit {
+		permit, ok := listener.acquireTCPSetup()
 		if !ok {
-			t.Fatalf("acquireTCPSetup() rejected before %d permits", maxPendingTCPSetups)
+			t.Fatalf("acquireTCPSetup() rejected before %d permits", listener.tcpSetupLimit)
 		}
-		releases = append(releases, release)
+		permits = append(permits, permit)
 	}
-	if release, ok := acquireTCPSetup(listener.tcpSetupSlots); ok {
-		release()
+	if permit, ok := listener.acquireTCPSetup(); ok {
+		permit.release()
 		t.Fatal("acquireTCPSetup() exceeded listener bound")
 	}
 	if elapsed := dialRejectedTCP(t, listener.TCPListener.Addr().String()); elapsed >= 2*time.Second {
 		t.Fatalf("listener-capacity rejection took %v, want immediate close", elapsed)
 	}
-	snapshot := listener.tcpAdmission.snapshot()
-	if snapshot.SetupCurrent != maxPendingTCPSetups || snapshot.SetupHighWater != maxPendingTCPSetups ||
-		snapshot.ListenerCapacity != 1 || tcpTerminalTotal(snapshot) != 1 {
-		t.Fatalf("saturated TCP admission snapshot = %+v, want setup 128/128 and one listener-capacity terminal", snapshot)
+	snapshot := manager.TCPAdmissionSnapshots()[0]
+	if snapshot.FlowLimit != 3 || snapshot.SetupLimit != 2 || snapshot.SetupCurrent != 2 || snapshot.SetupHighWater != 2 ||
+		snapshot.ListenerCapacity != 1 || snapshot.FlowCapacity != 0 || tcpTerminalTotal(snapshot) != 1 {
+		t.Fatalf("saturated TCP admission snapshot = %+v, want limits 3/2, setup 2/2, and one setup-capacity terminal", snapshot)
 	}
-	for _, release := range releases {
-		release()
-		release()
+	for _, permit := range permits {
+		permit.release()
+		permit.release()
 	}
-	if snapshot := listener.tcpAdmission.snapshot(); snapshot.SetupCurrent != 0 {
+	if snapshot := listener.tcpAdmissionSnapshot(); snapshot.SetupCurrent != 0 {
 		t.Fatalf("setup current after permit release = %d, want 0", snapshot.SetupCurrent)
 	}
 
 	tcpConn, peerStream := openRelayLifecycleFlow(t, testCtx, manager, peerConn)
 	waitForTCPAdmissionState(t, client, 1, 1, listener.tcpSetupSlots)
-	snapshot = listener.tcpAdmission.snapshot()
+	snapshot = listener.tcpAdmissionSnapshot()
 	if snapshot.SetupCurrent != 0 || snapshot.ActiveCurrent != 1 || snapshot.ActiveHighWater != 1 ||
 		snapshot.Attempts != 1 || snapshot.Retries != 0 || snapshot.Committed != 1 ||
 		tcpTerminalTotal(snapshot) != 2 {
@@ -361,12 +522,116 @@ func TestTCPSetupPermitSaturationRejectsAndRecovers(t *testing.T) {
 		t.Fatalf("close recovered TCP flow: %v", err)
 	}
 	waitForActiveConnections(t, client, 0)
-	if snapshot := listener.tcpAdmission.snapshot(); snapshot.SetupCurrent != 0 || snapshot.ActiveCurrent != 0 {
+	if snapshot := listener.tcpAdmissionSnapshot(); snapshot.SetupCurrent != 0 || snapshot.ActiveCurrent != 0 {
 		t.Fatalf("TCP admission current after recovered flow teardown = %+v, want zero", snapshot)
 	}
 }
 
-func TestTCPGenerationCapacityRejectsAndRecovers(t *testing.T) {
+func TestTCPSetupPermitDefaultLimitCornersAndRecovery(t *testing.T) {
+	const limit = config.DefaultMaxPendingTCPSetups
+	listener := &Listener{
+		tcpSetupLimit: limit,
+		tcpSetupSlots: make(chan struct{}, limit),
+	}
+
+	permits := make([]*tcpSetupPermit, 0, limit)
+	for i := range limit {
+		permit, ok := listener.acquireTCPSetup()
+		if !ok {
+			t.Fatalf("acquireTCPSetup(%d) rejected below default limit", i)
+		}
+		permits = append(permits, permit)
+	}
+	for i := range limit {
+		if permit, ok := listener.acquireTCPSetup(); ok {
+			permit.release()
+			t.Fatalf("2x attempt %d exceeded default setup limit", limit+i)
+		}
+	}
+	if snapshot := listener.tcpAdmissionSnapshot(); snapshot.SetupLimit != limit || snapshot.SetupCurrent != limit || snapshot.SetupHighWater != limit ||
+		snapshot.ActiveCurrent != 0 || snapshot.ActiveHighWater != 0 {
+		t.Fatalf("saturated default setup snapshot = %+v", snapshot)
+	}
+
+	permits[0].release()
+	recovered, ok := listener.acquireTCPSetup()
+	if !ok {
+		t.Fatal("acquireTCPSetup() did not recover after release")
+	}
+	recovered.release()
+	for _, permit := range permits[1:] {
+		permit.release()
+	}
+	if snapshot := listener.tcpAdmissionSnapshot(); snapshot.SetupLimit != limit || snapshot.SetupCurrent != 0 || snapshot.SetupHighWater != limit ||
+		snapshot.ActiveCurrent != 0 || snapshot.ActiveHighWater != 0 || len(listener.tcpSetupSlots) != 0 {
+		t.Fatalf("recovered default setup snapshot = %+v, slots=%d", snapshot, len(listener.tcpSetupSlots))
+	}
+}
+
+func TestTCPSetupPermitTransitionsAtomicallyToActive(t *testing.T) {
+	listener := &Listener{
+		tcpSetupLimit: 1,
+		tcpSetupSlots: make(chan struct{}, 1),
+	}
+	permit, ok := listener.acquireTCPSetup()
+	if !ok {
+		t.Fatal("acquireTCPSetup() = false")
+	}
+	if snapshot := listener.tcpAdmissionSnapshot(); snapshot.SetupCurrent != 1 || snapshot.ActiveCurrent != 0 {
+		t.Fatalf("setup snapshot = %+v, want setup/active 1/0", snapshot)
+	}
+
+	permit.activate()
+	if snapshot := listener.tcpAdmissionSnapshot(); snapshot.SetupCurrent != 0 || snapshot.ActiveCurrent != 1 ||
+		snapshot.SetupHighWater != 1 || snapshot.ActiveHighWater != 1 {
+		t.Fatalf("active snapshot = %+v, want setup/active 0/1 with high-water 1/1", snapshot)
+	}
+	if held := len(listener.tcpSetupSlots); held != 0 {
+		t.Fatalf("setup slots after activation = %d, want 0", held)
+	}
+
+	permit.release()
+	listener.tcpAdmission.finishActive()
+	if snapshot := listener.tcpAdmissionSnapshot(); snapshot.SetupCurrent != 0 || snapshot.ActiveCurrent != 0 {
+		t.Fatalf("final snapshot = %+v, want setup/active 0/0", snapshot)
+	}
+}
+
+func TestTCPSetupPermitHasNoSnapshotOwnershipGap(t *testing.T) {
+	listener := &Listener{
+		tcpSetupLimit: 1,
+		tcpSetupSlots: make(chan struct{}, 1),
+	}
+	for range 1_000 {
+		permit, ok := listener.acquireTCPSetup()
+		if !ok {
+			t.Fatal("acquireTCPSetup() = false")
+		}
+		done := make(chan struct{})
+		go func() {
+			permit.activate()
+			close(done)
+		}()
+		for {
+			snapshot := listener.tcpAdmissionSnapshot()
+			if snapshot.SetupCurrent+snapshot.ActiveCurrent != 1 {
+				t.Fatalf("setup/active snapshot = %d/%d, want exactly one owner", snapshot.SetupCurrent, snapshot.ActiveCurrent)
+			}
+			select {
+			case <-done:
+				listener.tcpAdmission.finishActive()
+				goto next
+			default:
+			}
+		}
+	next:
+	}
+	if snapshot := listener.tcpAdmissionSnapshot(); snapshot.SetupCurrent != 0 || snapshot.ActiveCurrent != 0 {
+		t.Fatalf("final snapshot = %+v, want no owner", snapshot)
+	}
+}
+
+func TestTCPGenerationSetupCapacityRejectsAndRecovers(t *testing.T) {
 	testCtx, cancelTest := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelTest()
 	quicListener, serverConn, peerConn := newRelayLifecycleQUICPair(t, testCtx, 32*1024)
@@ -400,7 +665,8 @@ func TestTCPGenerationCapacityRejectsAndRecovers(t *testing.T) {
 		time.Sleep(time.Millisecond)
 		snapshot = listener.tcpAdmission.snapshot()
 	}
-	if snapshot.SetupCurrent != 0 || snapshot.Attempts != 0 || snapshot.GenerationCapacity != 1 ||
+	if snapshot.SetupCurrent != 0 || snapshot.Attempts != 0 ||
+		snapshot.GenerationConnectionCapacity != 0 || snapshot.GenerationSetupCapacity != 1 ||
 		snapshot.PeerStreamLimit != 0 || snapshot.Unavailable != 0 || tcpTerminalTotal(snapshot) != 1 {
 		t.Fatalf("generation-capacity TCP admission snapshot = %+v", snapshot)
 	}
@@ -416,8 +682,70 @@ func TestTCPGenerationCapacityRejectsAndRecovers(t *testing.T) {
 	_ = tcpConn.Close()
 	waitForActiveConnections(t, client, 0)
 	if snapshot := listener.tcpAdmission.snapshot(); snapshot.Committed != 1 || snapshot.ActiveCurrent != 0 ||
-		snapshot.GenerationCapacity != 1 || tcpTerminalTotal(snapshot) != 2 {
+		snapshot.GenerationConnectionCapacity != 0 ||
+		snapshot.GenerationSetupCapacity != 1 || tcpTerminalTotal(snapshot) != 2 {
 		t.Fatalf("generation-capacity recovery TCP admission snapshot = %+v", snapshot)
+	}
+}
+
+func TestTCPGenerationConnectionCapacityRejectsAndRecovers(t *testing.T) {
+	testCtx, cancelTest := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelTest()
+	quicListener, serverConn, peerConn := newRelayLifecycleQUICPair(t, testCtx, 32*1024)
+	registerRelayLifecycleQUICCleanup(t, quicListener, serverConn, peerConn)
+
+	connectionPool := pool.NewWithLimits(
+		quicListener.Addr().String(),
+		pool.NewLeastConnectionsBalancer(),
+		zerolog.Nop(),
+		pool.Limits{
+			MaxClientGenerations:             1,
+			MaxPendingRegistrations:          1,
+			MaxTCPConnectionsPerGeneration:   1,
+			MaxPendingTCPSetupsPerGeneration: 2,
+			MaxUDPSessionsPerGeneration:      1,
+		},
+	)
+	t.Cleanup(connectionPool.Stop)
+	client := &pool.ClientConn{ID: "connection-capacity-client", Conn: serverConn, Metadata: pool.ClientMetadata{Capabilities: []string{"tcp"}}}
+	if err := connectionPool.Add(client); err != nil {
+		t.Fatalf("Add(client) error = %v", err)
+	}
+	admission, err := connectionPool.BeginTCPAdmission()
+	if err != nil {
+		t.Fatalf("BeginTCPAdmission() error = %v", err)
+	}
+	held, err := admission.Next()
+	if err != nil || held == nil || !held.Commit() {
+		t.Fatalf("commit held connection lease = (%v, %v)", held, err)
+	}
+
+	manager := startTCPAdmissionManager(t, quicListener.Addr().String(), connectionPool)
+	listener := manager.listeners[0]
+	dialRejectedTCP(t, listener.TCPListener.Addr().String())
+	deadline := time.Now().Add(time.Second)
+	snapshot := listener.tcpAdmission.snapshot()
+	for tcpTerminalTotal(snapshot) != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+		snapshot = listener.tcpAdmission.snapshot()
+	}
+	if snapshot.GenerationConnectionCapacity != 1 || snapshot.GenerationSetupCapacity != 0 ||
+		snapshot.Attempts != 0 || tcpTerminalTotal(snapshot) != 1 {
+		t.Fatalf("generation connection-capacity snapshot = %+v", snapshot)
+	}
+	if !held.Release() {
+		t.Fatal("release held connection lease = false")
+	}
+
+	tcpConn, peerStream := openRelayLifecycleFlow(t, testCtx, manager, peerConn)
+	peerStream.CancelRead(trafficStreamCancelCode)
+	peerStream.CancelWrite(trafficStreamCancelCode)
+	_ = tcpConn.Close()
+	waitForActiveConnections(t, client, 0)
+	if snapshot := listener.tcpAdmission.snapshot(); snapshot.Committed != 1 ||
+		snapshot.GenerationConnectionCapacity != 1 || snapshot.GenerationSetupCapacity != 0 ||
+		tcpTerminalTotal(snapshot) != 2 {
+		t.Fatalf("generation connection-capacity recovery snapshot = %+v", snapshot)
 	}
 }
 
@@ -452,7 +780,8 @@ func TestTCPDefaultQUICStreamLimitRejectsWithoutPoisoningGeneration(t *testing.T
 		snapshot = manager.listeners[0].tcpAdmission.snapshot()
 	}
 	if snapshot.Attempts != 1 || snapshot.StreamLimitAttempts != 1 || snapshot.Retries != 0 ||
-		snapshot.PeerStreamLimit != 1 || snapshot.GenerationCapacity != 0 ||
+		snapshot.PeerStreamLimit != 1 ||
+		snapshot.GenerationConnectionCapacity != 0 || snapshot.GenerationSetupCapacity != 0 ||
 		snapshot.SetupFailure != 0 || tcpTerminalTotal(snapshot) != 1 {
 		t.Fatalf("stream-limit TCP admission snapshot = %+v", snapshot)
 	}
@@ -498,7 +827,8 @@ func TestTCPSaturatedPreferredUsesBackupGeneration(t *testing.T) {
 	waitForTCPAdmissionState(t, backup, 2, 1, manager.listeners[0].tcpSetupSlots)
 	snapshot := manager.listeners[0].tcpAdmission.snapshot()
 	if snapshot.Attempts != 2 || snapshot.Retries != 1 || snapshot.StreamLimitAttempts != 1 ||
-		snapshot.Committed != 1 || snapshot.PeerStreamLimit != 0 || snapshot.GenerationCapacity != 0 ||
+		snapshot.Committed != 1 || snapshot.PeerStreamLimit != 0 ||
+		snapshot.GenerationConnectionCapacity != 0 || snapshot.GenerationSetupCapacity != 0 ||
 		snapshot.SetupFailure != 0 ||
 		tcpTerminalTotal(snapshot) != 1 {
 		t.Fatalf("backup-success TCP admission snapshot = %+v", snapshot)
@@ -538,9 +868,10 @@ func TestTCPProvisionalStreamAttachmentLosesToLocalShutdown(t *testing.T) {
 	registerTCPAdmissionClose(t, "provisional local peer", remote)
 	listenerCtx, cancelListener := context.WithCancel(context.Background())
 	listener := &Listener{
-		ctx:    listenerCtx,
-		cancel: cancelListener,
-		flows:  make(map[*tcpFlow]struct{}),
+		ctx:          listenerCtx,
+		cancel:       cancelListener,
+		flows:        make(map[*tcpFlow]struct{}),
+		tcpFlowLimit: config.DefaultMaxTCPConnections,
 	}
 	flow, ok := listener.addTCPFlow(local)
 	if !ok {
@@ -703,8 +1034,8 @@ func TestTCPPartialNewConnResetUsesBackupAndReleasesPrimaryLease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginTCPAdmission(17) error = %v", err)
 	}
-	if lease, err := admission.Next(); lease != nil || !errors.Is(err, pool.ErrTCPGenerationCapacity) {
-		t.Fatalf("17th primary lease probe = (%v, %v), want generation capacity", lease, err)
+	if lease, err := admission.Next(); lease != nil || !errors.Is(err, pool.ErrTCPGenerationSetupCapacity) {
+		t.Fatalf("17th primary lease probe = (%v, %v), want generation setup capacity", lease, err)
 	}
 	for i, lease := range leases {
 		if !lease.Release() {

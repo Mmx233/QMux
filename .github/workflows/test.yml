@@ -61,12 +61,12 @@ jobs:
           go test ./auth/... ./client/... ./cmd/... ./config/... ./protocol/... ./server/...
           -count=1 -timeout=8m
 
-      # Allocation calibration remains covered by the preceding non-race suite.
+      # Allocation and wall-clock performance checks remain covered by the preceding non-race suite.
       - name: Full non-E2E race suite
         timeout-minutes: 20
         run: >-
           go test -race ./auth/... ./client/... ./cmd/... ./config/... ./protocol/... ./server/...
-          -skip '^TestCodecAllocationEfficiency_Property$'
+          -skip '^(TestCodecAllocationEfficiency_Property|TestPoolSelectOverheadRatio_Property|TestConcurrentPoolThroughput_Property|TestHealthUpdateEfficiency_Property)$'
           -count=1 -timeout=15m
 
       - name: Functional E2E fault matrix

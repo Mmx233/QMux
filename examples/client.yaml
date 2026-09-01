@@ -5,6 +5,10 @@
 # Leave empty to auto-generate a unique ID on startup
 client_id: ""
 
+# Process-wide capacity limits. Omit a field or set it to 0 to use its default.
+capacity:
+  max_local_udp_sessions: 256
+
 # Server connection settings
 # Configure one or more QMux servers to connect to
 server:

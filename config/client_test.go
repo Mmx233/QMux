@@ -12,8 +12,8 @@ import (
 // Validates: Requirements 1.3, 6.1
 func TestServerCountValidation_Property(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		// Generate random server count between 0 and 15
-		count := rapid.IntRange(0, 15).Draw(t, "serverCount")
+		// Include counts above the former arbitrary limit of 10.
+		count := rapid.IntRange(0, 32).Draw(t, "serverCount")
 
 		// Create servers with valid addresses
 		servers := make([]ServerEndpoint, count)
@@ -27,8 +27,8 @@ func TestServerCountValidation_Property(t *testing.T) {
 		cs := &ClientServer{Servers: servers}
 		err := cs.Validate()
 
-		// Property: validation should fail if count < 1 or count > 10
-		if count < MinServers || count > MaxServers {
+		// Property: only an empty server list is invalid.
+		if count < MinServers {
 			if err == nil {
 				t.Fatalf("expected validation error for count %d, got nil", count)
 			}

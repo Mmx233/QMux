@@ -599,6 +599,78 @@ func TestRegistrationLifecycleStartAttemptDeadlineSchedulesFreshReconnect(t *tes
 	assertLifecycleUnpublished(t, cm)
 }
 
+func TestConnectionManagerStartPublishesSeventeenEndpointsBeforeDrain(t *testing.T) {
+	const endpointCount = 17
+	peer := newLifecycleStartPeer(t)
+	_, port, err := net.SplitHostPort(peer.listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoints := make([]config.ServerEndpoint, endpointCount)
+	serverDone := make([]<-chan error, endpointCount)
+	for i := range endpointCount {
+		host := []byte("localhost")
+		for bit := range len(host) {
+			if i&(1<<bit) != 0 {
+				host[bit] -= 'a' - 'A'
+			}
+		}
+		endpoints[i] = config.ServerEndpoint{
+			Address:    net.JoinHostPort(string(host), port),
+			ServerName: "lifecycle.test",
+		}
+		serverDone[i] = peer.serveRegistration(func(conn *quic.Conn, stream *quic.Stream, _ protocol.RegisterMsg) error {
+			if err := writeSuccessfulLifecycleAck(stream); err != nil {
+				return err
+			}
+			<-conn.Context().Done()
+			return nil
+		})
+	}
+
+	cm, err := NewConnectionManager(&config.Client{
+		ClientID: "seventeen-endpoints",
+		Server:   config.ClientServer{Servers: endpoints},
+		Quic: config.Quic{
+			HandshakeIdleTimeout: 10 * time.Second,
+			MaxIdleTimeout:       30 * time.Second,
+		},
+		TLS:               lifecycleClientTLSFiles(t),
+		HeartbeatInterval: time.Hour,
+		HealthTimeout:     2 * time.Hour,
+	}, zerolog.Nop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cm.Stop() })
+	cm.attemptTimeout = 20 * time.Second
+
+	startDone := make(chan error, 1)
+	go func() { startDone <- cm.Start(context.Background()) }()
+	if err := awaitLifecycle(t, startDone, "17-endpoint ConnectionManager.Start before draining NewConns"); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(cm.NewConns); got != endpointCount {
+		t.Fatalf("queued connections = %d, want %d", got, endpointCount)
+	}
+	seen := make(map[string]bool, endpointCount)
+	for range endpointCount {
+		sc := awaitLifecycle(t, cm.NewConns, "queued endpoint connection")
+		seen[sc.ServerAddr()] = true
+	}
+	if len(seen) != endpointCount {
+		t.Fatalf("distinct published endpoints = %d, want %d", len(seen), endpointCount)
+	}
+	if err := cm.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	for i := range endpointCount {
+		if err := awaitLifecycle(t, serverDone[i], "17-endpoint connection cleanup"); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestRegistrationLifecycleStopInterruptsStalledAck(t *testing.T) {
 	peer := newLifecyclePeer(t)
 	cm := newLifecycleManager(t, peer)
@@ -901,69 +973,80 @@ func TestRegistrationLifecycleCancellationAfterDeliveryRemainsCommitted(t *testi
 }
 
 func TestRegistrationLifecycleAckCancelRace(t *testing.T) {
-	peer := newLifecyclePeer(t)
-	cm := newLifecycleManager(t, peer)
 	const iterations = 200
+	const batchSize = 8
 
-	for iteration := range iterations {
-		ready := make(chan struct{})
-		releaseAck := make(chan struct{})
-		serverDone := peer.serveRegistration(func(conn *quic.Conn, stream *quic.Stream, _ protocol.RegisterMsg) error {
-			close(ready)
-			<-releaseAck
-			_ = writeSuccessfulLifecycleAck(stream)
-			<-conn.Context().Done()
-			return nil
+	for batchStart := 0; batchStart < iterations; batchStart += batchSize {
+		t.Run(fmt.Sprintf("batch-%d", batchStart/batchSize), func(t *testing.T) {
+			peer := newLifecyclePeer(t)
+			cm := newLifecycleManager(t, peer)
+			for iteration := batchStart; iteration < min(batchStart+batchSize, iterations); iteration++ {
+				ready := make(chan struct{})
+				releaseAck := make(chan struct{})
+				serverDone := peer.serveRegistration(func(conn *quic.Conn, stream *quic.Stream, _ protocol.RegisterMsg) error {
+					close(ready)
+					<-releaseAck
+					_ = writeSuccessfulLifecycleAck(stream)
+					<-conn.Context().Done()
+					return nil
+				})
+
+				ctx, cancel := context.WithCancel(context.Background())
+				type registrationResult struct {
+					connection *ServerConnection
+					err        error
+				}
+				result := make(chan registrationResult, 1)
+				go func() {
+					sc, err := cm.connectAndRegister(ctx, peer.endpoint())
+					result <- registrationResult{connection: sc, err: err}
+				}()
+				select {
+				case <-ready:
+				case outcome := <-result:
+					t.Fatalf("race registration %d ended before server readiness: %v", iteration, outcome.err)
+				case <-time.After(30 * time.Second):
+					t.Fatalf("timed out waiting for race registration %d", iteration)
+				}
+
+				start := make(chan struct{})
+				var racers sync.WaitGroup
+				racers.Add(2)
+				go func() {
+					defer racers.Done()
+					<-start
+					cancel()
+				}()
+				go func() {
+					defer racers.Done()
+					<-start
+					close(releaseAck)
+				}()
+				close(start)
+				racers.Wait()
+
+				outcome := awaitLifecycle(t, result, fmt.Sprintf("Ack/cancel race %d", iteration))
+				if outcome.err != nil {
+					if !errors.Is(outcome.err, context.Canceled) {
+						t.Fatalf("race %d returned non-cancellation error: %v", iteration, outcome.err)
+					}
+					if outcome.connection != nil {
+						t.Fatalf("race %d returned a provisional connection with error", iteration)
+					}
+				} else {
+					if outcome.connection == nil {
+						t.Fatalf("race %d succeeded without a connection", iteration)
+					}
+					if err := outcome.connection.Close(); err != nil {
+						t.Fatalf("race %d close winning connection: %v", iteration, err)
+					}
+				}
+				if err := awaitLifecycle(t, serverDone, fmt.Sprintf("race connection %d close", iteration)); err != nil {
+					t.Fatal(err)
+				}
+				assertLifecycleUnpublished(t, cm)
+			}
 		})
-
-		ctx, cancel := context.WithCancel(context.Background())
-		type registrationResult struct {
-			connection *ServerConnection
-			err        error
-		}
-		result := make(chan registrationResult, 1)
-		go func() {
-			sc, err := cm.connectAndRegister(ctx, peer.endpoint())
-			result <- registrationResult{connection: sc, err: err}
-		}()
-		awaitLifecycle(t, ready, fmt.Sprintf("race registration %d", iteration))
-
-		start := make(chan struct{})
-		var racers sync.WaitGroup
-		racers.Add(2)
-		go func() {
-			defer racers.Done()
-			<-start
-			cancel()
-		}()
-		go func() {
-			defer racers.Done()
-			<-start
-			close(releaseAck)
-		}()
-		close(start)
-		racers.Wait()
-
-		outcome := awaitLifecycle(t, result, fmt.Sprintf("Ack/cancel race %d", iteration))
-		if outcome.err != nil {
-			if !errors.Is(outcome.err, context.Canceled) {
-				t.Fatalf("race %d returned non-cancellation error: %v", iteration, outcome.err)
-			}
-			if outcome.connection != nil {
-				t.Fatalf("race %d returned a provisional connection with error", iteration)
-			}
-		} else {
-			if outcome.connection == nil {
-				t.Fatalf("race %d succeeded without a connection", iteration)
-			}
-			if err := outcome.connection.Close(); err != nil {
-				t.Fatalf("race %d close winning connection: %v", iteration, err)
-			}
-		}
-		if err := awaitLifecycle(t, serverDone, fmt.Sprintf("race connection %d close", iteration)); err != nil {
-			t.Fatal(err)
-		}
-		assertLifecycleUnpublished(t, cm)
 	}
 }
 

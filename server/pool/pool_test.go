@@ -20,6 +20,12 @@ func currentTestClient(pool *ConnectionPool, clientID string) *ClientConn {
 	return client
 }
 
+func largeTestLimits() Limits {
+	limits := defaultLimits()
+	limits.MaxClientGenerations = 2048
+	return limits
+}
+
 // TestConnectionPool_AddRemove tests adding and removing clients
 func TestConnectionPool_AddRemove(t *testing.T) {
 	pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
@@ -337,7 +343,9 @@ func BenchmarkConnectionPool_Select(b *testing.B) {
 
 // BenchmarkConnectionPool_Add benchmarks adding clients to pool
 func BenchmarkConnectionPool_Add(b *testing.B) {
-	pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
+	limits := largeTestLimits()
+	limits.MaxClientGenerations = max(limits.MaxClientGenerations, int64(b.N))
+	pool := NewWithLimits("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger(), limits)
 	defer pool.Stop()
 
 	// Pre-create clients to avoid allocation in the loop
@@ -362,7 +370,9 @@ func BenchmarkConnectionPool_Add(b *testing.B) {
 // BenchmarkConnectionPool_Remove benchmarks removing clients from pool
 func BenchmarkConnectionPool_Remove(b *testing.B) {
 	// Pre-populate pool with clients
-	pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
+	limits := largeTestLimits()
+	limits.MaxClientGenerations = max(limits.MaxClientGenerations, int64(b.N))
+	pool := NewWithLimits("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger(), limits)
 	defer pool.Stop()
 
 	clients := make([]*ClientConn, b.N)
@@ -389,7 +399,7 @@ func BenchmarkConnectionPool_Select_Sizes(b *testing.B) {
 
 	for _, size := range sizes {
 		b.Run(fmt.Sprintf("clients_%d", size), func(b *testing.B) {
-			pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
+			pool := NewWithLimits("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger(), largeTestLimits())
 			defer pool.Stop()
 
 			// Populate pool with clients
@@ -429,7 +439,7 @@ func populateBenchmarkPool(pool *ConnectionPool, count int) []string {
 
 // BenchmarkConnectionPool_Get benchmarks client lookup by ID
 func BenchmarkConnectionPool_Get(b *testing.B) {
-	pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
+	pool := NewWithLimits("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger(), largeTestLimits())
 	defer pool.Stop()
 
 	// Populate pool with 100 clients
@@ -446,7 +456,7 @@ func BenchmarkConnectionPool_Get(b *testing.B) {
 
 // BenchmarkConnectionPool_Parallel benchmarks concurrent pool operations
 func BenchmarkConnectionPool_Parallel(b *testing.B) {
-	pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
+	pool := NewWithLimits("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger(), largeTestLimits())
 	defer pool.Stop()
 
 	// Populate pool with 100 clients
@@ -475,7 +485,7 @@ func BenchmarkConnectionPool_Parallel(b *testing.B) {
 // Validates: Requirements 2.3
 func TestCacheInvalidationCorrectness_Property(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
+		pool := NewWithLimits("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger(), largeTestLimits())
 		defer pool.Stop()
 
 		// Generate initial client count (1-20)
@@ -572,7 +582,7 @@ func TestPoolSelectOverheadRatio_Property(t *testing.T) {
 		// Generate random pool size (50-200) - larger sizes for more stable measurements
 		poolSize := rapid.IntRange(50, 200).Draw(t, "poolSize")
 
-		pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
+		pool := NewWithLimits("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger(), largeTestLimits())
 		defer pool.Stop()
 
 		// Create clients
@@ -641,11 +651,14 @@ func TestPoolSelectOverheadRatio_Property(t *testing.T) {
 // (throughput increases with GOMAXPROCS).
 // Validates: Requirements 5.2
 func TestConcurrentPoolThroughput_Property(t *testing.T) {
+	if testing.Short() {
+		t.Skip("wall-clock throughput is covered by the full regression suite")
+	}
 	rapid.Check(t, func(t *rapid.T) {
 		// Generate random pool size (20-100)
 		poolSize := rapid.IntRange(20, 100).Draw(t, "poolSize")
 
-		pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
+		pool := NewWithLimits("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger(), largeTestLimits())
 		defer pool.Stop()
 
 		// Populate pool with clients
@@ -731,7 +744,7 @@ func TestHealthUpdateEfficiency_Property(t *testing.T) {
 		largePoolSize := rapid.IntRange(500, 1000).Draw(t, "largePoolSize")
 
 		// Create small pool
-		smallPool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
+		smallPool := NewWithLimits("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger(), largeTestLimits())
 		defer smallPool.Stop()
 
 		for i := range smallPoolSize {
@@ -745,7 +758,7 @@ func TestHealthUpdateEfficiency_Property(t *testing.T) {
 		}
 
 		// Create large pool
-		largePool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
+		largePool := NewWithLimits("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger(), largeTestLimits())
 		defer largePool.Stop()
 
 		for i := range largePoolSize {
@@ -901,7 +914,7 @@ func TestConnectionPool_SelectAllUnhealthy(t *testing.T) {
 // **Validates: Requirements 6.5**
 func TestUnhealthyExcludedFromLoadBalancer_Property(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
+		pool := NewWithLimits("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger(), largeTestLimits())
 		defer pool.Stop()
 
 		// Generate random number of clients (2-20)

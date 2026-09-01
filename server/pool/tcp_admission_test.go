@@ -103,15 +103,15 @@ func TestTCPAdmissionPendingBoundConcurrentAndStaleLease(t *testing.T) {
 	wg.Wait()
 	close(leases)
 
-	held := make([]*TCPLease, 0, maxPendingTCPSetupsPerClient)
+	held := make([]*TCPLease, 0, defaultMaxPendingTCPSetupsPerGeneration)
 	for lease := range leases {
 		held = append(held, lease)
 	}
-	if len(held) != maxPendingTCPSetupsPerClient {
-		t.Fatalf("reserved leases = %d, want %d", len(held), maxPendingTCPSetupsPerClient)
+	if len(held) != int(defaultMaxPendingTCPSetupsPerGeneration) {
+		t.Fatalf("reserved leases = %d, want %d", len(held), defaultMaxPendingTCPSetupsPerGeneration)
 	}
-	if pending := stale.tcpPending.Load(); pending != maxPendingTCPSetupsPerClient {
-		t.Fatalf("pending setups = %d, want %d", pending, maxPendingTCPSetupsPerClient)
+	if pending := stale.tcpPending.Load(); pending != defaultMaxPendingTCPSetupsPerGeneration {
+		t.Fatalf("pending setups = %d, want %d", pending, defaultMaxPendingTCPSetupsPerGeneration)
 	}
 
 	if !p.Remove(stale) {
@@ -143,9 +143,9 @@ func TestTCPAdmissionExhaustionReasons(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginTCPAdmission(capacity) error = %v", err)
 	}
-	client.tcpPending.Store(maxPendingTCPSetupsPerClient)
-	if lease, err := capacity.Next(); lease != nil || !errors.Is(err, ErrTCPGenerationCapacity) {
-		t.Fatalf("capacity Next() = (%v, %v), want ErrTCPGenerationCapacity", lease, err)
+	client.tcpPending.Store(defaultMaxPendingTCPSetupsPerGeneration)
+	if lease, err := capacity.Next(); lease != nil || !errors.Is(err, ErrTCPGenerationSetupCapacity) {
+		t.Fatalf("capacity Next() = (%v, %v), want ErrTCPGenerationSetupCapacity", lease, err)
 	}
 
 	client.tcpPending.Store(0)
@@ -186,7 +186,7 @@ func TestTCPAdmissionExhaustionReasons(t *testing.T) {
 	if !lease.Release() {
 		t.Fatal("Release(cursor lease) = false")
 	}
-	client.tcpPending.Store(maxPendingTCPSetupsPerClient)
+	client.tcpPending.Store(defaultMaxPendingTCPSetupsPerGeneration)
 	if lease, err := cursor.Next(); lease != nil || err != nil {
 		t.Fatalf("exhausted cursor Next() = (%v, %v), want nil exhaustion", lease, err)
 	}
@@ -235,7 +235,7 @@ func TestTCPAdmissionRevalidatesFallbackCapacity(t *testing.T) {
 	defer p.Stop()
 	first := addTCPAdmissionClient(t, p, "first", "tcp")
 	second := addTCPAdmissionClient(t, p, "second", "tcp")
-	second.tcpPending.Store(maxPendingTCPSetupsPerClient)
+	second.tcpPending.Store(defaultMaxPendingTCPSetupsPerGeneration)
 	balancer.selected = first
 
 	admission, err := p.BeginTCPAdmission()

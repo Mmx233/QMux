@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Mmx233/QMux/config"
@@ -19,13 +20,14 @@ import (
 	"github.com/Mmx233/QMux/server/tls/stek"
 	"github.com/Mmx233/QMux/server/traffic"
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/qlog"
+	"github.com/quic-go/quic-go/qlogwriter"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
 
 const (
 	registrationTimeout         = 10 * time.Second
-	maxPendingRegistrations     = 128
 	registrationErrorCode       = quic.ApplicationErrorCode(1)
 	registrationStreamErrorCode = quic.StreamErrorCode(1)
 	registrationFailureReason   = "registration failed"
@@ -35,6 +37,7 @@ const (
 type Server struct {
 	config               *config.Server
 	pools                map[string]*pool.ConnectionPool // quicAddr -> pool
+	handshakes           map[string]*handshakeStats      // quicAddr -> pre-Accept handshakes
 	trafficManager       *traffic.Manager
 	authenticator        auth.Auth
 	registrationTimeout  time.Duration
@@ -57,7 +60,96 @@ type RouteSnapshot struct {
 	TCPEligibleClients int
 	UDPEligibleClients int
 	TCPAdmission       traffic.TCPAdmissionSnapshot
+	UDPAdmission       traffic.UDPAdmissionSnapshot
+	Handshake          HandshakeSnapshot
+	PoolCapacity       pool.CapacitySnapshot
 	Ready              bool
+}
+
+// HandshakeSnapshot is a point-in-time, value-only view of pre-Accept QUIC
+// handshakes for one listener.
+type HandshakeSnapshot struct {
+	Current          int64
+	HighWater        int64
+	AccountingFaults uint64
+}
+
+type handshakeStats struct {
+	mu               sync.Mutex
+	current          atomic.Int64
+	highWater        atomic.Int64
+	accountingFaults atomic.Uint64
+}
+
+func (s *handshakeStats) snapshot() HandshakeSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return HandshakeSnapshot{
+		Current:          s.current.Load(),
+		HighWater:        s.highWater.Load(),
+		AccountingFaults: s.accountingFaults.Load(),
+	}
+}
+
+func (s *handshakeStats) start() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current := s.current.Add(1)
+	for high := s.highWater.Load(); current > high && !s.highWater.CompareAndSwap(high, current); high = s.highWater.Load() {
+	}
+}
+
+func (s *handshakeStats) finish() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for {
+		current := s.current.Load()
+		if current == 0 {
+			s.accountingFaults.Add(1)
+			return
+		}
+		if s.current.CompareAndSwap(current, current-1) {
+			return
+		}
+	}
+}
+
+func (s *handshakeStats) tracer(context.Context, bool, quic.ConnectionID) qlogwriter.Trace {
+	return &handshakeTrace{stats: s}
+}
+
+type handshakeTrace struct {
+	stats *handshakeStats
+	start sync.Once
+	end   sync.Once
+}
+
+func (t *handshakeTrace) AddProducer() qlogwriter.Recorder {
+	t.start.Do(t.stats.start)
+	return &handshakeRecorder{trace: t}
+}
+
+func (*handshakeTrace) SupportsSchemas(string) bool { return true }
+
+func (t *handshakeTrace) finish() {
+	t.end.Do(t.stats.finish)
+}
+
+type handshakeRecorder struct {
+	trace *handshakeTrace
+	once  sync.Once
+}
+
+func (r *handshakeRecorder) RecordEvent(event qlogwriter.Event) {
+	switch event.(type) {
+	case qlog.ALPNInformation, *qlog.ALPNInformation:
+		r.trace.finish()
+	}
+}
+
+func (r *handshakeRecorder) Close() error {
+	r.once.Do(r.trace.finish)
+	return nil
 }
 
 type registrationAckWriter func(
@@ -151,6 +243,7 @@ func New(conf *config.Server) (*Server, error) {
 
 	// Create connection pools for each listener
 	pools := make(map[string]*pool.ConnectionPool) // quicAddr -> pool
+	handshakes := make(map[string]*handshakeStats, len(ownedConfig.Listeners))
 	for _, listener := range ownedConfig.Listeners {
 		var balancer pool.LoadBalancer
 		switch ownedConfig.LoadBalancer {
@@ -159,9 +252,10 @@ func New(conf *config.Server) (*Server, error) {
 		default:
 			balancer = pool.NewLeastConnectionsBalancer()
 		}
-		p := pool.New(listener.QuicAddr, balancer, logger)
+		p := pool.NewWithLimits(listener.QuicAddr, balancer, logger, poolLimitsFromCapacity(listener.Capacity))
 
 		pools[listener.QuicAddr] = p
+		handshakes[listener.QuicAddr] = &handshakeStats{}
 		logger.Info().
 			Str("quic_addr", listener.QuicAddr).
 			Str("balancer", balancer.Name()).
@@ -171,6 +265,7 @@ func New(conf *config.Server) (*Server, error) {
 	srv := &Server{
 		config:               &ownedConfig,
 		pools:                pools,
+		handshakes:           handshakes,
 		authenticator:        authenticator,
 		registrationTimeout:  registrationTimeout,
 		writeRegistrationAck: protocol.WriteRegisterAckWithAuth,
@@ -178,6 +273,16 @@ func New(conf *config.Server) (*Server, error) {
 	}
 	srv.trafficManager = traffic.NewManager(srv.config, srv.pools, srv.logger)
 	return srv, nil
+}
+
+func poolLimitsFromCapacity(capacity config.ListenerCapacity) pool.Limits {
+	return pool.Limits{
+		MaxClientGenerations:             int64(capacity.MaxClientGenerations),
+		MaxPendingRegistrations:          int64(capacity.MaxPendingRegistrations),
+		MaxTCPConnectionsPerGeneration:   int64(capacity.MaxTCPConnectionsPerGeneration),
+		MaxPendingTCPSetupsPerGeneration: int64(capacity.MaxPendingTCPSetupsPerGeneration),
+		MaxUDPSessionsPerGeneration:      int64(capacity.MaxUDPSessionsPerGeneration),
+	}
 }
 
 // validateListeners establishes the route invariants required by readiness.
@@ -203,6 +308,9 @@ func validateListeners(listeners []config.QuicListener) error {
 	}
 
 	for i, listener := range listeners {
+		if err := listener.Capacity.Validate(fmt.Sprintf("listeners[%d].capacity", i)); err != nil {
+			return err
+		}
 		if err := validateListenerAddress(listener.QuicAddr); err != nil {
 			return fmt.Errorf("listeners[%d].quic_addr: %w", i, err)
 		}
@@ -288,8 +396,10 @@ func (s *Server) Start(ctx context.Context) error {
 func (s *Server) Snapshot() Snapshot {
 	listening := s.trafficManager != nil && s.trafficManager.Running()
 	var tcpAdmission []traffic.TCPAdmissionSnapshot
+	var udpAdmission []traffic.UDPAdmissionSnapshot
 	if s.trafficManager != nil {
 		tcpAdmission = s.trafficManager.TCPAdmissionSnapshots()
+		udpAdmission = s.trafficManager.UDPAdmissionSnapshots()
 	}
 	snapshot := Snapshot{
 		Routes: make([]RouteSnapshot, 0, len(s.config.Listeners)),
@@ -305,7 +415,11 @@ func (s *Server) Snapshot() Snapshot {
 		if i < len(tcpAdmission) {
 			route.TCPAdmission = tcpAdmission[i]
 		}
+		if i < len(udpAdmission) {
+			route.UDPAdmission = udpAdmission[i]
+		}
 		if connectionPool := s.pools[listener.QuicAddr]; connectionPool != nil {
+			route.PoolCapacity = connectionPool.Snapshot()
 			switch listener.Protocol {
 			case "tcp":
 				route.TCPEligibleClients = connectionPool.EligibleCount("tcp")
@@ -318,6 +432,9 @@ func (s *Server) Snapshot() Snapshot {
 				route.UDPEligibleClients = connectionPool.EligibleCount("udp")
 				route.Ready = listening && route.TCPEligibleClients > 0 && route.UDPEligibleClients > 0
 			}
+		}
+		if handshakes := s.handshakes[listener.QuicAddr]; handshakes != nil {
+			route.Handshake = handshakes.snapshot()
 		}
 		snapshot.Routes = append(snapshot.Routes, route)
 		snapshot.Ready = snapshot.Ready && route.Ready
@@ -461,6 +578,11 @@ func (s *Server) startListener(ctx context.Context, listenerConf config.QuicList
 
 	// Get QUIC config
 	quicConf := listenerConf.GetConfig()
+	handshakes := s.handshakes[listenerConf.QuicAddr]
+	if handshakes == nil {
+		handshakes = &handshakeStats{}
+	}
+	quicConf.Tracer = handshakes.tracer
 
 	// Create QUIC transport
 	tr := quic.Transport{
@@ -493,8 +615,6 @@ func (s *Server) startListener(ctx context.Context, listenerConf config.QuicList
 		Str("traffic_addr", listenerConf.TrafficAddr).
 		Str("protocol", listenerConf.Protocol).
 		Msg("QUIC listener started")
-	pendingRegistrations := make(chan struct{}, maxPendingRegistrations)
-
 	// Accept connections
 	for {
 		conn, err := ln.Accept(ctx)
@@ -504,39 +624,18 @@ func (s *Server) startListener(ctx context.Context, listenerConf config.QuicList
 			}
 			return fmt.Errorf("accept connection: %w", err)
 		}
-
-		permit, ok := acquirePendingRegistration(pendingRegistrations)
-		if !ok {
+		poolInst := s.pools[listenerConf.QuicAddr]
+		pending := poolInst.BeginPending()
+		if pending == nil {
 			logger.Warn().Str("remote", conn.RemoteAddr().String()).Msg("pending registration limit reached")
 			_ = conn.CloseWithError(registrationErrorCode, registrationFailureReason)
 			continue
 		}
 
 		connectionWG.Go(func() {
-			s.handleConnection(ctx, conn, listenerConf.QuicAddr, permit)
+			s.handleConnectionPending(ctx, conn, listenerConf.QuicAddr, pending)
 		})
 	}
-}
-
-type registrationPermit struct {
-	slots chan struct{}
-	once  sync.Once
-}
-
-func acquirePendingRegistration(slots chan struct{}) (*registrationPermit, bool) {
-	select {
-	case slots <- struct{}{}:
-		return &registrationPermit{slots: slots}, true
-	default:
-		return nil, false
-	}
-}
-
-func (p *registrationPermit) Release() {
-	if p == nil {
-		return
-	}
-	p.once.Do(func() { <-p.slots })
 }
 
 // handleConnection handles a new QUIC connection
@@ -544,9 +643,45 @@ func (s *Server) handleConnection(
 	ctx context.Context,
 	conn *quic.Conn,
 	quicAddr string,
-	registrationPermit *registrationPermit,
 ) {
-	defer registrationPermit.Release()
+	poolInst := s.pools[quicAddr]
+	pending := poolInst.BeginPending()
+	if pending == nil {
+		_ = conn.CloseWithError(registrationErrorCode, registrationFailureReason)
+		return
+	}
+	s.handleConnectionPending(ctx, conn, quicAddr, pending)
+}
+
+func (s *Server) handleConnectionPending(
+	ctx context.Context,
+	conn *quic.Conn,
+	quicAddr string,
+	pending *pool.Reservation,
+) {
+	poolInst := s.pools[quicAddr]
+	if pending == nil {
+		_ = conn.CloseWithError(registrationErrorCode, registrationFailureReason)
+		return
+	}
+	var registered *pool.ClientConn
+	var retirement *pool.Retirement
+	closeReason := registrationFailureReason
+	defer func() {
+		poolInst.Abort(pending)
+		if registered != nil && retirement == nil {
+			retirement = poolInst.BeginRetire(registered)
+		}
+		code := registrationErrorCode
+		if registered != nil {
+			code = 1
+		}
+		_ = conn.CloseWithError(code, closeReason)
+		if retirement != nil {
+			<-conn.Context().Done()
+			retirement.Done()
+		}
+	}()
 	logger := s.logger.With().
 		Str("remote", conn.RemoteAddr().String()).
 		Str("quic_addr", quicAddr).
@@ -561,13 +696,6 @@ func (s *Server) handleConnection(
 	registrationCtx, cancelRegistration := context.WithTimeout(ctx, timeout)
 	defer cancelRegistration()
 	registrationDeadline, _ := registrationCtx.Deadline()
-	registrationSucceeded := false
-	defer func() {
-		if !registrationSucceeded {
-			_ = conn.CloseWithError(registrationErrorCode, registrationFailureReason)
-		}
-	}()
-
 	// A completed handshake is the freshness boundary for exporter-bound auth.
 	select {
 	case <-conn.HandshakeComplete():
@@ -672,14 +800,11 @@ func (s *Server) handleConnection(
 
 	// Reserve the client ID without publishing it to traffic selection. The
 	// connection becomes visible only after the success Ack is on the wire.
-	poolInst := s.pools[quicAddr]
-	reservation, err := poolInst.Reserve(clientConn)
-	if err != nil {
+	if err := pending.Reserve(clientConn); err != nil {
 		logger.Error().Err(err).Msg("reserve pool entry failed")
 		_ = s.writeRegisterAck(controlStream, false, "registration unavailable", protocol.ProtocolVersion, nil, "")
 		return
 	}
-	defer poolInst.Abort(reservation)
 
 	selectedAuthScheme := s.authenticator.SelectedScheme()
 	if err := s.writeRegisterAck(
@@ -693,18 +818,12 @@ func (s *Server) handleConnection(
 		logger.Error().Err(err).Msg("send ack failed")
 		return
 	}
-	registrationPermit.Release()
-	if err := poolInst.Commit(reservation); err != nil {
+	if err := poolInst.Commit(pending); err != nil {
 		logger.Error().Err(err).Msg("commit pool entry failed")
 		return
 	}
-	defer func() {
-		if !poolInst.Remove(clientConn) {
-			logger.Warn().
-				Time("registered_at", clientConn.RegisteredAt).
-				Msg("client generation was not current during deferred cleanup")
-		}
-	}()
+	registered = clientConn
+	closeReason = "control stream ended"
 
 	// Stop registration cancellation before clearing the transaction deadline.
 	stopWatch()
@@ -713,9 +832,7 @@ func (s *Server) handleConnection(
 		logger.Error().Err(err).Msg("clear registration stream deadline failed")
 		return
 	}
-	registrationSucceeded = true
-
-	s.handleControlStream(ctx, poolInst, clientConn, quicAddr)
+	closeReason, retirement = s.handleControlStream(ctx, poolInst, clientConn, quicAddr)
 }
 
 func (s *Server) writeRegisterAck(
@@ -741,9 +858,9 @@ func (s *Server) handleControlStream(
 	poolInst *pool.ConnectionPool,
 	clientConn *pool.ClientConn,
 	quicAddr string,
-) {
+) (closeReason string, retirement *pool.Retirement) {
+	closeReason = "control stream ended"
 	ctx, cancel := context.WithCancel(ctx)
-	defer func() { _ = clientConn.Conn.CloseWithError(1, "control stream ended") }()
 
 	logger := s.logger.With().
 		Str("client_id", clientConn.ID).
@@ -785,6 +902,7 @@ func (s *Server) handleControlStream(
 		clientConn.ControlStream.CancelRead(registrationStreamErrorCode)
 		<-readerDone
 	}()
+	defer func() { retirement = poolInst.BeginRetire(clientConn) }()
 
 	now := time.Now()
 	healthExpiry := now.Add(s.config.HealthTimeout)
@@ -816,7 +934,7 @@ func (s *Server) handleControlStream(
 				if !poolInst.MarkUnhealthy(clientConn) {
 					logger.Debug().Msg("ignored stale heartbeat write failure")
 				}
-				_ = clientConn.Conn.CloseWithError(1, "heartbeat write failed")
+				closeReason = "heartbeat write failed"
 				return
 			}
 			logger.Debug().Msg("heartbeat sent to client")
@@ -847,7 +965,7 @@ func (s *Server) handleControlStream(
 			if !poolInst.MarkUnhealthy(clientConn) {
 				logger.Debug().Msg("ignored timeout for stale client generation")
 			}
-			_ = clientConn.Conn.CloseWithError(1, "heartbeat timeout")
+			closeReason = "heartbeat timeout"
 			return
 		}
 	}

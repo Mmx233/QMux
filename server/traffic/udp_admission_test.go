@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Mmx233/QMux/config"
 	"github.com/Mmx233/QMux/server/pool"
 	"github.com/quic-go/quic-go"
 	"github.com/rs/zerolog"
@@ -19,6 +20,7 @@ func newUDPAdmissionUnitHandler(p *pool.ConnectionPool, limit int) *UDPHandler {
 		ctx:          ctx,
 		cancel:       cancel,
 		logger:       zerolog.Nop(),
+		sessionLimit: int64(limit),
 		sessionSlots: make(chan struct{}, limit),
 		receivers:    make(map[*quic.Conn]struct{}),
 	}
@@ -34,29 +36,30 @@ func addTrafficUDPClient(t *testing.T, p *pool.ConnectionPool, id string) *pool.
 }
 
 func TestUDPAdmissionListenerLimitWiring(t *testing.T) {
-	connectionPool := pool.New("test", pool.NewRoundRobinBalancer(), zerolog.Nop())
+	const quicAddr = "udp-limit-test"
+	connectionPool := pool.New(quicAddr, pool.NewRoundRobinBalancer(), zerolog.Nop())
 	t.Cleanup(connectionPool.Stop)
-	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatalf("listen UDP for admission wiring: %v", err)
-	}
 	ctx, cancel := context.WithCancel(context.Background())
-	listener := &Listener{
-		Addr:            conn.LocalAddr().String(),
-		UDPConn:         conn,
-		Pool:            connectionPool,
-		ctx:             ctx,
-		cancel:          cancel,
-		logger:          zerolog.Nop(),
-		udpSessionLimit: 2,
+	manager := NewManager(&config.Server{Listeners: []config.QuicListener{{
+		QuicAddr:    quicAddr,
+		TrafficAddr: "127.0.0.1:0",
+		Protocol:    "udp",
+		Capacity:    config.ListenerCapacity{MaxUDPSessions: 2},
+	}}}, map[string]*pool.ConnectionPool{quicAddr: connectionPool}, zerolog.Nop())
+	if err := manager.Start(ctx); err != nil {
+		cancel()
+		t.Fatalf("start UDP admission manager: %v", err)
 	}
-	listener.startUDPHandler()
 	t.Cleanup(func() {
-		listener.close()
-		listener.wait()
+		cancel()
+		manager.Stop()
 	})
-	if got := cap(listener.udpHandler.sessionSlots); got != listener.udpSessionLimit {
-		t.Fatalf("listener UDP session capacity = %d, want %d", got, listener.udpSessionLimit)
+	listener := manager.listeners[0]
+	if got := cap(listener.udpHandler.sessionSlots); got != 2 {
+		t.Fatalf("listener UDP session capacity = %d, want 2", got)
+	}
+	if snapshot := manager.UDPAdmissionSnapshots()[0]; snapshot.SessionLimit != 2 {
+		t.Fatalf("UDP snapshot session limit = %d, want 2", snapshot.SessionLimit)
 	}
 }
 
@@ -70,9 +73,10 @@ func TestUDPAdmissionListenerAndGenerationDrops(t *testing.T) {
 		if _, err := handler.createSession(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}); !errors.Is(err, errUDPListenerCapacity) {
 			t.Fatalf("createSession() error = %v, want listener capacity", err)
 		}
-		if handler.sessionStats.listenerCapacityDrops.Load() != 1 || handler.sessionStats.generationCapacityDrops.Load() != 0 {
+		snapshot := handler.snapshot()
+		if snapshot.ListenerCapacityDrops != 1 || snapshot.GenerationCapacityDrops != 0 {
 			t.Fatalf("listener/generation drops = %d/%d, want 1/0",
-				handler.sessionStats.listenerCapacityDrops.Load(), handler.sessionStats.generationCapacityDrops.Load())
+				snapshot.ListenerCapacityDrops, snapshot.GenerationCapacityDrops)
 		}
 		if !handler.releaseSessionSlot() || handler.sessionStats.held.Load() != 0 || len(handler.sessionSlots) != 0 {
 			t.Fatal("listener capacity did not return to zero")
@@ -94,9 +98,10 @@ func TestUDPAdmissionListenerAndGenerationDrops(t *testing.T) {
 		if _, err := handler.createSession(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 2}); !errors.Is(err, pool.ErrUDPGenerationCapacity) {
 			t.Fatalf("createSession() error = %v, want generation capacity", err)
 		}
-		if handler.sessionStats.listenerCapacityDrops.Load() != 0 || handler.sessionStats.generationCapacityDrops.Load() != 1 {
+		snapshot := handler.snapshot()
+		if snapshot.ListenerCapacityDrops != 0 || snapshot.GenerationCapacityDrops != 1 {
 			t.Fatalf("listener/generation drops = %d/%d, want 0/1",
-				handler.sessionStats.listenerCapacityDrops.Load(), handler.sessionStats.generationCapacityDrops.Load())
+				snapshot.ListenerCapacityDrops, snapshot.GenerationCapacityDrops)
 		}
 		if handler.sessionStats.held.Load() != 0 || len(handler.sessionSlots) != 0 || handler.sessionStats.accountingFaults.Load() != 0 {
 			t.Fatal("generation rejection leaked listener admission")
@@ -184,11 +189,38 @@ func TestUDPAdmissionCompositeReleaseAccountingFaults(t *testing.T) {
 	release := handler.newSessionAdmissionRelease(client)
 	release()
 	release()
-	if handler.sessionStats.accountingFaults.Load() != 2 {
-		t.Fatalf("accounting faults = %d, want one listener and one generation fault", handler.sessionStats.accountingFaults.Load())
+	if got := handler.snapshot().AccountingFaults; got != 2 {
+		t.Fatalf("accounting faults = %d, want one listener and one generation fault", got)
 	}
 	if handler.sessionStats.held.Load() != 0 || len(handler.sessionSlots) != 0 {
 		t.Fatal("faulting composite release made listener accounting negative")
+	}
+}
+
+func TestUDPAdmissionAccountingFaultFailsClosedAndDrainsHeldSlot(t *testing.T) {
+	handler := newUDPAdmissionUnitHandler(nil, 2)
+	defer handler.cancel()
+	if !handler.acquireSessionSlot() {
+		t.Fatal("initial listener slot acquisition failed")
+	}
+	handler.sessionStats.publish()
+	handler.sessionStats.accountingFault()
+
+	before := handler.snapshot()
+	if handler.acquireSessionSlot() {
+		t.Fatal("listener slot acquisition succeeded after accounting fault")
+	}
+	after := handler.snapshot()
+	if after.ListenerCapacityDrops != before.ListenerCapacityDrops || after.SessionsCurrent != 1 || after.SessionPermits != 1 {
+		t.Fatalf("fault rejection snapshot = %+v, want one existing session/permit and no capacity drop", after)
+	}
+	handler.sessionStats.unpublish()
+	if !handler.releaseSessionSlot() {
+		t.Fatal("pre-fault listener slot did not release")
+	}
+	final := handler.snapshot()
+	if final.SessionsCurrent != 0 || final.SessionPermits != 0 || final.AccountingFaults != 1 || final.ListenerCapacityDrops != 0 {
+		t.Fatalf("drained fault snapshot = %+v, want zero sessions/permits, one fault, and no capacity drops", final)
 	}
 }
 

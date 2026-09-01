@@ -22,6 +22,16 @@ const (
 
 	// DefaultLoadBalancer is the default load balancing algorithm
 	DefaultLoadBalancer = "least-connections"
+
+	DefaultMaxClientGenerations             = 16
+	DefaultMaxPendingRegistrations          = 128
+	DefaultMaxTCPConnections                = 128
+	DefaultMaxPendingTCPSetups              = 128
+	DefaultMaxTCPConnectionsPerGeneration   = 100
+	DefaultMaxPendingTCPSetupsPerGeneration = 16
+	DefaultMaxUDPSessions                   = 1024
+	DefaultMaxUDPSessionsPerGeneration      = 256
+	DefaultMaxLocalUDPSessions              = 256
 )
 
 // DefaultCapabilities lists the default supported protocols

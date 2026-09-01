@@ -72,6 +72,14 @@ type UDPFragmentAssembler interface {
 	AddFragment(sessionID uint32, fragID uint16, index, total uint8, payload []byte) ([]byte, error)
 }
 
+// FragmentSnapshot is a value-only view of retained fragment assembly state.
+type FragmentSnapshot struct {
+	RetainedGroups       int64
+	RetainedBackingBytes int64
+	GroupCapacityDrops   uint64
+	ByteCapacityDrops    uint64
+}
+
 func writeUDPHeader(dst []byte, sessionID uint32) {
 	dst[0] = UDPDatagramTypeNormal
 	binary.BigEndian.PutUint32(dst[1:UDPHeaderSize], sessionID)
@@ -397,6 +405,8 @@ type ShardedFragmentAssembler struct {
 
 	retainedGroups atomic.Int64
 	retainedBytes  atomic.Int64
+	groupDrops     atomic.Uint64
+	byteDrops      atomic.Uint64
 	maxGroups      int
 	maxBytes       int64
 
@@ -435,6 +445,31 @@ func (sfa *ShardedFragmentAssembler) shardIndex(key fragmentKey) int {
 // getShard returns the shard for a fragment identity.
 func (sfa *ShardedFragmentAssembler) getShard(key fragmentKey) *fragmentShard {
 	return &sfa.shards[sfa.shardIndex(key)]
+}
+
+// Snapshot returns an exact cut of retained state without exposing fragment IDs.
+func (sfa *ShardedFragmentAssembler) Snapshot() FragmentSnapshot {
+	sfa.lifecycleMu.RLock()
+	for i := range sfa.shards {
+		sfa.shards[i].mu.Lock()
+	}
+
+	snapshot := FragmentSnapshot{
+		GroupCapacityDrops: sfa.groupDrops.Load(),
+		ByteCapacityDrops:  sfa.byteDrops.Load(),
+	}
+	for i := range sfa.shards {
+		snapshot.RetainedGroups += int64(len(sfa.shards[i].fragments))
+		for _, group := range sfa.shards[i].fragments {
+			snapshot.RetainedBackingBytes += group.retainedBytes
+		}
+	}
+
+	for i := len(sfa.shards); i > 0; i-- {
+		sfa.shards[i-1].mu.Unlock()
+	}
+	sfa.lifecycleMu.RUnlock()
+	return snapshot
 }
 
 func reserveFragmentCapacity(counter *atomic.Int64, amount, limit int64) bool {
@@ -543,6 +578,7 @@ func (sfa *ShardedFragmentAssembler) AddFragment(sessionID uint32, fragID uint16
 
 	pooled := len(payload) <= FragmentBufferSize
 	if !exists && !reserveFragmentCapacity(&sfa.retainedGroups, 1, int64(fragmentGroupLimit(sfa.maxGroups))) {
+		sfa.groupDrops.Add(1)
 		return nil, ErrFragmentAssemblerFull
 	}
 
@@ -553,6 +589,7 @@ func (sfa *ShardedFragmentAssembler) AddFragment(sessionID uint32, fragID uint16
 		retainedBytes = fragmentBufferRetainedBytes(bufPtr)
 	}
 	if !reserveFragmentCapacity(&sfa.retainedBytes, retainedBytes, fragmentByteLimit(sfa.maxBytes)) {
+		sfa.byteDrops.Add(1)
 		if bufPtr != nil {
 			PutFragmentBuffer(bufPtr)
 		}

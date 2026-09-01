@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -631,5 +632,134 @@ func TestUDPSenderRegistryUsesExactGeneration(t *testing.T) {
 	case <-fresh.Conn.Context().Done():
 		t.Fatalf("fresh same-ID generation closed by stale cleanup: %v", context.Cause(fresh.Conn.Context()))
 	default:
+	}
+}
+
+func TestUDPReceiverUsesExactGenerationBeforeFragmentRetention(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stalePair := newUDPSenderQUICPair(t, ctx)
+	freshPair := newUDPSenderQUICPair(t, ctx)
+	packetConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatalf("listen UDP for exact-generation receiver: %v", err)
+	}
+	staleSink, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		_ = packetConn.Close()
+		t.Fatalf("listen stale UDP sink: %v", err)
+	}
+	freshSink, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		_ = staleSink.Close()
+		_ = packetConn.Close()
+		t.Fatalf("listen fresh UDP sink: %v", err)
+	}
+	handlerCtx, cancelHandler := context.WithCancel(ctx)
+	handler := &UDPHandler{
+		packetConn:        packetConn,
+		logger:            zerolog.Nop(),
+		ctx:               handlerCtx,
+		cancel:            cancelHandler,
+		fragmentAssembler: protocol.NewShardedFragmentAssembler(protocol.DefaultShardCount),
+		receivers:         make(map[*quic.Conn]struct{}),
+		senders:           make(map[*pool.ClientConn]*udpSender),
+	}
+	stale := &pool.ClientConn{ID: "same-id", Conn: stalePair.server}
+	fresh := &pool.ClientConn{ID: "same-id", Conn: freshPair.server}
+	stale.ActiveConns.Store(1)
+	fresh.ActiveConns.Store(1)
+	staleSession := &UDPSession{id: 41, clientAddr: staleSink.LocalAddr().(*net.UDPAddr), client: stale}
+	freshSession := &UDPSession{id: 42, clientAddr: freshSink.LocalAddr().(*net.UDPAddr), client: fresh}
+	staleSession.lastActive.Store(1)
+	freshSession.lastActive.Store(2)
+	handler.sessions.Store(staleSession.clientAddr.String(), staleSession)
+	handler.sessions.Store(freshSession.clientAddr.String(), freshSession)
+	handler.sessionsByID.Store(staleSession.id, staleSession)
+	handler.sessionsByID.Store(freshSession.id, freshSession)
+	handler.sessionStats.current.Store(2)
+	handler.receivers[stalePair.server] = struct{}{}
+	handler.receivers[freshPair.server] = struct{}{}
+	handler.receiverWG.Add(2)
+	go handler.receiveDatagrams(stalePair.server)
+	go handler.receiveDatagrams(freshPair.server)
+	t.Cleanup(func() {
+		handler.close()
+		handler.wait()
+		_ = staleSink.Close()
+		_ = freshSink.Close()
+	})
+
+	wrongNormal := fragmentUDPSenderBatch(t, staleSession.id, []byte("wrong generation"))
+	if _, err := handler.sendBatch(freshPair.peer, wrongNormal); err != nil {
+		t.Fatalf("send wrong-generation normal datagram: %v", err)
+	}
+	protocol.ReleaseDatagramResults(wrongNormal.datagrams)
+	awaitUDPCondition(t, 3*time.Second, "wrong normal owner drop", func() bool {
+		return handler.senderStats.unknownSession.Load() == 1
+	})
+	if got := staleSession.lastActive.Load(); got != 1 {
+		t.Fatalf("stale session lastActive after wrong normal owner = %d, want 1", got)
+	}
+
+	wrongFragment := fragmentUDPSenderBatch(t, freshSession.id, make([]byte, protocol.MaxUDPPayload+1))
+	if err := stalePair.peer.SendDatagram(wrongFragment.datagrams[0].Data); err != nil {
+		protocol.ReleaseDatagramResults(wrongFragment.datagrams)
+		t.Fatalf("send wrong-generation fragment: %v", err)
+	}
+	protocol.ReleaseDatagramResults(wrongFragment.datagrams)
+	awaitUDPCondition(t, 3*time.Second, "wrong fragment owner drop", func() bool {
+		return handler.senderStats.unknownSession.Load() == 2
+	})
+	if got := handler.fragmentAssembler.Snapshot(); got.RetainedGroups != 0 || got.RetainedBackingBytes != 0 {
+		t.Fatalf("fragment state after wrong owner = %+v, want no retention", got)
+	}
+	if got := freshSession.lastActive.Load(); got != 2 {
+		t.Fatalf("fresh session lastActive after wrong fragment owner = %d, want 2", got)
+	}
+
+	unknown := fragmentUDPSenderBatch(t, 999, []byte("unknown session"))
+	if _, err := handler.sendBatch(freshPair.peer, unknown); err != nil {
+		t.Fatalf("send unknown-session datagram: %v", err)
+	}
+	protocol.ReleaseDatagramResults(unknown.datagrams)
+	awaitUDPCondition(t, 3*time.Second, "unknown session drop", func() bool {
+		return handler.senderStats.unknownSession.Load() == 3
+	})
+
+	freshPayload := []byte("fresh owner")
+	freshNormal := fragmentUDPSenderBatch(t, freshSession.id, freshPayload)
+	if _, err := handler.sendBatch(freshPair.peer, freshNormal); err != nil {
+		t.Fatalf("send fresh-owner normal datagram: %v", err)
+	}
+	protocol.ReleaseDatagramResults(freshNormal.datagrams)
+	if err := freshSink.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("set fresh sink deadline: %v", err)
+	}
+	buf := make([]byte, 65535)
+	n, _, err := freshSink.ReadFromUDP(buf)
+	if err != nil || string(buf[:n]) != string(freshPayload) {
+		t.Fatalf("fresh-owner public payload = %q, err %v, want %q", buf[:n], err, freshPayload)
+	}
+
+	stalePayload := make([]byte, protocol.MaxUDPPayload+1)
+	for i := range stalePayload {
+		stalePayload[i] = byte(i)
+	}
+	staleFragments := fragmentUDPSenderBatch(t, staleSession.id, stalePayload)
+	if _, err := handler.sendBatch(stalePair.peer, staleFragments); err != nil {
+		t.Fatalf("send stale-owner fragmented datagram: %v", err)
+	}
+	protocol.ReleaseDatagramResults(staleFragments.datagrams)
+	if err := staleSink.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("set stale sink deadline: %v", err)
+	}
+	n, _, err = staleSink.ReadFromUDP(buf)
+	if err != nil || !slices.Equal(buf[:n], stalePayload) {
+		t.Fatalf("stale-owner public payload length = %d, err %v, want %d", n, err, len(stalePayload))
+	}
+	if staleSession.lastActive.Load() == 1 || freshSession.lastActive.Load() == 2 {
+		t.Fatalf("owner activity was not refreshed: stale=%d fresh=%d",
+			staleSession.lastActive.Load(), freshSession.lastActive.Load())
 	}
 }

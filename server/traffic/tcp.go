@@ -20,7 +20,6 @@ import (
 const (
 	trafficStreamCancelCode quic.StreamErrorCode = 0
 	tcpSetupTimeout                              = 5 * time.Second
-	maxPendingTCPSetups                          = 128
 )
 
 var errNoTCPStreamCapacity = errors.New("no TCP stream capacity")
@@ -28,6 +27,10 @@ var errNoTCPStreamCapacity = errors.New("no TCP stream capacity")
 // TCPAdmissionSnapshot is a point-in-time, value-only view of one listener's
 // TCP setup and relay admission state.
 type TCPAdmissionSnapshot struct {
+	FlowLimit           int64
+	FlowCurrent         int64
+	FlowHighWater       int64
+	SetupLimit          int64
 	SetupCurrent        int64
 	SetupHighWater      int64
 	ActiveCurrent       int64
@@ -36,22 +39,28 @@ type TCPAdmissionSnapshot struct {
 	Retries             uint64
 	StreamLimitAttempts uint64
 	Committed           uint64
+	FlowCapacity        uint64
 	ListenerCapacity    uint64
 	Unavailable         uint64
-	GenerationCapacity  uint64
-	PeerStreamLimit     uint64
-	Deadline            uint64
-	SetupFailure        uint64
-	Canceled            uint64
+	// Deprecated: use GenerationConnectionCapacity and GenerationSetupCapacity.
+	GenerationCapacity           uint64
+	GenerationConnectionCapacity uint64
+	GenerationSetupCapacity      uint64
+	PeerStreamLimit              uint64
+	Deadline                     uint64
+	SetupFailure                 uint64
+	Canceled                     uint64
 }
 
 type tcpTerminalResult uint8
 
 const (
 	tcpTerminalCommitted tcpTerminalResult = iota
+	tcpTerminalFlowCapacity
 	tcpTerminalListenerCapacity
 	tcpTerminalUnavailable
-	tcpTerminalGenerationCapacity
+	tcpTerminalGenerationConnectionCapacity
+	tcpTerminalGenerationSetupCapacity
 	tcpTerminalPeerStreamLimit
 	tcpTerminalDeadline
 	tcpTerminalSetupFailure
@@ -59,71 +68,83 @@ const (
 )
 
 type tcpAdmissionStats struct {
-	setupCurrent        atomic.Int64
-	setupHighWater      atomic.Int64
-	activeCurrent       atomic.Int64
-	activeHighWater     atomic.Int64
-	attempts            atomic.Uint64
-	retries             atomic.Uint64
-	streamLimitAttempts atomic.Uint64
-	committed           atomic.Uint64
-	listenerCapacity    atomic.Uint64
-	unavailable         atomic.Uint64
-	generationCapacity  atomic.Uint64
-	peerStreamLimit     atomic.Uint64
-	deadline            atomic.Uint64
-	setupFailure        atomic.Uint64
-	canceled            atomic.Uint64
+	mu                           sync.Mutex
+	flowCurrent                  atomic.Int64
+	flowHighWater                atomic.Int64
+	setupCurrent                 atomic.Int64
+	setupHighWater               atomic.Int64
+	activeCurrent                atomic.Int64
+	activeHighWater              atomic.Int64
+	attempts                     atomic.Uint64
+	retries                      atomic.Uint64
+	streamLimitAttempts          atomic.Uint64
+	committed                    atomic.Uint64
+	flowCapacity                 atomic.Uint64
+	listenerCapacity             atomic.Uint64
+	unavailable                  atomic.Uint64
+	generationConnectionCapacity atomic.Uint64
+	generationSetupCapacity      atomic.Uint64
+	peerStreamLimit              atomic.Uint64
+	deadline                     atomic.Uint64
+	setupFailure                 atomic.Uint64
+	canceled                     atomic.Uint64
 }
 
 func (s *tcpAdmissionStats) snapshot() TCPAdmissionSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	generationConnectionCapacity := s.generationConnectionCapacity.Load()
+	generationSetupCapacity := s.generationSetupCapacity.Load()
 	return TCPAdmissionSnapshot{
-		SetupCurrent:        s.setupCurrent.Load(),
-		SetupHighWater:      s.setupHighWater.Load(),
-		ActiveCurrent:       s.activeCurrent.Load(),
-		ActiveHighWater:     s.activeHighWater.Load(),
-		Attempts:            s.attempts.Load(),
-		Retries:             s.retries.Load(),
-		StreamLimitAttempts: s.streamLimitAttempts.Load(),
-		Committed:           s.committed.Load(),
-		ListenerCapacity:    s.listenerCapacity.Load(),
-		Unavailable:         s.unavailable.Load(),
-		GenerationCapacity:  s.generationCapacity.Load(),
-		PeerStreamLimit:     s.peerStreamLimit.Load(),
-		Deadline:            s.deadline.Load(),
-		SetupFailure:        s.setupFailure.Load(),
-		Canceled:            s.canceled.Load(),
+		FlowCurrent:                  s.flowCurrent.Load(),
+		FlowHighWater:                s.flowHighWater.Load(),
+		SetupCurrent:                 s.setupCurrent.Load(),
+		SetupHighWater:               s.setupHighWater.Load(),
+		ActiveCurrent:                s.activeCurrent.Load(),
+		ActiveHighWater:              s.activeHighWater.Load(),
+		Attempts:                     s.attempts.Load(),
+		Retries:                      s.retries.Load(),
+		StreamLimitAttempts:          s.streamLimitAttempts.Load(),
+		Committed:                    s.committed.Load(),
+		FlowCapacity:                 s.flowCapacity.Load(),
+		ListenerCapacity:             s.listenerCapacity.Load(),
+		Unavailable:                  s.unavailable.Load(),
+		GenerationCapacity:           generationConnectionCapacity + generationSetupCapacity,
+		GenerationConnectionCapacity: generationConnectionCapacity,
+		GenerationSetupCapacity:      generationSetupCapacity,
+		PeerStreamLimit:              s.peerStreamLimit.Load(),
+		Deadline:                     s.deadline.Load(),
+		SetupFailure:                 s.setupFailure.Load(),
+		Canceled:                     s.canceled.Load(),
 	}
 }
 
-func (s *tcpAdmissionStats) startSetup() {
-	current := s.setupCurrent.Add(1)
-	updateAtomicMax(&s.setupHighWater, current)
-}
-
-func (s *tcpAdmissionStats) finishSetup() {
-	s.setupCurrent.Add(-1)
-}
-
-func (s *tcpAdmissionStats) startActive() {
-	current := s.activeCurrent.Add(1)
-	updateAtomicMax(&s.activeHighWater, current)
-}
-
 func (s *tcpAdmissionStats) finishActive() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.activeCurrent.Add(-1)
 }
 
 func (s *tcpAdmissionStats) finish(result tcpTerminalResult) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.finishLocked(result)
+}
+
+func (s *tcpAdmissionStats) finishLocked(result tcpTerminalResult) {
 	switch result {
 	case tcpTerminalCommitted:
 		s.committed.Add(1)
+	case tcpTerminalFlowCapacity:
+		s.flowCapacity.Add(1)
 	case tcpTerminalListenerCapacity:
 		s.listenerCapacity.Add(1)
 	case tcpTerminalUnavailable:
 		s.unavailable.Add(1)
-	case tcpTerminalGenerationCapacity:
-		s.generationCapacity.Add(1)
+	case tcpTerminalGenerationConnectionCapacity:
+		s.generationConnectionCapacity.Add(1)
+	case tcpTerminalGenerationSetupCapacity:
+		s.generationSetupCapacity.Add(1)
 	case tcpTerminalPeerStreamLimit:
 		s.peerStreamLimit.Add(1)
 	case tcpTerminalDeadline:
@@ -133,6 +154,55 @@ func (s *tcpAdmissionStats) finish(result tcpTerminalResult) {
 	case tcpTerminalCanceled:
 		s.canceled.Add(1)
 	}
+}
+
+type tcpSetupPermit struct {
+	listener *Listener
+	once     sync.Once
+}
+
+func (p *tcpSetupPermit) release() {
+	p.once.Do(func() {
+		stats := &p.listener.tcpAdmission
+		stats.mu.Lock()
+		<-p.listener.tcpSetupSlots
+		stats.setupCurrent.Add(-1)
+		stats.mu.Unlock()
+	})
+}
+
+func (p *tcpSetupPermit) activate() {
+	p.once.Do(func() {
+		stats := &p.listener.tcpAdmission
+		stats.mu.Lock()
+		<-p.listener.tcpSetupSlots
+		stats.setupCurrent.Add(-1)
+		current := stats.activeCurrent.Add(1)
+		updateAtomicMax(&stats.activeHighWater, current)
+		stats.mu.Unlock()
+	})
+}
+
+func (l *Listener) tcpAdmissionSnapshot() TCPAdmissionSnapshot {
+	snapshot := l.tcpAdmission.snapshot()
+	snapshot.FlowLimit = int64(l.tcpFlowLimit)
+	snapshot.SetupLimit = int64(l.tcpSetupLimit)
+	return snapshot
+}
+
+func (s *tcpAdmissionStats) attempt(retry bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.attempts.Add(1)
+	if retry {
+		s.retries.Add(1)
+	}
+}
+
+func (s *tcpAdmissionStats) streamLimitAttempt() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.streamLimitAttempts.Add(1)
 }
 
 type tcpFlow struct {
@@ -264,11 +334,16 @@ func (l *Listener) acceptTCP() {
 				continue
 			}
 		}
+		flow, ok := l.addTCPFlow(conn)
+		if !ok {
+			continue
+		}
 		setupDeadline := time.Now().Add(tcpSetupTimeout)
-		releaseSetup, ok := l.acquireTCPSetup()
+		setupPermit, ok := l.acquireTCPSetup()
 		if !ok {
 			l.tcpAdmission.finish(tcpTerminalListenerCapacity)
 			_ = conn.Close()
+			l.removeTCPFlow(flow)
 			continue
 		}
 
@@ -279,27 +354,20 @@ func (l *Listener) acceptTCP() {
 		}
 
 		l.handlerWG.Go(func() {
-			l.handleTCPConnection(conn, setupDeadline, releaseSetup)
+			l.handleTCPConnection(flow, setupDeadline, setupPermit)
 		})
 	}
 }
 
-func (l *Listener) acquireTCPSetup() (func(), bool) {
-	releaseSlot, ok := acquireTCPSetup(l.tcpSetupSlots)
-	if !ok {
-		return nil, false
-	}
-	l.tcpAdmission.startSetup()
-	return sync.OnceFunc(func() {
-		releaseSlot()
-		l.tcpAdmission.finishSetup()
-	}), true
-}
-
-func acquireTCPSetup(slots chan struct{}) (func(), bool) {
+func (l *Listener) acquireTCPSetup() (*tcpSetupPermit, bool) {
+	stats := &l.tcpAdmission
+	stats.mu.Lock()
+	defer stats.mu.Unlock()
 	select {
-	case slots <- struct{}{}:
-		return sync.OnceFunc(func() { <-slots }), true
+	case l.tcpSetupSlots <- struct{}{}:
+		current := stats.setupCurrent.Add(1)
+		updateAtomicMax(&stats.setupHighWater, current)
+		return &tcpSetupPermit{listener: l}, true
 	default:
 		return nil, false
 	}
@@ -307,35 +375,46 @@ func acquireTCPSetup(slots chan struct{}) (func(), bool) {
 
 func (l *Listener) addTCPFlow(conn net.Conn) (*tcpFlow, bool) {
 	flow := &tcpFlow{conn: conn}
+	stats := &l.tcpAdmission
+	stats.mu.Lock()
+	defer stats.mu.Unlock()
 	l.flowsMu.Lock()
+	defer l.flowsMu.Unlock()
 	if l.flowsClosing {
-		l.flowsMu.Unlock()
+		flow.abort()
+		return nil, false
+	}
+	if len(l.flows) >= l.tcpFlowLimit {
+		stats.finishLocked(tcpTerminalFlowCapacity)
 		flow.abort()
 		return nil, false
 	}
 	l.flows[flow] = struct{}{}
-	l.flowsMu.Unlock()
+	current := stats.flowCurrent.Add(1)
+	updateAtomicMax(&stats.flowHighWater, current)
 	return flow, true
 }
 
 func (l *Listener) removeTCPFlow(flow *tcpFlow) {
+	stats := &l.tcpAdmission
+	stats.mu.Lock()
+	defer stats.mu.Unlock()
 	l.flowsMu.Lock()
-	delete(l.flows, flow)
-	l.flowsMu.Unlock()
+	defer l.flowsMu.Unlock()
+	if _, ok := l.flows[flow]; ok {
+		delete(l.flows, flow)
+		stats.flowCurrent.Add(-1)
+	}
 }
 
 // handleTCPConnection handles a single TCP connection.
-func (l *Listener) handleTCPConnection(conn net.Conn, setupDeadline time.Time, releaseSetup func()) {
+func (l *Listener) handleTCPConnection(flow *tcpFlow, setupDeadline time.Time, setupPermit *tcpSetupPermit) {
+	conn := flow.conn
+	defer l.removeTCPFlow(flow)
 	terminal := tcpTerminalSetupFailure
 	finishTerminal := sync.OnceFunc(func() { l.tcpAdmission.finish(terminal) })
 	defer finishTerminal()
-	defer releaseSetup()
-	flow, ok := l.addTCPFlow(conn)
-	if !ok {
-		terminal = tcpTerminalCanceled
-		return
-	}
-	defer l.removeTCPFlow(flow)
+	defer setupPermit.release()
 	defer func() { _ = conn.Close() }()
 
 	logger := l.logger.With().
@@ -400,8 +479,11 @@ func (l *Listener) handleTCPConnection(conn net.Conn, setupDeadline time.Time, r
 		}
 		currentLease, err = admission.Next()
 		if err != nil {
-			if errors.Is(err, pool.ErrTCPGenerationCapacity) {
-				terminal = tcpTerminalGenerationCapacity
+			switch {
+			case errors.Is(err, pool.ErrTCPGenerationConnectionCapacity):
+				terminal = tcpTerminalGenerationConnectionCapacity
+			case errors.Is(err, pool.ErrTCPGenerationSetupCapacity):
+				terminal = tcpTerminalGenerationSetupCapacity
 			}
 			logger.Error().Err(err).Int("attempts", attempts).Msg("select TCP client failed")
 			return
@@ -418,10 +500,7 @@ func (l *Listener) handleTCPConnection(conn net.Conn, setupDeadline time.Time, r
 			logger.Debug().Err(errNoTCPStreamCapacity).Int("attempts", attempts).Msg("TCP setup rejected")
 			return
 		}
-		l.tcpAdmission.attempts.Add(1)
-		if attempts > 0 {
-			l.tcpAdmission.retries.Add(1)
-		}
+		l.tcpAdmission.attempt(attempts > 0)
 		attempts++
 		client = currentLease.Client()
 		clientLogger := logger.With().Str("client_id", client.ID).Logger()
@@ -438,7 +517,7 @@ func (l *Listener) handleTCPConnection(conn net.Conn, setupDeadline time.Time, r
 			stream = nil
 
 			if _, ok := errors.AsType[*quic.StreamLimitReachedError](err); ok {
-				l.tcpAdmission.streamLimitAttempts.Add(1)
+				l.tcpAdmission.streamLimitAttempt()
 				streamLimited = true
 				continue
 			}
@@ -524,11 +603,10 @@ func (l *Listener) handleTCPConnection(conn net.Conn, setupDeadline time.Time, r
 		flow.abort()
 		return
 	}
-	l.tcpAdmission.startActive()
+	setupPermit.activate()
 	active = true
 	terminal = tcpTerminalCommitted
 	finishTerminal()
-	releaseSetup()
 	defer func() { _ = flow.closeSendGracefully() }()
 
 	logger.Debug().Uint64("conn_id", connID).Int("attempts", attempts).Msg("forwarding connection")

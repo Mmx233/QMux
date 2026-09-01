@@ -30,7 +30,12 @@ type Client struct {
 	udpHandlers sync.Map // serverAddr -> *UDPHandler
 	localConns  sync.Map // connID -> net.Conn
 	udpBudget   *udpSessionBudget
+	dsendStats  *clientDsendStats
 	logger      zerolog.Logger
+
+	udpMu            sync.Mutex
+	liveUDPHandlers  map[*UDPHandler]struct{}
+	retiredFragments protocol.FragmentSnapshot
 
 	lifecycleMu  sync.Mutex
 	started      bool
@@ -41,10 +46,54 @@ type Client struct {
 	wg           sync.WaitGroup
 }
 
+// Snapshot is a value-only view of client capacity ownership.
+type Snapshot struct {
+	Endpoints      []EndpointSnapshot
+	UDPSessions    UDPSessionSnapshot
+	DSend          DSendSnapshot
+	Fragments      protocol.FragmentSnapshot
+	LiveAssemblers int
+}
+
+// EndpointSnapshot is one configured endpoint's generation phases.
+type EndpointSnapshot struct {
+	Endpoint            string
+	Handshaking         int64
+	Pending             int64
+	Registered          int64
+	Retiring            int64
+	GenerationHighWater int64
+	AccountingFaults    uint64
+}
+
+// UDPSessionSnapshot describes process-wide client UDP session admission.
+type UDPSessionSnapshot struct {
+	Current          int64
+	Permits          int64
+	HighWater        int64
+	Limit            int64
+	CapacityDrops    uint64
+	AccountingFaults uint64
+}
+
+// DSendSnapshot describes client-owned application datagram sends.
+type DSendSnapshot struct {
+	OwnedItems            int64
+	OwnedBacking          int64
+	OwnedItemsHighWater   int64
+	OwnedBackingHighWater int64
+	Workers               int64
+	SendErrors            uint64
+	FragmentDrops         uint64
+}
+
 // New creates a new client
 func New(conf *config.Client) (*Client, error) {
 	// Apply defaults to ensure all required fields have values
 	conf.ApplyDefaults()
+	if err := conf.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid client config: %w", err)
+	}
 
 	logger := log.With().
 		Str("com", "client").
@@ -63,10 +112,12 @@ func New(conf *config.Client) (*Client, error) {
 	}
 
 	return &Client{
-		config:    conf,
-		connMgr:   connMgr,
-		udpBudget: newUDPSessionBudget(0),
-		logger:    logger,
+		config:          conf,
+		connMgr:         connMgr,
+		udpBudget:       newUDPSessionBudget(conf.Capacity.MaxLocalUDPSessions),
+		dsendStats:      &clientDsendStats{},
+		liveUDPHandlers: make(map[*UDPHandler]struct{}),
+		logger:          logger,
 	}, nil
 }
 
@@ -135,19 +186,38 @@ func (c *Client) handleNewConnections(ctx context.Context) {
 
 			conn := sc.Connection()
 			if conn != nil {
+				endpoint := sc.ServerAddr()
+				c.udpMu.Lock()
+				if c.dsendStats == nil {
+					c.dsendStats = &clientDsendStats{}
+				}
+				dsendStats := c.dsendStats
+				c.udpMu.Unlock()
 				udpHandler := newUDPHandler(
 					c.config.Local.Host,
 					c.config.Local.Port,
 					c.config.UDP.IsFragmentationEnabled(),
 					c.logger,
 					c.udpBudget,
+					dsendStats,
 				)
+				c.udpMu.Lock()
+				if c.liveUDPHandlers == nil {
+					c.liveUDPHandlers = make(map[*UDPHandler]struct{})
+				}
+				c.liveUDPHandlers[udpHandler] = struct{}{}
 				udpHandler.Start(ctx, conn)
-				previousI, replaced := c.udpHandlers.Swap(sc.ServerAddr(), udpHandler)
+				previousI, replaced := c.udpHandlers.Swap(endpoint, udpHandler)
+				c.udpMu.Unlock()
+				go func() {
+					<-udpHandler.done
+					c.retireUDPHandler(endpoint, udpHandler)
+				}()
 				if replaced {
 					previous := previousI.(*UDPHandler)
 					if previous != udpHandler {
 						previous.stopAndWait()
+						c.retireUDPHandler(endpoint, previous)
 					}
 				}
 			}
@@ -323,6 +393,7 @@ func (c *Client) shutdown() error {
 		c.udpHandlers.Range(func(key, value any) bool {
 			if handler, ok := value.(*UDPHandler); ok {
 				handler.wait()
+				c.retireUDPHandler(key.(string), handler)
 			}
 			return true
 		})
@@ -338,6 +409,43 @@ func (c *Client) shutdown() error {
 	})
 
 	return c.shutdownErr
+}
+
+func (c *Client) retireUDPHandler(endpoint string, handler *UDPHandler) {
+	c.udpMu.Lock()
+	defer c.udpMu.Unlock()
+	if _, live := c.liveUDPHandlers[handler]; !live {
+		return
+	}
+	fragment := handler.fragmentAssembler.Snapshot()
+	c.retiredFragments.GroupCapacityDrops += fragment.GroupCapacityDrops
+	c.retiredFragments.ByteCapacityDrops += fragment.ByteCapacityDrops
+	delete(c.liveUDPHandlers, handler)
+	c.udpHandlers.CompareAndDelete(endpoint, handler)
+}
+
+// Snapshot takes exact subsystem-local cuts. Cross-subsystem reconciliation is
+// exact only after the client is quiescent.
+func (c *Client) Snapshot() Snapshot {
+	var snapshot Snapshot
+	if c.connMgr != nil {
+		snapshot.Endpoints = c.connMgr.endpointSnapshot()
+	}
+	snapshot.UDPSessions = c.udpBudget.snapshot()
+	snapshot.DSend = c.dsendStats.load()
+
+	c.udpMu.Lock()
+	snapshot.LiveAssemblers = len(c.liveUDPHandlers)
+	snapshot.Fragments = c.retiredFragments
+	for handler := range c.liveUDPHandlers {
+		fragment := handler.fragmentAssembler.Snapshot()
+		snapshot.Fragments.RetainedGroups += fragment.RetainedGroups
+		snapshot.Fragments.RetainedBackingBytes += fragment.RetainedBackingBytes
+		snapshot.Fragments.GroupCapacityDrops += fragment.GroupCapacityDrops
+		snapshot.Fragments.ByteCapacityDrops += fragment.ByteCapacityDrops
+	}
+	c.udpMu.Unlock()
+	return snapshot
 }
 
 // Stop stops the client

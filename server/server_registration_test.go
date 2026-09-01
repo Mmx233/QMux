@@ -91,11 +91,7 @@ func TestTokenRegistrationTransaction(t *testing.T) {
 		t.Fatalf("ValidateRegisterAckWithAuth() error = %v", err)
 	}
 	eventually(t, time.Second, func() bool { return harness.pool.Count() == 1 })
-	permit, ok := acquirePendingRegistration(harness.slots)
-	if !ok {
-		t.Fatal("registered connection still occupied pending registration capacity")
-	}
-	permit.Release()
+	assertPendingRegistrationAvailable(t, harness.pool)
 }
 
 func TestRegistrationReservationIsNotSelectableBeforeAck(t *testing.T) {
@@ -524,7 +520,6 @@ type registrationHarness struct {
 	server      *Server
 	listener    *quic.Listener
 	pool        *pool.ConnectionPool
-	slots       chan struct{}
 	ctx         context.Context
 	cancel      context.CancelFunc
 	handlerDone <-chan struct{}
@@ -652,15 +647,10 @@ func newRegistrationHarnessWithTLSAndQUIC(
 	if len(ackWriterFactories) == 1 {
 		server.writeRegistrationAck = ackWriterFactories[0](connectionPool)
 	}
-	slots := make(chan struct{}, 1)
-	permit, ok := acquirePendingRegistration(slots)
-	if !ok {
-		t.Fatal("acquire registration permit failed")
-	}
 	handlerDone := make(chan struct{})
 	go func() {
 		defer close(handlerDone)
-		server.handleConnection(ctx, serverConn, registrationTestAddress, permit)
+		server.handleConnection(ctx, serverConn, registrationTestAddress)
 	}()
 
 	harness := &registrationHarness{
@@ -669,7 +659,6 @@ func newRegistrationHarnessWithTLSAndQUIC(
 		server:      server,
 		listener:    listener,
 		pool:        connectionPool,
-		slots:       slots,
 		ctx:         ctx,
 		cancel:      cancel,
 		handlerDone: handlerDone,
@@ -715,15 +704,10 @@ func (h *registrationHarness) reconnect(t *testing.T, clientTLS *tls.Config, cli
 		_ = client.CloseWithError(0, "reconnect accept timeout")
 		t.Fatal("accept reconnected QUIC timed out")
 	}
-	permit, ok := acquirePendingRegistration(h.slots)
-	if !ok {
-		_ = client.CloseWithError(0, "registration capacity unavailable")
-		t.Fatal("acquire reconnect registration permit failed")
-	}
 	handlerDone := make(chan struct{})
 	go func() {
 		defer close(handlerDone)
-		h.server.handleConnection(h.ctx, serverConn, registrationTestAddress, permit)
+		h.server.handleConnection(h.ctx, serverConn, registrationTestAddress)
 	}()
 	h.client = client
 	h.serverConn = serverConn
@@ -812,14 +796,23 @@ func assertGenericConnectionClose(t *testing.T, conn *quic.Conn) {
 
 func assertRegistrationFailureReleasedResources(t *testing.T, harness *registrationHarness) {
 	t.Helper()
-	if got := harness.pool.Count(); got != 0 {
-		t.Fatalf("pool Count() after failed registration = %d, want 0", got)
+	snapshot := harness.pool.Snapshot()
+	if snapshot.ServerPending != 0 || snapshot.Reservations != 0 || snapshot.Registered != 0 ||
+		snapshot.ServerRetiring != 0 || snapshot.PendingRegistrations.Current != 0 ||
+		snapshot.ClientGenerations.Current != 0 {
+		t.Fatalf("pool snapshot after failed registration = %+v, want no owned generations", snapshot)
 	}
-	permit, ok := acquirePendingRegistration(harness.slots)
-	if !ok {
-		t.Fatal("failed registration did not release pending capacity")
+}
+
+func assertPendingRegistrationAvailable(t *testing.T, connectionPool *pool.ConnectionPool) {
+	t.Helper()
+	pending := connectionPool.BeginPending()
+	if pending == nil {
+		t.Fatal("pending registration capacity unavailable")
 	}
-	permit.Release()
+	if !connectionPool.Abort(pending) {
+		t.Fatal("abort pending registration failed")
+	}
 }
 
 func oversizedRegistrationHeader() []byte {

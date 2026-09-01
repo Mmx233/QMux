@@ -75,6 +75,15 @@ listeners:
   - quic_addr: "0.0.0.0:8443"    # QUIC control port
     traffic_addr: "0.0.0.0:8080" # Traffic forwarding port
     protocol: "both"              # tcp, udp, or both
+    capacity:
+      max_client_generations: 16
+      max_pending_registrations: 128
+      max_tcp_connections: 128
+      max_pending_tcp_setups: 128
+      max_tcp_connections_per_generation: 100
+      max_pending_tcp_setups_per_generation: 16
+      max_udp_sessions: 1024
+      max_udp_sessions_per_generation: 256
 
 auth:
   method: "mtls"
@@ -90,6 +99,9 @@ tls:
 Edit `client.yaml`:
 
 ```yaml
+capacity:
+  max_local_udp_sessions: 256
+
 server:
   servers:
     - address: "your-server-ip:8443"
@@ -107,6 +119,24 @@ tls:
   client_cert_file: "./certs/client.crt"
   client_key_file: "./certs/client.key"
 ```
+
+| Key                                     | Scope                                                                  | Default | When full                                                                 |
+|-----------------------------------------|------------------------------------------------------------------------|--------:|---------------------------------------------------------------------------|
+| `max_client_generations`                | Server listener: client generations                                    |      16 | Reject the new client registration.                                       |
+| `max_pending_registrations`             | Server listener: registrations not yet committed                       |     128 | Close the new registration connection.                                    |
+| `max_tcp_connections`                   | Server listener: pending and active TCP flows                          |     128 | Close the new TCP connection.                                             |
+| `max_pending_tcp_setups`                | Server listener: TCP flows still setting up                            |     128 | Close the new TCP connection.                                             |
+| `max_tcp_connections_per_generation`    | Server listener: pending and active TCP flows on one client generation |     100 | Try another eligible generation; otherwise close the new TCP connection.  |
+| `max_pending_tcp_setups_per_generation` | Server listener: pending TCP setups on one client generation           |      16 | Try another eligible generation; otherwise close the new TCP connection.  |
+| `max_udp_sessions`                      | Server listener: server-side UDP sessions                              |    1024 | Drop the datagram that would create a new session.                        |
+| `max_udp_sessions_per_generation`       | Server listener: server-side UDP sessions on one client generation     |     256 | Try another eligible generation; otherwise drop the new-session datagram. |
+| `max_local_udp_sessions`                | Client process: local UDP sessions shared by all UDP handlers          |     256 | Drop the datagram that would create a new local session.                  |
+
+All eight server settings are enforced independently for each `listeners` entry. `max_local_udp_sessions` is one process-wide client budget. Omitting a setting or using `0` selects its default; negative values are rejected, and there is no unlimited setting. When a gate is full, QMux rejects or drops only new work; it does not evict registered generations, established TCP connections, or existing UDP sessions.
+
+The per-generation TCP gates are independent: `max_tcp_connections_per_generation` (100 by default) counts pending and active connections, while `max_pending_tcp_setups_per_generation` (16 by default) counts only connections still being established. Completing setup releases the pending-setup slot but continues to consume a connection slot until the connection closes.
+
+For multi-listener deployments, calculate the aggregate budget from the actual listener count and workload, then validate the limits under that topology.
 
 ### 5. Run
 
