@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bytes"
+	"reflect"
 	"testing"
 
 	"github.com/Mmx233/QMux/config"
@@ -28,6 +29,131 @@ func TestBufferSizeConstants(t *testing.T) {
 		if size.got != size.want {
 			t.Errorf("%s buffer size = %d, want %d", size.name, size.got, size.want)
 		}
+	}
+}
+
+func TestGenericJSONWireContract(t *testing.T) {
+	checkWire := func(t *testing.T, wire *bytes.Buffer, want string) {
+		t.Helper()
+		msgType, got, err := ReadMessage(wire)
+		if err != nil {
+			t.Fatalf("ReadMessage() error = %v", err)
+		}
+		if msgType != MsgTypeError {
+			t.Fatalf("message type = %#x, want %#x", msgType, MsgTypeError)
+		}
+		if string(got) != want {
+			t.Errorf("JSON = %q, want %q", got, want)
+		}
+	}
+
+	encodeTests := []struct {
+		name    string
+		payload any
+		want    string
+	}{
+		{"nil register capabilities", RegisterMsg{}, `{"ClientID":"","Version":"","Capabilities":[]}`},
+		{"nil selected capabilities", RegisterAckMsg{}, `{"Success":false,"Message":"","ServerVersion":"","SelectedCapabilities":[]}`},
+		{"zero new connection", NewConnMsg{}, `{"ConnID":0,"Protocol":"","SourceAddr":"","DestAddr":"","Timestamp":0}`},
+		{"zero connection close", ConnCloseMsg{}, `{"ConnID":0,"Reason":""}`},
+		{"nil auth proof", RegisterMsg{Auth: &RegisterAuth{}}, `{"ClientID":"","Version":"","Capabilities":[],"Auth":{"Scheme":"","Proof":""}}`},
+	}
+	for _, test := range encodeTests {
+		t.Run("encode/"+test.name, func(t *testing.T) {
+			var wire bytes.Buffer
+			if err := WriteMessage(&wire, MsgTypeError, test.payload); err != nil {
+				t.Fatalf("WriteMessage() error = %v", err)
+			}
+			checkWire(t, &wire, test.want)
+		})
+	}
+
+	t.Run("encode/raw HTML and JS separators", func(t *testing.T) {
+		var wire bytes.Buffer
+		if err := WriteError(&wire, 0, "<>&\u2028\u2029"); err != nil {
+			t.Fatalf("WriteError() error = %v", err)
+		}
+		checkWire(t, &wire, "{\"Code\":0,\"Message\":\"<>&\u2028\u2029\"}")
+	})
+
+	var invalidUTF8Wire bytes.Buffer
+	if err := WriteMessage(&invalidUTF8Wire, MsgTypeError, ErrorMsg{Message: string([]byte{0xff})}); err == nil {
+		t.Error("WriteMessage() accepted invalid UTF-8")
+	}
+	if invalidUTF8Wire.Len() != 0 {
+		t.Errorf("WriteMessage() wrote %d bytes for invalid UTF-8", invalidUTF8Wire.Len())
+	}
+
+	decodeTests := []struct {
+		name    string
+		payload []byte
+		dst     any
+		want    any
+	}{
+		{
+			"unknown member ignored",
+			[]byte(`{"Timestamp":2,"Extra":true}`),
+			&HeartbeatMsg{},
+			HeartbeatMsg{Timestamp: 2},
+		},
+		{
+			"wrong case ignored",
+			[]byte(`{"timestamp":1}`),
+			&HeartbeatMsg{Timestamp: 7},
+			HeartbeatMsg{Timestamp: 7},
+		},
+		{
+			"object merge preserves absent and nested fields",
+			[]byte(`{"ClientID":"new","Auth":{"Scheme":"new"}}`),
+			&RegisterMsg{ClientID: "old", Version: ProtocolVersion, Capabilities: []string{"tcp"}, Auth: &RegisterAuth{Scheme: "old", Proof: []byte("proof")}},
+			RegisterMsg{ClientID: "new", Version: ProtocolVersion, Capabilities: []string{"tcp"}, Auth: &RegisterAuth{Scheme: "new", Proof: []byte("proof")}},
+		},
+		{
+			"null zeroes values",
+			[]byte(`{"ClientID":null,"Capabilities":null,"Auth":{"Proof":null}}`),
+			&RegisterMsg{ClientID: "old", Version: ProtocolVersion, Capabilities: []string{"tcp"}, Auth: &RegisterAuth{Scheme: "token", Proof: []byte("proof")}},
+			RegisterMsg{Version: ProtocolVersion, Auth: &RegisterAuth{Scheme: "token"}},
+		},
+		{
+			"null clears pointer",
+			[]byte(`{"Auth":null}`),
+			&RegisterMsg{Auth: &RegisterAuth{Scheme: "token"}},
+			RegisterMsg{},
+		},
+	}
+	for _, test := range decodeTests {
+		t.Run("decode/"+test.name, func(t *testing.T) {
+			if err := DecodeMessage(test.payload, test.dst); err != nil {
+				t.Fatalf("DecodeMessage() error = %v", err)
+			}
+			got := reflect.ValueOf(test.dst).Elem().Interface()
+			if !reflect.DeepEqual(got, test.want) {
+				t.Errorf("decoded value = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+
+	invalidUTF8 := append([]byte(`{"Message":"`), 0xff)
+	invalidUTF8 = append(invalidUTF8, []byte(`"}`)...)
+	rejectTests := []struct {
+		name    string
+		payload []byte
+		dst     any
+	}{
+		{"duplicate member", []byte(`{"Timestamp":1,"Timestamp":2}`), &HeartbeatMsg{}},
+		{"invalid UTF-8", invalidUTF8, &ErrorMsg{}},
+		{"malformed", []byte(`{"Timestamp":`), &HeartbeatMsg{}},
+		{"trailing value", []byte(`{"Timestamp":1}{}`), &HeartbeatMsg{}},
+		{"type mismatch", []byte(`{"Timestamp":"1"}`), &HeartbeatMsg{}},
+		{"int64 overflow", []byte(`{"Timestamp":9223372036854775808}`), &HeartbeatMsg{}},
+		{"uint32 overflow", []byte(`{"Code":4294967296}`), &ErrorMsg{}},
+	}
+	for _, test := range rejectTests {
+		t.Run("reject/"+test.name, func(t *testing.T) {
+			if err := DecodeMessage(test.payload, test.dst); err == nil {
+				t.Error("DecodeMessage() accepted invalid payload")
+			}
+		})
 	}
 }
 

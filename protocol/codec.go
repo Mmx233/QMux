@@ -3,17 +3,13 @@ package protocol
 import (
 	"bytes"
 	"encoding/binary"
-	stdjson "encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
-	"strconv"
 
-	jsoniter "github.com/json-iterator/go"
 	"github.com/quic-go/quic-go/quicvarint"
 )
-
-// json is a drop-in replacement for encoding/json with better performance
-var json = jsoniter.ConfigCompatibleWithStandardLibrary
 
 const (
 	// MaxPayloadSize is the generic protocol message payload limit.
@@ -30,7 +26,6 @@ func WriteMessage(w io.Writer, msgType byte, payload any) error {
 	buf := GetBuffer()
 	defer PutBuffer(buf)
 
-	// Use json-iterator's Marshal which is more allocation-efficient
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal payload: %w", err)
@@ -101,13 +96,9 @@ func DecodeMessage(payload []byte, msg any) error {
 
 // DecodeDrainRequest strictly decodes an empty JSON object.
 func DecodeDrainRequest(payload []byte) error {
-	decoder := stdjson.NewDecoder(bytes.NewReader(payload))
-	decoder.UseNumber()
+	decoder := jsontext.NewDecoder(bytes.NewReader(payload))
 	if err := drainObjectStart(decoder); err != nil {
 		return fmt.Errorf("decode drain request: %w", err)
-	}
-	if decoder.More() {
-		return fmt.Errorf("decode drain request: object must be empty")
 	}
 	if err := drainObjectEnd(decoder); err != nil {
 		return fmt.Errorf("decode drain request: %w", err)
@@ -117,70 +108,60 @@ func DecodeDrainRequest(payload []byte) error {
 
 // DecodeDrainComplete strictly decodes exactly one integral AcceptFence member.
 func DecodeDrainComplete(payload []byte) (DrainCompleteMsg, error) {
-	decoder := stdjson.NewDecoder(bytes.NewReader(payload))
-	decoder.UseNumber()
+	decoder := jsontext.NewDecoder(bytes.NewReader(payload))
 	if err := drainObjectStart(decoder); err != nil {
 		return DrainCompleteMsg{}, fmt.Errorf("decode drain complete: %w", err)
 	}
-	var msg DrainCompleteMsg
-	found := false
-	for decoder.More() {
-		name, err := decoder.Token()
-		if err != nil {
-			return DrainCompleteMsg{}, fmt.Errorf("decode drain complete: read member: %w", err)
-		}
-		if name != "AcceptFence" {
-			return DrainCompleteMsg{}, fmt.Errorf("decode drain complete: unknown member %q", name)
-		}
-		if found {
-			return DrainCompleteMsg{}, fmt.Errorf("decode drain complete: duplicate AcceptFence")
-		}
-		value, err := decoder.Token()
-		if err != nil {
-			return DrainCompleteMsg{}, fmt.Errorf("decode drain complete: read AcceptFence: %w", err)
-		}
-		number, ok := value.(stdjson.Number)
-		if !ok {
-			return DrainCompleteMsg{}, fmt.Errorf("decode drain complete: AcceptFence must be an integer")
-		}
-		msg.AcceptFence, err = strconv.ParseInt(number.String(), 10, 64)
-		if err != nil {
-			return DrainCompleteMsg{}, fmt.Errorf("decode drain complete: invalid AcceptFence: %w", err)
-		}
-		found = true
+	name, err := decoder.ReadToken()
+	if err != nil {
+		return DrainCompleteMsg{}, fmt.Errorf("decode drain complete: read member: %w", err)
 	}
-	if !found {
+	if name.Kind() == jsontext.KindEndObject {
 		return DrainCompleteMsg{}, fmt.Errorf("decode drain complete: missing AcceptFence")
+	}
+	if name.Kind() != jsontext.KindString || name.String() != "AcceptFence" {
+		return DrainCompleteMsg{}, fmt.Errorf("decode drain complete: unknown member %q", name.String())
+	}
+	value, err := decoder.ReadToken()
+	if err != nil {
+		return DrainCompleteMsg{}, fmt.Errorf("decode drain complete: read AcceptFence: %w", err)
+	}
+	if value.Kind() != jsontext.KindNumber {
+		return DrainCompleteMsg{}, fmt.Errorf("decode drain complete: AcceptFence must be an integer")
+	}
+	acceptFence, err := value.Int()
+	if err != nil {
+		return DrainCompleteMsg{}, fmt.Errorf("decode drain complete: invalid AcceptFence: %w", err)
 	}
 	if err := drainObjectEnd(decoder); err != nil {
 		return DrainCompleteMsg{}, fmt.Errorf("decode drain complete: %w", err)
 	}
-	if err := ValidateDrainFence(msg.AcceptFence); err != nil {
+	if err := ValidateDrainFence(acceptFence); err != nil {
 		return DrainCompleteMsg{}, err
 	}
-	return msg, nil
+	return DrainCompleteMsg{AcceptFence: acceptFence}, nil
 }
 
-func drainObjectStart(decoder *stdjson.Decoder) error {
-	token, err := decoder.Token()
+func drainObjectStart(decoder *jsontext.Decoder) error {
+	token, err := decoder.ReadToken()
 	if err != nil {
 		return err
 	}
-	if token != stdjson.Delim('{') {
+	if token.Kind() != jsontext.KindBeginObject {
 		return fmt.Errorf("payload must be an object")
 	}
 	return nil
 }
 
-func drainObjectEnd(decoder *stdjson.Decoder) error {
-	token, err := decoder.Token()
+func drainObjectEnd(decoder *jsontext.Decoder) error {
+	token, err := decoder.ReadToken()
 	if err != nil {
 		return err
 	}
-	if token != stdjson.Delim('}') {
+	if token.Kind() != jsontext.KindEndObject {
 		return fmt.Errorf("object is not closed")
 	}
-	if _, err := decoder.Token(); err != io.EOF {
+	if _, err := decoder.ReadToken(); err != io.EOF {
 		if err == nil {
 			return fmt.Errorf("trailing JSON token")
 		}
