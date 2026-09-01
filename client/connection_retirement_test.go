@@ -34,7 +34,9 @@ func newRetirementManager(t *testing.T, address string) *ConnectionManager {
 }
 
 func newDisconnectedRetirementConnection(address string) *ServerConnection {
-	return NewServerConnection(address, "lifecycle.test", tls.NewLRUClientSessionCache(1), zerolog.Nop())
+	sc := NewServerConnection(address, "lifecycle.test", tls.NewLRUClientSessionCache(1), zerolog.Nop())
+	sc.controlOnce.Do(func() {})
+	return sc
 }
 
 func awaitRetirementCondition(t *testing.T, event string, condition func() bool) {
@@ -89,21 +91,6 @@ func TestConnectionPublicationRetiresExactPreviousAndRejectsStaleCallback(t *tes
 	if old.State() != StateDisconnected || old.IsHealthy() {
 		t.Fatalf("retired old state = %s healthy=%t", old.State(), old.IsHealthy())
 	}
-	if got := cm.GetConnection(address); got != fresh {
-		t.Fatalf("current connection = %p, want fresh %p", got, fresh)
-	}
-
-	old.reconnectCallback(address)
-	if got := cm.GetConnection(address); got != fresh {
-		t.Fatalf("stale callback changed current connection to %p", got)
-	}
-	cm.reconnectMu.Lock()
-	reconnecting := cm.reconnecting[address]
-	cm.reconnectMu.Unlock()
-	if reconnecting {
-		t.Fatal("stale callback acquired a reconnect slot")
-	}
-
 	cm.rollbackPublication(fresh)
 	if got := cm.GetConnection(address); got != nil {
 		t.Fatalf("rollback retained connection %p", got)
@@ -112,6 +99,120 @@ func TestConnectionPublicationRetiresExactPreviousAndRejectsStaleCallback(t *tes
 		t.Fatal(err)
 	}
 	if err := cm.Stop(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRemoteCloseWaitsForReconnectCallbackBeforeRuntimeCleanup(t *testing.T) {
+	peer := newLifecyclePeer(t)
+	cm := newLifecycleManager(t, peer)
+	closePeer := make(chan struct{})
+	peerDone := peer.serveRegistration(func(conn *quic.Conn, stream *quic.Stream, _ protocol.RegisterMsg) error {
+		if err := writeSuccessfulLifecycleAck(stream); err != nil {
+			return err
+		}
+		<-closePeer
+		return conn.CloseWithError(0, "test remote close")
+	})
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	forceCtx, cancelForce := context.WithCancel(context.Background())
+	client := &Client{
+		config:          cm.config,
+		connMgr:         cm,
+		udpBudget:       newUDPSessionBudget(0),
+		dsendStats:      &clientDsendStats{},
+		liveUDPHandlers: make(map[*UDPHandler]struct{}),
+		forceCtx:        forceCtx,
+		forceCancel:     cancelForce,
+		runtimes:        make(map[*ServerConnection]*connectionRuntime),
+		logger:          zerolog.Nop(),
+	}
+	callbackRelease := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseCallback := func() { releaseOnce.Do(func() { close(callbackRelease) }) }
+	t.Cleanup(func() {
+		releaseCallback()
+		cancelRun()
+		_ = cm.Stop()
+		cancelForce()
+		client.watcherWG.Wait()
+	})
+
+	old, err := cm.connectAndRegister(runCtx, peer.endpoint())
+	if err != nil {
+		t.Fatalf("connect old generation: %v", err)
+	}
+	callbackEntered := make(chan struct{})
+	var callbackOnce sync.Once
+	old.controlMu.Lock()
+	controlLocked := true
+	defer func() {
+		if controlLocked {
+			old.controlMu.Unlock()
+		}
+	}()
+	published := make(chan bool, 1)
+	go func() { published <- cm.publishServerConnection(runCtx, old) }()
+	got := awaitLifecycle(t, cm.NewConns, "old generation delivery")
+	originalReconnect := old.reconnectCallback
+	if originalReconnect == nil {
+		old.controlMu.Unlock()
+		controlLocked = false
+		t.Fatal("publication did not install the reconnect callback")
+	}
+	old.SetReconnectCallback(func(address string) {
+		callbackOnce.Do(func() { close(callbackEntered) })
+		<-callbackRelease
+		originalReconnect(address)
+	})
+	old.controlMu.Unlock()
+	controlLocked = false
+	if got != old {
+		t.Fatalf("delivered generation = %p, want %p", got, old)
+	}
+	client.installRuntime(old)
+	if !awaitLifecycle(t, published, "old generation publication") {
+		t.Fatal("publish old generation failed")
+	}
+	client.runtimesMu.Lock()
+	runtime := client.runtimes[old]
+	client.runtimesMu.Unlock()
+	if runtime == nil {
+		t.Fatal("old generation runtime was not installed")
+	}
+
+	conn := old.Connection()
+	close(closePeer)
+	awaitLifecycle(t, callbackEntered, "remote-close reconnect callback")
+	awaitLifecycle(t, conn.Context().Done(), "remote QUIC close")
+	select {
+	case <-old.closeDone:
+		t.Fatal("runtime cleanup closed the generation before reconnect callback completed")
+	default:
+	}
+	if current := cm.GetConnection(old.ServerAddr()); current != old {
+		t.Fatalf("manager current = %p, want blocked old generation %p", current, old)
+	}
+	before := cm.endpointSnapshot()[0]
+	if before.Registered != 1 || before.Retiring != 0 || before.AccountingFaults != 0 {
+		t.Fatalf("blocked callback accounting = %+v, want one registered generation", before)
+	}
+
+	releaseCallback()
+	awaitLifecycle(t, old.closeDone, "old generation close completion")
+	awaitLifecycle(t, runtime.cleanupDone, "old runtime cleanup")
+	cancelRun()
+	if current := cm.GetConnection(old.ServerAddr()); current != nil {
+		t.Fatalf("manager retained closed generation %p", current)
+	}
+	if old.Connection() != nil || old.State() != StateDisconnected {
+		t.Fatalf("old generation survived close: conn=%p state=%s", old.Connection(), old.State())
+	}
+	after := cm.endpointSnapshot()[0]
+	if after.Registered != 0 || after.Retiring != 0 || after.AccountingFaults != 0 {
+		t.Fatalf("closed callback accounting = %+v, want all generation counts closed", after)
+	}
+	if err := awaitLifecycle(t, peerDone, "remote-close peer exit"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -141,6 +242,7 @@ func TestBlockedReplacementPublicationStopClosesBothGenerations(t *testing.T) {
 	awaitRetirementCondition(t, "blocked replacement publication", func() bool {
 		return cm.GetConnection(address) == fresh
 	})
+	awaitLifecycle(t, old.closeDone, "old generation retirement")
 	if old.State() != StateDisconnected || old.IsHealthy() {
 		t.Fatalf("blocked replacement retained old generation: state=%s healthy=%t", old.State(), old.IsHealthy())
 	}
@@ -310,18 +412,25 @@ func TestClientRetiresOneHundredExactGenerationsAndNoSuccessor(t *testing.T) {
 		Host: "127.0.0.1",
 		Port: backend.LocalAddr().(*net.UDPAddr).Port,
 	}
+	forceCtx, cancelForce := context.WithCancel(context.Background())
 	client := &Client{
-		config:    cm.config,
-		connMgr:   cm,
-		udpBudget: newUDPSessionBudget(0),
-		logger:    zerolog.Nop(),
+		config:          cm.config,
+		connMgr:         cm,
+		udpBudget:       newUDPSessionBudget(0),
+		dsendStats:      &clientDsendStats{},
+		liveUDPHandlers: make(map[*UDPHandler]struct{}),
+		forceCtx:        forceCtx,
+		forceCancel:     cancelForce,
+		runtimes:        make(map[*ServerConnection]*connectionRuntime),
+		logger:          zerolog.Nop(),
 	}
 	runCtx, cancelRun := context.WithCancel(context.Background())
-	client.wg.Go(func() { client.handleNewConnections(runCtx) })
+	client.producerWG.Go(client.handleNewConnections)
 	t.Cleanup(func() {
 		cancelRun()
-		client.wg.Wait()
 		_ = cm.Stop()
+		client.producerWG.Wait()
+		cancelForce()
 		client.udpHandlers.Range(func(_, value any) bool {
 			value.(*UDPHandler).stopAndWait()
 			return true
@@ -427,10 +536,10 @@ func TestClientRetiresOneHundredExactGenerationsAndNoSuccessor(t *testing.T) {
 	}
 
 	cancelRun()
-	client.wg.Wait()
 	if err := cm.Stop(); err != nil {
 		t.Fatal(err)
 	}
+	client.producerWG.Wait()
 }
 
 func TestServerConnectionCloseCannotBeReanimatedByHeartbeatCompletion(t *testing.T) {

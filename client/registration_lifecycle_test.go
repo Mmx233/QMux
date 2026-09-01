@@ -248,8 +248,10 @@ func assertLifecycleUnpublished(t *testing.T, cm *ConnectionManager) {
 		t.Fatalf("provisional connection entered manager map: count=%d", got)
 	}
 	select {
-	case sc := <-cm.NewConns:
-		t.Fatalf("provisional connection was published on NewConns: %v", sc.ServerAddr())
+	case sc, ok := <-cm.NewConns:
+		if ok {
+			t.Fatalf("provisional connection was published on NewConns: %v", sc.ServerAddr())
+		}
 	default:
 	}
 }

@@ -21,6 +21,8 @@ var (
 	ErrClientAlreadyStarted = errors.New("client already started")
 	// ErrClientStopped is returned when Start is called after shutdown.
 	ErrClientStopped = errors.New("client stopped")
+	// ErrPeerGracefulShutdownUnsupported is returned when a live peer can't drain.
+	ErrPeerGracefulShutdownUnsupported = errors.New("peer graceful shutdown unsupported")
 )
 
 // Client represents the QMux client
@@ -37,13 +39,49 @@ type Client struct {
 	liveUDPHandlers  map[*UDPHandler]struct{}
 	retiredFragments protocol.FragmentSnapshot
 
-	lifecycleMu  sync.Mutex
-	started      bool
-	stopped      bool
-	runCancel    context.CancelFunc
-	shutdownOnce sync.Once
-	shutdownErr  error
-	wg           sync.WaitGroup
+	lifecycleMu        sync.Mutex
+	started            bool
+	stopping           bool
+	runCancel          context.CancelFunc
+	forceCtx           context.Context
+	forceCancel        context.CancelFunc
+	coordinatorStarted bool
+	terminalSelected   bool
+	terminalSemantic   error
+	terminalTeardown   error
+	terminalDone       chan struct{}
+	startupWG          sync.WaitGroup
+	producerWG         sync.WaitGroup
+	watcherWG          sync.WaitGroup
+	runtimesMu         sync.Mutex
+	runtimes           map[*ServerConnection]*connectionRuntime
+}
+
+type connectionRuntime struct {
+	sc           *ServerConnection
+	conn         *quic.Conn
+	forceCtx     context.Context
+	cancelForce  context.CancelFunc
+	acceptCtx    context.Context
+	cancelAccept context.CancelFunc
+	acceptWG     sync.WaitGroup
+	handlerWG    sync.WaitGroup
+	acceptDone   chan struct{}
+	acceptErr    chan error
+	udp          *UDPHandler
+	localConns   sync.Map
+	mu           sync.Mutex
+	acceptedHigh int64
+	fence        int64
+	fenceSet     bool
+	cleanupOnce  sync.Once
+	cleanupDone  chan struct{}
+	cleanupErr   error
+}
+
+type targetResult struct {
+	semantic error
+	teardown error
 }
 
 // Snapshot is a value-only view of client capacity ownership.
@@ -118,20 +156,25 @@ func New(conf *config.Client) (*Client, error) {
 		return nil, fmt.Errorf("create connection manager: %w", err)
 	}
 
+	forceCtx, forceCancel := context.WithCancel(context.Background())
 	return &Client{
 		config:          conf,
 		connMgr:         connMgr,
 		udpBudget:       newUDPSessionBudget(conf.Capacity.MaxLocalUDPSessions),
 		dsendStats:      &clientDsendStats{},
 		liveUDPHandlers: make(map[*UDPHandler]struct{}),
+		runtimes:        make(map[*ServerConnection]*connectionRuntime),
 		logger:          logger,
+		terminalDone:    make(chan struct{}),
+		forceCtx:        forceCtx,
+		forceCancel:     forceCancel,
 	}, nil
 }
 
 // Start starts the client
 func (c *Client) Start(ctx context.Context) error {
 	c.lifecycleMu.Lock()
-	if c.stopped {
+	if c.stopping {
 		c.lifecycleMu.Unlock()
 		return ErrClientStopped
 	}
@@ -142,10 +185,20 @@ func (c *Client) Start(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	c.started = true
 	c.runCancel = cancel
-	c.wg.Go(func() {
-		c.handleNewConnections(runCtx)
-	})
+	c.startupWG.Add(1)
+	c.producerWG.Go(c.handleNewConnections)
 	c.lifecycleMu.Unlock()
+	callerWatchDone := make(chan struct{})
+	stopCallerWatch := context.AfterFunc(ctx, func() {
+		defer close(callerWatchDone)
+		c.selectTerminal(context.Cause(ctx), true)
+	})
+	defer func() {
+		if stopCallerWatch() {
+			close(callerWatchDone)
+		}
+		<-callerWatchDone
+	}()
 
 	servers := c.config.Server.GetServers()
 	serverAddrs := make([]string, len(servers))
@@ -158,105 +211,164 @@ func (c *Client) Start(ctx context.Context) error {
 		Str("local", net.JoinHostPort(c.config.Local.Host, strconv.Itoa(c.config.Local.Port))).
 		Msg("starting client")
 
-	// Start connection manager (handles connecting to all servers)
+	var startupErr error
 	if err := c.connMgr.Start(runCtx); err != nil {
-		_ = c.shutdown()
-		return fmt.Errorf("start connection manager: %w", err)
+		coordinatorCancellation := runCtx.Err() != nil && errors.Is(err, runCtx.Err())
+		if !coordinatorCancellation {
+			startupErr = fmt.Errorf("start connection manager: %w", err)
+			c.selectTerminal(startupErr, true)
+		}
 	}
+	c.startupWG.Done()
 
 	c.logger.Info().
 		Int("healthy", c.connMgr.HealthyCount()).
 		Int("total", c.connMgr.TotalCount()).
 		Msg("client started successfully")
 
-	// Wait for caller cancellation or an external Stop.
-	<-runCtx.Done()
+	select {
+	case <-ctx.Done():
+		c.selectTerminal(context.Cause(ctx), true)
+	case <-c.terminalDone:
+	}
 	c.logger.Info().Msg("client shutting down")
-
-	return c.shutdown()
+	<-c.terminalDone
+	c.lifecycleMu.Lock()
+	teardown := c.terminalTeardown
+	c.lifecycleMu.Unlock()
+	return errors.Join(startupErr, teardown)
 }
 
 // handleNewConnections listens on the connection manager's NewConns channel
 // and starts stream acceptance and UDP handler for each new connection.
-func (c *Client) handleNewConnections(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case sc, ok := <-c.connMgr.NewConns:
-			if !ok {
-				return
-			}
-			c.wg.Go(func() {
-				c.acceptStreamsFromConnection(ctx, sc)
-			})
 
-			conn := sc.Connection()
-			if conn != nil {
-				endpoint := sc.ServerAddr()
-				c.udpMu.Lock()
-				if c.dsendStats == nil {
-					c.dsendStats = &clientDsendStats{}
-				}
-				dsendStats := c.dsendStats
-				c.udpMu.Unlock()
-				udpHandler := newUDPHandler(
-					c.config.Local.Host,
-					c.config.Local.Port,
-					c.config.UDP.IsFragmentationEnabled(),
-					c.logger,
-					c.udpBudget,
-					dsendStats,
-				)
-				c.udpMu.Lock()
-				if c.liveUDPHandlers == nil {
-					c.liveUDPHandlers = make(map[*UDPHandler]struct{})
-				}
-				c.liveUDPHandlers[udpHandler] = struct{}{}
-				udpHandler.Start(ctx, conn)
-				previousI, replaced := c.udpHandlers.Swap(endpoint, udpHandler)
-				c.udpMu.Unlock()
-				go func() {
-					<-udpHandler.done
-					c.retireUDPHandler(endpoint, udpHandler)
-				}()
-				if replaced {
-					previous := previousI.(*UDPHandler)
-					if previous != udpHandler {
-						previous.stopAndWait()
-						c.retireUDPHandler(endpoint, previous)
-					}
-				}
-			}
-		}
+func (c *Client) handleNewConnections() {
+	for sc := range c.connMgr.NewConns {
+		c.installRuntime(sc)
 	}
 }
 
-// acceptStreamsFromConnection accepts incoming streams from a specific server connection
-func (c *Client) acceptStreamsFromConnection(ctx context.Context, sc *ServerConnection) {
-	logger := c.logger.With().Str("server", sc.ServerAddr()).Logger()
+func (c *Client) installRuntime(sc *ServerConnection) {
+	conn := sc.Connection()
+	forceCtx, cancelForce := context.WithCancel(c.forceCtx)
+	acceptCtx, cancelAccept := context.WithCancel(forceCtx)
+	runtime := &connectionRuntime{
+		sc: sc, conn: conn, forceCtx: forceCtx, cancelForce: cancelForce,
+		acceptCtx: acceptCtx, cancelAccept: cancelAccept,
+		acceptDone: make(chan struct{}), acceptErr: make(chan error, 1),
+		acceptedHigh: -1, cleanupDone: make(chan struct{}),
+	}
+	if conn != nil {
+		c.udpMu.Lock()
+		if c.dsendStats == nil {
+			c.dsendStats = &clientDsendStats{}
+		}
+		dsendStats := c.dsendStats
+		c.udpMu.Unlock()
+		runtime.udp = newUDPHandler(c.config.Local.Host, c.config.Local.Port,
+			c.config.UDP.IsFragmentationEnabled(), c.logger, c.udpBudget, dsendStats)
+	}
+	if conn == nil {
+		close(runtime.acceptDone)
+		c.runtimesMu.Lock()
+		c.runtimes[sc] = runtime
+		c.runtimesMu.Unlock()
+		return
+	}
+	runtime.acceptWG.Go(func() { c.acceptStreamsFromConnection(runtime) })
+	c.udpMu.Lock()
+	if c.liveUDPHandlers == nil {
+		c.liveUDPHandlers = make(map[*UDPHandler]struct{})
+	}
+	c.liveUDPHandlers[runtime.udp] = struct{}{}
+	runtime.udp.Start(forceCtx, conn)
+	c.udpHandlers.Store(sc.ServerAddr(), runtime.udp)
+	c.udpMu.Unlock()
+	c.runtimesMu.Lock()
+	c.runtimes[sc] = runtime
+	c.runtimesMu.Unlock()
+	c.watcherWG.Go(func() {
+		<-runtime.udp.done
+		c.retireUDPHandler(sc.ServerAddr(), runtime.udp)
+	})
+	c.watcherWG.Go(func() {
+		<-conn.Context().Done()
+		<-sc.closeDone
+		_ = c.cleanupRuntime(runtime)
+	})
+}
+
+// acceptStreamsFromConnection accepts streams through the server's drain fence.
+func (c *Client) acceptStreamsFromConnection(runtime *connectionRuntime) {
+	defer close(runtime.acceptDone)
+	logger := c.logger.With().Str("server", runtime.sc.ServerAddr()).Logger()
 
 	for {
-		stream, err := sc.AcceptStream(ctx)
+		stream, err := runtime.sc.AcceptStream(runtime.acceptCtx)
 		if err != nil {
-			if ctx.Err() != nil {
+			runtime.mu.Lock()
+			graceful := runtime.fenceSet && (runtime.fence == -1 || runtime.acceptedHigh >= runtime.fence)
+			runtime.mu.Unlock()
+			if graceful || runtime.forceCtx.Err() != nil {
 				return
 			}
-			// Connection may have been closed or become unhealthy
-			if !sc.IsHealthy() {
-				logger.Debug().Msg("stopping stream acceptance - connection unhealthy")
-				return
-			}
-			logger.Error().Err(err).Msg("accept stream failed")
+			runtime.failAccept(fmt.Errorf("accept stream: %w", err))
 			return
 		}
-
-		go c.handleStream(ctx, stream, sc)
+		streamID := int64(stream.StreamID())
+		if err := protocol.ValidateDrainFence(streamID); err != nil {
+			stream.CancelRead(0)
+			stream.CancelWrite(0)
+			runtime.failAccept(err)
+			return
+		}
+		runtime.mu.Lock()
+		if runtime.fenceSet && streamID > runtime.fence {
+			runtime.mu.Unlock()
+			stream.CancelRead(0)
+			stream.CancelWrite(0)
+			runtime.failAccept(fmt.Errorf("accepted stream %d above drain fence %d", streamID, runtime.fence))
+			return
+		}
+		runtime.handlerWG.Go(func() {
+			c.handleStream(runtime.forceCtx, stream, runtime.sc, runtime)
+		})
+		runtime.acceptedHigh = max(runtime.acceptedHigh, streamID)
+		stop := runtime.fenceSet && runtime.acceptedHigh >= runtime.fence
+		runtime.mu.Unlock()
+		if stop {
+			runtime.cancelAccept()
+		}
+		logger.Debug().Int64("stream_id", streamID).Msg("accepted TCP stream")
 	}
+}
+
+func (runtime *connectionRuntime) failAccept(err error) {
+	select {
+	case runtime.acceptErr <- err:
+	default:
+	}
+}
+
+func (runtime *connectionRuntime) setFence(fence int64) error {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.fenceSet && runtime.fence != fence {
+		return fmt.Errorf("conflicting drain fence %d after %d", fence, runtime.fence)
+	}
+	if runtime.acceptedHigh > fence {
+		return fmt.Errorf("drain fence %d below accepted stream %d", fence, runtime.acceptedHigh)
+	}
+	runtime.fenceSet = true
+	runtime.fence = fence
+	if fence == -1 || runtime.acceptedHigh >= fence {
+		runtime.cancelAccept()
+	}
+	return nil
 }
 
 // handleStream handles a single stream from server
-func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *ServerConnection) {
+func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *ServerConnection, runtimes ...*connectionRuntime) {
 	relayOwnsStream := false
 	defer func() {
 		if !relayOwnsStream {
@@ -283,7 +395,9 @@ func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *Serv
 
 	// Connect to local service
 	localAddr := net.JoinHostPort(c.config.Local.Host, strconv.Itoa(c.config.Local.Port))
-	localConn, err := net.DialTimeout(msg.Protocol, localAddr, 5*time.Second)
+	dialCtx, cancelDial := context.WithTimeout(ctx, 5*time.Second)
+	localConn, err := (&net.Dialer{}).DialContext(dialCtx, msg.Protocol, localAddr)
+	cancelDial()
 	if err != nil {
 		logger.Error().Err(err).Str("local_addr", localAddr).Msg("dial local service failed")
 		_ = protocol.WriteConnClose(stream, msg.ConnID, fmt.Sprintf("dial failed: %v", err))
@@ -312,6 +426,10 @@ func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *Serv
 
 	c.localConns.Store(msg.ConnID, localConn)
 	defer c.localConns.Delete(msg.ConnID)
+	if len(runtimes) != 0 {
+		runtimes[0].localConns.Store(msg.ConnID, localConn)
+		defer runtimes[0].localConns.Delete(msg.ConnID)
+	}
 
 	logger.Info().Str("local_addr", localAddr).Msg("connected to local service")
 
@@ -369,53 +487,283 @@ func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *Serv
 	_ = protocol.WriteConnClose(stream, msg.ConnID, "closed")
 }
 
-// shutdown gracefully shuts down the client
-func (c *Client) shutdown() error {
-	c.shutdownOnce.Do(func() {
-		c.lifecycleMu.Lock()
-		c.stopped = true
-		cancel := c.runCancel
+// Shutdown drains supported TCP generations and force-closes only failures.
+func (c *Client) Shutdown(ctx context.Context) error {
+	c.lifecycleMu.Lock()
+	c.startCoordinatorLocked()
+	done := c.terminalDone
+	c.lifecycleMu.Unlock()
+
+	select {
+	case <-done:
+		return c.sharedResult()
+	default:
+	}
+	select {
+	case <-done:
+		return c.sharedResult()
+	case <-ctx.Done():
+		cause := context.Cause(ctx)
+		won := c.selectTerminal(cause, true)
+		<-done
+		if won {
+			return c.sharedResult()
+		}
+		return errors.Join(cause, c.sharedResult())
+	}
+}
+
+func (c *Client) startCoordinatorLocked() {
+	if c.coordinatorStarted {
+		return
+	}
+	c.stopping = true
+	c.coordinatorStarted = true
+	go c.runCoordinator()
+}
+
+func (c *Client) selectTerminal(semantic error, force bool) bool {
+	c.lifecycleMu.Lock()
+	c.startCoordinatorLocked()
+	if c.terminalSelected {
 		c.lifecycleMu.Unlock()
+		return false
+	}
+	c.terminalSelected = true
+	c.terminalSemantic = semantic
+	forceCancel, runCancel := c.forceCancel, c.runCancel
+	c.lifecycleMu.Unlock()
 
-		if cancel != nil {
-			cancel()
+	if force {
+		if forceCancel != nil {
+			forceCancel()
 		}
+		if runCancel != nil {
+			runCancel()
+		}
+		c.forceOwned()
+	} else if runCancel != nil {
+		runCancel()
+	}
+	return true
+}
 
-		// Join every tracked user of ServerConnection.conn before Stop clears it.
-		c.wg.Wait()
-
+func (c *Client) forceOwned() {
+	runtimes := c.runtimeSnapshot()
+	for _, runtime := range runtimes {
 		if c.connMgr != nil {
-			if err := c.connMgr.Stop(); err != nil {
-				c.logger.Error().Err(err).Msg("error stopping connection manager")
-				c.shutdownErr = fmt.Errorf("stop connection manager: %w", err)
-			}
+			c.connMgr.retireConnection(runtime.sc)
 		}
-
-		c.udpHandlers.Range(func(key, value any) bool {
-			if handler, ok := value.(*UDPHandler); ok {
-				handler.Stop()
-			}
+	}
+	for _, runtime := range runtimes {
+		runtime.cancelForce()
+		runtime.cancelAccept()
+		_ = runtime.sc.Close()
+		if runtime.udp != nil {
+			runtime.udp.Stop()
+		}
+		runtime.localConns.Range(func(_, value any) bool {
+			_ = value.(net.Conn).Close()
 			return true
 		})
-		c.udpHandlers.Range(func(key, value any) bool {
-			if handler, ok := value.(*UDPHandler); ok {
-				handler.wait()
-				c.retireUDPHandler(key.(string), handler)
-			}
-			return true
-		})
-
-		c.localConns.Range(func(key, value any) bool {
-			if conn, ok := value.(net.Conn); ok {
-				_ = conn.Close()
-			}
-			return true
-		})
-
-		c.logger.Info().Msg("client shutdown complete")
+	}
+	c.localConns.Range(func(_, value any) bool {
+		_ = value.(net.Conn).Close()
+		return true
 	})
+}
 
-	return c.shutdownErr
+func (c *Client) runCoordinator() {
+	if c.connMgr != nil {
+		c.connMgr.stopPublishing()
+	}
+	c.startupWG.Wait()
+	c.producerWG.Wait()
+
+	runtimes := c.runtimeSnapshot()
+	results := make(chan targetResult, len(runtimes))
+	var targets sync.WaitGroup
+	for _, runtime := range runtimes {
+		targets.Go(func() { results <- c.processRuntime(runtime) })
+	}
+	targets.Wait()
+	close(results)
+	var semanticErrors, teardownErrors []error
+	for result := range results {
+		semanticErrors = append(semanticErrors, result.semantic)
+		teardownErrors = append(teardownErrors, result.teardown)
+	}
+	c.selectTerminal(errors.Join(semanticErrors...), false)
+	if c.connMgr != nil {
+		teardownErrors = append(teardownErrors, c.connMgr.Stop())
+	}
+	c.watcherWG.Wait()
+
+	c.lifecycleMu.Lock()
+	c.terminalTeardown = errors.Join(teardownErrors...)
+	close(c.terminalDone)
+	c.lifecycleMu.Unlock()
+	c.logger.Info().Msg("client shutdown complete")
+}
+
+func (c *Client) processRuntime(runtime *connectionRuntime) targetResult {
+	current := c.connMgr != nil && c.connMgr.isCurrent(runtime.sc)
+	if !current || runtime.conn == nil || runtime.transportDone() {
+		return targetResult{teardown: c.cleanupRuntime(runtime)}
+	}
+	fail := func(err error) targetResult {
+		return targetResult{
+			semantic: fmt.Errorf("server %s: %w", runtime.sc.ServerAddr(), err),
+			teardown: c.cleanupRuntime(runtime),
+		}
+	}
+	if !runtime.sc.IsHealthy() {
+		return fail(fmt.Errorf("connection is unhealthy"))
+	}
+	if !runtime.sc.controlAlive() {
+		return fail(runtime.sc.controlResult())
+	}
+	if !runtime.sc.HasCapability(protocol.CapabilityTCPDrainV1) {
+		return fail(ErrPeerGracefulShutdownUnsupported)
+	}
+	if err := runtime.sc.requestDrain(c.forceCtx); err != nil {
+		if c.forceCtx.Err() != nil {
+			return targetResult{teardown: c.cleanupRuntime(runtime)}
+		}
+		return fail(err)
+	}
+
+	var fence int64
+	select {
+	case <-c.forceCtx.Done():
+		return targetResult{teardown: c.cleanupRuntime(runtime)}
+	case err := <-runtime.acceptErr:
+		return fail(err)
+	case <-runtime.sc.controlDone:
+		return fail(runtime.sc.controlResult())
+	case <-runtime.conn.Context().Done():
+		return fail(fmt.Errorf("connection closed before drain complete: %w", context.Cause(runtime.conn.Context())))
+	case fence = <-runtime.sc.drainComplete:
+	}
+	if err := runtime.setFence(fence); err != nil {
+		return fail(err)
+	}
+
+	select {
+	case <-c.forceCtx.Done():
+		return targetResult{teardown: c.cleanupRuntime(runtime)}
+	case err := <-runtime.acceptErr:
+		return fail(err)
+	case <-runtime.sc.controlDone:
+		return fail(runtime.sc.controlResult())
+	case <-runtime.conn.Context().Done():
+		return fail(fmt.Errorf("connection closed before accept fence: %w", context.Cause(runtime.conn.Context())))
+	case <-runtime.acceptDone:
+	}
+	handlersDone := make(chan struct{})
+	go func() {
+		runtime.handlerWG.Wait()
+		close(handlersDone)
+	}()
+	defer func() { <-handlersDone }()
+	select {
+	case <-c.forceCtx.Done():
+		return targetResult{teardown: c.cleanupRuntime(runtime)}
+	case err := <-runtime.acceptErr:
+		return fail(err)
+	case <-runtime.sc.controlDone:
+		return fail(runtime.sc.controlResult())
+	case <-runtime.conn.Context().Done():
+		return fail(fmt.Errorf("connection closed before handlers completed: %w", context.Cause(runtime.conn.Context())))
+	case <-handlersDone:
+		if err := c.waitControlQuiescent(runtime); err != nil {
+			if c.forceCtx.Err() != nil {
+				return targetResult{teardown: c.cleanupRuntime(runtime)}
+			}
+			return fail(err)
+		}
+		if runtime.transportDone() {
+			return fail(fmt.Errorf("control or transport stopped before target success"))
+		}
+		select {
+		case err := <-runtime.acceptErr:
+			return fail(err)
+		default:
+		}
+	}
+	return targetResult{teardown: c.cleanupRuntime(runtime)}
+}
+
+func (c *Client) waitControlQuiescent(runtime *connectionRuntime) error {
+	for runtime.sc.controlPending.Load() != 0 {
+		select {
+		case <-c.forceCtx.Done():
+			return context.Cause(c.forceCtx)
+		case <-runtime.sc.controlDone:
+			return runtime.sc.controlResult()
+		case <-runtime.sc.controlProgress:
+		}
+	}
+	if !runtime.sc.controlAlive() || runtime.sc.controlPending.Load() != 0 {
+		return fmt.Errorf("control stopped before target success")
+	}
+	return nil
+}
+
+func (runtime *connectionRuntime) transportDone() bool {
+	select {
+	case <-runtime.conn.Context().Done():
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Client) cleanupRuntime(runtime *connectionRuntime) error {
+	runtime.cleanupOnce.Do(func() {
+		runtime.cancelForce()
+		runtime.cancelAccept()
+		if c.connMgr != nil {
+			c.connMgr.retireConnection(runtime.sc)
+		}
+		runtime.cleanupErr = runtime.sc.Close()
+		runtime.localConns.Range(func(_, value any) bool {
+			_ = value.(net.Conn).Close()
+			return true
+		})
+		if runtime.udp != nil {
+			runtime.udp.Stop()
+		}
+		runtime.acceptWG.Wait()
+		runtime.handlerWG.Wait()
+		if runtime.udp != nil {
+			runtime.udp.wait()
+			c.retireUDPHandler(runtime.sc.ServerAddr(), runtime.udp)
+		}
+		runtime.sc.waitControl()
+		c.runtimesMu.Lock()
+		delete(c.runtimes, runtime.sc)
+		c.runtimesMu.Unlock()
+		close(runtime.cleanupDone)
+	})
+	<-runtime.cleanupDone
+	return runtime.cleanupErr
+}
+
+func (c *Client) runtimeSnapshot() []*connectionRuntime {
+	c.runtimesMu.Lock()
+	defer c.runtimesMu.Unlock()
+	runtimes := make([]*connectionRuntime, 0, len(c.runtimes))
+	for _, runtime := range c.runtimes {
+		runtimes = append(runtimes, runtime)
+	}
+	return runtimes
+}
+
+func (c *Client) sharedResult() error {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	return errors.Join(c.terminalSemantic, c.terminalTeardown)
 }
 
 func (c *Client) retireUDPHandler(endpoint string, handler *UDPHandler) {
@@ -457,7 +805,11 @@ func (c *Client) Snapshot() Snapshot {
 
 // Stop stops the client
 func (c *Client) Stop() error {
-	return c.shutdown()
+	c.selectTerminal(ErrClientStopped, true)
+	<-c.terminalDone
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	return c.terminalTeardown
 }
 
 // HealthyConnectionCount returns the number of healthy server connections.

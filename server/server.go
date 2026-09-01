@@ -792,6 +792,7 @@ func (s *Server) handleControlStream(
 	// Channel to receive messages from the read goroutine
 	type readResult struct {
 		msgType byte
+		payload []byte
 		err     error
 	}
 	readCh := make(chan readResult, 1)
@@ -801,9 +802,9 @@ func (s *Server) handleControlStream(
 	go func(ctx context.Context, stream *quic.Stream, readCh chan readResult, conn *quic.Conn) {
 		defer close(readerDone)
 		for {
-			msgType, _, err := protocol.ReadMessage(stream)
+			msgType, payload, err := protocol.ReadMessage(stream)
 			select {
-			case readCh <- readResult{msgType: msgType, err: err}:
+			case readCh <- readResult{msgType: msgType, payload: payload, err: err}:
 			case <-ctx.Done():
 				return
 			case <-conn.Context().Done():
@@ -819,11 +820,16 @@ func (s *Server) handleControlStream(
 		clientConn.ControlStream.CancelRead(registrationStreamErrorCode)
 		<-readerDone
 	}()
-	defer func() { retirement = poolInst.BeginRetire(clientConn) }()
+	defer func() {
+		if retirement == nil {
+			retirement = poolInst.BeginRetire(clientConn)
+		}
+	}()
 
 	now := time.Now()
 	healthExpiry := now.Add(s.config.HealthTimeout)
 	heartbeatDeadline := time.After(time.Until(healthExpiry))
+	var tcpDrained <-chan int64
 	for {
 		select {
 		case <-ctx.Done():
@@ -862,15 +868,62 @@ func (s *Server) handleControlStream(
 				return
 			}
 
-			if result.msgType == protocol.MsgTypeHeartbeat {
-				current, ok := poolInst.Get(clientConn.ID)
-				if !ok || current != clientConn {
-					logger.Debug().Msg("ignored heartbeat from stale client generation")
-					return
+			switch result.msgType {
+			case protocol.MsgTypeHeartbeat:
+				if retirement == nil {
+					current, ok := poolInst.Get(clientConn.ID)
+					if !ok || current != clientConn {
+						logger.Debug().Msg("ignored heartbeat from stale client generation")
+						return
+					}
 				}
 				logger.Debug().Msg("heartbeat received from client")
 				healthExpiry = time.Now().Add(s.config.HealthTimeout)
 				heartbeatDeadline = time.After(time.Until(healthExpiry))
+			case protocol.MsgTypeDrainRequest:
+				if !protocol.HasCapability(clientConn.Metadata.Capabilities, protocol.CapabilityTCPDrainV1) {
+					closeReason = "unnegotiated drain request"
+					return
+				}
+				if err := protocol.DecodeDrainRequest(result.payload); err != nil {
+					closeReason = "invalid drain request"
+					logger.Debug().Err(err).Msg(closeReason)
+					return
+				}
+				if retirement == nil {
+					retirement = poolInst.BeginRetire(clientConn)
+					if retirement == nil {
+						closeReason = "stale drain request"
+						return
+					}
+					tcpDrained = retirement.TCPDrained()
+				}
+			case protocol.MsgTypeDrainComplete:
+				closeReason = "wrong-direction drain complete"
+				return
+			}
+
+		case fence := <-tcpDrained:
+			tcpDrained = nil
+			if err := protocol.ValidateDrainFence(fence); err != nil {
+				closeReason = "invalid drain fence"
+				logger.Debug().Err(err).Msg(closeReason)
+				return
+			}
+			now := time.Now()
+			writeDeadline, fresh := drainCompleteWriteDeadline(now, s.config.HeartbeatInterval, healthExpiry)
+			if !fresh {
+				closeReason = "drain complete deadline expired"
+				return
+			}
+			if err := clientConn.ControlStream.SetWriteDeadline(writeDeadline); err != nil {
+				closeReason = "set drain complete deadline failed"
+				return
+			}
+			if err := protocol.WriteDrainComplete(clientConn.ControlStream, fence); err != nil {
+				closeReason = "write drain complete failed"
+				logger.Debug().Err(err).Msg(closeReason)
+				return
 			}
 
 		case <-heartbeatDeadline:
@@ -887,4 +940,12 @@ func (s *Server) handleControlStream(
 			return
 		}
 	}
+}
+
+func drainCompleteWriteDeadline(now time.Time, interval time.Duration, healthExpiry time.Time) (time.Time, bool) {
+	deadline := now.Add(interval)
+	if healthExpiry.Before(deadline) {
+		deadline = healthExpiry
+	}
+	return deadline, deadline.After(now)
 }

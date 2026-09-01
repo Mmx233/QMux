@@ -55,6 +55,8 @@ type ClientConn struct {
 	tcpPending  atomic.Int64
 	tcpActive   atomic.Int64
 	udpSessions atomic.Int64
+	tcpStreamID atomic.Int64
+	tcpOpened   atomic.Bool
 
 	// Health
 	healthy atomic.Bool
@@ -93,9 +95,11 @@ type Reservation struct {
 // Retirement holds an exact generation out of selection until owner cleanup
 // and all traffic leases finish.
 type Retirement struct {
-	pool *ConnectionPool
-	conn *ClientConn
-	done bool
+	pool       *ConnectionPool
+	conn       *ClientConn
+	done       bool
+	tcpDrained chan int64
+	drainSent  bool
 }
 
 const (
@@ -405,9 +409,10 @@ func (p *ConnectionPool) BeginRetire(expected *ClientConn) *Retirement {
 	}
 	expected.healthy.Store(false)
 	delete(p.clients, expected.ID)
-	retirement := &Retirement{pool: p, conn: expected}
+	retirement := &Retirement{pool: p, conn: expected, tcpDrained: make(chan int64, 1)}
 	p.retiring[expected] = retirement
 	p.cachedClients.Store(nil)
+	p.signalTCPDrainedLocked(retirement)
 
 	p.logger.Info().
 		Str("client_id", expected.ID).
@@ -416,6 +421,26 @@ func (p *ConnectionPool) BeginRetire(expected *ClientConn) *Retirement {
 		Uint64("total_conns", expected.TotalConns.Load()).
 		Msg("client retiring from pool")
 	return retirement
+}
+
+// TCPDrained reports the last successfully opened server TCP stream exactly once.
+func (r *Retirement) TCPDrained() <-chan int64 {
+	if r == nil {
+		return nil
+	}
+	return r.tcpDrained
+}
+
+func (p *ConnectionPool) signalTCPDrainedLocked(retirement *Retirement) {
+	if retirement == nil || retirement.drainSent || retirement.conn.tcpPending.Load()+retirement.conn.tcpActive.Load() != 0 {
+		return
+	}
+	fence := int64(-1)
+	if retirement.conn.tcpOpened.Load() {
+		fence = retirement.conn.tcpStreamID.Load()
+	}
+	retirement.tcpDrained <- fence
+	retirement.drainSent = true
 }
 
 // Done idempotently completes retirement of the exact generation.
@@ -684,6 +709,19 @@ func (l *TCPLease) Client() *ClientConn {
 	return l.conn
 }
 
+// RecordStream records a successfully opened server-initiated TCP stream.
+func (l *TCPLease) RecordStream(streamID int64) {
+	if l == nil || l.conn == nil {
+		return
+	}
+	for current := l.conn.tcpStreamID.Load(); streamID > current; current = l.conn.tcpStreamID.Load() {
+		if l.conn.tcpStreamID.CompareAndSwap(current, streamID) {
+			break
+		}
+	}
+	l.conn.tcpOpened.Store(true)
+}
+
 // Commit moves a pending setup to the established connection counters.
 func (l *TCPLease) Commit() bool {
 	if l == nil || l.pool == nil {
@@ -722,6 +760,7 @@ func (l *TCPLease) Release() bool {
 		return false
 	}
 	l.state = tcpLeaseReleased
+	l.pool.signalTCPDrainedLocked(l.pool.retiring[l.conn])
 	l.pool.finalizeRetirementLocked(l.conn)
 	return true
 }

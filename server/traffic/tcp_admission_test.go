@@ -312,6 +312,8 @@ func TestTCPAdmissionSnapshotGenerationCapacityCompatibility(t *testing.T) {
 	stats.finish(tcpTerminalGenerationSetupCapacity)
 
 	snapshot := stats.snapshot()
+	// Verify the deprecated aggregate remains compatible with the split fields.
+	//goland:noinspection GoDeprecation
 	if snapshot.GenerationConnectionCapacity != 2 || snapshot.GenerationSetupCapacity != 1 ||
 		snapshot.GenerationCapacity != 3 {
 		t.Fatalf("generation capacity snapshot = %+v, want split 2/1 and aggregate 3", snapshot)
@@ -1102,6 +1104,38 @@ func TestTCPNewConnStreamResetDoesNotPoisonGeneration(t *testing.T) {
 	if snapshot.SetupCurrent != 0 || snapshot.ActiveCurrent != 0 || snapshot.Attempts != 2 ||
 		snapshot.Committed != 1 || snapshot.SetupFailure != 1 || tcpTerminalTotal(snapshot) != 2 {
 		t.Fatalf("stream-reset recovery TCP admission snapshot = %+v", snapshot)
+	}
+}
+
+func TestTCPNewConnResetRecordsDrainFence(t *testing.T) {
+	testCtx, cancelTest := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelTest()
+	quicListener, serverConn, peerConn := newRelayLifecycleQUICPair(t, testCtx, 32*1024)
+	registerRelayLifecycleQUICCleanup(t, quicListener, serverConn, peerConn)
+
+	connectionPool, client, _, done := startBlockedNewConn(t, serverConn, "drain-fence-client", 3*time.Second)
+	peerStream, err := peerConn.AcceptStream(testCtx)
+	if err != nil {
+		t.Fatalf("AcceptStream() before reset error = %v", err)
+	}
+	wantFence := int64(peerStream.StreamID())
+	peerStream.CancelRead(73)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("NewConn write did not stop after peer stream reset")
+	}
+	retirement := connectionPool.BeginRetire(client)
+	if retirement == nil {
+		t.Fatal("BeginRetire() = nil")
+	}
+	select {
+	case fence := <-retirement.TCPDrained():
+		if fence != wantFence {
+			t.Fatalf("drain fence = %d, want reset stream ID %d", fence, wantFence)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retirement did not publish the reset stream fence")
 	}
 }
 

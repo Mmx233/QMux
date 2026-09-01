@@ -26,6 +26,8 @@ var errNoTCPStreamCapacity = errors.New("no TCP stream capacity")
 
 // TCPAdmissionSnapshot is a point-in-time, value-only view of one listener's
 // TCP setup and relay admission state.
+//
+//goland:noinspection GoDeprecation
 type TCPAdmissionSnapshot struct {
 	FlowLimit           int64
 	FlowCurrent         int64
@@ -42,6 +44,8 @@ type TCPAdmissionSnapshot struct {
 	FlowCapacity        uint64
 	ListenerCapacity    uint64
 	Unavailable         uint64
+	// GenerationCapacity remains for public and JSON compatibility.
+	//
 	// Deprecated: use GenerationConnectionCapacity and GenerationSetupCapacity.
 	GenerationCapacity           uint64
 	GenerationConnectionCapacity uint64
@@ -95,6 +99,8 @@ func (s *tcpAdmissionStats) snapshot() TCPAdmissionSnapshot {
 	defer s.mu.Unlock()
 	generationConnectionCapacity := s.generationConnectionCapacity.Load()
 	generationSetupCapacity := s.generationSetupCapacity.Load()
+	// Preserve the deprecated aggregate for public and JSON compatibility.
+	//goland:noinspection GoDeprecation
 	return TCPAdmissionSnapshot{
 		FlowCurrent:                  s.flowCurrent.Load(),
 		FlowHighWater:                s.flowHighWater.Load(),
@@ -530,6 +536,7 @@ func (l *Listener) handleTCPConnection(flow *tcpFlow, setupDeadline time.Time, s
 			setupFailed = true
 			continue
 		}
+		currentLease.RecordStream(int64(stream.StreamID()))
 		if !flow.setStream(stream) {
 			terminal = tcpTerminalCanceled
 			flow.abort()

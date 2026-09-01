@@ -4,11 +4,94 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 )
 
 type recordingBalancer struct {
 	selected *ClientConn
 	calls    int
+}
+
+func TestTCPRetirementFenceWaitsForPreBarrierLease(t *testing.T) {
+	p := newTCPAdmissionPool(t)
+	old := addTCPAdmissionClient(t, p, "client", "tcp")
+	admission, err := p.BeginTCPAdmission()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := admission.Next()
+	if err != nil || lease == nil {
+		t.Fatalf("Next() = (%v, %v)", lease, err)
+	}
+
+	retirement := p.BeginRetire(old)
+	if retirement == nil || p.IsCurrentEligible(old, "tcp") {
+		t.Fatal("retirement did not remove the exact generation from selection")
+	}
+	if err := p.Add(&ClientConn{ID: old.ID, Metadata: ClientMetadata{Capabilities: []string{"tcp"}}}); err != nil {
+		t.Fatalf("same-ID replacement Add() error = %v", err)
+	}
+	select {
+	case fence := <-retirement.TCPDrained():
+		t.Fatalf("drained before pending lease completed: %d", fence)
+	default:
+	}
+
+	lease.RecordStream(5)
+	if !lease.Commit() || !lease.Release() {
+		t.Fatal("pre-barrier lease did not commit and release")
+	}
+	select {
+	case fence := <-retirement.TCPDrained():
+		if fence != 5 {
+			t.Fatalf("drain fence = %d, want 5", fence)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retirement did not signal TCP drain")
+	}
+	select {
+	case fence := <-retirement.TCPDrained():
+		t.Fatalf("retirement signaled twice: %d", fence)
+	default:
+	}
+}
+
+func TestTCPRetirementWithoutStreamsSignalsSentinel(t *testing.T) {
+	p := newTCPAdmissionPool(t)
+	retirement := p.BeginRetire(addTCPAdmissionClient(t, p, "client", "tcp"))
+	select {
+	case fence := <-retirement.TCPDrained():
+		if fence != -1 {
+			t.Fatalf("drain fence = %d, want -1", fence)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("zero-stream retirement did not signal")
+	}
+}
+
+func TestTCPRetirementPendingOpenFailureSignalsSentinel(t *testing.T) {
+	p := newTCPAdmissionPool(t)
+	client := addTCPAdmissionClient(t, p, "client", "tcp")
+	admission, err := p.BeginTCPAdmission()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := admission.Next()
+	if err != nil || lease == nil {
+		t.Fatalf("Next() = (%v, %v)", lease, err)
+	}
+	retirement := p.BeginRetire(client)
+	if !lease.Release() {
+		t.Fatal("pending lease Release() = false")
+	}
+	select {
+	case fence := <-retirement.TCPDrained():
+		if fence != -1 {
+			t.Fatalf("drain fence = %d, want -1", fence)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pending open failure did not complete retirement")
+	}
 }
 
 func (b *recordingBalancer) Select(_ []*ClientConn) (*ClientConn, error) {
@@ -17,6 +100,13 @@ func (b *recordingBalancer) Select(_ []*ClientConn) (*ClientConn, error) {
 }
 
 func (*recordingBalancer) Name() string { return "recording" }
+
+func newTCPAdmissionPool(t *testing.T) *ConnectionPool {
+	t.Helper()
+	p := New("test", NewRoundRobinBalancer(), newTestLogger())
+	t.Cleanup(p.Stop)
+	return p
+}
 
 func addTCPAdmissionClient(t *testing.T, p *ConnectionPool, id string, capabilities ...string) *ClientConn {
 	t.Helper()

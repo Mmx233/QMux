@@ -32,11 +32,11 @@ func awaitClientLifecycle[T any](t *testing.T, result <-chan T, event string) (v
 	return value
 }
 
-func newClientLifecycleClient(t *testing.T, clientID string, endpoint config.ServerEndpoint) *Client {
+func newClientLifecycleClient(t *testing.T, clientID string, endpoints ...config.ServerEndpoint) *Client {
 	t.Helper()
 	c, err := New(&config.Client{
 		ClientID: clientID,
-		Server:   config.ClientServer{Servers: []config.ServerEndpoint{endpoint}},
+		Server:   config.ClientServer{Servers: endpoints},
 		Local:    config.LocalService{Host: "127.0.0.1", Port: 1},
 		Quic: config.Quic{
 			HandshakeIdleTimeout: 10 * time.Second,
@@ -166,6 +166,9 @@ func TestClientLifecycle(t *testing.T) {
 		}
 		if prefix := "start connection manager: load credentials: read CA cert:"; !strings.HasPrefix(err.Error(), prefix) {
 			t.Fatalf("Start error = %q, want prefix %q", err, prefix)
+		}
+		if err := c.Shutdown(context.Background()); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("post-terminal Shutdown error = %v, want fs.ErrNotExist in chain", err)
 		}
 
 		concurrentStops := [2]<-chan error{

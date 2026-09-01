@@ -7,17 +7,15 @@ import (
 
 // Message types
 const (
-	MsgTypeRegister    = 0x01 // Client registration
-	MsgTypeRegisterAck = 0x02 // Server acknowledgment
-	MsgTypeHeartbeat   = 0x03 // Keepalive
-	MsgTypeNewConn     = 0x04 // New connection metadata
-	MsgTypeConnClose   = 0x06 // Connection closed
-	MsgTypeError       = 0xFF // Error message
+	MsgTypeRegister      = 0x01 // Client registration
+	MsgTypeRegisterAck   = 0x02 // Server acknowledgment
+	MsgTypeHeartbeat     = 0x03 // Keepalive
+	MsgTypeNewConn       = 0x04 // New connection metadata
+	MsgTypeDrainRequest  = 0x05 // Client requests retirement from TCP selection
+	MsgTypeConnClose     = 0x06 // Connection closed
+	MsgTypeDrainComplete = 0x07 // Server reports the final accepted TCP stream
+	MsgTypeError         = 0xFF // Error message
 )
-
-// Note: MsgTypeConnData (0x05) is not used in current design.
-// Data flows directly on QUIC streams for better performance.
-// Each connection gets its own stream, no need for message framing.
 
 // RegisterMsg is sent by client to register with server
 type RegisterMsg struct {
@@ -45,6 +43,14 @@ type RegisterAckMsg struct {
 // HeartbeatMsg is sent periodically to keep connection alive
 type HeartbeatMsg struct {
 	Timestamp int64 // Unix timestamp
+}
+
+// DrainRequestMsg asks the server to retire this generation from TCP selection.
+type DrainRequestMsg struct{}
+
+// DrainCompleteMsg reports the last server-initiated bidirectional stream ID.
+type DrainCompleteMsg struct {
+	AcceptFence int64
 }
 
 // NewConnMsg is sent by server to client when new connection arrives
@@ -79,7 +85,10 @@ type Message struct {
 //goland:noinspection GoNameStartsWithPackageName
 const ProtocolVersion = "2.0"
 
-const CapabilityUDPWireV2 = "udp-wire-v2"
+const (
+	CapabilityUDPWireV2  = "udp-wire-v2"
+	CapabilityTCPDrainV1 = "tcp-drain-v1"
+)
 
 // HasCapability reports whether capabilities contains capability.
 func HasCapability(capabilities []string, capability string) bool {

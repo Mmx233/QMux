@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -57,6 +58,7 @@ type ServerConnection struct {
 
 	conn          atomic.Pointer[quic.Conn]
 	controlStream atomic.Pointer[quic.Stream]
+	capabilities  []string
 
 	// Health tracking
 	healthy       atomic.Bool
@@ -79,16 +81,52 @@ type ServerConnection struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	controlOnce     sync.Once
+	controlWG       sync.WaitGroup
+	controlStarted  atomic.Bool
+	controlDone     chan struct{}
+	controlMu       sync.Mutex
+	controlErr      error
+	controlClosing  bool
+	controlPending  atomic.Int64
+	controlProgress chan struct{}
+	drainCommands   chan drainCommand
+	drainComplete   chan int64
+	drainEpoch      atomic.Uint32
+	writeDrain      func(*quic.Stream) error
+	handlerMu       sync.RWMutex
+	nonHeartbeat    NonHeartbeatHandler
+
 	closeOnce sync.Once
 	closeMu   sync.Mutex
 	closed    bool
 	closeErr  error
+	closeDone chan struct{}
 	onClosed  func()
 
 	// Protected by the owning ConnectionManager.publishMu.
 	capacityEndpoint int
 	capacityPhase    clientGenerationPhase
 }
+
+type drainCommand struct {
+	result chan error
+}
+
+type controlReadResult struct {
+	msgType    byte
+	payload    []byte
+	drain      protocol.DrainCompleteMsg
+	drainEpoch uint32
+	err        error
+}
+
+const (
+	drainNotRequested uint32 = iota
+	drainRequestWriting
+	drainRequestCommitted
+	drainCompleteReceived
+)
 
 // NewServerConnection creates a new ServerConnection instance.
 // The sessionCache should be obtained from SessionCacheManager to ensure
@@ -104,8 +142,13 @@ func NewServerConnection(serverAddr, serverName string, sessionCache tls.ClientS
 		logger: logger.With().
 			Str("server_addr", serverAddr).
 			Logger(),
-		ctx:    ctx,
-		cancel: cancel,
+		ctx:             ctx,
+		cancel:          cancel,
+		controlDone:     make(chan struct{}),
+		controlProgress: make(chan struct{}, 1),
+		drainCommands:   make(chan drainCommand, 1),
+		drainComplete:   make(chan int64, 1),
+		closeDone:       make(chan struct{}),
 	}
 
 	// Initialize as disconnected and unhealthy
@@ -317,7 +360,7 @@ func (sc *ServerConnection) CheckReceivedHealth() bool {
 // It sends heartbeats to the server at the configured interval,
 // receives heartbeats from the server updating lastReceivedFromServer timestamp,
 // and checks for heartbeat timeout to detect unhealthy connection.
-func (sc *ServerConnection) heartbeatLoop(sendInterval time.Duration, controlStream *quic.Stream) {
+func (sc *ServerConnection) heartbeatLoop(sendInterval time.Duration, controlStream *quic.Stream) error {
 	sc.logger.Debug().
 		Dur("send_interval", sendInterval).
 		Dur("health_timeout", sc.healthTimeout).
@@ -327,40 +370,71 @@ func (sc *ServerConnection) heartbeatLoop(sendInterval time.Duration, controlStr
 	sendTicker := time.NewTicker(sendInterval)
 	defer sendTicker.Stop()
 
-	// Channel to receive messages from the read goroutine
-	type readResult struct {
-		msgType byte
-		payload []byte
-		err     error
+	if controlStream == nil {
+		return fmt.Errorf("no control stream")
 	}
-	readCh := make(chan readResult, 1)
+	readCh := make(chan controlReadResult, 1)
+	readerCtx, cancelReader := context.WithCancel(sc.ctx)
+	readerDone := make(chan struct{})
 
-	// Start a goroutine to read messages
-	go func(ctx context.Context, stream *quic.Stream, readCh chan readResult) {
+	go func() {
+		defer close(readerDone)
 		for {
-			if stream == nil {
-				return
+			msgType, payload, err := protocol.ReadMessage(controlStream)
+			result := controlReadResult{msgType: msgType, payload: payload, err: err}
+			if err == nil && msgType == protocol.MsgTypeDrainComplete {
+				result.drain, result.err = protocol.DecodeDrainComplete(payload)
 			}
-			msgType, payload, err := protocol.ReadMessage(stream)
+			result.drainEpoch = sc.drainEpoch.Load()
+			sc.controlPending.Add(1)
 			select {
-			case readCh <- readResult{msgType: msgType, payload: payload, err: err}:
-			case <-ctx.Done():
+			case readCh <- result:
+			case <-readerCtx.Done():
+				sc.controlPending.Add(-1)
 				return
 			}
-			if err != nil {
+			if result.err != nil {
 				return
 			}
 		}
-	}(sc.ctx, controlStream, readCh)
+	}()
+	defer func() {
+		cancelReader()
+		controlStream.CancelRead(0)
+		<-readerDone
+	}()
 
 	now := time.Now()
 	healthExpiry := now.Add(sc.healthTimeout)
 	heartbeatDeadline := time.After(time.Until(healthExpiry))
+	completeFence := int64(-2)
 	for {
 		select {
 		case <-sc.ctx.Done():
 			sc.logger.Debug().Msg("heartbeat loop stopped: context cancelled")
-			return
+			return nil
+
+		case command := <-sc.drainCommands:
+			sc.drainEpoch.Store(drainRequestWriting)
+			now := time.Now()
+			writeDeadline, fresh := drainWriteDeadline(now, sendInterval, healthExpiry)
+			var err error
+			if !fresh {
+				err = fmt.Errorf("drain request deadline expired")
+			} else if err = controlStream.SetWriteDeadline(writeDeadline); err == nil {
+				if sc.writeDrain == nil {
+					err = protocol.WriteDrainRequest(controlStream)
+				} else {
+					err = sc.writeDrain(controlStream)
+				}
+			}
+			if err == nil {
+				sc.drainEpoch.Store(drainRequestCommitted)
+			}
+			command.result <- err
+			if err != nil {
+				return fmt.Errorf("write drain request: %w", err)
+			}
 
 		case <-sendTicker.C:
 			now := time.Now()
@@ -371,32 +445,58 @@ func (sc *ServerConnection) heartbeatLoop(sendInterval time.Duration, controlStr
 			if !writeDeadline.After(now) {
 				continue
 			}
-			if err := sc.sendHeartbeat(controlStream, writeDeadline); err != nil {
+			if err := writeHeartbeat(controlStream, writeDeadline); err != nil {
 				sc.logger.Debug().Err(err).Msg("heartbeat send failed, exiting loop")
-				return
+				return fmt.Errorf("send heartbeat: %w", err)
 			}
+			sc.MarkHealthy()
+			sc.logger.Debug().Msg("heartbeat sent")
 
 		case result := <-readCh:
 			if result.err != nil {
 				sc.logger.Debug().Err(result.err).Msg("read from control stream failed")
-				// Mark unhealthy and trigger reconnection on read error
-				sc.MarkUnhealthy()
-				if sc.reconnectCallback != nil {
-					sc.reconnectCallback(sc.serverAddr)
-				}
-				return
+				return fmt.Errorf("read control stream: %w", result.err)
 			}
 
-			if result.msgType == protocol.MsgTypeHeartbeat {
+			switch result.msgType {
+			case protocol.MsgTypeHeartbeat:
 				// Update last received timestamp and reset deadline
 				sc.UpdateLastReceivedFromServer()
 				sc.logger.Debug().Msg("heartbeat received from server")
 				healthExpiry = time.Now().Add(sc.healthTimeout)
 				heartbeatDeadline = time.After(time.Until(healthExpiry))
-			} else {
+			case protocol.MsgTypeDrainComplete:
+				if !sc.HasCapability(protocol.CapabilityTCPDrainV1) {
+					return fmt.Errorf("unnegotiated drain complete")
+				}
+				currentEpoch := sc.drainEpoch.Load()
+				if result.drainEpoch == drainNotRequested ||
+					result.drainEpoch == drainRequestWriting && currentEpoch < drainRequestCommitted ||
+					currentEpoch < drainRequestCommitted {
+					return fmt.Errorf("unsolicited drain complete")
+				}
+				if currentEpoch == drainCompleteReceived {
+					if completeFence != result.drain.AcceptFence {
+						return fmt.Errorf("conflicting drain complete fence %d after %d", result.drain.AcceptFence, completeFence)
+					}
+					sc.controlReadDone()
+					continue
+				}
+				completeFence = result.drain.AcceptFence
+				sc.drainEpoch.Store(drainCompleteReceived)
+				select {
+				case sc.drainComplete <- result.drain.AcceptFence:
+				default:
+				}
+			case protocol.MsgTypeDrainRequest:
+				return fmt.Errorf("wrong-direction drain request")
+			default:
 				// Route non-heartbeat messages to handler
-				if nonHeartbeatHandler != nil {
-					if err := nonHeartbeatHandler(result.msgType, result.payload); err != nil {
+				sc.handlerMu.RLock()
+				handler := sc.nonHeartbeat
+				sc.handlerMu.RUnlock()
+				if handler != nil {
+					if err := handler(result.msgType, result.payload); err != nil {
 						sc.logger.Warn().
 							Uint8("msg_type", result.msgType).
 							Err(err).
@@ -408,6 +508,7 @@ func (sc *ServerConnection) heartbeatLoop(sendInterval time.Duration, controlStr
 						Msg("received non-heartbeat message (no handler set)")
 				}
 			}
+			sc.controlReadDone()
 
 		case <-heartbeatDeadline:
 			lastReceived := sc.LastReceivedFromServer()
@@ -417,16 +518,24 @@ func (sc *ServerConnection) heartbeatLoop(sendInterval time.Duration, controlStr
 				Dur("timeout", sc.healthTimeout).
 				Msg("server heartbeat timeout")
 
-			// Mark connection as unhealthy
-			sc.MarkUnhealthy()
-
-			// Trigger reconnection if callback is set
-			if sc.reconnectCallback != nil {
-				sc.logger.Info().Msg("triggering reconnection due to health timeout")
-				sc.reconnectCallback(sc.serverAddr)
-			}
-			return
+			return fmt.Errorf("server heartbeat timeout")
 		}
+	}
+}
+
+func drainWriteDeadline(now time.Time, interval time.Duration, healthExpiry time.Time) (time.Time, bool) {
+	deadline := now.Add(interval)
+	if healthExpiry.Before(deadline) {
+		deadline = healthExpiry
+	}
+	return deadline, deadline.After(now)
+}
+
+func (sc *ServerConnection) controlReadDone() {
+	sc.controlPending.Add(-1)
+	select {
+	case sc.controlProgress <- struct{}{}:
+	default:
 	}
 }
 
@@ -434,14 +543,12 @@ func (sc *ServerConnection) heartbeatLoop(sendInterval time.Duration, controlStr
 // It receives the message type and payload, and returns an error if handling fails.
 type NonHeartbeatHandler func(msgType byte, payload []byte) error
 
-// nonHeartbeatHandler is the handler for non-heartbeat messages.
-// If nil, non-heartbeat messages are logged and ignored.
-var nonHeartbeatHandler NonHeartbeatHandler
-
 // SetNonHeartbeatHandler sets the handler for non-heartbeat messages received on the control stream.
 // This allows routing of non-heartbeat messages to appropriate handlers without blocking heartbeat processing.
 func (sc *ServerConnection) SetNonHeartbeatHandler(handler NonHeartbeatHandler) {
-	nonHeartbeatHandler = handler
+	sc.handlerMu.Lock()
+	sc.nonHeartbeat = handler
+	sc.handlerMu.Unlock()
 }
 
 // StartHeartbeatLoops starts the unified heartbeat loop for this connection.
@@ -450,13 +557,92 @@ func (sc *ServerConnection) SetNonHeartbeatHandler(handler NonHeartbeatHandler) 
 //
 // All operations use the same connection context for coordinated shutdown.
 func (sc *ServerConnection) StartHeartbeatLoops(heartbeatInterval time.Duration) {
-	sc.logger.Debug().
-		Dur("heartbeat_interval", heartbeatInterval).
-		Dur("health_timeout", sc.healthTimeout).
-		Msg("starting heartbeat loop")
+	sc.controlMu.Lock()
+	if sc.controlClosing {
+		sc.controlMu.Unlock()
+		return
+	}
+	sc.controlOnce.Do(func() {
+		sc.logger.Debug().
+			Dur("heartbeat_interval", heartbeatInterval).
+			Dur("health_timeout", sc.healthTimeout).
+			Msg("starting heartbeat loop")
+		sc.controlStarted.Store(true)
+		controlStream := sc.controlStream.Load()
+		sc.controlWG.Go(func() {
+			err := sc.heartbeatLoop(heartbeatInterval, controlStream)
+			if err != nil && sc.ctx.Err() == nil {
+				sc.MarkUnhealthy()
+				if sc.reconnectCallback != nil {
+					sc.reconnectCallback(sc.serverAddr)
+				}
+			}
+			sc.controlMu.Lock()
+			sc.controlErr = err
+			sc.controlMu.Unlock()
+			close(sc.controlDone)
+		})
+	})
+	sc.controlMu.Unlock()
+}
 
-	controlStream := sc.controlStream.Load()
-	go sc.heartbeatLoop(heartbeatInterval, controlStream)
+// HasCapability reports whether registration selected capability for this generation.
+func (sc *ServerConnection) HasCapability(capability string) bool {
+	return slices.Contains(sc.capabilities, capability)
+}
+
+func (sc *ServerConnection) requestDrain(ctx context.Context) error {
+	if !sc.controlStarted.Load() {
+		return fmt.Errorf("control loop not started")
+	}
+	result := make(chan error, 1)
+	select {
+	case sc.drainCommands <- drainCommand{result: result}:
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	case <-sc.ctx.Done():
+		return context.Cause(sc.ctx)
+	case <-sc.controlDone:
+		return sc.controlResult()
+	}
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	case <-sc.ctx.Done():
+		return context.Cause(sc.ctx)
+	case <-sc.controlDone:
+		return sc.controlResult()
+	}
+}
+
+func (sc *ServerConnection) controlResult() error {
+	sc.controlMu.Lock()
+	defer sc.controlMu.Unlock()
+	if sc.controlErr == nil {
+		return fmt.Errorf("control loop stopped")
+	}
+	return sc.controlErr
+}
+
+func (sc *ServerConnection) controlAlive() bool {
+	if !sc.controlStarted.Load() {
+		return false
+	}
+	select {
+	case <-sc.controlDone:
+		return false
+	default:
+		return true
+	}
+}
+
+func (sc *ServerConnection) waitControl() {
+	sc.controlMu.Lock()
+	sc.controlClosing = true
+	sc.controlMu.Unlock()
+	sc.controlWG.Wait()
 }
 
 // --- Connection Lifecycle Methods ---
@@ -581,6 +767,7 @@ func (sc *ServerConnection) RegisterWithAuth(ctx context.Context, clientID strin
 	if err := sc.acceptRegisterAckWithAuth(ackMsg, expectedAuthScheme); err != nil {
 		return err
 	}
+	sc.capabilities = slices.Clone(ackMsg.SelectedCapabilities)
 	if !stopAndWait() {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("registration canceled: %w", err)
@@ -643,27 +830,9 @@ func (sc *ServerConnection) SendHeartbeat() error {
 }
 
 func (sc *ServerConnection) sendHeartbeat(controlStream *quic.Stream, deadline time.Time) error {
-	if controlStream == nil {
-		// No control stream is a failure condition - mark unhealthy (Requirement 1.3)
-		sc.MarkUnhealthy()
-		sc.logger.Error().Msg("heartbeat send failed: no control stream")
-
-		// Trigger reconnection if callback is set (Requirement 1.3)
-		if sc.reconnectCallback != nil {
-			sc.logger.Info().Msg("triggering reconnection due to missing control stream")
-			sc.reconnectCallback(sc.serverAddr)
-		}
-
-		return fmt.Errorf("no control stream")
-	}
-
-	err := controlStream.SetWriteDeadline(deadline)
-	if err == nil {
-		// The heartbeat message contains a Unix timestamp (Requirement 1.4).
-		err = protocol.WriteHeartbeat(controlStream, time.Now().Unix())
-	}
+	err := writeHeartbeat(controlStream, deadline)
 	if err != nil {
-		// Mark connection as unhealthy on write error (Requirement 1.3)
+		// Heartbeat write failures mark the generation unhealthy (Requirement 1.3).
 		sc.MarkUnhealthy()
 		sc.logger.Error().Err(err).Msg("heartbeat send failed")
 
@@ -679,6 +848,16 @@ func (sc *ServerConnection) sendHeartbeat(controlStream *quic.Stream, deadline t
 	sc.MarkHealthy()
 	sc.logger.Debug().Msg("heartbeat sent")
 	return nil
+}
+
+func writeHeartbeat(controlStream *quic.Stream, deadline time.Time) error {
+	if controlStream == nil {
+		return fmt.Errorf("no control stream")
+	}
+	if err := controlStream.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	return protocol.WriteHeartbeat(controlStream, time.Now().Unix())
 }
 
 // AcceptStream accepts an incoming stream from this server.
@@ -697,10 +876,12 @@ func (sc *ServerConnection) AcceptStream(ctx context.Context) (*quic.Stream, err
 	return stream, nil
 }
 
-// Close gracefully closes the connection.
-// Active streams can continue until they complete or fail naturally.
+// Close abruptly closes the connection and all active streams.
 func (sc *ServerConnection) Close() error {
 	sc.closeOnce.Do(func() {
+		sc.controlMu.Lock()
+		sc.controlClosing = true
+		sc.controlMu.Unlock()
 		sc.cancel()
 
 		if controlStream := sc.controlStream.Swap(nil); controlStream != nil {
@@ -714,7 +895,6 @@ func (sc *ServerConnection) Close() error {
 			sc.closeErr = conn.CloseWithError(0, "shutdown")
 			sc.logger.Info().Msg("connection closed")
 		}
-
 		sc.closeMu.Lock()
 		sc.closed = true
 		onClosed := sc.onClosed
@@ -722,6 +902,7 @@ func (sc *ServerConnection) Close() error {
 		if onClosed != nil {
 			onClosed()
 		}
+		close(sc.closeDone)
 	})
 	return sc.closeErr
 }

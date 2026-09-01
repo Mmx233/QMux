@@ -113,18 +113,12 @@ func TestHeartbeatWriteDeadlineBoundsFlowControlStall(t *testing.T) {
 		sc := NewServerConnection("heartbeat.test:8443", "heartbeat.test", tls.NewLRUClientSessionCache(1), zerolog.Nop())
 		sc.SetHealthConfig(5 * time.Second)
 		sc.MarkHealthy()
+		sc.controlStream.Store(stream)
 		var reconnects atomic.Int32
-		sc.SetReconnectCallback(func(string) {
-			reconnects.Add(1)
-			sc.cancel()
-		})
-		loopDone := make(chan struct{})
-		go func() {
-			sc.heartbeatLoop(100*time.Millisecond, stream)
-			close(loopDone)
-		}()
+		sc.SetReconnectCallback(func(string) { reconnects.Add(1) })
+		sc.StartHeartbeatLoops(100 * time.Millisecond)
 		select {
-		case <-loopDone:
+		case <-sc.controlDone:
 		case <-time.After(2 * time.Second):
 			_ = sender.CloseWithError(0, "unblock stalled heartbeat loop")
 			t.Fatal("heartbeat loop did not exit its stalled write")

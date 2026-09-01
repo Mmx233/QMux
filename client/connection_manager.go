@@ -40,9 +40,10 @@ type ConnectionManager struct {
 
 	// Publication is the commit point for a registered connection. Stop closes
 	// this gate before canceling attempts so a late acknowledgment cannot commit.
-	publishMu sync.Mutex
-	closed    bool
-	endpoints []clientEndpointPhases
+	publishMu         sync.Mutex
+	closed            bool
+	endpoints         []clientEndpointPhases
+	newConnsCloseOnce sync.Once
 
 	// Internal test seam; the production default remains fixed and is not config.
 	attemptTimeout time.Duration
@@ -283,13 +284,9 @@ func (cm *ConnectionManager) publishServerConnection(ctx context.Context, sc *Se
 		return false
 	}
 
-	// NewConns delivery transfers ownership and cannot be rolled back. Stop
-	// waits for this publisher before closing connections owned by the manager.
-	cm.publishMu.Lock()
-	if !cm.closed && ctx.Err() == nil && cm.ctx.Err() == nil {
-		sc.StartHeartbeatLoops(cm.config.HeartbeatInterval)
-	}
-	cm.publishMu.Unlock()
+	// Delivery commits ownership. Control ownership starts even if shutdown
+	// closes the publication gate immediately after the send.
+	sc.StartHeartbeatLoops(cm.config.HeartbeatInterval)
 	return true
 }
 
@@ -450,18 +447,10 @@ func (cm *ConnectionManager) reconnectionLoop(ctx context.Context, serverAddr st
 	}
 }
 
-// Stop gracefully shuts down all connections.
-// It cancels the context to stop heartbeat and reconnection goroutines,
-// then closes all server connections. Active streams can complete naturally.
+// Stop abruptly shuts down all connections.
 func (cm *ConnectionManager) Stop() error {
 	cm.logger.Info().Msg("stopping connection manager")
-
-	cm.publishMu.Lock()
-	cm.closed = true
-	cm.cancel()
-	cm.publishMu.Unlock()
-
-	cm.wg.Wait()
+	cm.stopPublishing()
 	cm.logger.Debug().Msg("all goroutines stopped")
 
 	cm.publishMu.Lock()
@@ -481,13 +470,38 @@ func (cm *ConnectionManager) Stop() error {
 			closeErrors = append(closeErrors, fmt.Errorf("close %s: %w", sc.ServerAddr(), err))
 		}
 	}
+	for _, sc := range published {
+		sc.waitControl()
+	}
 
 	if len(closeErrors) > 0 {
 		cm.logger.Warn().Int("errors", len(closeErrors)).Msg("errors during shutdown")
 	}
 
 	cm.logger.Info().Msg("connection manager stopped")
-	return nil
+	return errors.Join(closeErrors...)
+}
+
+func (cm *ConnectionManager) stopPublishing() {
+	cm.publishMu.Lock()
+	cm.closed = true
+	cm.cancel()
+	cm.publishMu.Unlock()
+	cm.wg.Wait()
+	cm.newConnsCloseOnce.Do(func() { close(cm.NewConns) })
+}
+
+func (cm *ConnectionManager) isCurrent(sc *ServerConnection) bool {
+	current, ok := cm.connections.Load(sc.ServerAddr())
+	return ok && current == sc
+}
+
+func (cm *ConnectionManager) retireConnection(sc *ServerConnection) {
+	cm.publishMu.Lock()
+	if cm.connections.CompareAndDelete(sc.ServerAddr(), sc) {
+		cm.detachGenerationLocked(sc)
+	}
+	cm.publishMu.Unlock()
 }
 
 func (cm *ConnectionManager) trackGenerationLocked(sc *ServerConnection, phase clientGenerationPhase) {

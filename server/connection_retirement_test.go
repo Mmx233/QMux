@@ -213,3 +213,109 @@ func TestStaleControlHeartbeatRetiresOnlyItsGeneration(t *testing.T) {
 		t.Fatalf("pool generation after stale cleanup = (%p, %v), want fresh %p", got, ok, fresh)
 	}
 }
+
+func registerDrainClient(t *testing.T, harness *registrationHarness, clientID string) *quic.Stream {
+	t.Helper()
+	stream := harness.openStream(t)
+	if err := protocol.WriteRegister(stream, clientID, protocol.ProtocolVersion,
+		[]string{"tcp", protocol.CapabilityUDPWireV2, protocol.CapabilityTCPDrainV1}); err != nil {
+		t.Fatalf("WriteRegister() error = %v", err)
+	}
+	var ack protocol.RegisterAckMsg
+	if err := protocol.ReadTypedMessage(stream, protocol.MsgTypeRegisterAck, &ack); err != nil {
+		t.Fatalf("read registration Ack: %v", err)
+	}
+	if !protocol.HasCapability(ack.SelectedCapabilities, protocol.CapabilityTCPDrainV1) {
+		t.Fatalf("selected capabilities = %v, missing drain", ack.SelectedCapabilities)
+	}
+	eventually(t, time.Second, func() bool { return harness.pool.Count() == 1 })
+	return stream
+}
+
+func TestDrainRequestRetiresGenerationAndKeepsRetiredHeartbeatAlive(t *testing.T) {
+	clientCertificate, clientRoots := registrationTestClientCertificate(
+		t, "drain-retirement", false, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
+	serverTLS, clientTLS := registrationMTLSTLSConfigs(t, clientRoots, clientCertificate)
+	harness := newRegistrationHarnessWithTLS(t, mtls.New(clientRoots), time.Second, serverTLS, clientTLS)
+	const clientID = "draining-client"
+	controlStream := registerDrainClient(t, harness, clientID)
+	old, _ := harness.pool.Get(clientID)
+	if err := old.ControlStream.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatalf("set stale DrainComplete deadline: %v", err)
+	}
+
+	if err := protocol.WriteDrainRequest(controlStream); err != nil {
+		t.Fatalf("WriteDrainRequest() error = %v", err)
+	}
+	msgType, payload, err := protocol.ReadMessage(controlStream)
+	if err != nil {
+		t.Fatalf("read DrainComplete: %v", err)
+	}
+	if msgType != protocol.MsgTypeDrainComplete {
+		t.Fatalf("message type = 0x%x, want DrainComplete", msgType)
+	}
+	complete, err := protocol.DecodeDrainComplete(payload)
+	if err != nil || complete.AcceptFence != -1 {
+		t.Fatalf("DrainComplete = (%+v, %v), want fence -1", complete, err)
+	}
+	if harness.pool.IsCurrentEligible(old, "tcp") {
+		t.Fatal("old generation remained eligible after DrainRequest")
+	}
+	fresh := &pool.ClientConn{ID: clientID, Metadata: pool.ClientMetadata{Capabilities: []string{"tcp"}}}
+	if err := harness.pool.Add(fresh); err != nil {
+		t.Fatalf("add same-ID fresh generation: %v", err)
+	}
+	if err := protocol.WriteDrainRequest(controlStream); err != nil {
+		t.Fatalf("write duplicate DrainRequest: %v", err)
+	}
+	for range 3 {
+		if err := protocol.WriteHeartbeat(controlStream, time.Now().Unix()); err != nil {
+			t.Fatalf("write retired heartbeat: %v", err)
+		}
+	}
+	time.Sleep(20 * time.Millisecond)
+	if current, ok := harness.pool.Get(clientID); !ok || current != fresh {
+		t.Fatalf("current generation = (%p, %v), want fresh %p", current, ok, fresh)
+	}
+	select {
+	case <-harness.client.Context().Done():
+		t.Fatalf("retired generation closed while heartbeating: %v", context.Cause(harness.client.Context()))
+	default:
+	}
+}
+
+func TestDrainCompleteWriteDeadlineRejectsExpiredHealthBound(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	deadline, fresh := drainCompleteWriteDeadline(now, time.Second, now.Add(-time.Nanosecond))
+	if fresh || !deadline.Before(now) {
+		t.Fatalf("drain deadline = (%v, %t), want expired", deadline, fresh)
+	}
+}
+
+func TestDrainCompleteWriteFailureClosesOnlyRetiredGeneration(t *testing.T) {
+	clientCertificate, clientRoots := registrationTestClientCertificate(
+		t, "drain-write-failure", false, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
+	serverTLS, clientTLS := registrationMTLSTLSConfigs(t, clientRoots, clientCertificate)
+	harness := newRegistrationHarnessWithTLS(t, mtls.New(clientRoots), time.Second, serverTLS, clientTLS)
+	const clientID = "drain-write-failure-client"
+	controlStream := registerDrainClient(t, harness, clientID)
+	old, _ := harness.pool.Get(clientID)
+	controlStream.CancelRead(99)
+	if err := protocol.WriteDrainRequest(controlStream); err != nil {
+		t.Fatalf("WriteDrainRequest() error = %v", err)
+	}
+	eventually(t, time.Second, func() bool { return !harness.pool.IsCurrentEligible(old, "tcp") })
+	fresh := &pool.ClientConn{ID: clientID, Metadata: pool.ClientMetadata{Capabilities: []string{"tcp"}}}
+	if err := harness.pool.Add(fresh); err != nil {
+		t.Fatalf("add fresh generation: %v", err)
+	}
+	select {
+	case <-harness.client.Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("old generation did not close after DrainComplete write failure")
+	}
+	harness.waitForHandler(t)
+	if current, ok := harness.pool.Get(clientID); !ok || current != fresh {
+		t.Fatalf("current generation = (%p, %v), want fresh %p", current, ok, fresh)
+	}
+}

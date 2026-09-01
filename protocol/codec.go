@@ -1,11 +1,15 @@
 package protocol
 
 import (
+	"bytes"
 	"encoding/binary"
+	stdjson "encoding/json"
 	"fmt"
 	"io"
+	"strconv"
 
 	jsoniter "github.com/json-iterator/go"
+	"github.com/quic-go/quic-go/quicvarint"
 )
 
 // json is a drop-in replacement for encoding/json with better performance
@@ -41,8 +45,12 @@ func WriteMessage(w io.Writer, msgType byte, payload any) error {
 	buf.Write(data)
 
 	// Single write to the underlying writer
-	if _, err := w.Write(buf.Bytes()); err != nil {
+	n, err := w.Write(buf.Bytes())
+	if err != nil {
 		return fmt.Errorf("write message: %w", err)
+	}
+	if n != buf.Len() {
+		return fmt.Errorf("write message: %w", io.ErrShortWrite)
 	}
 
 	return nil
@@ -89,6 +97,104 @@ func DecodeMessage(payload []byte, msg any) error {
 		return fmt.Errorf("unmarshal payload: %w", err)
 	}
 	return nil
+}
+
+// DecodeDrainRequest strictly decodes an empty JSON object.
+func DecodeDrainRequest(payload []byte) error {
+	decoder := stdjson.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	if err := drainObjectStart(decoder); err != nil {
+		return fmt.Errorf("decode drain request: %w", err)
+	}
+	if decoder.More() {
+		return fmt.Errorf("decode drain request: object must be empty")
+	}
+	if err := drainObjectEnd(decoder); err != nil {
+		return fmt.Errorf("decode drain request: %w", err)
+	}
+	return nil
+}
+
+// DecodeDrainComplete strictly decodes exactly one integral AcceptFence member.
+func DecodeDrainComplete(payload []byte) (DrainCompleteMsg, error) {
+	decoder := stdjson.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	if err := drainObjectStart(decoder); err != nil {
+		return DrainCompleteMsg{}, fmt.Errorf("decode drain complete: %w", err)
+	}
+	var msg DrainCompleteMsg
+	found := false
+	for decoder.More() {
+		name, err := decoder.Token()
+		if err != nil {
+			return DrainCompleteMsg{}, fmt.Errorf("decode drain complete: read member: %w", err)
+		}
+		if name != "AcceptFence" {
+			return DrainCompleteMsg{}, fmt.Errorf("decode drain complete: unknown member %q", name)
+		}
+		if found {
+			return DrainCompleteMsg{}, fmt.Errorf("decode drain complete: duplicate AcceptFence")
+		}
+		value, err := decoder.Token()
+		if err != nil {
+			return DrainCompleteMsg{}, fmt.Errorf("decode drain complete: read AcceptFence: %w", err)
+		}
+		number, ok := value.(stdjson.Number)
+		if !ok {
+			return DrainCompleteMsg{}, fmt.Errorf("decode drain complete: AcceptFence must be an integer")
+		}
+		msg.AcceptFence, err = strconv.ParseInt(number.String(), 10, 64)
+		if err != nil {
+			return DrainCompleteMsg{}, fmt.Errorf("decode drain complete: invalid AcceptFence: %w", err)
+		}
+		found = true
+	}
+	if !found {
+		return DrainCompleteMsg{}, fmt.Errorf("decode drain complete: missing AcceptFence")
+	}
+	if err := drainObjectEnd(decoder); err != nil {
+		return DrainCompleteMsg{}, fmt.Errorf("decode drain complete: %w", err)
+	}
+	if err := ValidateDrainFence(msg.AcceptFence); err != nil {
+		return DrainCompleteMsg{}, err
+	}
+	return msg, nil
+}
+
+func drainObjectStart(decoder *stdjson.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if token != stdjson.Delim('{') {
+		return fmt.Errorf("payload must be an object")
+	}
+	return nil
+}
+
+func drainObjectEnd(decoder *stdjson.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if token != stdjson.Delim('}') {
+		return fmt.Errorf("object is not closed")
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("trailing JSON token")
+		}
+		return fmt.Errorf("trailing data: %w", err)
+	}
+	return nil
+}
+
+// ValidateDrainFence validates a server-initiated bidirectional QUIC stream ID.
+func ValidateDrainFence(fence int64) error {
+	if fence == -1 || fence >= 1 && fence <= int64(quicvarint.Max) && fence%4 == 1 {
+		return nil
+	}
+	return fmt.Errorf("invalid drain accept fence %d", fence)
 }
 
 // ReadTypedMessage reads and decodes a message in one call
@@ -152,6 +258,19 @@ func WriteHeartbeat(w io.Writer, timestamp int64) error {
 		Timestamp: timestamp,
 	}
 	return WriteMessage(w, MsgTypeHeartbeat, msg)
+}
+
+// WriteDrainRequest writes an empty drain request.
+func WriteDrainRequest(w io.Writer) error {
+	return WriteMessage(w, MsgTypeDrainRequest, DrainRequestMsg{})
+}
+
+// WriteDrainComplete writes the final server stream fence.
+func WriteDrainComplete(w io.Writer, acceptFence int64) error {
+	if err := ValidateDrainFence(acceptFence); err != nil {
+		return err
+	}
+	return WriteMessage(w, MsgTypeDrainComplete, DrainCompleteMsg{AcceptFence: acceptFence})
 }
 
 // WriteNewConn writes a new connection message

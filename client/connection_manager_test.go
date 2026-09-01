@@ -444,8 +444,10 @@ func TestConnectionManagerStopJoinsBlockedPublication(t *testing.T) {
 		t.Fatalf("provisional connection state = %s, want disconnected", sc.State())
 	}
 	select {
-	case got := <-cm.NewConns:
-		t.Fatalf("received connection after Stop: %p", got)
+	case got, ok := <-cm.NewConns:
+		if ok {
+			t.Fatalf("received connection after Stop: %p", got)
+		}
 	default:
 	}
 }
