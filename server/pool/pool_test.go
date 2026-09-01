@@ -32,8 +32,7 @@ func TestConnectionPool_AddRemove(t *testing.T) {
 	defer pool.Stop()
 
 	client := &ClientConn{
-		ID:       "test-client",
-		LastSeen: time.Now(),
+		ID: "test-client",
 	}
 
 	// Add client
@@ -72,8 +71,7 @@ func TestConnectionPool_Select(t *testing.T) {
 
 	// Add healthy client
 	client1 := &ClientConn{
-		ID:       "client1",
-		LastSeen: time.Now(),
+		ID: "client1",
 	}
 	client1.healthy.Store(true)
 	_ = pool.Add(client1)
@@ -95,9 +93,9 @@ func TestConnectionPool_HAFailover(t *testing.T) {
 
 	// Add 3 healthy clients
 	clients := []*ClientConn{
-		{ID: "client1", LastSeen: time.Now()},
-		{ID: "client2", LastSeen: time.Now()},
-		{ID: "client3", LastSeen: time.Now()},
+		{ID: "client1"},
+		{ID: "client2"},
+		{ID: "client3"},
 	}
 	for _, c := range clients {
 		c.healthy.Store(true)
@@ -142,8 +140,8 @@ func TestConnectionPool_MinimalDowntime(t *testing.T) {
 	defer pool.Stop()
 
 	// Add 2 clients
-	client1 := &ClientConn{ID: "client1", LastSeen: time.Now()}
-	client2 := &ClientConn{ID: "client2", LastSeen: time.Now()}
+	client1 := &ClientConn{ID: "client1"}
+	client2 := &ClientConn{ID: "client2"}
 	client1.healthy.Store(true)
 	client2.healthy.Store(true)
 
@@ -209,8 +207,7 @@ func TestConnectionPool_ConcurrentOperations(t *testing.T) {
 		id := i
 		wg.Go(func() {
 			client := &ClientConn{
-				ID:       fmt.Sprintf("%c", 'A'+id),
-				LastSeen: time.Now(),
+				ID: fmt.Sprintf("%c", 'A'+id),
 			}
 			client.healthy.Store(true)
 			_ = pool.Add(client)
@@ -249,8 +246,7 @@ func TestConnectionPool_AllClientsDown(t *testing.T) {
 	// Add 2 healthy clients
 	for i := range 2 {
 		client := &ClientConn{
-			ID:       fmt.Sprintf("%c", 'A'+i),
-			LastSeen: time.Now(),
+			ID: fmt.Sprintf("%c", 'A'+i),
 		}
 		client.healthy.Store(true)
 		_ = pool.Add(client)
@@ -287,8 +283,7 @@ func TestConnectionPool_RapidFailover(t *testing.T) {
 	// Add 5 clients
 	for i := range 5 {
 		client := &ClientConn{
-			ID:       fmt.Sprintf("%c", 'A'+i),
-			LastSeen: time.Now(),
+			ID: fmt.Sprintf("%c", 'A'+i),
 		}
 		client.healthy.Store(true)
 		_ = pool.Add(client)
@@ -328,8 +323,7 @@ func BenchmarkConnectionPool_Select(b *testing.B) {
 	// Add 10 clients
 	for i := range 10 {
 		client := &ClientConn{
-			ID:       fmt.Sprintf("%c", 'A'+i),
-			LastSeen: time.Now(),
+			ID: fmt.Sprintf("%c", 'A'+i),
 		}
 		client.healthy.Store(true)
 		_ = pool.Add(client)
@@ -354,8 +348,7 @@ func BenchmarkConnectionPool_Add(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		clientIDs[i] = fmt.Sprintf("client-%d", i)
 		clients[i] = &ClientConn{
-			ID:       clientIDs[i],
-			LastSeen: time.Now(),
+			ID: clientIDs[i],
 		}
 	}
 
@@ -378,8 +371,7 @@ func BenchmarkConnectionPool_Remove(b *testing.B) {
 	clients := make([]*ClientConn, b.N)
 	for i := 0; i < b.N; i++ {
 		clients[i] = &ClientConn{
-			ID:       fmt.Sprintf("client-%d", i),
-			LastSeen: time.Now(),
+			ID: fmt.Sprintf("client-%d", i),
 		}
 		clients[i].healthy.Store(true)
 		_ = pool.Add(clients[i])
@@ -406,8 +398,7 @@ func BenchmarkConnectionPool_Select_Sizes(b *testing.B) {
 			for i := range size {
 				clientID := fmt.Sprintf("client-%d", i)
 				client := &ClientConn{
-					ID:       clientID,
-					LastSeen: time.Now(),
+					ID: clientID,
 				}
 				client.healthy.Store(true)
 				_ = pool.Add(client)
@@ -428,8 +419,7 @@ func populateBenchmarkPool(pool *ConnectionPool, count int) []string {
 	for i := range count {
 		clientIDs[i] = fmt.Sprintf("client-%d", i)
 		client := &ClientConn{
-			ID:       clientIDs[i],
-			LastSeen: time.Now(),
+			ID: clientIDs[i],
 		}
 		client.healthy.Store(true)
 		_ = pool.Add(client)
@@ -496,8 +486,7 @@ func TestCacheInvalidationCorrectness_Property(t *testing.T) {
 		for i := range initialCount {
 			clientIDs[i] = fmt.Sprintf("client-%d", i)
 			client := &ClientConn{
-				ID:       clientIDs[i],
-				LastSeen: time.Now(),
+				ID: clientIDs[i],
 			}
 			client.healthy.Store(true)
 			_ = pool.Add(client)
@@ -527,8 +516,7 @@ func TestCacheInvalidationCorrectness_Property(t *testing.T) {
 				newID := fmt.Sprintf("client-%d", nextClientID)
 				nextClientID++
 				client := &ClientConn{
-					ID:       newID,
-					LastSeen: time.Now(),
+					ID: newID,
 				}
 				client.healthy.Store(true)
 				_ = pool.Add(client)
@@ -590,8 +578,7 @@ func TestPoolSelectOverheadRatio_Property(t *testing.T) {
 		for i := range poolSize {
 			clientID := fmt.Sprintf("client-%d", i)
 			clients[i] = &ClientConn{
-				ID:       clientID,
-				LastSeen: time.Now(),
+				ID: clientID,
 			}
 			clients[i].healthy.Store(true)
 			_ = pool.Add(clients[i])
@@ -665,8 +652,7 @@ func TestConcurrentPoolThroughput_Property(t *testing.T) {
 		for i := range poolSize {
 			clientID := fmt.Sprintf("client-%d", i)
 			client := &ClientConn{
-				ID:       clientID,
-				LastSeen: time.Now(),
+				ID: clientID,
 			}
 			client.healthy.Store(true)
 			_ = pool.Add(client)
@@ -750,8 +736,7 @@ func TestHealthUpdateEfficiency_Property(t *testing.T) {
 		for i := range smallPoolSize {
 			clientID := fmt.Sprintf("client-%d", i)
 			client := &ClientConn{
-				ID:       clientID,
-				LastSeen: time.Now(),
+				ID: clientID,
 			}
 			client.healthy.Store(true)
 			_ = smallPool.Add(client)
@@ -764,8 +749,7 @@ func TestHealthUpdateEfficiency_Property(t *testing.T) {
 		for i := range largePoolSize {
 			clientID := fmt.Sprintf("client-%d", i)
 			client := &ClientConn{
-				ID:       clientID,
-				LastSeen: time.Now(),
+				ID: clientID,
 			}
 			client.healthy.Store(true)
 			_ = largePool.Add(client)
@@ -836,9 +820,9 @@ func TestConnectionPool_SelectExcludesUnhealthy(t *testing.T) {
 
 	// Add 3 clients
 	clients := []*ClientConn{
-		{ID: "client1", LastSeen: time.Now()},
-		{ID: "client2", LastSeen: time.Now()},
-		{ID: "client3", LastSeen: time.Now()},
+		{ID: "client1"},
+		{ID: "client2"},
+		{ID: "client3"},
 	}
 
 	// Mark all as healthy initially
@@ -889,8 +873,7 @@ func TestConnectionPool_SelectAllUnhealthy(t *testing.T) {
 	// Add 3 clients
 	for i := range 3 {
 		client := &ClientConn{
-			ID:       fmt.Sprintf("client%d", i),
-			LastSeen: time.Now(),
+			ID: fmt.Sprintf("client%d", i),
 		}
 		client.healthy.Store(true)
 		_ = pool.Add(client)
@@ -931,8 +914,7 @@ func TestUnhealthyExcludedFromLoadBalancer_Property(t *testing.T) {
 		for i := range clientCount {
 			clientIDs[i] = fmt.Sprintf("client-%d", i)
 			client := &ClientConn{
-				ID:       clientIDs[i],
-				LastSeen: time.Now(),
+				ID: clientIDs[i],
 			}
 			client.healthy.Store(true)
 			_ = pool.Add(client)
@@ -983,8 +965,7 @@ func TestUnhealthyExcludedFromLoadBalancer_DynamicHealth_Property(t *testing.T) 
 		for i := range clientCount {
 			clientIDs[i] = fmt.Sprintf("client-%d", i)
 			client := &ClientConn{
-				ID:       clientIDs[i],
-				LastSeen: time.Now(),
+				ID: clientIDs[i],
 			}
 			client.healthy.Store(true)
 			_ = pool.Add(client)
@@ -1051,8 +1032,7 @@ func TestUnhealthyExcludedFromLoadBalancer_LeastConnections_Property(t *testing.
 		for i := range clientCount {
 			clientIDs[i] = fmt.Sprintf("client-%d", i)
 			client := &ClientConn{
-				ID:       clientIDs[i],
-				LastSeen: time.Now(),
+				ID: clientIDs[i],
 			}
 			client.healthy.Store(true)
 			// Set varying connection counts - unhealthy clients might have lowest connections

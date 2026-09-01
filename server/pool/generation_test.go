@@ -16,21 +16,12 @@ func TestGenerationCurrentMutators(t *testing.T) {
 	client := &ClientConn{
 		ID:           "client",
 		RegisteredAt: registeredAt,
-		LastSeen:     time.Unix(1, 0),
 	}
 	if err := pool.Add(client); err != nil {
 		t.Fatalf("Add() error = %v", err)
 	}
 	if !client.healthy.Load() {
 		t.Fatal("Add() did not mark the client healthy")
-	}
-
-	beforeUpdate := time.Now()
-	if !pool.UpdateLastSeen(client) {
-		t.Fatal("UpdateLastSeen() = false for current generation")
-	}
-	if client.LastSeen.Before(beforeUpdate) {
-		t.Fatalf("UpdateLastSeen() timestamp = %v, want >= %v", client.LastSeen, beforeUpdate)
 	}
 
 	warmGenerationCache(t, pool, client)
@@ -74,7 +65,7 @@ func TestGenerationStaleMutatorsAreNoOps(t *testing.T) {
 	pool := New("test", NewRoundRobinBalancer(), newTestLogger())
 	defer pool.Stop()
 
-	stale := &ClientConn{ID: "client", LastSeen: time.Unix(1, 0)}
+	stale := &ClientConn{ID: "client"}
 	if err := pool.Add(stale); err != nil {
 		t.Fatalf("Add(stale) error = %v", err)
 	}
@@ -82,22 +73,12 @@ func TestGenerationStaleMutatorsAreNoOps(t *testing.T) {
 		t.Fatal("Remove(stale) = false while it is current")
 	}
 
-	currentLastSeen := time.Unix(2, 0)
-	current := &ClientConn{ID: stale.ID, LastSeen: currentLastSeen}
+	current := &ClientConn{ID: stale.ID}
 	if err := pool.Add(current); err != nil {
 		t.Fatalf("Add(current) error = %v", err)
 	}
 
 	cached := warmGenerationCache(t, pool, current)
-	staleLastSeen := stale.LastSeen
-	if pool.UpdateLastSeen(stale) {
-		t.Fatal("UpdateLastSeen(stale) = true")
-	}
-	if stale.LastSeen != staleLastSeen || current.LastSeen != currentLastSeen {
-		t.Fatalf("stale UpdateLastSeen changed timestamps: stale=%v current=%v", stale.LastSeen, current.LastSeen)
-	}
-	assertGenerationCacheUnchanged(t, pool, cached)
-
 	if pool.MarkUnhealthy(stale) {
 		t.Fatal("MarkUnhealthy(stale) = true")
 	}
@@ -148,12 +129,12 @@ func TestGenerationNilEmptyAndUnknownAreNoOps(t *testing.T) {
 		t.Fatal("failed Add(empty ID) consumed the pointer")
 	}
 
-	current := &ClientConn{ID: "current", LastSeen: time.Unix(1, 0)}
+	current := &ClientConn{ID: "current"}
 	if err := pool.Add(current); err != nil {
 		t.Fatalf("Add(current) error = %v", err)
 	}
 	cached := warmGenerationCache(t, pool, current)
-	unknown := &ClientConn{ID: "unknown", LastSeen: time.Unix(2, 0)}
+	unknown := &ClientConn{ID: "unknown"}
 
 	tests := []struct {
 		name      string
@@ -166,10 +147,6 @@ func TestGenerationNilEmptyAndUnknownAreNoOps(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			candidate := test.candidate
-			lastSeen := candidateLastSeen(candidate)
-			if pool.UpdateLastSeen(candidate) {
-				t.Fatal("UpdateLastSeen() = true")
-			}
 			if pool.MarkUnhealthy(candidate) {
 				t.Fatal("MarkUnhealthy() = true")
 			}
@@ -178,9 +155,6 @@ func TestGenerationNilEmptyAndUnknownAreNoOps(t *testing.T) {
 			}
 			if pool.Remove(candidate) {
 				t.Fatal("Remove() = true")
-			}
-			if candidateLastSeen(candidate) != lastSeen {
-				t.Fatal("no-op mutators changed candidate LastSeen")
 			}
 			if !current.healthy.Load() {
 				t.Fatal("no-op mutators changed current health")
@@ -325,7 +299,7 @@ func TestGenerationInterleavingsAcrossBalancers(t *testing.T) {
 		{
 			name: "all stale mutator orders",
 			afterAdd: func(t *testing.T, pool *ConnectionPool, stale *ClientConn) {
-				if pool.MarkHealthy(stale) || pool.UpdateLastSeen(stale) || pool.Remove(stale) || pool.MarkUnhealthy(stale) {
+				if pool.MarkHealthy(stale) || pool.Remove(stale) || pool.MarkUnhealthy(stale) {
 					t.Fatal("stale mutator succeeded")
 				}
 			},
@@ -338,7 +312,7 @@ func TestGenerationInterleavingsAcrossBalancers(t *testing.T) {
 				pool := New("test", balancer.new(), newTestLogger())
 				defer pool.Stop()
 
-				stale := &ClientConn{ID: "client", LastSeen: time.Unix(1, 0)}
+				stale := &ClientConn{ID: "client"}
 				if err := pool.Add(stale); err != nil {
 					t.Fatalf("Add(stale) error = %v", err)
 				}
@@ -349,7 +323,7 @@ func TestGenerationInterleavingsAcrossBalancers(t *testing.T) {
 					t.Fatal("Remove(stale) = false while current")
 				}
 
-				current := &ClientConn{ID: stale.ID, LastSeen: time.Unix(2, 0)}
+				current := &ClientConn{ID: stale.ID}
 				if err := pool.Add(current); err != nil {
 					t.Fatalf("Add(current) error = %v", err)
 				}
@@ -386,14 +360,14 @@ func TestGenerationConcurrentStaleCompletionsAreBounded(t *testing.T) {
 			pool := New("test", balancer.new(), newTestLogger())
 			defer pool.Stop()
 
-			stale := &ClientConn{ID: "client", LastSeen: time.Unix(1, 0)}
+			stale := &ClientConn{ID: "client"}
 			if err := pool.Add(stale); err != nil {
 				t.Fatalf("Add(stale) error = %v", err)
 			}
 			if !pool.Remove(stale) {
 				t.Fatal("Remove(stale) = false while current")
 			}
-			current := &ClientConn{ID: stale.ID, LastSeen: time.Unix(2, 0)}
+			current := &ClientConn{ID: stale.ID}
 			if err := pool.Add(current); err != nil {
 				t.Fatalf("Add(current) error = %v", err)
 			}
@@ -407,15 +381,13 @@ func TestGenerationConcurrentStaleCompletionsAreBounded(t *testing.T) {
 				wg.Go(func() {
 					<-start
 					var succeeded bool
-					switch i % 4 {
+					switch i % 3 {
 					case 0:
 						succeeded = pool.Remove(stale)
 					case 1:
 						succeeded = pool.MarkUnhealthy(stale)
 					case 2:
 						succeeded = pool.MarkHealthy(stale)
-					case 3:
-						succeeded = pool.UpdateLastSeen(stale)
 					}
 					if succeeded {
 						unexpectedSuccesses.Add(1)
@@ -472,11 +444,4 @@ func assertGenerationCacheUnchanged(t *testing.T, pool *ConnectionPool, expected
 	if got := pool.cachedClients.Load(); got != expected {
 		t.Fatalf("cachedClients pointer changed from %p to %p", expected, got)
 	}
-}
-
-func candidateLastSeen(candidate *ClientConn) time.Time {
-	if candidate == nil {
-		return time.Time{}
-	}
-	return candidate.LastSeen
 }

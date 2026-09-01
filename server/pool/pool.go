@@ -47,7 +47,6 @@ type ClientConn struct {
 	Conn          *quic.Conn
 	ControlStream *quic.Stream
 	RegisteredAt  time.Time
-	LastSeen      time.Time
 	Metadata      ClientMetadata
 
 	// Connection tracking
@@ -858,19 +857,6 @@ func isEligible(conn *ClientConn, protocol string) bool {
 		return false
 	}
 	return slices.Contains(conn.Metadata.Capabilities, protocol)
-}
-
-// UpdateLastSeen updates the last seen timestamp for the expected client generation.
-// It reports whether expected was still current and the update was applied.
-func (p *ConnectionPool) UpdateLastSeen(expected *ClientConn) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if !p.isCurrentLocked(expected) {
-		return false
-	}
-	expected.LastSeen = time.Now()
-	return true
 }
 
 // MarkUnhealthy marks the expected client generation as unhealthy.

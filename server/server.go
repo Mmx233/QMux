@@ -709,7 +709,6 @@ func (s *Server) handleConnectionPending(
 		Conn:          conn,
 		ControlStream: controlStream,
 		RegisteredAt:  time.Now(),
-		LastSeen:      time.Now(),
 		Metadata: pool.ClientMetadata{
 			Version:      regMsg.Version,
 			Capabilities: slices.Clone(selectedCapabilities),
@@ -769,7 +768,7 @@ func (s *Server) writeRegisterAck(
 
 // handleControlStream handles bidirectional heartbeat messages on the control stream.
 // It sends heartbeats to the client at the configured interval,
-// receives heartbeats from the client updating LastSeen timestamp,
+// receives heartbeats from the client to refresh the loop-local health expiry,
 // and checks for heartbeat timeout to detect unhealthy clients.
 func (s *Server) handleControlStream(
 	ctx context.Context,
@@ -864,7 +863,8 @@ func (s *Server) handleControlStream(
 			}
 
 			if result.msgType == protocol.MsgTypeHeartbeat {
-				if !poolInst.UpdateLastSeen(clientConn) {
+				current, ok := poolInst.Get(clientConn.ID)
+				if !ok || current != clientConn {
 					logger.Debug().Msg("ignored heartbeat from stale client generation")
 					return
 				}
@@ -874,7 +874,7 @@ func (s *Server) handleControlStream(
 			}
 
 		case <-heartbeatDeadline:
-			timeSinceLastSeen := time.Since(clientConn.LastSeen)
+			timeSinceLastSeen := time.Since(healthExpiry.Add(-s.config.HealthTimeout))
 			logger.Warn().
 				Dur("time_since_last_seen", timeSinceLastSeen).
 				Dur("timeout", s.config.HealthTimeout).

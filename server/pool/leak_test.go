@@ -70,7 +70,6 @@ func TestConnectionPool_AddRemove_NoLeak(t *testing.T) {
 		conn := &ClientConn{
 			ID:           clientID,
 			RegisteredAt: time.Now(),
-			LastSeen:     time.Now(),
 		}
 
 		// Remove first if exists (to allow re-add)
@@ -114,7 +113,6 @@ func TestConnectionPool_ConcurrentOperations_NoLeak(t *testing.T) {
 				conn := &ClientConn{
 					ID:           clientID,
 					RegisteredAt: time.Now(),
-					LastSeen:     time.Now(),
 				}
 				pool.Remove(clients[id].Load())
 				if pool.Add(conn) == nil {
@@ -141,7 +139,6 @@ func TestConnectionPool_ConcurrentOperations_NoLeak(t *testing.T) {
 				conn := clients[id].Load()
 				pool.MarkHealthy(conn)
 				pool.MarkUnhealthy(conn)
-				pool.UpdateLastSeen(conn)
 			}
 		})
 	}
@@ -163,7 +160,6 @@ func TestConnectionPool_ClientHealthTransitions_NoLeak(t *testing.T) {
 	conn := &ClientConn{
 		ID:           "test-client",
 		RegisteredAt: time.Now(),
-		LastSeen:     time.Now(),
 	}
 	_ = pool.Add(conn)
 

@@ -121,7 +121,7 @@ func TestHeartbeatWriteStallRetiresExactServerGeneration(t *testing.T) {
 	if err := <-serverHeartbeats; err != nil {
 		t.Fatalf("read fresh server heartbeats: %v", err)
 	}
-	if harness.pool.UpdateLastSeen(stale) || harness.pool.MarkUnhealthy(stale) || harness.pool.Remove(stale) {
+	if harness.pool.MarkUnhealthy(stale) || harness.pool.Remove(stale) {
 		t.Fatal("stale heartbeat generation mutated its replacement")
 	}
 	current, ok := harness.pool.Get(clientID)
