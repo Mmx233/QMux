@@ -1,7 +1,6 @@
 package e2e
 
 import (
-	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -243,47 +242,4 @@ func TestIperf3ComprehensiveBenchmark(t *testing.T) {
 	}
 
 	runPERF003Matrix(t)
-}
-
-// ============================================
-// Live iperf3 Output Test (for debugging)
-// ============================================
-
-func TestIperf3LiveOutput(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping live output test in short mode")
-	}
-
-	if !iperf3Available() {
-		t.Skip("iperf3 not available")
-	}
-
-	certDir := generateTestCertificates(t)
-
-	localPort := getFreePort(t)
-	startIperf3Server(t, localPort)
-	time.Sleep(300 * time.Millisecond)
-
-	trafficPort := setupQMuxEndpoint(t, certDir, "tcp", "iperf3-live-client", localPort,
-		2*time.Minute, 300*time.Millisecond, 500*time.Millisecond, true)
-
-	clientCmd := exec.Command("iperf3", iperf3ClientArgs(trafficPort, 10, 2, "tcp", false)...)
-
-	stdout, err := clientCmd.StdoutPipe()
-	if err != nil {
-		t.Fatalf("failed to get stdout pipe: %v", err)
-	}
-
-	if err := clientCmd.Start(); err != nil {
-		t.Fatalf("failed to start iperf3: %v", err)
-	}
-
-	scanner := bufio.NewScanner(stdout)
-	for scanner.Scan() {
-		t.Log(scanner.Text())
-	}
-
-	if err := clientCmd.Wait(); err != nil {
-		t.Logf("iperf3 finished with: %v", err)
-	}
 }

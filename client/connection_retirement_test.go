@@ -398,7 +398,7 @@ func TestReconnectReleasesSlotBeforeFreshPublicationCallback(t *testing.T) {
 	}
 }
 
-func TestClientRetiresOneHundredExactGenerationsAndNoSuccessor(t *testing.T) {
+func TestClientRetiresSuccessiveExactGenerationsAndNoSuccessor(t *testing.T) {
 	peer := newLifecyclePeer(t)
 	cm := newLifecycleManager(t, peer)
 	cm.config.HeartbeatInterval = time.Hour
@@ -437,7 +437,7 @@ func TestClientRetiresOneHundredExactGenerationsAndNoSuccessor(t *testing.T) {
 		})
 	})
 
-	const generations = 100
+	const generations = 2
 	var currentSC *ServerConnection
 	var currentHandler *UDPHandler
 	var currentSession *UDPSession

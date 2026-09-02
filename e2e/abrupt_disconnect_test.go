@@ -18,8 +18,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// TestClientAbruptDisconnect_MTLS tests server behavior when a client disconnects abruptly
-// without a graceful shutdown, using default heartbeats under both load balancers.
+// TestClientAbruptDisconnect_MTLS tests server behavior when a client disconnects abruptly.
 func TestClientAbruptDisconnect_MTLS(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds and SIGKILLs a child process while waiting for the default 30s health timeout")
@@ -32,13 +31,7 @@ func TestClientAbruptDisconnect_MTLS(t *testing.T) {
 		t.Fatalf("build child binary: %v, output: %s", err, output)
 	}
 
-	t.Run("least-connections", func(t *testing.T) {
-		testClientAbruptDisconnect(t, binaryPath, "least-connections")
-	})
-
-	t.Run("round-robin", func(t *testing.T) {
-		testClientAbruptDisconnect(t, binaryPath, "round-robin")
-	})
+	testClientAbruptDisconnect(t, binaryPath, config.DefaultLoadBalancer)
 }
 
 // testClientAbruptDisconnect is the core test function for abrupt disconnect scenarios

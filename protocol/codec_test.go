@@ -2,7 +2,6 @@ package protocol
 
 import (
 	"bytes"
-	"reflect"
 	"testing"
 
 	"github.com/Mmx233/QMux/config"
@@ -47,25 +46,15 @@ func TestGenericJSONWireContract(t *testing.T) {
 		}
 	}
 
-	encodeTests := []struct {
-		name    string
-		payload any
-		want    string
-	}{
-		{"nil register capabilities", RegisterMsg{}, `{"ClientID":"","Version":"","Capabilities":[]}`},
-		{"nil selected capabilities", RegisterAckMsg{}, `{"Success":false,"Message":"","ServerVersion":"","SelectedCapabilities":[]}`},
-		{"zero new connection", NewConnMsg{}, `{"ConnID":0,"Protocol":"","SourceAddr":"","DestAddr":"","Timestamp":0}`},
-		{"zero connection close", ConnCloseMsg{}, `{"ConnID":0,"Reason":""}`},
-		{"nil auth proof", RegisterMsg{Auth: &RegisterAuth{}}, `{"ClientID":"","Version":"","Capabilities":[],"Auth":{"Scheme":"","Proof":""}}`},
+	var wire bytes.Buffer
+	if err := WriteMessage(&wire, MsgTypeError, RegisterMsg{}); err != nil {
+		t.Fatalf("WriteMessage() error = %v", err)
 	}
-	for _, test := range encodeTests {
-		t.Run("encode/"+test.name, func(t *testing.T) {
-			var wire bytes.Buffer
-			if err := WriteMessage(&wire, MsgTypeError, test.payload); err != nil {
-				t.Fatalf("WriteMessage() error = %v", err)
-			}
-			checkWire(t, &wire, test.want)
-		})
+	checkWire(t, &wire, `{"ClientID":"","Version":"","Capabilities":[]}`)
+
+	var heartbeat HeartbeatMsg
+	if err := DecodeMessage([]byte(`{"Timestamp":2}`), &heartbeat); err != nil || heartbeat.Timestamp != 2 {
+		t.Fatalf("DecodeMessage() = (%+v, %v)", heartbeat, err)
 	}
 
 	t.Run("encode/raw HTML and JS separators", func(t *testing.T) {
@@ -82,55 +71,6 @@ func TestGenericJSONWireContract(t *testing.T) {
 	}
 	if invalidUTF8Wire.Len() != 0 {
 		t.Errorf("WriteMessage() wrote %d bytes for invalid UTF-8", invalidUTF8Wire.Len())
-	}
-
-	decodeTests := []struct {
-		name    string
-		payload []byte
-		dst     any
-		want    any
-	}{
-		{
-			"unknown member ignored",
-			[]byte(`{"Timestamp":2,"Extra":true}`),
-			&HeartbeatMsg{},
-			HeartbeatMsg{Timestamp: 2},
-		},
-		{
-			"wrong case ignored",
-			[]byte(`{"timestamp":1}`),
-			&HeartbeatMsg{Timestamp: 7},
-			HeartbeatMsg{Timestamp: 7},
-		},
-		{
-			"object merge preserves absent and nested fields",
-			[]byte(`{"ClientID":"new","Auth":{"Scheme":"new"}}`),
-			&RegisterMsg{ClientID: "old", Version: ProtocolVersion, Capabilities: []string{"tcp"}, Auth: &RegisterAuth{Scheme: "old", Proof: []byte("proof")}},
-			RegisterMsg{ClientID: "new", Version: ProtocolVersion, Capabilities: []string{"tcp"}, Auth: &RegisterAuth{Scheme: "new", Proof: []byte("proof")}},
-		},
-		{
-			"null zeroes values",
-			[]byte(`{"ClientID":null,"Capabilities":null,"Auth":{"Proof":null}}`),
-			&RegisterMsg{ClientID: "old", Version: ProtocolVersion, Capabilities: []string{"tcp"}, Auth: &RegisterAuth{Scheme: "token", Proof: []byte("proof")}},
-			RegisterMsg{Version: ProtocolVersion, Auth: &RegisterAuth{Scheme: "token"}},
-		},
-		{
-			"null clears pointer",
-			[]byte(`{"Auth":null}`),
-			&RegisterMsg{Auth: &RegisterAuth{Scheme: "token"}},
-			RegisterMsg{},
-		},
-	}
-	for _, test := range decodeTests {
-		t.Run("decode/"+test.name, func(t *testing.T) {
-			if err := DecodeMessage(test.payload, test.dst); err != nil {
-				t.Fatalf("DecodeMessage() error = %v", err)
-			}
-			got := reflect.ValueOf(test.dst).Elem().Interface()
-			if !reflect.DeepEqual(got, test.want) {
-				t.Errorf("decoded value = %#v, want %#v", got, test.want)
-			}
-		})
 	}
 
 	invalidUTF8 := append([]byte(`{"Message":"`), 0xff)

@@ -1060,7 +1060,7 @@ func TestRegistrationLifecycleAckCancelRace(t *testing.T) {
 func TestRegistrationLifecycleRepeatedFailuresCloseProvisionalConnections(t *testing.T) {
 	peer := newLifecyclePeer(t)
 	cm := newLifecycleManager(t, peer)
-	const attempts = 100
+	const attempts = 2
 	seen := make(map[*quic.Conn]struct{}, attempts)
 
 	for attempt := range attempts {

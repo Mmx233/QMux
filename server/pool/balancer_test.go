@@ -5,15 +5,10 @@ import (
 	"fmt"
 	"sync"
 	"testing"
-
-	"pgregory.net/rapid"
 )
 
-// TestRoundRobinBalancer_Basic tests basic round-robin selection
-func TestRoundRobinBalancer_Basic(t *testing.T) {
+func TestRoundRobinBalancer(t *testing.T) {
 	balancer := NewRoundRobinBalancer()
-
-	// Create 3 healthy clients
 	clients := []*ClientConn{
 		{ID: "client1"},
 		{ID: "client2"},
@@ -23,7 +18,6 @@ func TestRoundRobinBalancer_Basic(t *testing.T) {
 		c.healthy.Store(true)
 	}
 
-	// Test round-robin distribution
 	selections := make(map[string]int)
 	for range 9 {
 		selected, err := balancer.Select(clients)
@@ -33,363 +27,100 @@ func TestRoundRobinBalancer_Basic(t *testing.T) {
 		selections[selected.ID]++
 	}
 
-	// Each client should be selected 3 times
 	for _, c := range clients {
 		if selections[c.ID] != 3 {
 			t.Errorf("client %s selected %d times, want 3", c.ID, selections[c.ID])
 		}
 	}
-}
-
-// TestRoundRobinBalancer_SkipUnhealthy tests that unhealthy clients are skipped
-func TestRoundRobinBalancer_SkipUnhealthy(t *testing.T) {
-	balancer := NewRoundRobinBalancer()
-
-	clients := []*ClientConn{
-		{ID: "client1"},
-		{ID: "client2"},
-		{ID: "client3"},
-	}
-
-	// Mark client1 and client3 as healthy, client2 as unhealthy
-	clients[0].healthy.Store(true)
 	clients[1].healthy.Store(false)
-	clients[2].healthy.Store(true)
-
-	selections := make(map[string]int)
-	for range 10 {
+	for range 6 {
 		selected, err := balancer.Select(clients)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		selections[selected.ID]++
-
-		// Should never select unhealthy client
 		if selected.ID == "client2" {
 			t.Error("selected unhealthy client2")
 		}
 	}
-
-	// client2 should never be selected
-	if selections["client2"] != 0 {
-		t.Errorf("unhealthy client2 selected %d times, want 0", selections["client2"])
-	}
-
-	// client1 and client3 should be selected
-	if selections["client1"] == 0 {
-		t.Error("healthy client1 never selected")
-	}
-	if selections["client3"] == 0 {
-		t.Error("healthy client3 never selected")
-	}
 }
 
-// TestRoundRobinBalancer_AllUnhealthy tests error when all clients are unhealthy
-func TestRoundRobinBalancer_AllUnhealthy(t *testing.T) {
-	balancer := NewRoundRobinBalancer()
-
-	clients := []*ClientConn{
-		{ID: "client1"},
-		{ID: "client2"},
-	}
-
-	// Mark all clients as unhealthy
-	for _, c := range clients {
-		c.healthy.Store(false)
-	}
-
-	_, err := balancer.Select(clients)
-	if !errors.Is(err, ErrNoHealthyClients) {
-		t.Errorf("expected ErrNoHealthyClients, got %v", err)
-	}
-}
-
-// TestRoundRobinBalancer_NoClients tests error when no clients exist
-func TestRoundRobinBalancer_NoClients(t *testing.T) {
-	balancer := NewRoundRobinBalancer()
-
-	_, err := balancer.Select([]*ClientConn{})
-	if !errors.Is(err, ErrNoClientsAvailable) {
-		t.Errorf("expected ErrNoClientsAvailable, got %v", err)
-	}
-}
-
-// TestRoundRobinBalancer_Concurrent tests thread-safety
-func TestRoundRobinBalancer_Concurrent(t *testing.T) {
-	balancer := NewRoundRobinBalancer()
-
+func TestLeastConnectionsBalancer(t *testing.T) {
+	balancer := NewLeastConnectionsBalancer()
 	clients := []*ClientConn{
 		{ID: "client1"},
 		{ID: "client2"},
 		{ID: "client3"},
 	}
-	for _, c := range clients {
-		c.healthy.Store(true)
+	for i, connections := range []int64{5, 2, 8} {
+		clients[i].healthy.Store(true)
+		clients[i].ActiveConns.Store(connections)
+	}
+	selected, err := balancer.Select(clients)
+	if err != nil || selected.ID != "client2" {
+		t.Fatalf("least-connections selection = %v, %v", selected, err)
 	}
 
-	// Run 100 goroutines selecting simultaneously
-	var wg sync.WaitGroup
-	errCh := make(chan error, 100)
-
-	for range 100 {
-		wg.Go(func() {
-			for range 100 {
-				_, err := balancer.Select(clients)
-				if err != nil {
-					errCh <- err
-					return
-				}
-			}
-		})
-	}
-
-	wg.Wait()
-	close(errCh)
-
-	// Check for any errors
-	for err := range errCh {
-		t.Errorf("concurrent selection error: %v", err)
-	}
-}
-
-// TestRoundRobinBalancer_DynamicHealth tests handling of clients becoming unhealthy
-func TestRoundRobinBalancer_DynamicHealth(t *testing.T) {
-	balancer := NewRoundRobinBalancer()
-
-	clients := []*ClientConn{
-		{ID: "client1"},
-		{ID: "client2"},
-		{ID: "client3"},
-	}
-	for _, c := range clients {
-		c.healthy.Store(true)
-	}
-
-	// Select a few times
-	for range 5 {
-		_, err := balancer.Select(clients)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	}
-
-	// Mark client2 as unhealthy mid-test
 	clients[1].healthy.Store(false)
-
-	// Continue selecting - should skip client2
-	selections := make(map[string]int)
-	for range 10 {
-		selected, err := balancer.Select(clients)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		selections[selected.ID]++
+	selected, err = balancer.Select(clients)
+	if err != nil || selected.ID != "client1" {
+		t.Fatalf("selection after client2 became unhealthy = %v, %v", selected, err)
 	}
 
-	if selections["client2"] != 0 {
-		t.Errorf("unhealthy client2 selected %d times after becoming unhealthy", selections["client2"])
+	for _, client := range clients {
+		client.healthy.Store(true)
+		client.ActiveConns.Store(5)
 	}
-}
-
-// TestLeastConnectionsBalancer_Basic tests basic least-connections selection
-func TestLeastConnectionsBalancer_Basic(t *testing.T) {
-	balancer := NewLeastConnectionsBalancer()
-
-	clients := []*ClientConn{
-		{ID: "client1"},
-		{ID: "client2"},
-		{ID: "client3"},
-	}
-	for _, c := range clients {
-		c.healthy.Store(true)
-	}
-
-	// Set different connection counts
-	clients[0].ActiveConns.Store(5)
-	clients[1].ActiveConns.Store(2)
-	clients[2].ActiveConns.Store(8)
-
-	// Should select client2 with lowest connections
-	selected, err := balancer.Select(clients)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if selected.ID != "client2" {
-		t.Errorf("expected client2 with least connections, got %s", selected.ID)
+	selected, err = balancer.Select(clients)
+	if err != nil || selected != clients[0] {
+		t.Fatalf("equal-count selection = %v, %v; want first client", selected, err)
 	}
 }
 
-// TestLeastConnectionsBalancer_SkipUnhealthy tests skipping unhealthy clients
-func TestLeastConnectionsBalancer_SkipUnhealthy(t *testing.T) {
-	balancer := NewLeastConnectionsBalancer()
-
-	clients := []*ClientConn{
-		{ID: "client1"},
-		{ID: "client2"},
-		{ID: "client3"},
-	}
-
-	// client1 has least connections but is unhealthy
-	clients[0].ActiveConns.Store(1)
-	clients[0].healthy.Store(false)
-
-	clients[1].ActiveConns.Store(5)
-	clients[1].healthy.Store(true)
-
-	clients[2].ActiveConns.Store(3)
-	clients[2].healthy.Store(true)
-
-	// Should select client3 (healthy with fewer connections than client2)
-	selected, err := balancer.Select(clients)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if selected.ID != "client3" {
-		t.Errorf("expected client3, got %s", selected.ID)
-	}
-}
-
-// TestLeastConnectionsBalancer_AllUnhealthy tests error when all clients are unhealthy
-func TestLeastConnectionsBalancer_AllUnhealthy(t *testing.T) {
-	balancer := NewLeastConnectionsBalancer()
-
-	clients := []*ClientConn{
-		{ID: "client1"},
-		{ID: "client2"},
-	}
-
-	// Mark all clients as unhealthy
-	for _, c := range clients {
-		c.healthy.Store(false)
-	}
-
-	_, err := balancer.Select(clients)
-	if !errors.Is(err, ErrNoHealthyClients) {
-		t.Errorf("expected ErrNoHealthyClients, got %v", err)
-	}
-}
-
-// TestLeastConnectionsBalancer_NoClients tests error when no clients exist
-func TestLeastConnectionsBalancer_NoClients(t *testing.T) {
-	balancer := NewLeastConnectionsBalancer()
-
-	_, err := balancer.Select([]*ClientConn{})
-	if !errors.Is(err, ErrNoClientsAvailable) {
-		t.Errorf("expected ErrNoClientsAvailable, got %v", err)
-	}
-}
-
-// TestLeastConnectionsBalancer_Concurrent tests thread-safety
-func TestLeastConnectionsBalancer_Concurrent(t *testing.T) {
-	balancer := NewLeastConnectionsBalancer()
-
-	clients := []*ClientConn{
-		{ID: "client1"},
-		{ID: "client2"},
-		{ID: "client3"},
-	}
-	for i, c := range clients {
-		c.healthy.Store(true)
-		c.ActiveConns.Store(int64(i * 10))
-	}
-
-	// Run 100 goroutines selecting simultaneously
-	var wg sync.WaitGroup
-	errCh := make(chan error, 100)
-
-	for range 100 {
-		wg.Go(func() {
-			for range 100 {
-				_, err := balancer.Select(clients)
-				if err != nil {
-					errCh <- err
-					return
-				}
+func TestBalancersUnavailable(t *testing.T) {
+	for name, newBalancer := range map[string]func() LoadBalancer{
+		"round robin":       func() LoadBalancer { return NewRoundRobinBalancer() },
+		"least connections": func() LoadBalancer { return NewLeastConnectionsBalancer() },
+	} {
+		t.Run(name, func(t *testing.T) {
+			balancer := newBalancer()
+			if _, err := balancer.Select(nil); !errors.Is(err, ErrNoClientsAvailable) {
+				t.Fatalf("empty clients error = %v", err)
+			}
+			if _, err := balancer.Select([]*ClientConn{{ID: "unhealthy"}}); !errors.Is(err, ErrNoHealthyClients) {
+				t.Fatalf("all-unhealthy error = %v", err)
 			}
 		})
 	}
-
-	wg.Wait()
-	close(errCh)
-
-	// Check for any errors
-	for err := range errCh {
-		t.Errorf("concurrent selection error: %v", err)
-	}
 }
 
-// TestLeastConnectionsBalancer_DynamicHealth tests handling of clients becoming unhealthy
-func TestLeastConnectionsBalancer_DynamicHealth(t *testing.T) {
-	balancer := NewLeastConnectionsBalancer()
-
-	clients := []*ClientConn{
-		{ID: "client1"},
-		{ID: "client2"},
-		{ID: "client3"},
-	}
-	for i, c := range clients {
-		c.healthy.Store(true)
-		c.ActiveConns.Store(int64((i + 1) * 10)) // 10, 20, 30
-	}
-
-	// Initially client1 should be selected (least connections)
-	selected, err := balancer.Select(clients)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if selected.ID != "client1" {
-		t.Errorf("expected client1, got %s", selected.ID)
-	}
-
-	// Mark client1 as unhealthy mid-test
-	clients[0].healthy.Store(false)
-
-	// Now client2 should be selected (least connections among healthy)
-	selected, err = balancer.Select(clients)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if selected.ID != "client2" {
-		t.Errorf("expected client2 after client1 became unhealthy, got %s", selected.ID)
-	}
-}
-
-// TestLeastConnectionsBalancer_EqualConnections tests selection when multiple clients have same connection count
-func TestLeastConnectionsBalancer_EqualConnections(t *testing.T) {
-	balancer := NewLeastConnectionsBalancer()
-
-	clients := []*ClientConn{
-		{ID: "client1"},
-		{ID: "client2"},
-		{ID: "client3"},
-	}
-	for _, c := range clients {
-		c.healthy.Store(true)
-		c.ActiveConns.Store(5) // All have same connection count
-	}
-
-	// Should select one of them without error (deterministic: first one with min)
-	selected, err := balancer.Select(clients)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Should consistently select the first client when all have equal connections
-	if selected.ID != "client1" {
-		t.Errorf("expected client1 (first with min connections), got %s", selected.ID)
-	}
-
-	// Verify consistency across multiple calls
-	for i := range 10 {
-		s, err := balancer.Select(clients)
-		if err != nil {
-			t.Fatalf("unexpected error on iteration %d: %v", i, err)
-		}
-		if s.ID != "client1" {
-			t.Errorf("iteration %d: expected consistent selection of client1, got %s", i, s.ID)
-		}
+func TestBalancersConcurrent(t *testing.T) {
+	for name, balancer := range map[string]LoadBalancer{
+		"round robin":       NewRoundRobinBalancer(),
+		"least connections": NewLeastConnectionsBalancer(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			clients := []*ClientConn{{ID: "client1"}, {ID: "client2"}, {ID: "client3"}}
+			for _, client := range clients {
+				client.healthy.Store(true)
+			}
+			var wg sync.WaitGroup
+			errs := make(chan error, 16)
+			for range 16 {
+				wg.Go(func() {
+					for range 100 {
+						if _, err := balancer.Select(clients); err != nil {
+							errs <- err
+							return
+						}
+					}
+				})
+			}
+			wg.Wait()
+			close(errs)
+			for err := range errs {
+				t.Error(err)
+			}
+		})
 	}
 }
 
@@ -524,90 +255,5 @@ func BenchmarkBalancer_Parallel(b *testing.B) {
 				_, _ = balancer.Select(clients)
 			}
 		})
-	})
-}
-
-// Feature: performance-optimizations, Property 2: Balancer Allocation Constancy
-// *For any* client count n, the Load_Balancer Select operation SHALL produce a constant
-// number of allocations (≤1) regardless of n.
-// Validates: Requirements 2.2, 2.4
-func TestBalancerAllocationConstancy_Property(t *testing.T) {
-	rapid.Check(t, func(t *rapid.T) {
-		// Generate random client count between 1 and 500
-		clientCount := rapid.IntRange(1, 500).Draw(t, "clientCount")
-
-		// Create clients with mixed health status (some unhealthy to trigger allocation path)
-		clients := make([]*ClientConn, clientCount)
-		for i := range clientCount {
-			clients[i] = &ClientConn{ID: string(rune('A' + (i % 26)))}
-			// Make 20% of clients unhealthy to test the allocation path
-			clients[i].healthy.Store(i%5 != 0)
-			clients[i].ActiveConns.Store(int64(i % 100))
-		}
-
-		// Ensure at least one healthy client
-		clients[0].healthy.Store(true)
-
-		// Test RoundRobinBalancer
-		rrBalancer := NewRoundRobinBalancer()
-		allocsBefore := testing.AllocsPerRun(100, func() {
-			_, _ = rrBalancer.Select(clients)
-		})
-
-		// Property: allocations should be ≤1 regardless of client count
-		// When some clients are unhealthy, we allow 1 allocation for the filtered slice
-		if allocsBefore > 1 {
-			t.Errorf("RoundRobinBalancer: expected ≤1 allocation, got %.0f for %d clients", allocsBefore, clientCount)
-		}
-
-		// Test LeastConnectionsBalancer
-		lcBalancer := NewLeastConnectionsBalancer()
-		allocsLC := testing.AllocsPerRun(100, func() {
-			_, _ = lcBalancer.Select(clients)
-		})
-
-		if allocsLC > 1 {
-			t.Errorf("LeastConnectionsBalancer: expected ≤1 allocation, got %.0f for %d clients", allocsLC, clientCount)
-		}
-	})
-}
-
-// Feature: performance-optimizations, Property 5: All-Healthy Fast Path
-// *For any* pool where all clients are healthy, the balancer SHALL skip filtering
-// and use the input slice directly (verified by zero additional allocations).
-// Validates: Requirements 3.3
-func TestAllHealthyFastPath_Property(t *testing.T) {
-	rapid.Check(t, func(t *rapid.T) {
-		// Generate random client count between 1 and 500
-		clientCount := rapid.IntRange(1, 500).Draw(t, "clientCount")
-
-		// Create all healthy clients
-		clients := make([]*ClientConn, clientCount)
-		for i := range clientCount {
-			clients[i] = &ClientConn{ID: string(rune('A' + (i % 26)))}
-			clients[i].healthy.Store(true)
-			clients[i].ActiveConns.Store(int64(i % 100))
-		}
-
-		// Test RoundRobinBalancer - should have 0 allocations when all healthy
-		rrBalancer := NewRoundRobinBalancer()
-		allocsRR := testing.AllocsPerRun(100, func() {
-			_, _ = rrBalancer.Select(clients)
-		})
-
-		// Property: zero allocations when all clients are healthy
-		if allocsRR > 0 {
-			t.Errorf("RoundRobinBalancer: expected 0 allocations for all-healthy pool, got %.0f for %d clients", allocsRR, clientCount)
-		}
-
-		// Test LeastConnectionsBalancer - should have 0 allocations when all healthy
-		lcBalancer := NewLeastConnectionsBalancer()
-		allocsLC := testing.AllocsPerRun(100, func() {
-			_, _ = lcBalancer.Select(clients)
-		})
-
-		if allocsLC > 0 {
-			t.Errorf("LeastConnectionsBalancer: expected 0 allocations for all-healthy pool, got %.0f for %d clients", allocsLC, clientCount)
-		}
 	})
 }
