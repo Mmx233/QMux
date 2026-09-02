@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -241,6 +242,95 @@ func newTestClient(t testing.TB, cfg *config.Client) *client.Client {
 		t.Fatalf("create test client %q: %v", cfg.ClientID, err)
 	}
 	return c
+}
+
+func TestTCPBackendDialFailureReturnsNoTunnelBytes(t *testing.T) {
+	certDir := generateTestCertificates(t)
+	backend, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatalf("reserve unavailable backend port: %v", err)
+	}
+	t.Cleanup(func() { _ = backend.Close() })
+	backendPort := backend.Addr().(*net.TCPAddr).Port
+	quicPort, trafficPort := getFreePort(t), getFreePort(t)
+	trafficAddr := fmt.Sprintf("127.0.0.1:%d", trafficPort)
+	testCtx, cancelTest := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelTest()
+	timeline := newFaultTimeline(t, "TCP backend dial failure")
+
+	serverRun := startFaultServer(t, testCtx, "dial-failure server",
+		newMTLSServerConfig(certDir, "tcp", quicPort, trafficPort, time.Second, 10*time.Second), timeline)
+	clientRun := startFaultClient(testCtx, "dial-failure client", newTestClient(t,
+		newMTLSClientConfig(certDir, "dial-failure-client", backendPort, time.Second, 0, quicPort)), timeline)
+	t.Cleanup(func() {
+		if err := clientRun.stopAndJoin(5 * time.Second); err != nil {
+			t.Errorf("stop dial-failure client: %v", err)
+		}
+		if err := serverRun.run.stopAndJoin(5 * time.Second); err != nil {
+			t.Errorf("stop dial-failure server: %v", err)
+		}
+	})
+
+	if err := waitForFault(testCtx, 15*time.Second, func() string {
+		return fmt.Sprintf("one ready TCP route; snapshot=%+v", serverRun.Snapshot())
+	}, func(time.Duration) bool {
+		snapshot := serverRun.Snapshot()
+		return len(snapshot.Routes) == 1 && snapshot.Routes[0].TrafficAddr == trafficAddr &&
+			snapshot.Routes[0].Ready && snapshot.Routes[0].TCPEligibleClients == 1
+	}, serverRun.run, clientRun); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := backend.Close(); err != nil {
+		t.Fatalf("release unavailable backend port: %v", err)
+	}
+	before := serverRun.Snapshot()
+	if len(before.Routes) != 1 || before.Routes[0].TrafficAddr != trafficAddr {
+		t.Fatalf("target TCP route before dial = %+v, want %s", before.Routes, trafficAddr)
+	}
+	targetQuicAddr := before.Routes[0].QuicAddr
+	committedBefore := before.Routes[0].TCPAdmission.Committed
+
+	publicConn, err := net.DialTimeout("tcp", trafficAddr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial public TCP route: %v", err)
+	}
+	defer func() { _ = publicConn.Close() }()
+	if err := publicConn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set public TCP read deadline: %v", err)
+	}
+	var response [1]byte
+	n, readErr := publicConn.Read(response[:])
+	if n != 0 {
+		t.Fatalf("backend dial failure returned %d tunnel bytes, first byte %#x", n, response[0])
+	}
+	if readErr == nil {
+		t.Fatal("backend dial failure returned no bytes without terminating the public read")
+	}
+	var netErr net.Error
+	if errors.As(readErr, &netErr) && netErr.Timeout() {
+		t.Fatalf("public read timed out after backend dial failure: %v", readErr)
+	}
+	if !errors.Is(readErr, io.EOF) && !errors.Is(readErr, syscall.ECONNRESET) {
+		t.Fatalf("public read error = %T %v, want EOF or ECONNRESET", readErr, readErr)
+	}
+
+	if err := waitForFault(testCtx, 5*time.Second, func() string {
+		return fmt.Sprintf("dial-failure TCP ownership release; snapshot=%+v", serverRun.Snapshot())
+	}, func(time.Duration) bool {
+		snapshot := serverRun.Snapshot()
+		if len(snapshot.Routes) != 1 {
+			return false
+		}
+		route := snapshot.Routes[0]
+		return route.QuicAddr == targetQuicAddr && route.TrafficAddr == trafficAddr &&
+			route.TCPAdmission.Committed >= committedBefore+1 &&
+			route.TCPAdmission.FlowCurrent == 0 && route.TCPAdmission.SetupCurrent == 0 &&
+			route.TCPAdmission.ActiveCurrent == 0 && route.PoolCapacity.TCPPending == 0 &&
+			route.PoolCapacity.TCPActive == 0 && route.TCPEligibleClients == 1
+	}, serverRun.run, clientRun); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestTCPReverseProxy_MTLS tests TCP reverse proxy functionality with mTLS authentication

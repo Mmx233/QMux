@@ -132,6 +132,97 @@ func TestClientTCPRelayDeliversResponseAfterRequestFIN(t *testing.T) {
 	}
 }
 
+func TestClientTCPSetupFailureResetsBothStreamDirections(t *testing.T) {
+	testCtx, cancelTest := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelTest()
+
+	backend, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatalf("reserve unavailable backend port: %v", err)
+	}
+	t.Cleanup(func() { _ = backend.Close() })
+	backendPort := backend.Addr().(*net.TCPAddr).Port
+
+	clientQUIC, peerQUIC := newClientRelayQUICPair(t, testCtx)
+	peerStream, err := peerQUIC.OpenStreamSync(testCtx)
+	if err != nil {
+		t.Fatalf("open setup-failure peer stream: %v", err)
+	}
+	if err := protocol.WriteNewConn(peerStream, 1, "tcp", "peer", "local", time.Now().Unix()); err != nil {
+		t.Fatalf("write setup-failure NewConn: %v", err)
+	}
+	clientStream, err := clientQUIC.AcceptStream(testCtx)
+	if err != nil {
+		t.Fatalf("accept setup-failure client stream: %v", err)
+	}
+
+	c := &Client{
+		config: &config.Client{Local: config.LocalService{Host: "127.0.0.1", Port: backendPort}},
+		logger: zerolog.Nop(),
+	}
+	handlerDone := make(chan struct{})
+	if err := backend.Close(); err != nil {
+		t.Fatalf("release unavailable backend port: %v", err)
+	}
+	go func() {
+		c.handleStream(testCtx, clientStream, &ServerConnection{serverAddr: "relay-test"})
+		close(handlerDone)
+	}()
+
+	if err := peerStream.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("set setup-failure read deadline: %v", err)
+	}
+	var response [1]byte
+	n, readErr := peerStream.Read(response[:])
+	var streamErr *quic.StreamError
+	if n != 0 || !errors.As(readErr, &streamErr) || !streamErr.Remote || streamErr.ErrorCode != 0 || streamErr.StreamID != peerStream.StreamID() {
+		t.Fatalf("setup-failure read = (%d, %T %v), want no bytes and remote reset for stream %d code 0", n, readErr, readErr, peerStream.StreamID())
+	}
+
+	select {
+	case <-peerStream.Context().Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("setup-failure peer did not receive STOP_SENDING")
+	}
+	streamErr = nil
+	if cause := context.Cause(peerStream.Context()); !errors.As(cause, &streamErr) || !streamErr.Remote || streamErr.ErrorCode != 0 || streamErr.StreamID != peerStream.StreamID() {
+		t.Fatalf("setup-failure send context cause = %T %v, want remote STOP_SENDING for stream %d code 0", cause, cause, peerStream.StreamID())
+	}
+	n, writeErr := peerStream.Write([]byte("must fail"))
+	streamErr = nil
+	if n != 0 || !errors.As(writeErr, &streamErr) || !streamErr.Remote || streamErr.ErrorCode != 0 || streamErr.StreamID != peerStream.StreamID() {
+		t.Fatalf("setup-failure future write = (%d, %T %v), want remote STOP_SENDING for stream %d code 0", n, writeErr, writeErr, peerStream.StreamID())
+	}
+
+	select {
+	case <-handlerDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("setup-failure handler did not join")
+	}
+	select {
+	case <-clientQUIC.Context().Done():
+		t.Fatalf("setup failure closed client QUIC connection: %v", context.Cause(clientQUIC.Context()))
+	case <-peerQUIC.Context().Done():
+		t.Fatalf("setup failure closed peer QUIC connection: %v", context.Cause(peerQUIC.Context()))
+	default:
+	}
+	probeStream, err := peerQUIC.OpenStreamSync(testCtx)
+	if err != nil {
+		t.Fatalf("open probe stream after setup failure: %v", err)
+	}
+	if _, err := probeStream.Write([]byte{1}); err != nil {
+		t.Fatalf("write probe stream after setup failure: %v", err)
+	}
+	clientProbe, err := clientQUIC.AcceptStream(testCtx)
+	if err != nil {
+		t.Fatalf("accept probe stream after setup failure: %v", err)
+	}
+	var probe [1]byte
+	if _, err := io.ReadFull(clientProbe, probe[:]); err != nil {
+		t.Fatalf("read probe stream after setup failure: %v", err)
+	}
+}
+
 type blockedClientRelay struct {
 	peerStream  *quic.Stream
 	handlerDone <-chan struct{}

@@ -372,7 +372,8 @@ func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *Serv
 	relayOwnsStream := false
 	defer func() {
 		if !relayOwnsStream {
-			_ = stream.Close()
+			stream.CancelRead(0)
+			stream.CancelWrite(0)
 		}
 	}()
 
@@ -400,7 +401,6 @@ func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *Serv
 	cancelDial()
 	if err != nil {
 		logger.Error().Err(err).Str("local_addr", localAddr).Msg("dial local service failed")
-		_ = protocol.WriteConnClose(stream, msg.ConnID, fmt.Sprintf("dial failed: %v", err))
 		return
 	}
 	defer func() {
@@ -482,9 +482,6 @@ func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *Serv
 	} else {
 		logger.Debug().Msg("connection closed")
 	}
-
-	// Send close message
-	_ = protocol.WriteConnClose(stream, msg.ConnID, "closed")
 }
 
 // Shutdown drains supported TCP generations and force-closes only failures.
