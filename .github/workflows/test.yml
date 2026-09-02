@@ -38,6 +38,13 @@ jobs:
           -run '^(TestServerRestartReconnect_MTLS|TestClientReconnection_MTLS|TestClientAbruptDisconnect_MTLS)$'
           -count=1 -timeout=300s
 
+      - name: QUIC path fault E2E
+        timeout-minutes: 2
+        run: >-
+          go test -race ./e2e
+          -run '^TestQUICPathFaultMatrix_MTLS$'
+          -count=1 -timeout=90s
+
   checks-benchmark:
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
