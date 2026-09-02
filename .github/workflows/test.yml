@@ -1,4 +1,4 @@
-name: Go Tests
+name: Go Checks
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  test:
+  checks-quick:
     if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
@@ -40,7 +40,7 @@ jobs:
           -run '^(TestServerRestartReconnect_MTLS|TestClientReconnection_MTLS)$'
           -count=1 -timeout=110s
 
-  slow-regression:
+  checks-extended:
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
@@ -75,3 +75,20 @@ jobs:
           go test -race ./e2e
           -run '^(TestServerRestartReconnect_MTLS|TestClientReconnection_MTLS|TestClientAbruptDisconnect_MTLS)$'
           -count=1 -timeout=300s
+
+  checks-benchmark:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Non-E2E benchmarks
+        timeout-minutes: 10
+        run: >-
+          go test ./auth/... ./client/... ./cmd/... ./config/... ./protocol/... ./server/...
+          -run '^$' -bench . -benchmem -count=1 -timeout=8m
