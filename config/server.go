@@ -175,18 +175,24 @@ type ServerTLS struct {
 	ServerCertFile string `yaml:"server_cert_file"`
 	ServerKeyFile  string `yaml:"server_key_file"`
 
-	// Rotation interval for session ticket encryption keys.
-	// Recommended: 24h for production, 0 to disable rotation.
-	// Keys are rotated periodically to limit the exposure window if compromised.
+	// Rotation interval for custom session ticket encryption keys.
+	// Zero delegates key rotation to Go's automatic TLS policy.
 	SessionTicketEncryptionKeyRotationInterval time.Duration `yaml:"session_ticket_encryption_key_rotation_interval"`
 
-	// Number of keys to maintain during rotation (current + old keys).
-	// Recommended: 2-3 for smooth rotation, default: 2 if not specified.
-	// Higher values allow clients with older tickets to still resume sessions.
-	SessionTicketEncryptionKeyRotationOverlap uint8 `yaml:"session_ticket_encryption_key_rotation_overlap"`
+	// Number of old keys retained during custom rotation. Omitted or null uses
+	// the default of 7; an explicit zero retains no old keys.
+	SessionTicketEncryptionKeyRotationOverlap *uint8 `yaml:"session_ticket_encryption_key_rotation_overlap"`
 
 	// Loaded certificate (not from YAML)
 	ServerCert tls.Certificate `yaml:"-"`
+}
+
+// RotationOldKeyLimit returns the configured old-key limit for custom rotation.
+func (t *ServerTLS) RotationOldKeyLimit() uint8 {
+	if t.SessionTicketEncryptionKeyRotationOverlap == nil {
+		return DefaultSessionTicketEncryptionKeyRotationOverlap
+	}
+	return *t.SessionTicketEncryptionKeyRotationOverlap
 }
 
 // LoadCertificates loads server TLS certificate and key from files
@@ -297,6 +303,9 @@ func (s *Server) Validate() error {
 	}
 	if s.TLS.SessionTicketEncryptionKeyRotationInterval < 0 {
 		return errors.New("tls.session_ticket_encryption_key_rotation_interval must not be negative")
+	}
+	if s.TLS.SessionTicketEncryptionKeyRotationInterval == 0 && s.TLS.SessionTicketEncryptionKeyRotationOverlap != nil {
+		return errors.New("tls.session_ticket_encryption_key_rotation_overlap must be omitted when tls.session_ticket_encryption_key_rotation_interval is 0")
 	}
 	if err := s.Auth.Validate(); err != nil {
 		return fmt.Errorf("auth: %w", err)

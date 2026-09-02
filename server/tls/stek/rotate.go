@@ -76,7 +76,8 @@ func NewRotateManager(interval time.Duration, overlap uint8) (*RotateManager, er
 
 	m.logger.Info().
 		Int("initial_keys", 1).
-		Uint8("overlap", overlap).
+		Uint8("old_key_limit", overlap).
+		Int("max_total_keys", int(overlap)+1).
 		Msg("initialized session ticket encryption keys")
 
 	return m, nil
@@ -117,7 +118,8 @@ func (m *RotateManager) rotate() error {
 
 	m.logger.Info().
 		Int("total_keys", len(newKeys)).
-		Int("overlap", int(m.overlap)).
+		Int("old_keys", len(newKeys)-1).
+		Uint8("old_key_limit", m.overlap).
 		Msg("rotated session ticket encryption keys")
 
 	return nil
@@ -137,7 +139,8 @@ func (m *RotateManager) Start(ctx context.Context) {
 
 	m.logger.Info().
 		Dur("interval", m.interval).
-		Uint8("overlap", m.overlap).
+		Uint8("old_key_limit", m.overlap).
+		Int("max_total_keys", int(m.overlap)+1).
 		Msg("starting session ticket key rotation")
 	m.mu.Unlock()
 

@@ -318,7 +318,7 @@ func TestServerRestartReconnect_MTLS(t *testing.T) {
 			ServerCertFile: filepath.Join(certDir, "server.crt"),
 			ServerKeyFile:  filepath.Join(certDir, "server.key"),
 			SessionTicketEncryptionKeyRotationInterval: 24 * time.Hour,
-			SessionTicketEncryptionKeyRotationOverlap:  2,
+			SessionTicketEncryptionKeyRotationOverlap:  new(uint8(2)),
 		},
 		HeartbeatInterval: 1 * time.Second,
 		HealthTimeout:     3 * time.Second,

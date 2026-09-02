@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Mmx233/QMux/config"
 	"github.com/Mmx233/QMux/examples"
@@ -22,6 +23,7 @@ func TestServerConfigTemplateFields(t *testing.T) {
 	require.NoError(t, err, "failed to load server config template")
 	assertCanonicalQUICKeys(t, string(content))
 	assertUDPTemplateKeys(t, string(content))
+	assertSessionTicketTemplate(t, string(content))
 
 	var cfg config.Server
 	decoder := yaml.NewDecoder(bytes.NewReader(content))
@@ -64,6 +66,11 @@ func TestServerConfigTemplateFields(t *testing.T) {
 	uncommented := decodeUncommentedUDP[config.Server](t, string(content))
 	require.NotNil(t, uncommented.Listeners[0].UDP.EnableFragmentation)
 	assert.True(t, *uncommented.Listeners[0].UDP.EnableFragmentation)
+
+	tlsConfig := decodeUncommentedSessionTicketConfig(t, string(content))
+	assert.Equal(t, 24*time.Hour, tlsConfig.SessionTicketEncryptionKeyRotationInterval)
+	require.NotNil(t, tlsConfig.SessionTicketEncryptionKeyRotationOverlap)
+	assert.Equal(t, uint8(7), *tlsConfig.SessionTicketEncryptionKeyRotationOverlap)
 }
 
 // TestClientConfigTemplateFields verifies that the embedded client.yaml template:
@@ -124,6 +131,33 @@ func assertUDPTemplateKeys(t *testing.T, content string) {
 	if !strings.Contains(content, "enable_fragmentation:") {
 		t.Error("template should contain enable_fragmentation")
 	}
+}
+
+func assertSessionTicketTemplate(t *testing.T, content string) {
+	t.Helper()
+	for _, key := range []string{
+		"session_ticket_encryption_key_rotation_interval",
+		"session_ticket_encryption_key_rotation_overlap",
+	} {
+		if strings.Count(content, key+":") != 1 {
+			t.Errorf("template should contain one %s key", key)
+		}
+	}
+}
+
+func decodeUncommentedSessionTicketConfig(t *testing.T, content string) config.ServerTLS {
+	t.Helper()
+	for _, setting := range []string{
+		"session_ticket_encryption_key_rotation_interval: 24h",
+		"session_ticket_encryption_key_rotation_overlap: 7",
+	} {
+		content = strings.Replace(content, "# "+setting, setting, 1)
+	}
+	var cfg config.Server
+	decoder := yaml.NewDecoder(strings.NewReader(content))
+	decoder.KnownFields(true)
+	require.NoError(t, decoder.Decode(&cfg), "uncommented session ticket settings should strict-decode")
+	return cfg.TLS
 }
 
 func decodeUncommentedUDP[T any](t *testing.T, content string) T {

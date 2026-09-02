@@ -17,7 +17,8 @@ func TestApplyDefaults(t *testing.T) {
 	server := Server{Listeners: []QuicListener{{}}}
 	server.ApplyDefaults()
 	if server.HeartbeatInterval != DefaultHeartbeatInterval || server.HealthTimeout != DefaultHealthTimeout ||
-		server.LoadBalancer != DefaultLoadBalancer || server.Listeners[0].Capacity != defaultListenerCapacity() {
+		server.LoadBalancer != DefaultLoadBalancer || server.Listeners[0].Capacity != defaultListenerCapacity() ||
+		server.TLS.SessionTicketEncryptionKeyRotationOverlap != nil {
 		t.Fatalf("server defaults = %+v", server)
 	}
 
@@ -46,18 +47,50 @@ func TestApplyDefaultsPreservesValues(t *testing.T) {
 		MaxTCPConnectionsPerGeneration: 5, MaxPendingTCPSetupsPerGeneration: 6,
 		MaxUDPSessions: 7, MaxUDPSessionsPerGeneration: 8,
 	}
+	overlap := uint8(2)
 	server := Server{
 		Listeners: []QuicListener{{Capacity: wantCapacity}}, LoadBalancer: "round-robin",
 		HeartbeatInterval: time.Second, HealthTimeout: 2 * time.Second,
+		TLS: ServerTLS{
+			SessionTicketEncryptionKeyRotationInterval: time.Hour,
+			SessionTicketEncryptionKeyRotationOverlap:  &overlap,
+		},
 	}
 	server.ApplyDefaults()
 	if server.HeartbeatInterval != time.Second || server.HealthTimeout != 2*time.Second ||
-		server.LoadBalancer != "round-robin" || server.Listeners[0].Capacity != wantCapacity {
+		server.LoadBalancer != "round-robin" || server.Listeners[0].Capacity != wantCapacity ||
+		server.TLS.SessionTicketEncryptionKeyRotationOverlap != &overlap {
 		t.Fatalf("server values changed: %+v", server)
 	}
 
 	if got := (Quic{MaxIdleTimeout: time.Second}).GetConfig().MaxIdleTimeout; got != time.Second {
 		t.Fatalf("QUIC idle timeout changed to %v", got)
+	}
+}
+
+func TestServerTLSRotationOldKeyLimit(t *testing.T) {
+	tests := []struct {
+		name  string
+		value *uint8
+		want  uint8
+	}{
+		{name: "omitted", want: DefaultSessionTicketEncryptionKeyRotationOverlap},
+		{name: "zero", value: new(uint8(0)), want: 0},
+		{name: "one", value: new(uint8(1)), want: 1},
+		{name: "two", value: new(uint8(2)), want: 2},
+		{name: "six", value: new(uint8(6)), want: 6},
+		{name: "seven", value: new(uint8(7)), want: 7},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			tlsConfig := ServerTLS{SessionTicketEncryptionKeyRotationOverlap: test.value}
+			if got := tlsConfig.RotationOldKeyLimit(); got != test.want {
+				t.Fatalf("RotationOldKeyLimit() = %d, want %d", got, test.want)
+			}
+			if tlsConfig.SessionTicketEncryptionKeyRotationOverlap != test.value {
+				t.Fatal("RotationOldKeyLimit mutated overlap presence")
+			}
+		})
 	}
 }
 

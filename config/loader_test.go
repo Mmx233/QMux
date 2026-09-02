@@ -260,18 +260,81 @@ tls:
 
 func TestLoadConfigUDPFragmentation(t *testing.T) {
 	client, err := LoadConfig[Client](writeTestConfig(t, "udp:\n  enable_fragmentation: false\n"))
-	if err != nil || client.UDP.EnableFragmentation == nil || *client.UDP.EnableFragmentation {
-		t.Fatalf("client enable_fragmentation = %v, error = %v", client.UDP.EnableFragmentation, err)
+	if err != nil {
+		t.Fatalf("load client config: %v", err)
+	}
+	if client.UDP.EnableFragmentation == nil || *client.UDP.EnableFragmentation {
+		t.Fatalf("client enable_fragmentation = %v", client.UDP.EnableFragmentation)
 	}
 
 	server, err := LoadConfig[Server](writeTestConfig(t, "listeners:\n  - udp:\n      enable_fragmentation: true\n"))
-	if err != nil || server.Listeners[0].UDP.EnableFragmentation == nil || !*server.Listeners[0].UDP.EnableFragmentation {
-		t.Fatalf("server enable_fragmentation = %v, error = %v", server.Listeners[0].UDP.EnableFragmentation, err)
+	if err != nil {
+		t.Fatalf("load server config: %v", err)
+	}
+	if server.Listeners[0].UDP.EnableFragmentation == nil || !*server.Listeners[0].UDP.EnableFragmentation {
+		t.Fatalf("server enable_fragmentation = %v", server.Listeners[0].UDP.EnableFragmentation)
 	}
 
 	var defaults UDPConfig
 	if !defaults.IsFragmentationEnabled() {
 		t.Fatal("omitted enable_fragmentation did not default to true")
+	}
+}
+
+func TestLoadServerConfigSessionTicketRotationOverlap(t *testing.T) {
+	tests := []struct {
+		name        string
+		interval    string
+		overlap     string
+		wantPresent bool
+		wantLimit   uint8
+		wantTotal   int
+	}{
+		{name: "omitted", interval: "  session_ticket_encryption_key_rotation_interval: 24h\n", wantLimit: 7, wantTotal: 8},
+		{name: "null", interval: "  session_ticket_encryption_key_rotation_interval: 24h\n", overlap: "  session_ticket_encryption_key_rotation_overlap: null\n", wantLimit: 7, wantTotal: 8},
+		{name: "zero", interval: "  session_ticket_encryption_key_rotation_interval: 24h\n", overlap: "  session_ticket_encryption_key_rotation_overlap: 0\n", wantPresent: true, wantLimit: 0, wantTotal: 1},
+		{name: "one", interval: "  session_ticket_encryption_key_rotation_interval: 24h\n", overlap: "  session_ticket_encryption_key_rotation_overlap: 1\n", wantPresent: true, wantLimit: 1, wantTotal: 2},
+		{name: "two", interval: "  session_ticket_encryption_key_rotation_interval: 24h\n", overlap: "  session_ticket_encryption_key_rotation_overlap: 2\n", wantPresent: true, wantLimit: 2, wantTotal: 3},
+		{name: "six", interval: "  session_ticket_encryption_key_rotation_interval: 24h\n", overlap: "  session_ticket_encryption_key_rotation_overlap: 6\n", wantPresent: true, wantLimit: 6, wantTotal: 7},
+		{name: "seven", interval: "  session_ticket_encryption_key_rotation_interval: 24h\n", overlap: "  session_ticket_encryption_key_rotation_overlap: 7\n", wantPresent: true, wantLimit: 7, wantTotal: 8},
+		{name: "automatic omitted", wantLimit: 7},
+		{name: "automatic null", overlap: "  session_ticket_encryption_key_rotation_overlap: null\n", wantLimit: 7},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := writeTestConfig(t, `listeners:
+  - quic_addr: "127.0.0.1:8443"
+    traffic_addr: "127.0.0.1:8080"
+    protocol: tcp
+auth:
+  method: token
+  token: "0123456789abcdef"
+tls:
+  server_cert_file: "server.pem"
+  server_key_file: "server-key.pem"
+`+test.interval+test.overlap)
+
+			raw, err := LoadConfig[Server](path)
+			if err != nil {
+				t.Fatalf("LoadConfig: %v", err)
+			}
+			loaded, err := LoadServerConfig(path)
+			if err != nil {
+				t.Fatalf("LoadServerConfig: %v", err)
+			}
+			if got := raw.TLS.SessionTicketEncryptionKeyRotationOverlap != nil; got != test.wantPresent {
+				t.Fatalf("raw overlap presence = %t, want %t", got, test.wantPresent)
+			}
+			if got := loaded.TLS.SessionTicketEncryptionKeyRotationOverlap != nil; got != test.wantPresent {
+				t.Fatalf("typed overlap presence = %t, want %t", got, test.wantPresent)
+			}
+			if got := loaded.TLS.RotationOldKeyLimit(); got != test.wantLimit {
+				t.Fatalf("old-key limit = %d, want %d", got, test.wantLimit)
+			}
+			if test.wantTotal != 0 && int(loaded.TLS.RotationOldKeyLimit())+1 != test.wantTotal {
+				t.Fatalf("max total keys = %d, want %d", int(loaded.TLS.RotationOldKeyLimit())+1, test.wantTotal)
+			}
+		})
 	}
 }
 

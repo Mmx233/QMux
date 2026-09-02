@@ -75,14 +75,15 @@ tls:
   # Path to server private key file
   server_key_file: "./certs/server.key"
 
-  # Session ticket encryption key rotation (optional)
-  # Rotation interval for session ticket encryption keys
-  # Recommended: 24h for production, 0 to disable rotation
+  # Custom session ticket encryption key rotation interval.
+  # 0 (default) uses Go's automatic rotation. Go 1.27 rotates keys every 24h
+  # and expires them after 7d. Set a positive duration for QMux custom rotation.
   # session_ticket_encryption_key_rotation_interval: 24h
 
-  # Number of keys to maintain during rotation (current + old keys)
-  # Recommended: 2-3 for smooth rotation
-  # session_ticket_encryption_key_rotation_overlap: 2
+  # Number of old keys retained by QMux custom rotation.
+  # Omit or set null to retain 7 old keys (8 total); 0 retains no old keys.
+  # Valid only when the custom rotation interval is positive.
+  # session_ticket_encryption_key_rotation_overlap: 7
 
 # Load balancer algorithm: "least-connections" (default) or "round-robin"
 # least-connections: selects the client with fewest active connections

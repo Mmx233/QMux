@@ -9,10 +9,12 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"io"
 	"math/big"
 	"net"
+	"reflect"
 	"testing"
 	"time"
 
@@ -444,6 +446,17 @@ func TestMTLSRegistrationAcceptsResumedTLS13Session(t *testing.T) {
 		t, "resumed", true, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	)
 	serverTLS, clientTLS := registrationMTLSTLSConfigs(t, clientRoots, clientCertificate)
+	before := serverTLS.Clone()
+	manager, err := configureSessionTicketKeyRotation(serverTLS, 0, 0)
+	if err != nil {
+		t.Fatalf("configure automatic session tickets: %v", err)
+	}
+	if manager != nil || serverTLS.GetConfigForClient != nil {
+		t.Fatal("zero interval installed a custom session ticket manager")
+	}
+	if !reflect.DeepEqual(serverTLS, before) {
+		t.Fatal("zero interval mutated the TLS config")
+	}
 	cache := newRegistrationSessionCache()
 	clientTLS.ClientSessionCache = cache
 
@@ -474,6 +487,79 @@ func TestMTLSRegistrationAcceptsResumedTLS13Session(t *testing.T) {
 		t.Fatalf("resumed server verified chain length = %d, want 3", got)
 	}
 	registerMTLSClient(t, second, "mtls-second")
+}
+
+type sessionTicketLogCapture struct {
+	events chan []byte
+}
+
+func (c *sessionTicketLogCapture) Write(p []byte) (int, error) {
+	c.events <- append([]byte(nil), p...)
+	return len(p), nil
+}
+
+func TestSessionTicketRotationModeLogs(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		interval time.Duration
+		overlap  *uint8
+		message  string
+	}{
+		{name: "automatic", message: "using Go automatic session ticket key rotation"},
+		{name: "custom", interval: time.Hour, overlap: new(uint8(7)), message: "session ticket key rotation enabled"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			certificate, _ := registrationTestCertificate(t)
+			capture := &sessionTicketLogCapture{events: make(chan []byte, 16)}
+			srv := &Server{
+				config: &config.Server{
+					Auth: config.ServerAuth{Method: "token"},
+					TLS: config.ServerTLS{
+						ServerCert: certificate,
+						SessionTicketEncryptionKeyRotationInterval: test.interval,
+						SessionTicketEncryptionKeyRotationOverlap:  test.overlap,
+					},
+				},
+				handshakes: make(map[string]*handshakeStats),
+				logger:     zerolog.New(capture),
+			}
+			listener := config.QuicListener{
+				QuicAddr: "127.0.0.1:0", TrafficAddr: "127.0.0.1:0", Protocol: "tcp",
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			done := make(chan error, 1)
+			go func() { done <- srv.startListener(ctx, listener) }()
+
+			var event map[string]any
+			for event["message"] != test.message {
+				select {
+				case raw := <-capture.events:
+					if err := json.Unmarshal(raw, &event); err != nil {
+						t.Fatalf("decode log event: %v", err)
+					}
+				case <-time.After(2 * time.Second):
+					t.Fatalf("timed out waiting for %q", test.message)
+				}
+			}
+			cancel()
+			if err := <-done; err != nil {
+				t.Fatalf("startListener: %v", err)
+			}
+
+			if test.interval == 0 {
+				if _, ok := event["old_key_limit"]; ok {
+					t.Fatalf("automatic mode logged custom key limit: %v", event)
+				}
+				return
+			}
+			if got := int(event["old_key_limit"].(float64)); got != 7 {
+				t.Fatalf("old_key_limit = %d, want 7", got)
+			}
+			if got := int(event["max_total_keys"].(float64)); got != 8 {
+				t.Fatalf("max_total_keys = %d, want 8", got)
+			}
+		})
+	}
 }
 
 func TestMTLSHandshakeRejectsUnverifiedClientCertificates(t *testing.T) {

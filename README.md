@@ -184,6 +184,12 @@ tls:
 
 The token itself is never sent over the wire. After the TLS 1.3 handshake completes, the client sends an HMAC-SHA512 registration proof bound to that connection through the TLS exporter. The client still validates the server certificate using `ca_cert_file`, while token mode neither requires nor sends a client certificate. A proof captured from one connection cannot authenticate another connection, including a resumed TLS session.
 
+### Session ticket key rotation
+
+By default, QMux leaves session ticket key rotation to Go. In the Go 1.27 baseline, Go rotates keys every 24 hours and expires them after 7 days; Go owns this automatic policy.
+
+Set `tls.session_ticket_encryption_key_rotation_interval` to a positive duration to use QMux's custom rotation. `tls.session_ticket_encryption_key_rotation_overlap` is the number of old keys retained: omission or `null` uses the fixed default of 7 old keys (8 total), while numeric `0` retains no old keys. The overlap setting is invalid when the interval is zero or omitted.
+
 # Performance
 
 ## Test Environment

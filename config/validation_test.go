@@ -148,6 +148,8 @@ func TestServerValidateListeners(t *testing.T) {
 
 func TestServerValidateRemainingPaths(t *testing.T) {
 	valid := validServerValidationConfig()
+	zeroOverlap := uint8(0)
+	oneOverlap := uint8(1)
 	roundRobin := valid
 	roundRobin.LoadBalancer = "round-robin"
 	if err := roundRobin.Validate(); err != nil {
@@ -165,6 +167,8 @@ func TestServerValidateRemainingPaths(t *testing.T) {
 		{"heartbeat relation", func(s *Server) { s.HealthTimeout = s.HeartbeatInterval }, "health_timeout"},
 		{"server certificate", func(s *Server) { s.TLS.ServerCertFile = "" }, "tls.server_cert_file"},
 		{"negative STEK", func(s *Server) { s.TLS.SessionTicketEncryptionKeyRotationInterval = -1 }, "tls.session_ticket_encryption_key_rotation_interval"},
+		{"zero interval with zero overlap", func(s *Server) { s.TLS.SessionTicketEncryptionKeyRotationOverlap = &zeroOverlap }, "tls.session_ticket_encryption_key_rotation_overlap"},
+		{"zero interval with positive overlap", func(s *Server) { s.TLS.SessionTicketEncryptionKeyRotationOverlap = &oneOverlap }, "tls.session_ticket_encryption_key_rotation_overlap"},
 		{"auth", func(s *Server) { s.Auth.Token = "short" }, "auth:"},
 	}
 	for _, test := range tests {

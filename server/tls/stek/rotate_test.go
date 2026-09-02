@@ -1,10 +1,18 @@
 package stek
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 )
 
 func TestNewRotateManager(t *testing.T) {
@@ -37,71 +45,94 @@ func newTestRotateManager(t *testing.T, interval time.Duration, overlap uint8) *
 	return manager
 }
 
-func TestRotateManager_Rotation(t *testing.T) {
-	// overlap=2 means: 1 current + up to 2 old keys = max 3 keys
-	manager := newTestRotateManager(t, 100*time.Millisecond, 2)
+func TestRotateManagerKeyLimits(t *testing.T) {
+	for _, test := range []struct {
+		oldKeyLimit uint8
+		wantTotal   int
+	}{
+		{oldKeyLimit: 0, wantTotal: 1},
+		{oldKeyLimit: 1, wantTotal: 2},
+		{oldKeyLimit: 2, wantTotal: 3},
+		{oldKeyLimit: 6, wantTotal: 7},
+		{oldKeyLimit: 7, wantTotal: 8},
+	} {
+		t.Run(fmt.Sprintf("old_keys_%d", test.oldKeyLimit), func(t *testing.T) {
+			manager := newTestRotateManager(t, time.Hour, test.oldKeyLimit)
+			for range 8 {
+				if err := manager.rotate(); err != nil {
+					t.Fatalf("rotate: %v", err)
+				}
+			}
+			if got := len(*manager.Keys.Load()); got != test.wantTotal {
+				t.Fatalf("total keys = %d, want %d", got, test.wantTotal)
+			}
+		})
+	}
+}
 
-	// Get initial key (should be only 1)
-	initialKeys := manager.Keys.Load()
-	if len(*initialKeys) != 1 {
-		t.Fatalf("Expected 1 initial key, got %d", len(*initialKeys))
-	}
-	key0 := (*initialKeys)[0]
-
-	// First rotation: [key1, key0]
-	err := manager.rotate()
-	if err != nil {
-		t.Fatalf("rotate() failed: %v", err)
-	}
-	keys := manager.Keys.Load()
-	if len(*keys) != 2 {
-		t.Errorf("Expected 2 keys after 1st rotation, got %d", len(*keys))
-	}
-	key1 := (*keys)[0]
-	if key1 == key0 {
-		t.Error("Expected first key to change after rotation")
-	}
-	if (*keys)[1] != key0 {
-		t.Error("Expected second key to be the old first key")
-	}
-
-	// Second rotation: [key2, key1, key0]
-	err = manager.rotate()
-	if err != nil {
-		t.Fatalf("rotate() failed: %v", err)
-	}
-	keys = manager.Keys.Load()
-	if len(*keys) != 3 {
-		t.Errorf("Expected 3 keys after 2nd rotation (1 current + 2 old), got %d", len(*keys))
-	}
-	key2 := (*keys)[0]
-	if (*keys)[1] != key1 {
-		t.Error("Expected second key to be key1")
-	}
-	if (*keys)[2] != key0 {
-		t.Error("Expected third key to be key0")
-	}
-
-	// Third rotation: [key3, key2, key1] - key0 should be dropped
-	err = manager.rotate()
-	if err != nil {
-		t.Fatalf("rotate() failed: %v", err)
-	}
-	keys = manager.Keys.Load()
-	if len(*keys) != 3 {
-		t.Errorf("Expected 3 keys after 3rd rotation, got %d", len(*keys))
-	}
-	if (*keys)[1] != key2 {
-		t.Error("Expected second key to be key2")
-	}
-	if (*keys)[2] != key1 {
-		t.Error("Expected third key to be key1")
-	}
-	// key0 should no longer be present
-	for i, k := range *keys {
-		if k == key0 {
-			t.Errorf("key0 should have been dropped, but found at index %d", i)
+func TestRotateManagerSevenOldKeyBoundary(t *testing.T) {
+	manager := newTestRotateManager(t, time.Hour, 7)
+	initial := (*manager.Keys.Load())[0]
+	for range 7 {
+		if err := manager.rotate(); err != nil {
+			t.Fatalf("rotate: %v", err)
 		}
+	}
+	keys := *manager.Keys.Load()
+	if len(keys) != 8 || keys[7] != initial {
+		t.Fatalf("keys after seven rotations = %d, initial key not retained at boundary", len(keys))
+	}
+	if err := manager.rotate(); err != nil {
+		t.Fatalf("eighth rotate: %v", err)
+	}
+	keys = *manager.Keys.Load()
+	if len(keys) != 8 || slices.Contains(keys, initial) {
+		t.Fatal("initial key remained after the eighth rotation")
+	}
+}
+
+func TestRotateManagerLogsLimitAndActualKeys(t *testing.T) {
+	previous := log.Logger
+	var output bytes.Buffer
+	log.Logger = zerolog.New(&output)
+	t.Cleanup(func() { log.Logger = previous })
+
+	manager := newTestRotateManager(t, time.Hour, 7)
+	if err := manager.rotate(); err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	manager.Start(context.Background())
+	manager.Stop()
+
+	want := map[string]map[string]int{
+		"initialized session ticket encryption keys": {"initial_keys": 1, "old_key_limit": 7, "max_total_keys": 8},
+		"rotated session ticket encryption keys":     {"old_keys": 1, "total_keys": 2, "old_key_limit": 7},
+		"starting session ticket key rotation":       {"old_key_limit": 7, "max_total_keys": 8},
+	}
+	for line := range strings.SplitSeq(strings.TrimSpace(output.String()), "\n") {
+		var event map[string]any
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("decode log event: %v", err)
+		}
+		if _, ok := event["overlap"]; ok {
+			t.Fatalf("ambiguous overlap field in event: %v", event)
+		}
+		if _, ok := event["key_overlap"]; ok {
+			t.Fatalf("ambiguous key_overlap field in event: %v", event)
+		}
+		fields, ok := want[event["message"].(string)]
+		if !ok {
+			continue
+		}
+		for field, value := range fields {
+			if got := int(event[field].(float64)); got != value {
+				t.Fatalf("%s %s = %d, want %d", event["message"], field, got, value)
+			}
+		}
+		delete(want, event["message"].(string))
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing log events: %v", want)
 	}
 }
 
@@ -173,25 +204,4 @@ func TestRotateManager_ContextCancellationIsJoinable(t *testing.T) {
 	}
 
 	manager.Stop()
-}
-
-func TestRotateManager_ZeroOverlap(t *testing.T) {
-	manager := newTestRotateManager(t, time.Hour, 0)
-	keys := manager.Keys.Load()
-	if len(*keys) != 1 {
-		t.Errorf("Expected 1 initial key, got %d", len(*keys))
-	}
-	key0 := (*keys)[0]
-
-	err := manager.rotate()
-	if err != nil {
-		t.Fatalf("rotate() failed: %v", err)
-	}
-	keys = manager.Keys.Load()
-	if len(*keys) != 1 {
-		t.Errorf("Expected 1 key after rotation with overlap=0, got %d", len(*keys))
-	}
-	if (*keys)[0] == key0 {
-		t.Error("Expected key to change after rotation")
-	}
 }

@@ -211,8 +211,7 @@ func New(conf *config.Server) (*Server, error) {
 		return nil, fmt.Errorf("invalid server config: %w", err)
 	}
 
-	ownedConfig := *conf
-	ownedConfig.Listeners = cloneListeners(conf.Listeners)
+	ownedConfig := cloneServerConfig(conf)
 
 	logger := log.With().Str("com", "server").Logger()
 
@@ -285,6 +284,16 @@ func cloneListeners(listeners []config.QuicListener) []config.QuicListener {
 			copied := *value
 			cloned[i].UDP.EnableFragmentation = &copied
 		}
+	}
+	return cloned
+}
+
+func cloneServerConfig(conf *config.Server) config.Server {
+	cloned := *conf
+	cloned.Listeners = cloneListeners(conf.Listeners)
+	if value := conf.TLS.SessionTicketEncryptionKeyRotationOverlap; value != nil {
+		copied := *value
+		cloned.TLS.SessionTicketEncryptionKeyRotationOverlap = &copied
 	}
 	return cloned
 }
@@ -421,6 +430,28 @@ func superviseServer(
 	return context.Cause(ctx)
 }
 
+func configureSessionTicketKeyRotation(
+	tlsConf *tls.Config,
+	interval time.Duration,
+	oldKeyLimit uint8,
+) (*stek.RotateManager, error) {
+	if interval == 0 {
+		return nil, nil
+	}
+
+	manager, err := stek.NewRotateManager(interval, oldKeyLimit)
+	if err != nil {
+		return nil, err
+	}
+	tlsConf.SetSessionTicketKeys(*manager.Keys.Load())
+	tlsConf.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
+		cfg := tlsConf.Clone()
+		cfg.SetSessionTicketKeys(*manager.Keys.Load())
+		return cfg, nil
+	}
+	return manager, nil
+}
+
 // startListener starts a QUIC listener
 func (s *Server) startListener(ctx context.Context, listenerConf config.QuicListener) error {
 	logger := s.logger.With().Str("quic_addr", listenerConf.QuicAddr).Logger()
@@ -438,28 +469,6 @@ func (s *Server) startListener(ctx context.Context, listenerConf config.QuicList
 	}
 	defer func() { _ = udpConn.Close() }()
 
-	// Initialize session ticket key rotation
-	var stekManager *stek.RotateManager
-	if s.config.TLS.SessionTicketEncryptionKeyRotationInterval > 0 {
-		overlap := s.config.TLS.SessionTicketEncryptionKeyRotationOverlap
-		if overlap == 0 {
-			overlap = 2
-		}
-
-		stekManager, err = stek.NewRotateManager(
-			s.config.TLS.SessionTicketEncryptionKeyRotationInterval,
-			overlap,
-		)
-		if err != nil {
-			return fmt.Errorf("initialize session ticket key rotation: %w", err)
-		}
-
-		logger.Info().
-			Dur("rotation_interval", s.config.TLS.SessionTicketEncryptionKeyRotationInterval).
-			Uint8("key_overlap", overlap).
-			Msg("session ticket key rotation enabled")
-	}
-
 	// Configure TLS based on auth method
 	tlsConf := &tls.Config{
 		Certificates: []tls.Certificate{s.config.TLS.ServerCert},
@@ -475,14 +484,23 @@ func (s *Server) startListener(ctx context.Context, listenerConf config.QuicList
 		tlsConf.ClientAuth = tls.NoClientCert
 	}
 
-	// Configure session ticket keys with automatic rotation
-	if stekManager != nil {
-		tlsConf.SetSessionTicketKeys(*stekManager.Keys.Load())
-		tlsConf.GetConfigForClient = func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
-			cfg := tlsConf.Clone()
-			cfg.SetSessionTicketKeys(*stekManager.Keys.Load())
-			return cfg, nil
-		}
+	oldKeyLimit := s.config.TLS.RotationOldKeyLimit()
+	stekManager, err := configureSessionTicketKeyRotation(
+		tlsConf,
+		s.config.TLS.SessionTicketEncryptionKeyRotationInterval,
+		oldKeyLimit,
+	)
+	if err != nil {
+		return fmt.Errorf("initialize session ticket key rotation: %w", err)
+	}
+	if stekManager == nil {
+		logger.Info().Msg("using Go automatic session ticket key rotation")
+	} else {
+		logger.Info().
+			Dur("rotation_interval", s.config.TLS.SessionTicketEncryptionKeyRotationInterval).
+			Uint8("old_key_limit", oldKeyLimit).
+			Int("max_total_keys", int(oldKeyLimit)+1).
+			Msg("session ticket key rotation enabled")
 	}
 
 	// Get QUIC config

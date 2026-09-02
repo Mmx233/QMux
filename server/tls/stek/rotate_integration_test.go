@@ -177,25 +177,42 @@ func TestSTEKRotationDoesNotBreakExistingConnections(t *testing.T) {
 	assertSTEKEcho(t, conn, "after rotation")
 }
 
-type notifyingSessionCache struct {
-	tls.ClientSessionCache
+type pinnedSessionCache struct {
+	mu     sync.Mutex
+	key    string
+	state  *tls.ClientSessionState
 	stored chan struct{}
-	once   sync.Once
 }
 
-func (c *notifyingSessionCache) Put(key string, state *tls.ClientSessionState) {
-	c.ClientSessionCache.Put(key, state)
-	c.once.Do(func() { close(c.stored) })
+func newPinnedSessionCache() *pinnedSessionCache {
+	return &pinnedSessionCache{stored: make(chan struct{})}
 }
 
-func TestSTEKRotationSessionResumption(t *testing.T) {
-	cert, roots := generateTestCert(t)
-	manager, serverTLS := newTestSTEKServerConfig(t, cert, 1)
-	harness := newSTEKQUICHarness(t, serverTLS)
-	cache := &notifyingSessionCache{
-		ClientSessionCache: tls.NewLRUClientSessionCache(1),
-		stored:             make(chan struct{}),
+func (c *pinnedSessionCache) Put(key string, state *tls.ClientSessionState) {
+	if state == nil {
+		return
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.state == nil {
+		c.key = key
+		c.state = state
+		close(c.stored)
+	}
+}
+
+func (c *pinnedSessionCache) Get(key string) (*tls.ClientSessionState, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.state, c.state != nil && c.key == key
+}
+
+func newSTEKResumptionFixture(t *testing.T, oldKeyLimit uint8) (*RotateManager, *stekQUICHarness, *tls.Config) {
+	t.Helper()
+	cert, roots := generateTestCert(t)
+	manager, serverTLS := newTestSTEKServerConfig(t, cert, oldKeyLimit)
+	harness := newSTEKQUICHarness(t, serverTLS)
+	cache := newPinnedSessionCache()
 	clientTLS := &tls.Config{
 		RootCAs:            roots,
 		ServerName:         "localhost",
@@ -215,7 +232,11 @@ func TestSTEKRotationSessionResumption(t *testing.T) {
 		t.Fatal("client did not receive a session ticket")
 	}
 	_ = first.CloseWithError(0, "done")
+	return manager, harness, clientTLS
+}
 
+func TestSTEKRotationSessionResumption(t *testing.T) {
+	manager, harness, clientTLS := newSTEKResumptionFixture(t, 1)
 	if err := manager.rotate(); err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
@@ -225,4 +246,27 @@ func TestSTEKRotationSessionResumption(t *testing.T) {
 		t.Fatal("connection did not resume with the retained ticket key")
 	}
 	assertSTEKEcho(t, second, "resumed")
+}
+
+func TestSTEKSevenOldKeySessionResumptionBoundary(t *testing.T) {
+	manager, harness, clientTLS := newSTEKResumptionFixture(t, 7)
+	for range 7 {
+		if err := manager.rotate(); err != nil {
+			t.Fatalf("rotate: %v", err)
+		}
+	}
+	second := harness.dial(t, clientTLS)
+	if !second.ConnectionState().TLS.DidResume {
+		t.Fatal("original ticket did not resume after seven rotations")
+	}
+	_ = second.CloseWithError(0, "done")
+
+	if err := manager.rotate(); err != nil {
+		t.Fatalf("eighth rotate: %v", err)
+	}
+	third := harness.dial(t, clientTLS)
+	defer func() { _ = third.CloseWithError(0, "done") }()
+	if third.ConnectionState().TLS.DidResume {
+		t.Fatal("original ticket resumed after its key was dropped")
+	}
 }

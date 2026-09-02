@@ -23,6 +23,9 @@ const (
 	// DefaultLoadBalancer is the default load balancing algorithm
 	DefaultLoadBalancer = "least-connections"
 
+	// DefaultSessionTicketEncryptionKeyRotationOverlap is the default number of old keys retained.
+	DefaultSessionTicketEncryptionKeyRotationOverlap uint8 = 7
+
 	DefaultMaxClientGenerations             = 16
 	DefaultMaxPendingRegistrations          = 128
 	DefaultMaxTCPConnections                = 128

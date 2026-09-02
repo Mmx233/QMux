@@ -26,32 +26,59 @@ func TestNewValidatesListenersBeforeCertificates(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "listeners[0].protocol") {
 		t.Fatalf("New() error = %v, want listener protocol validation", err)
 	}
+
+	_, err = New(&config.Server{
+		Listeners: []config.QuicListener{{
+			QuicAddr: "127.0.0.1:8443", TrafficAddr: "127.0.0.1:8080", Protocol: "tcp",
+		}},
+		Auth: config.ServerAuth{Method: "token", Token: "0123456789abcdef"},
+		TLS: config.ServerTLS{
+			ServerCertFile: "missing.pem",
+			ServerKeyFile:  "missing-key.pem",
+			SessionTicketEncryptionKeyRotationOverlap: new(uint8(0)),
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "tls.session_ticket_encryption_key_rotation_overlap") {
+		t.Fatalf("New() error = %v, want overlap validation before certificate loading", err)
+	}
 }
 
-func TestCloneListenersOwnsBooleanPointers(t *testing.T) {
+func TestCloneServerConfigOwnsPointers(t *testing.T) {
 	fragmentation := true
-	original := []config.QuicListener{
-		{
+	overlap := uint8(2)
+	original := &config.Server{
+		Listeners: []config.QuicListener{{
 			QuicAddr: "127.0.0.1:8443",
 			UDP: config.UDPConfig{
 				EnableFragmentation: &fragmentation,
 			},
-		},
-		{QuicAddr: "127.0.0.1:8444"},
+		}, {
+			QuicAddr: "127.0.0.1:8444",
+		}},
+		TLS: config.ServerTLS{SessionTicketEncryptionKeyRotationOverlap: &overlap},
 	}
 
-	cloned := cloneListeners(original)
-	if cloned[0].UDP.EnableFragmentation == original[0].UDP.EnableFragmentation {
+	cloned := cloneServerConfig(original)
+	if cloned.Listeners[0].UDP.EnableFragmentation == original.Listeners[0].UDP.EnableFragmentation {
 		t.Fatal("clone retained caller-owned boolean pointers")
 	}
-	if cloned[1].UDP.EnableFragmentation != nil {
+	if cloned.Listeners[1].UDP.EnableFragmentation != nil {
 		t.Fatal("clone did not preserve nil boolean pointers")
+	}
+	if cloned.TLS.SessionTicketEncryptionKeyRotationOverlap == original.TLS.SessionTicketEncryptionKeyRotationOverlap {
+		t.Fatal("clone retained caller-owned overlap pointer")
 	}
 
 	fragmentation = false
-	original[0].QuicAddr = "mutated"
-	if !*cloned[0].UDP.EnableFragmentation || cloned[0].QuicAddr != "127.0.0.1:8443" {
+	overlap = 7
+	original.Listeners[0].QuicAddr = "mutated"
+	if !*cloned.Listeners[0].UDP.EnableFragmentation || cloned.Listeners[0].QuicAddr != "127.0.0.1:8443" ||
+		*cloned.TLS.SessionTicketEncryptionKeyRotationOverlap != 2 {
 		t.Fatal("caller mutation changed cloned listeners")
+	}
+
+	if cloneServerConfig(&config.Server{}).TLS.SessionTicketEncryptionKeyRotationOverlap != nil {
+		t.Fatal("clone did not preserve omitted overlap")
 	}
 }
 
