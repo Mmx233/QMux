@@ -25,6 +25,8 @@ var (
 	ErrPeerGracefulShutdownUnsupported = errors.New("peer graceful shutdown unsupported")
 )
 
+const tcpSetupTimeout = 5 * time.Second
+
 // Client represents the QMux client
 type Client struct {
 	config      *config.Client
@@ -376,11 +378,24 @@ func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *Serv
 			stream.CancelWrite(0)
 		}
 	}()
+	setupDeadline := time.Now().Add(tcpSetupTimeout)
+	if err := stream.SetDeadline(setupDeadline); err != nil {
+		c.logger.Error().Err(err).Str("server", sc.ServerAddr()).Msg("set TCP setup deadline failed")
+		return
+	}
 
 	// Read NewConn message
 	var msg protocol.NewConnMsg
 	if err := protocol.ReadTypedMessage(stream, protocol.MsgTypeNewConn, &msg); err != nil {
 		c.logger.Error().Err(err).Str("server", sc.ServerAddr()).Msg("read NewConn message failed")
+		return
+	}
+	if msg.ConnID == 0 || msg.Protocol != "tcp" {
+		c.logger.Error().
+			Uint64("conn_id", msg.ConnID).
+			Str("protocol", msg.Protocol).
+			Str("server", sc.ServerAddr()).
+			Msg("invalid NewConn message")
 		return
 	}
 
@@ -396,8 +411,8 @@ func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *Serv
 
 	// Connect to local service
 	localAddr := net.JoinHostPort(c.config.Local.Host, strconv.Itoa(c.config.Local.Port))
-	dialCtx, cancelDial := context.WithTimeout(ctx, 5*time.Second)
-	localConn, err := (&net.Dialer{}).DialContext(dialCtx, msg.Protocol, localAddr)
+	dialCtx, cancelDial := context.WithDeadline(ctx, setupDeadline)
+	localConn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", localAddr)
 	cancelDial()
 	if err != nil {
 		logger.Error().Err(err).Str("local_addr", localAddr).Msg("dial local service failed")
@@ -429,6 +444,14 @@ func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *Serv
 	if len(runtimes) != 0 {
 		runtimes[0].localConns.Store(msg.ConnID, localConn)
 		defer runtimes[0].localConns.Delete(msg.ConnID)
+	}
+	if err := protocol.WriteNewConnAck(stream, msg.ConnID); err != nil {
+		logger.Error().Err(err).Msg("write NewConn acknowledgment failed")
+		return
+	}
+	if err := stream.SetDeadline(time.Time{}); err != nil {
+		logger.Error().Err(err).Msg("clear TCP setup deadline failed")
+		return
 	}
 
 	logger.Info().Str("local_addr", localAddr).Msg("connected to local service")

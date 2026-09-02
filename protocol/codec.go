@@ -16,6 +16,8 @@ const (
 	MaxPayloadSize = 10 * 1024 * 1024
 	// MaxRegistrationPayloadSize is the stricter limit for registration traffic.
 	MaxRegistrationPayloadSize = 4 * 1024
+	// MaxNewConnAckPayloadSize bounds the per-TCP-flow setup acknowledgment.
+	MaxNewConnAckPayloadSize = 4 * 1024
 )
 
 // Wire format: [1 byte type][4 bytes length][payload]
@@ -254,6 +256,11 @@ func WriteNewConn(w io.Writer, connID uint64, protocol, sourceAddr, destAddr str
 		Timestamp:  timestamp,
 	}
 	return WriteMessage(w, MsgTypeNewConn, msg)
+}
+
+// WriteNewConnAck confirms that the backend for connID is ready for raw relay.
+func WriteNewConnAck(w io.Writer, connID uint64) error {
+	return WriteMessage(w, MsgTypeNewConnAck, NewConnAckMsg{ConnID: connID})
 }
 
 // WriteConnClose writes a connection close message

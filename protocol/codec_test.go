@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bytes"
+	"encoding/binary"
 	"testing"
 
 	"github.com/Mmx233/QMux/config"
@@ -94,6 +95,29 @@ func TestGenericJSONWireContract(t *testing.T) {
 				t.Error("DecodeMessage() accepted invalid payload")
 			}
 		})
+	}
+}
+
+func TestNewConnAckRoundTrip(t *testing.T) {
+	var wire bytes.Buffer
+	if err := WriteNewConnAck(&wire, 42); err != nil {
+		t.Fatal(err)
+	}
+	var ack NewConnAckMsg
+	if err := ReadTypedMessageLimited(&wire, MsgTypeNewConnAck, &ack, MaxNewConnAckPayloadSize); err != nil {
+		t.Fatal(err)
+	}
+	if ack.ConnID != 42 {
+		t.Fatalf("ConnID = %d, want 42", ack.ConnID)
+	}
+
+	var oversized bytes.Buffer
+	oversized.WriteByte(MsgTypeNewConnAck)
+	var length [4]byte
+	binary.BigEndian.PutUint32(length[:], MaxNewConnAckPayloadSize+1)
+	oversized.Write(length[:])
+	if err := ReadTypedMessageLimited(&oversized, MsgTypeNewConnAck, &ack, MaxNewConnAckPayloadSize); err == nil {
+		t.Fatal("oversized NewConn acknowledgment was accepted")
 	}
 }
 

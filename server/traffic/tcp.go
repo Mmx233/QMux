@@ -38,6 +38,7 @@ type TCPAdmissionSnapshot struct {
 	Attempts                     uint64
 	Retries                      uint64
 	StreamLimitAttempts          uint64
+	AckFailureAttempts           uint64
 	Committed                    uint64
 	FlowCapacity                 uint64
 	ListenerCapacity             uint64
@@ -76,6 +77,7 @@ type tcpAdmissionStats struct {
 	attempts                     atomic.Uint64
 	retries                      atomic.Uint64
 	streamLimitAttempts          atomic.Uint64
+	ackFailureAttempts           atomic.Uint64
 	committed                    atomic.Uint64
 	flowCapacity                 atomic.Uint64
 	listenerCapacity             atomic.Uint64
@@ -101,6 +103,7 @@ func (s *tcpAdmissionStats) snapshot() TCPAdmissionSnapshot {
 		Attempts:                     s.attempts.Load(),
 		Retries:                      s.retries.Load(),
 		StreamLimitAttempts:          s.streamLimitAttempts.Load(),
+		AckFailureAttempts:           s.ackFailureAttempts.Load(),
 		Committed:                    s.committed.Load(),
 		FlowCapacity:                 s.flowCapacity.Load(),
 		ListenerCapacity:             s.listenerCapacity.Load(),
@@ -200,6 +203,12 @@ func (s *tcpAdmissionStats) streamLimitAttempt() {
 	s.streamLimitAttempts.Add(1)
 }
 
+func (s *tcpAdmissionStats) ackFailureAttempt() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ackFailureAttempts.Add(1)
+}
+
 type tcpFlow struct {
 	conn net.Conn
 
@@ -246,10 +255,10 @@ func (f *tcpFlow) commitStream(stream *quic.Stream) bool {
 
 func newConnWriteResult(n, size int, err error) (bool, error) {
 	if n < 0 || n > size {
-		return false, fmt.Errorf("invalid NewConn write count %d for %d-byte frame", n, size)
+		return true, fmt.Errorf("invalid NewConn write count %d for %d-byte frame", n, size)
 	}
-	if n == size {
-		return false, err
+	if n == size && err == nil {
+		return false, nil
 	}
 	if err == nil {
 		err = io.ErrShortWrite
@@ -531,61 +540,119 @@ func (l *Listener) handleTCPConnection(flow *tcpFlow, setupDeadline time.Time, s
 			flow.abort()
 			return
 		}
-		if err := stream.SetWriteDeadline(setupDeadline); err != nil {
-			clientLogger.Error().Err(err).Int("attempts", attempts).Msg("set NewConn write deadline failed")
-			flow.abort()
-			return
+		abandonAttempt := func() bool {
+			if !flow.detachStream(stream) {
+				if l.ctx.Err() != nil || flow.isAborted() {
+					terminal = tcpTerminalCanceled
+				}
+				flow.abort()
+				return false
+			}
+			stream.CancelRead(trafficStreamCancelCode)
+			stream.CancelWrite(trafficStreamCancelCode)
+			if !currentLease.Release() {
+				clientLogger.Error().Int("attempts", attempts).Msg("release TCP admission lease failed")
+				flow.abort()
+				return false
+			}
+			currentLease = nil
+			stream = nil
+			return true
+		}
+		if err := stream.SetDeadline(setupDeadline); err != nil {
+			if l.ctx.Err() != nil || flow.isAborted() {
+				terminal = tcpTerminalCanceled
+				flow.abort()
+				return
+			}
+			if errors.Is(err, os.ErrDeadlineExceeded) || !time.Now().Before(setupDeadline) {
+				terminal = tcpTerminalDeadline
+				flow.abort()
+				return
+			}
+			setupFailed = true
+			clientLogger.Error().Err(err).Int("attempts", attempts).Msg("set TCP setup deadline failed")
+			if !abandonAttempt() {
+				return
+			}
+			continue
 		}
 
 		n, writeErr := stream.Write(newConnFrame)
 		retry, writeErr := newConnWriteResult(n, len(newConnFrame), writeErr)
 		if writeErr != nil {
 			localAbort := l.ctx.Err() != nil || flow.isAborted()
-			var streamErr *quic.StreamError
 			switch {
 			case localAbort:
 				terminal = tcpTerminalCanceled
 				clientLogger.Debug().Err(writeErr).Int("attempts", attempts).Msg("NewConn write interrupted by shutdown")
-			case errors.Is(writeErr, os.ErrDeadlineExceeded):
+				flow.abort()
+				return
+			case errors.Is(writeErr, os.ErrDeadlineExceeded) || !time.Now().Before(setupDeadline):
 				terminal = tcpTerminalDeadline
 				clientLogger.Error().Err(writeErr).Int("attempts", attempts).Msg("NewConn write deadline reached")
-			case errors.As(writeErr, &streamErr):
-				setupFailed = true
-				clientLogger.Debug().Err(writeErr).Int("attempts", attempts).Msg("NewConn stream canceled")
+				flow.abort()
+				return
 			default:
 				setupFailed = true
 				clientLogger.Error().Err(writeErr).Int("attempts", attempts).Msg("send NewConn message failed")
 			}
-		}
-		if !retry {
-			if writeErr != nil {
+			if !retry {
 				flow.abort()
 				return
 			}
-			logger = clientLogger
-			break
+			if !abandonAttempt() {
+				return
+			}
+			continue
 		}
-		if !flow.detachStream(stream) {
+
+		// ponytail: one stalled ACK can consume the 5s setup budget; add per-attempt budgeting only if production evidence shows it blocks useful failover.
+		var ack protocol.NewConnAckMsg
+		ackErr := protocol.ReadTypedMessageLimited(stream, protocol.MsgTypeNewConnAck, &ack, protocol.MaxNewConnAckPayloadSize)
+		if ackErr == nil && (ack.ConnID == 0 || ack.ConnID != connID) {
+			ackErr = fmt.Errorf("invalid NewConn acknowledgment ID %d, want %d", ack.ConnID, connID)
+		}
+		if ackErr != nil {
 			if l.ctx.Err() != nil || flow.isAborted() {
 				terminal = tcpTerminalCanceled
+				flow.abort()
+				return
 			}
-			flow.abort()
-			return
+			l.tcpAdmission.ackFailureAttempt()
+			if errors.Is(ackErr, os.ErrDeadlineExceeded) || !time.Now().Before(setupDeadline) {
+				terminal = tcpTerminalDeadline
+				clientLogger.Error().Err(ackErr).Int("attempts", attempts).Msg("NewConn acknowledgment deadline reached")
+				flow.abort()
+				return
+			}
+			setupFailed = true
+			clientLogger.Debug().Err(ackErr).Int("attempts", attempts).Msg("read NewConn acknowledgment failed")
+			if !abandonAttempt() {
+				return
+			}
+			continue
 		}
-		stream.CancelRead(trafficStreamCancelCode)
-		stream.CancelWrite(trafficStreamCancelCode)
-		if !currentLease.Release() {
-			clientLogger.Error().Int("attempts", attempts).Msg("release TCP admission lease failed")
-			flow.abort()
-			return
+		if err := stream.SetDeadline(time.Time{}); err != nil {
+			if l.ctx.Err() != nil || flow.isAborted() {
+				terminal = tcpTerminalCanceled
+				flow.abort()
+				return
+			}
+			if errors.Is(err, os.ErrDeadlineExceeded) || !time.Now().Before(setupDeadline) {
+				terminal = tcpTerminalDeadline
+				flow.abort()
+				return
+			}
+			setupFailed = true
+			clientLogger.Error().Err(err).Int("attempts", attempts).Msg("clear TCP setup deadline failed")
+			if !abandonAttempt() {
+				return
+			}
+			continue
 		}
-		currentLease = nil
-		stream = nil
-	}
-	if err := stream.SetWriteDeadline(time.Time{}); err != nil {
-		logger.Error().Err(err).Int("attempts", attempts).Msg("clear NewConn write deadline failed")
-		flow.abort()
-		return
+		logger = clientLogger
+		break
 	}
 	if !flow.commitStream(stream) {
 		if l.ctx.Err() != nil || flow.isAborted() {

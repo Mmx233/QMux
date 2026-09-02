@@ -14,6 +14,7 @@ const (
 	MsgTypeDrainRequest  = 0x05 // Client requests retirement from TCP selection
 	MsgTypeConnClose     = 0x06 // Connection closed
 	MsgTypeDrainComplete = 0x07 // Server reports the final accepted TCP stream
+	MsgTypeNewConnAck    = 0x08 // Client confirms its backend connection is ready
 	MsgTypeError         = 0xFF // Error message
 )
 
@@ -60,6 +61,11 @@ type NewConnMsg struct {
 	SourceAddr string // Original client address (IP:port)
 	DestAddr   string // Target address on traffic listener (IP:port)
 	Timestamp  int64  // Connection timestamp
+}
+
+// NewConnAckMsg confirms that the client connected to the backend.
+type NewConnAckMsg struct {
+	ConnID uint64
 }
 
 // ConnCloseMsg indicates connection closure

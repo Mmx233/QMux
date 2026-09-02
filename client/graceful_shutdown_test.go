@@ -148,6 +148,9 @@ func TestClientShutdownAcceptsThroughFenceAndWaitsForHandler(t *testing.T) {
 			if err := protocol.WriteNewConn(stream, 1, "tcp", "peer", "local", time.Now().Unix()); err != nil {
 				return err
 			}
+			if err := readClientNewConnAck(stream, 1); err != nil {
+				return err
+			}
 			if _, err := stream.Write(request); err != nil {
 				return err
 			}

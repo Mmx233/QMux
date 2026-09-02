@@ -290,6 +290,8 @@ func TestTCPBackendDialFailureReturnsNoTunnelBytes(t *testing.T) {
 	}
 	targetQuicAddr := before.Routes[0].QuicAddr
 	committedBefore := before.Routes[0].TCPAdmission.Committed
+	setupFailureBefore := before.Routes[0].TCPAdmission.SetupFailure
+	ackFailureBefore := before.Routes[0].TCPAdmission.AckFailureAttempts
 
 	publicConn, err := net.DialTimeout("tcp", trafficAddr, 5*time.Second)
 	if err != nil {
@@ -324,11 +326,139 @@ func TestTCPBackendDialFailureReturnsNoTunnelBytes(t *testing.T) {
 		}
 		route := snapshot.Routes[0]
 		return route.QuicAddr == targetQuicAddr && route.TrafficAddr == trafficAddr &&
-			route.TCPAdmission.Committed >= committedBefore+1 &&
+			route.TCPAdmission.Committed == committedBefore &&
+			route.TCPAdmission.SetupFailure >= setupFailureBefore+1 &&
+			route.TCPAdmission.AckFailureAttempts >= ackFailureBefore+1 &&
 			route.TCPAdmission.FlowCurrent == 0 && route.TCPAdmission.SetupCurrent == 0 &&
 			route.TCPAdmission.ActiveCurrent == 0 && route.PoolCapacity.TCPPending == 0 &&
 			route.PoolCapacity.TCPActive == 0 && route.TCPEligibleClients == 1
 	}, serverRun.run, clientRun); err != nil {
+		t.Fatal(err)
+	}
+
+	recoveredBackend, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: backendPort})
+	if err != nil {
+		t.Fatalf("restore backend listener without restarting QMux: %v", err)
+	}
+	closeOnCleanup(t, recoveredBackend)
+	serveTCPEcho(recoveredBackend)
+	assertTCPEcho(t, trafficAddr, []byte("backend-recovered"))
+	if err := waitForFault(testCtx, 5*time.Second, func() string {
+		return fmt.Sprintf("recovered TCP commit and ownership release; snapshot=%+v", serverRun.Snapshot())
+	}, func(time.Duration) bool {
+		snapshot := serverRun.Snapshot()
+		if len(snapshot.Routes) != 1 {
+			return false
+		}
+		route := snapshot.Routes[0]
+		return route.TCPAdmission.Committed >= committedBefore+1 &&
+			route.TCPAdmission.FlowCurrent == 0 && route.TCPAdmission.SetupCurrent == 0 &&
+			route.TCPAdmission.ActiveCurrent == 0 && route.PoolCapacity.TCPPending == 0 &&
+			route.PoolCapacity.TCPActive == 0 && route.TCPEligibleClients == 1
+	}, serverRun.run, clientRun); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTCPBackendDialFailureFallsBackToReadyClient(t *testing.T) {
+	certDir := generateTestCertificates(t)
+	_, goodPort := startTCPEchoListener(t)
+	badBackend, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatalf("reserve refused backend port: %v", err)
+	}
+	closeOnCleanup(t, badBackend)
+	badPort := badBackend.Addr().(*net.TCPAddr).Port
+	quicPort, trafficPort := getFreePort(t), getFreePort(t)
+	trafficAddr := fmt.Sprintf("127.0.0.1:%d", trafficPort)
+	testCtx, cancelTest := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelTest()
+	timeline := newFaultTimeline(t, "TCP backend fallback")
+
+	serverRun := startFaultServer(t, testCtx, "fallback server",
+		newMTLSServerConfig(certDir, "tcp", quicPort, trafficPort, time.Second, 10*time.Second), timeline)
+	goodRun := startFaultClient(testCtx, "ready backend client", newTestClient(t,
+		newMTLSClientConfig(certDir, "ready-backend-client", goodPort, time.Second, 0, quicPort)), timeline)
+	t.Cleanup(func() {
+		if err := goodRun.stopAndJoin(5 * time.Second); err != nil {
+			t.Errorf("stop ready backend client: %v", err)
+		}
+		if err := serverRun.run.stopAndJoin(5 * time.Second); err != nil {
+			t.Errorf("stop fallback server: %v", err)
+		}
+	})
+
+	if err := waitForFault(testCtx, 15*time.Second, func() string {
+		return fmt.Sprintf("one ready TCP route; snapshot=%+v", serverRun.Snapshot())
+	}, func(time.Duration) bool {
+		snapshot := serverRun.Snapshot()
+		return len(snapshot.Routes) == 1 && snapshot.Routes[0].Ready &&
+			snapshot.Routes[0].TCPEligibleClients == 1
+	}, serverRun.run, goodRun); err != nil {
+		t.Fatal(err)
+	}
+
+	hold, err := net.DialTimeout("tcp", trafficAddr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial held good-backend flow: %v", err)
+	}
+	defer func() { _ = hold.Close() }()
+	if err := hold.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set held flow deadline: %v", err)
+	}
+	if _, err := hold.Write([]byte("hold")); err != nil {
+		t.Fatalf("write held flow: %v", err)
+	}
+	var heldEcho [4]byte
+	if _, err := io.ReadFull(hold, heldEcho[:]); err != nil || string(heldEcho[:]) != "hold" {
+		t.Fatalf("read held flow = %q, %v", heldEcho, err)
+	}
+	if err := waitForFault(testCtx, 5*time.Second, func() string {
+		return fmt.Sprintf("one active good-backend flow; snapshot=%+v", serverRun.Snapshot())
+	}, func(time.Duration) bool {
+		snapshot := serverRun.Snapshot()
+		return len(snapshot.Routes) == 1 && snapshot.Routes[0].PoolCapacity.TCPActive == 1
+	}, serverRun.run, goodRun); err != nil {
+		t.Fatal(err)
+	}
+
+	badRun := startFaultClient(testCtx, "refused backend client", newTestClient(t,
+		newMTLSClientConfig(certDir, "refused-backend-client", badPort, time.Second, 0, quicPort)), timeline)
+	t.Cleanup(func() {
+		if err := badRun.stopAndJoin(5 * time.Second); err != nil {
+			t.Errorf("stop refused backend client: %v", err)
+		}
+	})
+	if err := waitForFault(testCtx, 15*time.Second, func() string {
+		return fmt.Sprintf("two TCP-eligible clients; snapshot=%+v", serverRun.Snapshot())
+	}, func(time.Duration) bool {
+		snapshot := serverRun.Snapshot()
+		return len(snapshot.Routes) == 1 && snapshot.Routes[0].TCPEligibleClients == 2
+	}, serverRun.run, goodRun, badRun); err != nil {
+		t.Fatal(err)
+	}
+	if err := badBackend.Close(); err != nil {
+		t.Fatalf("close reserved backend port for deterministic refusal: %v", err)
+	}
+
+	before := serverRun.Snapshot().Routes[0].TCPAdmission
+	assertTCPEcho(t, trafficAddr, []byte("fallback-after-refusal"))
+	if err := waitForFault(testCtx, 5*time.Second, func() string {
+		return fmt.Sprintf("failed ACK retry and fallback commit; snapshot=%+v", serverRun.Snapshot())
+	}, func(time.Duration) bool {
+		snapshot := serverRun.Snapshot()
+		if len(snapshot.Routes) != 1 {
+			return false
+		}
+		route := snapshot.Routes[0]
+		return route.TCPAdmission.Attempts >= before.Attempts+2 &&
+			route.TCPAdmission.Retries >= before.Retries+1 &&
+			route.TCPAdmission.AckFailureAttempts >= before.AckFailureAttempts+1 &&
+			route.TCPAdmission.Committed >= before.Committed+1 &&
+			route.TCPAdmission.SetupCurrent == 0 && route.TCPAdmission.ActiveCurrent == 1 &&
+			route.PoolCapacity.TCPPending == 0 && route.PoolCapacity.TCPActive == 1 &&
+			route.TCPEligibleClients == 2
+	}, serverRun.run, goodRun, badRun); err != nil {
 		t.Fatal(err)
 	}
 }

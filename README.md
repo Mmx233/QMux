@@ -134,7 +134,7 @@ tls:
 
 All eight server settings are enforced independently for each `listeners` entry. `max_local_udp_sessions` is one process-wide client budget. Omitting a setting or using `0` selects its default; negative values are rejected, and there is no unlimited setting. When a gate is full, QMux rejects or drops only new work; it does not evict registered generations, established TCP connections, or existing UDP sessions.
 
-The per-generation TCP gates are independent: `max_tcp_connections_per_generation` (100 by default) counts pending and active connections, while `max_pending_tcp_setups_per_generation` (16 by default) counts only connections still being established. Completing setup releases the pending-setup slot but continues to consume a connection slot until the connection closes.
+The per-generation TCP gates are independent: `max_tcp_connections_per_generation` (100 by default) counts pending and active connections, while `max_pending_tcp_setups_per_generation` (16 by default) counts only connections still being established. A pending TCP setup remains counted through backend dial and the NewConn ACK round trip, so size this limit for peak concurrent setup latency; success activates it and failure or the setup deadline releases it.
 
 For multi-listener deployments, calculate the aggregate budget from the actual listener count and workload, then validate the limits under that topology.
 
@@ -327,6 +327,7 @@ sequenceDiagram
     
     Client->>SVC: Dial internal service
     SVC-->>Client: Connected
+    Client->>Server: NewConnAckMsg{ConnID}
     
     Note over User,SVC: Bidirectional Tunnel Established
     

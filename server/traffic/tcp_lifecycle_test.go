@@ -262,6 +262,9 @@ func openRelayLifecycleFlow(
 	if err := protocol.ReadTypedMessage(peerStream, protocol.MsgTypeNewConn, &newConn); err != nil {
 		t.Fatalf("read NewConn message: %v", err)
 	}
+	if err := protocol.WriteNewConnAck(peerStream, newConn.ConnID); err != nil {
+		t.Fatalf("write NewConn acknowledgment: %v", err)
+	}
 	return tcpConn, peerStream
 }
 
@@ -454,6 +457,9 @@ func TestTCPRelayManagerShutdownAbortsFlowControlBlockedSend(t *testing.T) {
 	var newConn protocol.NewConnMsg
 	if err := protocol.ReadTypedMessage(peerStream, protocol.MsgTypeNewConn, &newConn); err != nil {
 		t.Fatalf("read blocked relay NewConn message: %v", err)
+	}
+	if err := protocol.WriteNewConnAck(peerStream, newConn.ConnID); err != nil {
+		t.Fatalf("write blocked relay NewConn acknowledgment: %v", err)
 	}
 	waitForActiveConnections(t, pooledClient, 1)
 

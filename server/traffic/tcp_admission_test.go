@@ -33,12 +33,12 @@ func TestNewConnWriteResult(t *testing.T) {
 		wantErr    error
 		wantAnyErr bool
 	}{
-		{name: "negative count", n: -1, wantAnyErr: true},
-		{name: "oversized count", n: 11, wantAnyErr: true},
+		{name: "negative count", n: -1, wantRetry: true, wantAnyErr: true},
+		{name: "oversized count", n: 11, wantRetry: true, wantAnyErr: true},
 		{name: "short nil error", n: 4, wantRetry: true, wantErr: io.ErrShortWrite},
 		{name: "partial error", n: 4, err: writeErr, wantRetry: true, wantErr: writeErr},
 		{name: "full success", n: 10},
-		{name: "full error", n: 10, err: writeErr, wantErr: writeErr},
+		{name: "full error", n: 10, err: writeErr, wantRetry: true, wantErr: writeErr},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -134,6 +134,10 @@ func startTCPFallbackSetup(t *testing.T, ctx context.Context, primaryWindow uint
 }
 
 func startTCPFallbackFlow(t *testing.T, listener *Listener) net.Conn {
+	return startTCPFallbackFlowWithTimeout(t, listener, tcpSetupTimeout)
+}
+
+func startTCPFallbackFlowWithTimeout(t *testing.T, listener *Listener, timeout time.Duration) net.Conn {
 	t.Helper()
 	release, ok := listener.acquireTCPSetup()
 	if !ok {
@@ -145,7 +149,7 @@ func startTCPFallbackFlow(t *testing.T, listener *Listener) net.Conn {
 	if !ok {
 		t.Fatal("addTCPFlow() = false")
 	}
-	go listener.handleTCPConnection(flow, time.Now().Add(tcpSetupTimeout), release)
+	go listener.handleTCPConnection(flow, time.Now().Add(timeout), release)
 	return remote
 }
 
@@ -193,6 +197,9 @@ func openPartialTCPFallback(
 	}
 	if newConn.ConnID == 0 {
 		t.Fatal("backup NewConn connID = 0")
+	}
+	if err := protocol.WriteNewConnAck(backupStream, newConn.ConnID); err != nil {
+		t.Fatalf("write backup NewConn acknowledgment: %v", err)
 	}
 	return tcpConn, primaryStream, backupStream
 }
@@ -651,6 +658,7 @@ func TestTCPGenerationSetupCapacityRejectsAndRecovers(t *testing.T) {
 	}
 
 	tcpConn, peerStream := openRelayLifecycleFlow(t, testCtx, manager, peerConn)
+	waitForActiveConnections(t, client, 1)
 	peerStream.CancelRead(trafficStreamCancelCode)
 	peerStream.CancelWrite(trafficStreamCancelCode)
 	_ = tcpConn.Close()
@@ -712,6 +720,7 @@ func TestTCPGenerationConnectionCapacityRejectsAndRecovers(t *testing.T) {
 	}
 
 	tcpConn, peerStream := openRelayLifecycleFlow(t, testCtx, manager, peerConn)
+	waitForActiveConnections(t, client, 1)
 	peerStream.CancelRead(trafficStreamCancelCode)
 	peerStream.CancelWrite(trafficStreamCancelCode)
 	_ = tcpConn.Close()
@@ -797,6 +806,9 @@ func TestTCPSaturatedPreferredUsesBackupGeneration(t *testing.T) {
 	var newConn protocol.NewConnMsg
 	if err := protocol.ReadTypedMessage(peerStream, protocol.MsgTypeNewConn, &newConn); err != nil {
 		t.Fatalf("read backup NewConn message: %v", err)
+	}
+	if err := protocol.WriteNewConnAck(peerStream, newConn.ConnID); err != nil {
+		t.Fatalf("write backup NewConn acknowledgment: %v", err)
 	}
 	waitForTCPAdmissionState(t, backup, 2, 1, manager.listeners[0].tcpSetupSlots)
 	snapshot := manager.listeners[0].tcpAdmission.snapshot()
@@ -1019,6 +1031,136 @@ func TestTCPPartialNewConnResetUsesBackupAndReleasesPrimaryLease(t *testing.T) {
 	waitForTCPAdmissionState(t, primary, 0, 0, listener.tcpSetupSlots)
 }
 
+func TestTCPNewConnAckFailureUsesBackupAndTransfersOwnership(t *testing.T) {
+	tests := []struct {
+		name       string
+		payload    any
+		mismatched bool
+	}{
+		{name: "null", payload: nil},
+		{name: "missing ConnID", payload: struct{}{}},
+		{name: "zero ConnID", payload: protocol.NewConnAckMsg{}},
+		{name: "mismatched ConnID", mismatched: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			testCtx, cancelTest := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancelTest()
+			setup := startTCPFallbackSetup(t, testCtx, 256*1024)
+			tcpConn := startTCPFallbackFlow(t, setup.listener)
+
+			primaryStream, err := setup.primaryPeer.AcceptStream(testCtx)
+			if err != nil {
+				t.Fatalf("primary AcceptStream() error = %v", err)
+			}
+			var primaryNewConn protocol.NewConnMsg
+			if err := protocol.ReadTypedMessage(primaryStream, protocol.MsgTypeNewConn, &primaryNewConn); err != nil {
+				t.Fatalf("read primary NewConn message: %v", err)
+			}
+			if snapshot := setup.listener.tcpAdmission.snapshot(); snapshot.SetupCurrent != 1 || snapshot.ActiveCurrent != 0 {
+				t.Fatalf("pending ACK listener ownership = %+v, want setup 1, active 0", snapshot)
+			}
+			if snapshot := setup.connectionPool.Snapshot(); snapshot.TCPPending != 1 || snapshot.TCPActive != 0 {
+				t.Fatalf("pending ACK pool ownership = %+v, want pending 1, active 0", snapshot)
+			}
+			payload := test.payload
+			if test.mismatched {
+				payload = protocol.NewConnAckMsg{ConnID: primaryNewConn.ConnID + 1}
+			}
+			if err := protocol.WriteMessage(primaryStream, protocol.MsgTypeNewConnAck, payload); err != nil {
+				t.Fatalf("write invalid primary NewConn acknowledgment: %v", err)
+			}
+
+			backupStream, err := setup.backupPeer.AcceptStream(testCtx)
+			if err != nil {
+				t.Fatalf("backup AcceptStream() error = %v", err)
+			}
+			var backupNewConn protocol.NewConnMsg
+			if err := protocol.ReadTypedMessage(backupStream, protocol.MsgTypeNewConn, &backupNewConn); err != nil {
+				t.Fatalf("read backup NewConn message: %v", err)
+			}
+			if backupNewConn.ConnID != primaryNewConn.ConnID {
+				t.Fatalf("backup ConnID = %d, want stable ID %d", backupNewConn.ConnID, primaryNewConn.ConnID)
+			}
+			if err := protocol.WriteNewConnAck(backupStream, backupNewConn.ConnID); err != nil {
+				t.Fatalf("write backup NewConn acknowledgment: %v", err)
+			}
+
+			waitForTCPAdmissionState(t, setup.backup, 2, 1, setup.listener.tcpSetupSlots)
+			if active, total := setup.primary.ActiveConns.Load(), setup.primary.TotalConns.Load(); active != 0 || total != 0 {
+				t.Fatalf("rejected primary active/total = %d/%d, want 0/0", active, total)
+			}
+			if snapshot := setup.connectionPool.Snapshot(); snapshot.TCPPending != 0 || snapshot.TCPActive != 1 {
+				t.Fatalf("acknowledged backup pool ownership = %+v, want pending 0, active 1", snapshot)
+			}
+			snapshot := setup.listener.tcpAdmission.snapshot()
+			if snapshot.SetupCurrent != 0 || snapshot.ActiveCurrent != 1 || snapshot.Attempts != 2 ||
+				snapshot.Retries != 1 || snapshot.AckFailureAttempts != 1 || snapshot.Committed != 1 {
+				t.Fatalf("ACK fallback TCP admission snapshot = %+v", snapshot)
+			}
+
+			backupStream.CancelRead(trafficStreamCancelCode)
+			backupStream.CancelWrite(trafficStreamCancelCode)
+			if err := tcpConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				t.Fatalf("close acknowledged backup TCP flow: %v", err)
+			}
+			waitForActiveConnections(t, setup.backup, 1)
+		})
+	}
+}
+
+func TestTCPStalledNewConnAckExhaustsDeadlineAndReleasesOwnership(t *testing.T) {
+	testCtx, cancelTest := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelTest()
+	setup := startTCPFallbackSetup(t, testCtx, 256*1024)
+	tcpConn := startTCPFallbackFlowWithTimeout(t, setup.listener, 200*time.Millisecond)
+
+	primaryStream, err := setup.primaryPeer.AcceptStream(testCtx)
+	if err != nil {
+		t.Fatalf("primary AcceptStream() error = %v", err)
+	}
+	var newConn protocol.NewConnMsg
+	if err := protocol.ReadTypedMessage(primaryStream, protocol.MsgTypeNewConn, &newConn); err != nil {
+		t.Fatalf("read primary NewConn message: %v", err)
+	}
+	if snapshot := setup.listener.tcpAdmission.snapshot(); snapshot.SetupCurrent != 1 || snapshot.ActiveCurrent != 0 {
+		t.Fatalf("stalled ACK listener ownership = %+v, want setup 1, active 0", snapshot)
+	}
+	if snapshot := setup.connectionPool.Snapshot(); snapshot.TCPPending != 1 || snapshot.TCPActive != 0 {
+		t.Fatalf("stalled ACK pool ownership = %+v, want pending 1, active 0", snapshot)
+	}
+
+	if err := tcpConn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set TCP failure read deadline: %v", err)
+	}
+	if _, err := tcpConn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("TCP connection remained open after stalled acknowledgment deadline")
+	}
+	deadline := time.Now().Add(time.Second)
+	for setup.listener.tcpAdmission.snapshot().Deadline != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if snapshot := setup.listener.tcpAdmission.snapshot(); snapshot.SetupCurrent != 0 || snapshot.ActiveCurrent != 0 ||
+		snapshot.Attempts != 1 || snapshot.Retries != 0 || snapshot.AckFailureAttempts != 1 ||
+		snapshot.Committed != 0 || snapshot.Deadline != 1 {
+		t.Fatalf("stalled ACK TCP admission snapshot = %+v", snapshot)
+	}
+	if snapshot := setup.connectionPool.Snapshot(); snapshot.TCPPending != 0 || snapshot.TCPActive != 0 {
+		t.Fatalf("stalled ACK released pool ownership = %+v, want pending 0, active 0", snapshot)
+	}
+	if active, total := setup.primary.ActiveConns.Load(), setup.primary.TotalConns.Load(); active != 0 || total != 0 {
+		t.Fatalf("stalled primary active/total = %d/%d, want 0/0", active, total)
+	}
+
+	backupCtx, cancelBackup := context.WithTimeout(testCtx, 100*time.Millisecond)
+	defer cancelBackup()
+	if stream, err := setup.backupPeer.AcceptStream(backupCtx); err == nil {
+		stream.CancelRead(trafficStreamCancelCode)
+		stream.CancelWrite(trafficStreamCancelCode)
+		t.Fatal("backup received a stream after the first ACK consumed the total setup deadline")
+	}
+}
+
 func TestTCPNewConnStreamResetDoesNotPoisonGeneration(t *testing.T) {
 	testCtx, cancelTest := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancelTest()
@@ -1061,6 +1203,9 @@ func TestTCPNewConnStreamResetDoesNotPoisonGeneration(t *testing.T) {
 	var newConn protocol.NewConnMsg
 	if err := protocol.ReadTypedMessage(stream, protocol.MsgTypeNewConn, &newConn); err != nil {
 		t.Fatalf("read next request NewConn message: %v", err)
+	}
+	if err := protocol.WriteNewConnAck(stream, newConn.ConnID); err != nil {
+		t.Fatalf("write next request NewConn acknowledgment: %v", err)
 	}
 	if current, ok := connectionPool.Get(client.ID); !ok || current != client {
 		t.Fatalf("current generation after stream reset = (%p, %v), want (%p, true)", current, ok, client)
@@ -1172,6 +1317,9 @@ func TestTCPConnectionScopedOpenFailureUsesBackup(t *testing.T) {
 	var newConn protocol.NewConnMsg
 	if err := protocol.ReadTypedMessage(backupStream, protocol.MsgTypeNewConn, &newConn); err != nil {
 		t.Fatalf("read backup NewConn message: %v", err)
+	}
+	if err := protocol.WriteNewConnAck(backupStream, newConn.ConnID); err != nil {
+		t.Fatalf("write backup NewConn acknowledgment: %v", err)
 	}
 	if active, total := setup.primary.ActiveConns.Load(), setup.primary.TotalConns.Load(); active != 0 || total != 0 {
 		t.Fatalf("failed generation active/total = %d/%d, want 0/0", active, total)

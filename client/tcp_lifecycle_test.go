@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"testing"
@@ -46,6 +47,17 @@ func newClientRelayQUICPair(t *testing.T, ctx context.Context) (*quic.Conn, *qui
 		_ = result.conn.CloseWithError(0, "test complete")
 	})
 	return clientConn, result.conn
+}
+
+func readClientNewConnAck(stream *quic.Stream, connID uint64) error {
+	var ack protocol.NewConnAckMsg
+	if err := protocol.ReadTypedMessageLimited(stream, protocol.MsgTypeNewConnAck, &ack, protocol.MaxNewConnAckPayloadSize); err != nil {
+		return fmt.Errorf("read NewConn acknowledgment: %w", err)
+	}
+	if ack.ConnID != connID {
+		return fmt.Errorf("NewConn acknowledgment ID = %d, want %d", ack.ConnID, connID)
+	}
+	return nil
 }
 
 func TestClientTCPRelayDeliversResponseAfterRequestFIN(t *testing.T) {
@@ -111,6 +123,9 @@ func TestClientTCPRelayDeliversResponseAfterRequestFIN(t *testing.T) {
 		c.handleStream(testCtx, clientStream, &ServerConnection{serverAddr: "relay-test"})
 		close(handlerDone)
 	}()
+	if err := readClientNewConnAck(peerStream, 1); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := peerStream.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatalf("set response deadline: %v", err)
@@ -278,6 +293,9 @@ func newBlockedClientRelay(
 		c.handleStream(flowCtx, clientStream, &ServerConnection{serverAddr: "relay-test"})
 		close(handlerDone)
 	}()
+	if err := readClientNewConnAck(peerStream, connID); err != nil {
+		t.Fatal(err)
+	}
 
 	deadline := time.NewTimer(3 * time.Second)
 	defer deadline.Stop()
