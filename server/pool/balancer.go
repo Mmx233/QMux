@@ -23,42 +23,46 @@ func NewRoundRobinBalancer() *RoundRobinBalancer {
 	return &RoundRobinBalancer{}
 }
 
-// Select chooses a client using round-robin algorithm with O(1) complexity
+// Select chooses a healthy client using round-robin order.
 func (r *RoundRobinBalancer) Select(clients []*ClientConn) (*ClientConn, error) {
 	if len(clients) == 0 {
 		return nil, ErrNoClientsAvailable
 	}
 
-	// Fast path: check if all clients are healthy to avoid allocation
-	allHealthy := true
+	healthyCount := 0
 	for _, c := range clients {
-		if !c.healthy.Load() {
-			allHealthy = false
-			break
+		if c.healthy.Load() {
+			healthyCount++
 		}
 	}
-
-	var healthy []*ClientConn
-	if allHealthy {
-		// No allocation needed - use input slice directly
-		healthy = clients
-	} else {
-		// Filter unhealthy clients (allocation only when needed)
-		healthy = make([]*ClientConn, 0, len(clients))
-		for _, c := range clients {
-			if c.healthy.Load() {
-				healthy = append(healthy, c)
-			}
-		}
-	}
-
-	if len(healthy) == 0 {
+	if healthyCount == 0 {
 		return nil, ErrNoHealthyClients
 	}
 
-	// O(1) selection - single atomic increment with modulo
-	idx := r.counter.Add(1) % uint64(len(healthy))
-	return healthy[idx], nil
+	idx := int(r.counter.Add(1) % uint64(healthyCount))
+	if healthyCount == len(clients) {
+		return clients[idx], nil
+	}
+
+	// Health may change between scans; fallback still returns a client observed
+	// healthy during the selection scan.
+	var fallback *ClientConn
+	for _, c := range clients {
+		if !c.healthy.Load() {
+			continue
+		}
+		if fallback == nil {
+			fallback = c
+		}
+		if idx == 0 {
+			return c, nil
+		}
+		idx--
+	}
+	if fallback != nil {
+		return fallback, nil
+	}
+	return nil, ErrNoHealthyClients
 }
 
 // Name returns the balancer name
@@ -74,64 +78,31 @@ func NewLeastConnectionsBalancer() *LeastConnectionsBalancer {
 	return &LeastConnectionsBalancer{}
 }
 
-// Select chooses the client with fewest active connections
-// Uses linear scan for small pools (≤100 clients) and optimized path for larger pools
+// Select chooses the healthy client with fewest active connections.
 func (l *LeastConnectionsBalancer) Select(clients []*ClientConn) (*ClientConn, error) {
 	if len(clients) == 0 {
 		return nil, ErrNoClientsAvailable
 	}
 
-	// Fast path: check if all clients are healthy to avoid allocation
-	allHealthy := true
+	var selected *ClientConn
+	var minConns int64
+
 	for _, c := range clients {
 		if !c.healthy.Load() {
-			allHealthy = false
-			break
+			continue
 		}
-	}
-
-	if allHealthy {
-		// No allocation needed - scan input slice directly
-		return l.selectFromSlice(clients)
-	}
-
-	// Filter unhealthy clients (allocation only when needed)
-	healthy := make([]*ClientConn, 0, len(clients))
-	for _, c := range clients {
-		if c.healthy.Load() {
-			healthy = append(healthy, c)
-		}
-	}
-
-	if len(healthy) == 0 {
-		return nil, ErrNoHealthyClients
-	}
-
-	return l.selectFromSlice(healthy)
-}
-
-// selectFromSlice finds the client with least connections from a slice of healthy clients
-func (l *LeastConnectionsBalancer) selectFromSlice(clients []*ClientConn) (*ClientConn, error) {
-	if len(clients) == 0 {
-		return nil, ErrNoHealthyClients
-	}
-
-	// Linear scan is efficient for all practical pool sizes
-	// Heap-based selection only provides benefit for very large pools (>1000)
-	// and adds complexity, so we use linear scan for simplicity
-	var selected *ClientConn
-	minConns := int64(^uint64(0) >> 1) // Max int64
-
-	for _, c := range clients {
 		// Commit increments active before decrementing pending. Read in the
 		// opposite order so selection may briefly overcount, but never undercount.
 		conns := c.tcpPending.Load() + c.ActiveConns.Load()
-		if conns < minConns {
+		if selected == nil || conns < minConns {
 			minConns = conns
 			selected = c
 		}
 	}
 
+	if selected == nil {
+		return nil, ErrNoHealthyClients
+	}
 	return selected, nil
 }
 

@@ -27,7 +27,7 @@ const (
 	FragmentTimeout   = 5 * time.Second                     // Timeout for incomplete fragments
 
 	// DefaultShardCount is the default number of shards for the fragment assembler
-	DefaultShardCount = 16
+	DefaultShardCount = 64
 
 	maxRetainedFragmentGroups = 4096
 	maxRetainedFragmentBytes  = 64 << 20
@@ -595,6 +595,7 @@ func (sfa *ShardedFragmentAssembler) AddFragment(sessionID uint32, fragID uint16
 		group = &fragmentGroup{
 			total:     total,
 			data:      make([][]byte, total),
+			buffers:   make([]*[]byte, 0, total),
 			createdAt: time.Now(),
 		}
 		shard.fragments[key] = group

@@ -33,6 +33,7 @@ func TestRoundRobinBalancer(t *testing.T) {
 		}
 	}
 	clients[1].healthy.Store(false)
+	clear(selections)
 	for range 6 {
 		selected, err := balancer.Select(clients)
 		if err != nil {
@@ -40,6 +41,12 @@ func TestRoundRobinBalancer(t *testing.T) {
 		}
 		if selected.ID == "client2" {
 			t.Error("selected unhealthy client2")
+		}
+		selections[selected.ID]++
+	}
+	for _, client := range []*ClientConn{clients[0], clients[2]} {
+		if selections[client.ID] != 3 {
+			t.Errorf("client %s selected %d times, want 3", client.ID, selections[client.ID])
 		}
 	}
 }
@@ -88,6 +95,28 @@ func TestBalancersUnavailable(t *testing.T) {
 			}
 			if _, err := balancer.Select([]*ClientConn{{ID: "unhealthy"}}); !errors.Is(err, ErrNoHealthyClients) {
 				t.Fatalf("all-unhealthy error = %v", err)
+			}
+		})
+	}
+}
+
+func TestBalancersMixedHealthDoNotAllocate(t *testing.T) {
+	clients := []*ClientConn{{ID: "healthy"}, {ID: "unhealthy"}, {ID: "also-healthy"}}
+	clients[0].healthy.Store(true)
+	clients[2].healthy.Store(true)
+
+	for name, balancer := range map[string]LoadBalancer{
+		"round robin":       NewRoundRobinBalancer(),
+		"least connections": NewLeastConnectionsBalancer(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			allocs := testing.AllocsPerRun(100, func() {
+				if _, err := balancer.Select(clients); err != nil {
+					t.Fatal(err)
+				}
+			})
+			if allocs != 0 {
+				t.Fatalf("mixed-health selection allocated %.0f objects, want 0", allocs)
 			}
 		})
 	}

@@ -123,7 +123,7 @@ func makeBenchmarkFragmentSets(tb testing.TB, count int) [][]benchmarkFragment {
 
 func BenchmarkShardedFragmentAssembler_AddFragment(b *testing.B) {
 	fragments := makeBenchmarkFragmentSets(b, 1)[0]
-	assembler := NewShardedFragmentAssembler(16)
+	assembler := NewShardedFragmentAssembler(DefaultShardCount)
 	defer assembler.Close()
 
 	b.ResetTimer()
@@ -137,21 +137,31 @@ func BenchmarkShardedFragmentAssembler_AddFragment(b *testing.B) {
 func BenchmarkShardedFragmentAssembler_Concurrent(b *testing.B) {
 	const fragmentSetCount = 16
 	sets := makeBenchmarkFragmentSets(b, fragmentSetCount)
-	assembler := NewShardedFragmentAssembler(16)
-	defer assembler.Close()
-	var sessionID atomic.Uint32
+	for _, tc := range []struct {
+		name   string
+		shards int
+	}{
+		{"16_shards", 16},
+		{"64_shards", 64},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			assembler := NewShardedFragmentAssembler(tc.shards)
+			defer assembler.Close()
+			var sessionID atomic.Uint32
 
-	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		setIndex := 0
-		for pb.Next() {
-			id := sessionID.Add(1)
-			for _, fragment := range sets[setIndex%fragmentSetCount] {
-				_, _ = assembler.AddFragment(id, fragment.fragID, fragment.index, fragment.total, fragment.payload)
-			}
-			setIndex++
-		}
-	})
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				setIndex := 0
+				for pb.Next() {
+					id := sessionID.Add(1)
+					for _, fragment := range sets[setIndex%fragmentSetCount] {
+						_, _ = assembler.AddFragment(id, fragment.fragID, fragment.index, fragment.total, fragment.payload)
+					}
+					setIndex++
+				}
+			})
+		})
+	}
 }
 
 func BenchmarkAtomicCounter_FragmentIDPattern(b *testing.B) {
