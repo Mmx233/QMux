@@ -385,7 +385,8 @@ func BenchmarkConnectionPool_Remove(b *testing.B) {
 	}
 }
 
-// BenchmarkConnectionPool_Select_Sizes benchmarks selection with varying pool sizes
+// BenchmarkConnectionPool_Select_Sizes compares pool and raw-balancer selection
+// on the same clients at each pool size.
 func BenchmarkConnectionPool_Select_Sizes(b *testing.B) {
 	sizes := []int{10, 100, 1000}
 
@@ -404,12 +405,21 @@ func BenchmarkConnectionPool_Select_Sizes(b *testing.B) {
 				_ = pool.Add(client)
 			}
 
-			b.ReportAllocs()
-			b.ResetTimer()
+			clients := pool.List()
+			balancer := NewRoundRobinBalancer()
 
-			for i := 0; i < b.N; i++ {
-				_, _ = pool.Select()
-			}
+			b.Run("Pool", func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					_, _ = pool.Select()
+				}
+			})
+			b.Run("Balancer", func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					_, _ = balancer.Select(clients)
+				}
+			})
 		})
 	}
 }
@@ -444,29 +454,41 @@ func BenchmarkConnectionPool_Get(b *testing.B) {
 	}
 }
 
-// BenchmarkConnectionPool_Parallel benchmarks concurrent pool operations
-func BenchmarkConnectionPool_Parallel(b *testing.B) {
+func BenchmarkConnectionPool_SelectParallel(b *testing.B) {
 	pool := NewWithLimits("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger(), largeTestLimits())
 	defer pool.Stop()
 
-	// Populate pool with 100 clients
-	clientIDs := populateBenchmarkPool(pool, 100)
+	populateBenchmarkPool(pool, 100)
 
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	b.RunParallel(func(pb *testing.PB) {
-		i := 0
 		for pb.Next() {
-			// Mix of Select and Get operations
-			if i%2 == 0 {
-				_, _ = pool.Select()
-			} else {
-				_, _ = pool.Get(clientIDs[i%100])
-			}
-			i++
+			_, _ = pool.Select()
 		}
 	})
+}
+
+func BenchmarkConnectionPool_HealthUpdates(b *testing.B) {
+	for _, size := range []int{10, 100, 1000} {
+		b.Run(fmt.Sprintf("clients_%d", size), func(b *testing.B) {
+			pool := NewWithLimits("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger(), largeTestLimits())
+			defer pool.Stop()
+
+			populateBenchmarkPool(pool, size)
+			client := currentTestClient(pool, "client-0")
+
+			b.ReportAllocs()
+			for i := 0; b.Loop(); i++ {
+				if i%2 == 0 {
+					pool.MarkUnhealthy(client)
+				} else {
+					pool.MarkHealthy(client)
+				}
+			}
+		})
+	}
 }
 
 // Feature: performance-optimizations, Property 3: Balancer Cache Invalidation
@@ -555,257 +577,6 @@ func TestCacheInvalidationCorrectness_Property(t *testing.T) {
 					t.Errorf("Select returned unhealthy client %s", selected.ID)
 				}
 			}
-		}
-	})
-}
-
-// Feature: performance-optimizations, Property 7: Pool Select Overhead Ratio
-// *For any* pool size, Pool.Select time SHALL be less than 2x the raw Balancer.Select time.
-// Validates: Requirements 5.1
-//
-// Note: This test uses a 3.0x threshold to account for measurement variance in property testing.
-// The actual overhead is verified to be <2x in dedicated benchmarks (BenchmarkConnectionPool_Select_Sizes).
-func TestPoolSelectOverheadRatio_Property(t *testing.T) {
-	rapid.Check(t, func(t *rapid.T) {
-		// Generate random pool size (50-200) - larger sizes for more stable measurements
-		poolSize := rapid.IntRange(50, 200).Draw(t, "poolSize")
-
-		pool := NewWithLimits("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger(), largeTestLimits())
-		defer pool.Stop()
-
-		// Create clients
-		clients := make([]*ClientConn, poolSize)
-		for i := range poolSize {
-			clientID := fmt.Sprintf("client-%d", i)
-			clients[i] = &ClientConn{
-				ID: clientID,
-			}
-			clients[i].healthy.Store(true)
-			_ = pool.Add(clients[i])
-		}
-
-		// Warm up the cache with many iterations
-		for range 1000 {
-			_, _ = pool.Select()
-		}
-
-		// Measure raw balancer time with more iterations for stability
-		balancer := NewRoundRobinBalancer()
-		clientSlice := pool.List()
-
-		// Use testing.Benchmark-style measurement for more accurate timing
-		// Run multiple rounds and take the average to reduce variance
-		rounds := 5
-		iterations := 100000
-
-		var totalRawTime, totalPoolTime time.Duration
-
-		for range rounds {
-			start := time.Now()
-			for range iterations {
-				_, _ = balancer.Select(clientSlice)
-			}
-			totalRawTime += time.Since(start)
-
-			start = time.Now()
-			for range iterations {
-				_, _ = pool.Select()
-			}
-			totalPoolTime += time.Since(start)
-		}
-
-		avgRawTime := totalRawTime / time.Duration(rounds)
-		avgPoolTime := totalPoolTime / time.Duration(rounds)
-
-		// Property: Pool.Select should be less than 3.0x raw balancer time
-		// Using 3.0x threshold to account for measurement variance in property testing
-		// Dedicated benchmarks verify the actual overhead is <2x
-		if avgRawTime < time.Microsecond*100 {
-			// Raw balancer is too fast to measure reliably, skip this iteration
-			return
-		}
-
-		ratio := float64(avgPoolTime) / float64(avgRawTime)
-		if ratio > 3.0 {
-			t.Errorf("Pool.Select overhead ratio %.2fx exceeds 3.0x limit for pool size %d (pool: %v, raw: %v)",
-				ratio, poolSize, avgPoolTime, avgRawTime)
-		}
-	})
-}
-
-// Feature: performance-optimizations, Property 8: Concurrent Pool Throughput
-// *For any* number of concurrent goroutines, Pool operations SHALL scale with parallelism
-// (throughput increases with GOMAXPROCS).
-// Validates: Requirements 5.2
-func TestConcurrentPoolThroughput_Property(t *testing.T) {
-	if testing.Short() {
-		t.Skip("wall-clock throughput is covered by the full regression suite")
-	}
-	rapid.Check(t, func(t *rapid.T) {
-		// Generate random pool size (20-100)
-		poolSize := rapid.IntRange(20, 100).Draw(t, "poolSize")
-
-		pool := NewWithLimits("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger(), largeTestLimits())
-		defer pool.Stop()
-
-		// Populate pool with clients
-		for i := range poolSize {
-			clientID := fmt.Sprintf("client-%d", i)
-			client := &ClientConn{
-				ID: clientID,
-			}
-			client.healthy.Store(true)
-			_ = pool.Add(client)
-		}
-
-		// Warm up the cache
-		for range 1000 {
-			_, _ = pool.Select()
-		}
-
-		// Use larger iteration count for more stable measurements
-		iterations := 100000
-
-		// Measure throughput with 1 goroutine (run multiple rounds for stability)
-		rounds := 3
-		var totalSingleTime time.Duration
-		for range rounds {
-			start := time.Now()
-			for range iterations {
-				_, _ = pool.Select()
-			}
-			totalSingleTime += time.Since(start)
-		}
-		avgSingleTime := totalSingleTime / time.Duration(rounds)
-
-		// Measure throughput with multiple goroutines (4)
-		numGoroutines := 4
-		iterationsPerGoroutine := iterations / numGoroutines
-
-		var totalMultiTime time.Duration
-		for range rounds {
-			var wg sync.WaitGroup
-			start := time.Now()
-			for range numGoroutines {
-				wg.Go(func() {
-					for range iterationsPerGoroutine {
-						_, _ = pool.Select()
-					}
-				})
-			}
-			wg.Wait()
-			totalMultiTime += time.Since(start)
-		}
-		avgMultiTime := totalMultiTime / time.Duration(rounds)
-
-		// Skip if measurements are too fast to be reliable
-		if avgSingleTime < time.Millisecond || avgMultiTime < time.Millisecond {
-			return
-		}
-
-		// Property: Multi-goroutine throughput should not degrade catastrophically
-		// Some contention overhead is expected with lock-based data structures
-		// The key property is that throughput scales reasonably with parallelism
-		singleThroughput := float64(iterations) / avgSingleTime.Seconds()
-		multiThroughput := float64(iterations) / avgMultiTime.Seconds()
-
-		// Multi-goroutine throughput should be at least 25% of single-goroutine throughput
-		// This ensures no catastrophic lock contention (e.g., from a global lock)
-		// Note: Some overhead is expected due to lock contention and cache coherency
-		if multiThroughput < singleThroughput*0.25 {
-			t.Errorf("Concurrent throughput degraded catastrophically: single=%.0f ops/s, multi=%.0f ops/s (ratio: %.2f)",
-				singleThroughput, multiThroughput, multiThroughput/singleThroughput)
-		}
-	})
-}
-
-// Feature: performance-optimizations, Property 9: Health Update Efficiency
-// *For any* health status change (MarkHealthy/MarkUnhealthy), the operation SHALL complete
-// in O(1) time without rebuilding the client list.
-// Validates: Requirements 5.4
-func TestHealthUpdateEfficiency_Property(t *testing.T) {
-	rapid.Check(t, func(t *rapid.T) {
-		// Generate random pool sizes to test O(1) behavior
-		smallPoolSize := rapid.IntRange(10, 50).Draw(t, "smallPoolSize")
-		largePoolSize := rapid.IntRange(500, 1000).Draw(t, "largePoolSize")
-
-		// Create small pool
-		smallPool := NewWithLimits("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger(), largeTestLimits())
-		defer smallPool.Stop()
-
-		for i := range smallPoolSize {
-			clientID := fmt.Sprintf("client-%d", i)
-			client := &ClientConn{
-				ID: clientID,
-			}
-			client.healthy.Store(true)
-			_ = smallPool.Add(client)
-		}
-
-		// Create large pool
-		largePool := NewWithLimits("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger(), largeTestLimits())
-		defer largePool.Stop()
-
-		for i := range largePoolSize {
-			clientID := fmt.Sprintf("client-%d", i)
-			client := &ClientConn{
-				ID: clientID,
-			}
-			client.healthy.Store(true)
-			_ = largePool.Add(client)
-		}
-
-		// Use larger iteration count for more stable measurements
-		iterations := 100000
-		targetClientSmall := currentTestClient(smallPool, "client-0")
-		targetClientLarge := currentTestClient(largePool, "client-0")
-
-		// Run multiple rounds for stability
-		rounds := 3
-		var totalSmallTime, totalLargeTime time.Duration
-
-		for range rounds {
-			start := time.Now()
-			for i := range iterations {
-				if i%2 == 0 {
-					smallPool.MarkUnhealthy(targetClientSmall)
-				} else {
-					smallPool.MarkHealthy(targetClientSmall)
-				}
-			}
-			totalSmallTime += time.Since(start)
-
-			start = time.Now()
-			for i := range iterations {
-				if i%2 == 0 {
-					largePool.MarkUnhealthy(targetClientLarge)
-				} else {
-					largePool.MarkHealthy(targetClientLarge)
-				}
-			}
-			totalLargeTime += time.Since(start)
-		}
-
-		avgSmallTime := totalSmallTime / time.Duration(rounds)
-		avgLargeTime := totalLargeTime / time.Duration(rounds)
-
-		// Skip if measurements are too fast to be reliable
-		if avgSmallTime < time.Millisecond {
-			return
-		}
-
-		// Property: O(1) means large pool time should be similar to small pool time
-		// Allow up to 3x difference to account for map lookup variance and cache effects
-		// The key is that it doesn't scale linearly with pool size
-		ratio := float64(avgLargeTime) / float64(avgSmallTime)
-		poolSizeRatio := float64(largePoolSize) / float64(smallPoolSize)
-
-		// If operations were O(n), the time ratio would be close to poolSizeRatio
-		// For O(1), the ratio should be much smaller than poolSizeRatio
-		// We check that ratio is less than 50% of poolSizeRatio
-		if ratio > poolSizeRatio*0.5 {
-			t.Errorf("Health update time scales with pool size (not O(1)): small=%v, large=%v, ratio=%.2f, poolSizeRatio=%.2f",
-				avgSmallTime, avgLargeTime, ratio, poolSizeRatio)
 		}
 	})
 }

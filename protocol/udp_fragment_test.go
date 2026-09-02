@@ -1481,41 +1481,6 @@ func BenchmarkFragmentAssembler_Concurrent(b *testing.B) {
 	})
 }
 
-// ============================================================================
-// Atomic Counter Benchmarks
-// ============================================================================
-
-// BenchmarkAtomicCounter_Concurrent benchmarks the atomic.Uint32 counter
-// performance under concurrent access from multiple goroutines.
-// This simulates the fragment ID counter usage pattern in FragmentUDPPooled.
-func BenchmarkAtomicCounter_Concurrent(b *testing.B) {
-	var counter atomic.Uint32
-
-	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			counter.Add(1)
-		}
-	})
-}
-
-// BenchmarkMutexCounter_Concurrent benchmarks a mutex-protected counter
-// for comparison with the atomic counter. This represents the old approach
-// using sync.Mutex for fragment ID counter protection.
-func BenchmarkMutexCounter_Concurrent(b *testing.B) {
-	var mu sync.Mutex
-	var counter uint32
-
-	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			mu.Lock()
-			counter++
-			mu.Unlock()
-		}
-	})
-}
-
 // BenchmarkAtomicCounter_FragmentIDPattern benchmarks the atomic counter
 // in a pattern that more closely matches the actual FragmentUDPPooled usage:
 // increment counter and use the value for fragment ID generation.

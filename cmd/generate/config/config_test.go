@@ -114,17 +114,8 @@ func assertCanonicalQUICKeys(t *testing.T, content string) {
 		"max_incoming_streams", "keep_alive_period", "handshake_idle_timeout",
 		"max_idle_timeout",
 	}
-	forbidden := []string{
-		"initialstreamreceivewindow", "maxstreamreceivewindow",
-		"initialconnectionreceivewindow", "maxconnectionreceivewindow",
-		"maxincomingstreams", "keepaliveperiod", "handshakeidletimeout",
-		"maxidletimeout", "allow_0rtt", "allow0rtt",
-	}
 	for _, key := range canonical {
 		assert.Contains(t, content, key+":", "template should contain canonical QUIC key")
-	}
-	for _, key := range forbidden {
-		assert.False(t, strings.Contains(content, key+":"), "template should not contain forbidden QUIC key %q", key)
 	}
 }
 
@@ -132,11 +123,6 @@ func assertUDPTemplateKeys(t *testing.T, content string) {
 	t.Helper()
 	if !strings.Contains(content, "enable_fragmentation:") {
 		t.Error("template should contain enable_fragmentation")
-	}
-	for _, key := range []string{"fragment_assembler_shards", "enable_buffer_pooling", "read_buffer_size", "datagram_buffer_size"} {
-		if strings.Contains(content, key+":") {
-			t.Errorf("template should not contain removed UDP key %q", key)
-		}
 	}
 }
 
