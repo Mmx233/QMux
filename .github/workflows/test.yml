@@ -8,8 +8,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  checks-quick:
-    if: github.event_name == 'push' || github.event_name == 'pull_request'
+  checks:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -25,41 +24,6 @@ jobs:
       - name: Predictable short suite
         timeout-minutes: 5
         run: go test -short ./... -count=1 -timeout=3m
-
-      - name: Core generation, lifecycle, and snapshot race tests
-        timeout-minutes: 3
-        run: >-
-          go test -race ./server/pool ./client ./server
-          -run '^(TestGenerationCurrentMutators|TestGenerationStaleMutatorsAreNoOps|TestGenerationConcurrentStaleCompletionsAreBounded|TestClientLifecycle|TestConnectionManagerStopJoinsBlockedPublication|TestSnapshotRequiresEveryRoute|TestSnapshotConcurrentHealthUpdates)$'
-          -count=1 -timeout=2m
-
-      - name: E2E restart and same-ID race smoke
-        timeout-minutes: 2
-        run: >-
-          go test -race ./e2e
-          -run '^(TestServerRestartReconnect_MTLS|TestClientReconnection_MTLS)$'
-          -count=1 -timeout=110s
-
-  checks-extended:
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-
-      - name: Predictable short suite
-        timeout-minutes: 5
-        run: go test -short ./... -count=1 -timeout=3m
-
-      - name: Full non-E2E suite
-        timeout-minutes: 10
-        run: >-
-          go test ./auth/... ./client/... ./cmd/... ./config/... ./protocol/... ./server/...
-          -count=1 -timeout=8m
 
       - name: Full non-E2E race suite
         timeout-minutes: 20
