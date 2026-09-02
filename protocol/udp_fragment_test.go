@@ -3,7 +3,6 @@ package protocol
 import (
 	"bytes"
 	"errors"
-	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -162,32 +161,4 @@ func BenchmarkShardedFragmentAssembler_Concurrent(b *testing.B) {
 			})
 		})
 	}
-}
-
-func BenchmarkAtomicCounter_FragmentIDPattern(b *testing.B) {
-	var counter atomic.Uint32
-	data := make([]byte, 3000)
-
-	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			results, _ := FragmentUDPPooled(12345, data, &counter, true)
-			ReleaseDatagramResults(results)
-		}
-	})
-}
-
-func BenchmarkMutexCounter_FragmentIDPattern(b *testing.B) {
-	var mu sync.Mutex
-	var fragID uint16
-	data := make([]byte, 3000)
-
-	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			mu.Lock()
-			_, _ = FragmentUDP(12345, data, &fragID, true)
-			mu.Unlock()
-		}
-	})
 }
