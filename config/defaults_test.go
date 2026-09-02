@@ -3,178 +3,62 @@ package config
 import (
 	"testing"
 	"time"
-
-	"pgregory.net/rapid"
 )
 
-// Feature: consolidate-defaults, Property 1: Zero-value fields receive correct defaults
-// **Validates: Requirements 3.1, 4.1, 4.2, 5.1, 7.1**
-func TestZeroValueDefaultsApplication_Property(t *testing.T) {
-	rapid.Check(t, func(t *rapid.T) {
-		// Test Client.ApplyDefaults() with zero values
-		client := &Client{
-			// All defaultable fields are zero
-			ClientID:          "",
-			HeartbeatInterval: 0,
-		}
+func TestApplyDefaults(t *testing.T) {
+	client := Client{}
+	client.ApplyDefaults()
+	if client.ClientID == "" || client.Auth.Method != ClientAuthMethodMTLS ||
+		client.HeartbeatInterval != DefaultHeartbeatInterval || client.HealthTimeout != DefaultHealthTimeout ||
+		client.Capacity != defaultClientCapacity() {
+		t.Fatalf("client defaults = %+v", client)
+	}
 
-		client.ApplyDefaults()
+	server := Server{Listeners: []QuicListener{{}}}
+	server.ApplyDefaults()
+	if server.HeartbeatInterval != DefaultHeartbeatInterval || server.HealthTimeout != DefaultHealthTimeout ||
+		server.LoadBalancer != DefaultLoadBalancer || server.Listeners[0].Capacity != defaultListenerCapacity() {
+		t.Fatalf("server defaults = %+v", server)
+	}
 
-		// Property: ClientID should be generated (non-empty UUID)
-		if client.ClientID == "" {
-			t.Fatal("expected ClientID to be generated, got empty string")
-		}
-
-		// Property: HeartbeatInterval should equal DefaultHeartbeatInterval
-		if client.HeartbeatInterval != DefaultHeartbeatInterval {
-			t.Fatalf("expected HeartbeatInterval=%v, got %v", DefaultHeartbeatInterval, client.HeartbeatInterval)
-		}
-		if client.Capacity != defaultClientCapacity() {
-			t.Fatalf("client capacity = %+v, want %+v", client.Capacity, defaultClientCapacity())
-		}
-	})
-
-	rapid.Check(t, func(t *rapid.T) {
-		// Test Server.ApplyDefaults() with zero values
-		server := &Server{
-			Listeners:         []QuicListener{{}},
-			HeartbeatInterval: 0,
-			HealthTimeout:     0,
-		}
-
-		server.ApplyDefaults()
-
-		// Property: HeartbeatInterval should equal DefaultHeartbeatInterval
-		if server.HeartbeatInterval != DefaultHeartbeatInterval {
-			t.Fatalf("expected HeartbeatInterval=%v, got %v", DefaultHeartbeatInterval, server.HeartbeatInterval)
-		}
-
-		// Property: HealthTimeout should equal DefaultHealthTimeout
-		if server.HealthTimeout != DefaultHealthTimeout {
-			t.Fatalf("expected HealthTimeout=%v, got %v", DefaultHealthTimeout, server.HealthTimeout)
-		}
-		if server.Listeners[0].Capacity != defaultListenerCapacity() {
-			t.Fatalf("listener capacity = %+v, want %+v", server.Listeners[0].Capacity, defaultListenerCapacity())
-		}
-	})
-
-	rapid.Check(t, func(t *rapid.T) {
-		// Test Quic.GetConfig() with zero MaxIdleTimeout
-		quic := Quic{
-			MaxIdleTimeout: 0,
-		}
-
-		cfg := quic.GetConfig()
-
-		// Property: MaxIdleTimeout should equal DefaultMaxIdleTimeout
-		if cfg.MaxIdleTimeout != DefaultMaxIdleTimeout {
-			t.Fatalf("expected MaxIdleTimeout=%v, got %v", DefaultMaxIdleTimeout, cfg.MaxIdleTimeout)
-		}
-	})
+	if got := (Quic{}).GetConfig().MaxIdleTimeout; got != DefaultMaxIdleTimeout {
+		t.Fatalf("QUIC idle timeout = %v, want %v", got, DefaultMaxIdleTimeout)
+	}
 }
 
-// Feature: consolidate-defaults, Property 2: Non-zero fields are preserved
-// **Validates: Requirements 7.2**
-func TestNonZeroValuePreservation_Property(t *testing.T) {
-	// Generator for non-zero durations (1ms to 1 hour)
-	nonZeroDurationGen := rapid.Custom(func(t *rapid.T) time.Duration {
-		ms := rapid.Int64Range(1, 3600000).Draw(t, "durationMs")
-		return time.Duration(ms) * time.Millisecond
-	})
+func TestApplyDefaultsPreservesValues(t *testing.T) {
+	client := Client{
+		ClientID:          "client-id",
+		Auth:              ClientAuth{Method: ClientAuthMethodToken},
+		Capacity:          ClientCapacity{MaxLocalUDPSessions: 7},
+		HeartbeatInterval: time.Second,
+		HealthTimeout:     2 * time.Second,
+	}
+	client.ApplyDefaults()
+	if client.ClientID != "client-id" || client.Auth.Method != ClientAuthMethodToken ||
+		client.HeartbeatInterval != time.Second || client.HealthTimeout != 2*time.Second ||
+		client.Capacity.MaxLocalUDPSessions != 7 {
+		t.Fatalf("client values changed: %+v", client)
+	}
 
-	// Generator for non-empty client IDs
-	nonEmptyClientIDGen := rapid.Custom(func(t *rapid.T) string {
-		return rapid.StringMatching(`[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`).Draw(t, "clientID")
-	})
+	wantCapacity := ListenerCapacity{
+		MaxClientGenerations: 1, MaxPendingRegistrations: 2, MaxTCPConnections: 3, MaxPendingTCPSetups: 4,
+		MaxTCPConnectionsPerGeneration: 5, MaxPendingTCPSetupsPerGeneration: 6,
+		MaxUDPSessions: 7, MaxUDPSessionsPerGeneration: 8,
+	}
+	server := Server{
+		Listeners: []QuicListener{{Capacity: wantCapacity}}, LoadBalancer: "round-robin",
+		HeartbeatInterval: time.Second, HealthTimeout: 2 * time.Second,
+	}
+	server.ApplyDefaults()
+	if server.HeartbeatInterval != time.Second || server.HealthTimeout != 2*time.Second ||
+		server.LoadBalancer != "round-robin" || server.Listeners[0].Capacity != wantCapacity {
+		t.Fatalf("server values changed: %+v", server)
+	}
 
-	// Test Client.ApplyDefaults() preserves non-zero values
-	rapid.Check(t, func(t *rapid.T) {
-		originalClientID := nonEmptyClientIDGen.Draw(t, "originalClientID")
-		originalHeartbeat := nonZeroDurationGen.Draw(t, "originalHeartbeat")
-
-		client := &Client{
-			ClientID:          originalClientID,
-			Capacity:          ClientCapacity{MaxLocalUDPSessions: 7},
-			HeartbeatInterval: originalHeartbeat,
-		}
-
-		client.ApplyDefaults()
-
-		// Property: ClientID should be preserved
-		if client.ClientID != originalClientID {
-			t.Fatalf("expected ClientID=%q to be preserved, got %q", originalClientID, client.ClientID)
-		}
-
-		// Property: HeartbeatInterval should be preserved
-		if client.HeartbeatInterval != originalHeartbeat {
-			t.Fatalf("expected HeartbeatInterval=%v to be preserved, got %v", originalHeartbeat, client.HeartbeatInterval)
-		}
-		if client.Capacity.MaxLocalUDPSessions != 7 {
-			t.Fatalf("MaxLocalUDPSessions = %d, want 7", client.Capacity.MaxLocalUDPSessions)
-		}
-	})
-
-	// Test Server.ApplyDefaults() preserves non-zero values
-	rapid.Check(t, func(t *rapid.T) {
-		originalHeartbeatInterval := nonZeroDurationGen.Draw(t, "originalHeartbeatInterval")
-		originalHealthTimeout := nonZeroDurationGen.Draw(t, "originalHealthTimeout")
-
-		server := &Server{
-			Listeners: []QuicListener{{Capacity: ListenerCapacity{
-				MaxClientGenerations:             1,
-				MaxPendingRegistrations:          2,
-				MaxTCPConnections:                3,
-				MaxPendingTCPSetups:              4,
-				MaxTCPConnectionsPerGeneration:   5,
-				MaxPendingTCPSetupsPerGeneration: 6,
-				MaxUDPSessions:                   7,
-				MaxUDPSessionsPerGeneration:      8,
-			}}},
-			HeartbeatInterval: originalHeartbeatInterval,
-			HealthTimeout:     originalHealthTimeout,
-		}
-
-		server.ApplyDefaults()
-
-		// Property: HeartbeatInterval should be preserved
-		if server.HeartbeatInterval != originalHeartbeatInterval {
-			t.Fatalf("expected HeartbeatInterval=%v to be preserved, got %v", originalHeartbeatInterval, server.HeartbeatInterval)
-		}
-
-		// Property: HealthTimeout should be preserved
-		if server.HealthTimeout != originalHealthTimeout {
-			t.Fatalf("expected HealthTimeout=%v to be preserved, got %v", originalHealthTimeout, server.HealthTimeout)
-		}
-		wantCapacity := ListenerCapacity{
-			MaxClientGenerations:             1,
-			MaxPendingRegistrations:          2,
-			MaxTCPConnections:                3,
-			MaxPendingTCPSetups:              4,
-			MaxTCPConnectionsPerGeneration:   5,
-			MaxPendingTCPSetupsPerGeneration: 6,
-			MaxUDPSessions:                   7,
-			MaxUDPSessionsPerGeneration:      8,
-		}
-		if server.Listeners[0].Capacity != wantCapacity {
-			t.Fatalf("listener capacity = %+v, want %+v", server.Listeners[0].Capacity, wantCapacity)
-		}
-	})
-
-	// Test Quic.GetConfig() preserves non-zero MaxIdleTimeout
-	rapid.Check(t, func(t *rapid.T) {
-		originalMaxIdleTimeout := nonZeroDurationGen.Draw(t, "originalMaxIdleTimeout")
-
-		quic := Quic{
-			MaxIdleTimeout: originalMaxIdleTimeout,
-		}
-
-		cfg := quic.GetConfig()
-
-		// Property: MaxIdleTimeout should be preserved
-		if cfg.MaxIdleTimeout != originalMaxIdleTimeout {
-			t.Fatalf("expected MaxIdleTimeout=%v to be preserved, got %v", originalMaxIdleTimeout, cfg.MaxIdleTimeout)
-		}
-	})
+	if got := (Quic{MaxIdleTimeout: time.Second}).GetConfig().MaxIdleTimeout; got != time.Second {
+		t.Fatalf("QUIC idle timeout changed to %v", got)
+	}
 }
 
 func TestCapacityValidation(t *testing.T) {

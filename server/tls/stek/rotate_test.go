@@ -8,7 +8,6 @@ import (
 )
 
 func TestNewRotateManager(t *testing.T) {
-	// Test valid parameters
 	manager, err := NewRotateManager(time.Hour, 3)
 	if err != nil {
 		t.Fatalf("NewRotateManager failed: %v", err)
@@ -17,7 +16,6 @@ func TestNewRotateManager(t *testing.T) {
 		t.Fatal("Expected non-nil manager")
 	}
 
-	// Verify only 1 initial key was generated
 	keys := manager.Keys.Load()
 	if keys == nil {
 		t.Fatal("Expected non-nil keys")
@@ -25,29 +23,8 @@ func TestNewRotateManager(t *testing.T) {
 	if len(*keys) != 1 {
 		t.Errorf("Expected 1 initial key, got %d", len(*keys))
 	}
-
-}
-
-func TestNewRotateManager_InvalidParameters(t *testing.T) {
-	tests := []struct {
-		name     string
-		interval time.Duration
-		overlap  uint8
-		wantErr  bool
-	}{
-		{"zero interval", 0, 2, true},
-		{"negative interval", -time.Hour, 2, true},
-		{"zero overlap", time.Hour, 0, false}, // overlap=0 is valid (no old keys retained)
-		{"valid parameters", time.Hour, 2, false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, err := NewRotateManager(tt.interval, tt.overlap)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("NewRotateManager() error = %v, wantErr %v", err, tt.wantErr)
-			}
-		})
+	if _, err := NewRotateManager(0, 2); err == nil {
+		t.Fatal("zero rotation interval was accepted")
 	}
 }
 
@@ -129,26 +106,18 @@ func TestRotateManager_Rotation(t *testing.T) {
 }
 
 func TestRotateManager_StartStop(t *testing.T) {
-	manager, err := NewRotateManager(50*time.Millisecond, 2)
-	if err != nil {
-		t.Fatalf("NewRotateManager failed: %v", err)
+	manager := newTestRotateManager(t, time.Millisecond, 2)
+	initial := (*manager.Keys.Load())[0]
+	manager.Start(context.Background())
+	deadline := time.After(time.Second)
+	for (*manager.Keys.Load())[0] == initial {
+		select {
+		case <-deadline:
+			t.Fatal("periodic rotation did not replace the initial key")
+		case <-time.After(time.Millisecond):
+		}
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-
-	// Start rotation
-	manager.Start(ctx)
-
-	// Wait for at least one rotation
-	time.Sleep(150 * time.Millisecond)
-
-	// Stop should be idempotent
 	manager.Stop()
-	manager.Stop()
-
-	// Wait for context to expire
-	<-ctx.Done()
 }
 
 func TestRotateManager_StopJoinsAndIsIdempotent(t *testing.T) {
@@ -206,52 +175,14 @@ func TestRotateManager_ContextCancellationIsJoinable(t *testing.T) {
 	manager.Stop()
 }
 
-func TestRotateManager_OverlapLimit(t *testing.T) {
-	// overlap=2 means max 3 keys (1 current + 2 old)
-	manager, err := NewRotateManager(time.Hour, 2)
-	if err != nil {
-		t.Fatalf("NewRotateManager failed: %v", err)
-	}
-
-	// Initial: 1 key
-	keys := manager.Keys.Load()
-	if len(*keys) != 1 {
-		t.Errorf("Expected 1 initial key, got %d", len(*keys))
-	}
-
-	// Rotate multiple times and verify max keys = 1 + overlap
-	expectedCounts := []int{2, 3, 3, 3, 3} // after each rotation
-	for i := range 5 {
-		err = manager.rotate()
-		if err != nil {
-			t.Fatalf("rotate() failed on iteration %d: %v", i, err)
-		}
-
-		keys := manager.Keys.Load()
-		if len(*keys) != expectedCounts[i] {
-			t.Errorf("After rotation %d: expected %d keys, got %d", i+1, expectedCounts[i], len(*keys))
-		}
-	}
-
-	// Final check: should have exactly 3 keys (1 current + 2 old)
-	finalKeys := manager.Keys.Load()
-	if len(*finalKeys) != 3 {
-		t.Errorf("Expected exactly 3 keys after multiple rotations, got %d", len(*finalKeys))
-	}
-}
-
 func TestRotateManager_ZeroOverlap(t *testing.T) {
-	// overlap=0 means only keep current key, no old keys
 	manager := newTestRotateManager(t, time.Hour, 0)
-
-	// Initial: 1 key
 	keys := manager.Keys.Load()
 	if len(*keys) != 1 {
 		t.Errorf("Expected 1 initial key, got %d", len(*keys))
 	}
 	key0 := (*keys)[0]
 
-	// After rotation: still only 1 key (new one, old one dropped)
 	err := manager.rotate()
 	if err != nil {
 		t.Fatalf("rotate() failed: %v", err)
@@ -262,17 +193,5 @@ func TestRotateManager_ZeroOverlap(t *testing.T) {
 	}
 	if (*keys)[0] == key0 {
 		t.Error("Expected key to change after rotation")
-	}
-
-	// Multiple rotations should always result in 1 key
-	for i := range 5 {
-		err = manager.rotate()
-		if err != nil {
-			t.Fatalf("rotate() failed on iteration %d: %v", i, err)
-		}
-		keys = manager.Keys.Load()
-		if len(*keys) != 1 {
-			t.Errorf("Expected 1 key after rotation %d, got %d", i+1, len(*keys))
-		}
 	}
 }

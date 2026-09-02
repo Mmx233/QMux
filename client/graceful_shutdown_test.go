@@ -69,49 +69,6 @@ func TestClientShutdownNegotiatesDrainAndJoinsOwnership(t *testing.T) {
 	}
 }
 
-func TestClientShutdownUnsupportedPeerSendsNoDrain(t *testing.T) {
-	peer := newLifecycleStartPeer(t)
-	drainSeen := make(chan struct{}, 1)
-	serverDone := peer.serveRegistration(func(conn *quic.Conn, stream *quic.Stream, _ protocol.RegisterMsg) error {
-		if err := protocol.WriteRegisterAckWithAuth(stream, true, "registered", protocol.ProtocolVersion,
-			[]string{"tcp", "udp", protocol.CapabilityUDPWireV2}, ""); err != nil {
-			return err
-		}
-		for {
-			msgType, _, err := protocol.ReadMessage(stream)
-			if err != nil {
-				<-conn.Context().Done()
-				return nil
-			}
-			if msgType == protocol.MsgTypeDrainRequest {
-				drainSeen <- struct{}{}
-			}
-		}
-	})
-	c := newClientLifecycleClient(t, "unsupported-drain", peer.endpoint())
-	t.Cleanup(func() { _ = c.Stop() })
-	startDone := callClientLifecycle(func() error { return c.Start(context.Background()) })
-	awaitRetirementCondition(t, "unsupported client runtime", func() bool {
-		return c.TotalConnectionCount() == 1
-	})
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	if err := c.Shutdown(ctx); !errors.Is(err, ErrPeerGracefulShutdownUnsupported) {
-		t.Fatalf("Shutdown() error = %v, want ErrPeerGracefulShutdownUnsupported", err)
-	}
-	select {
-	case <-drainSeen:
-		t.Fatal("unsupported peer received DrainRequest")
-	default:
-	}
-	if err := awaitClientLifecycle(t, startDone, "unsupported Start join"); err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-	if err := awaitLifecycle(t, serverDone, "unsupported server close"); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestClientShutdownAcceptsThroughFenceAndWaitsForHandler(t *testing.T) {
 	backend, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

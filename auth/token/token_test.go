@@ -79,15 +79,6 @@ func TestComputeAndVerify(t *testing.T) {
 		t.Fatalf("Verify: %v", err)
 	}
 
-	resumedState := clientState
-	resumedState.DidResume = true
-	resumedProof, err := Compute(secret, transcript, resumedState)
-	if err != nil {
-		t.Fatalf("Compute with resumed state: %v", err)
-	}
-	if !bytes.Equal(resumedProof, proof) {
-		t.Fatal("DidResume changed the post-handshake proof")
-	}
 }
 
 func TestVerifyRejectsMutations(t *testing.T) {

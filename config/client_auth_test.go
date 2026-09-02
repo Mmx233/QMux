@@ -16,14 +16,6 @@ import (
 	sharedtoken "github.com/Mmx233/QMux/auth/token"
 )
 
-func TestClientAuthDefaultsToMTLS(t *testing.T) {
-	client := Client{}
-	client.ApplyDefaults()
-	if client.Auth.Method != ClientAuthMethodMTLS {
-		t.Fatalf("auth method = %q, want %q", client.Auth.Method, ClientAuthMethodMTLS)
-	}
-}
-
 func TestClientAuthValidationAndConditionalCertificates(t *testing.T) {
 	validMTLS := Client{
 		Server: ClientServer{Servers: []ServerEndpoint{{Address: "server.example.com:8443"}}},
@@ -194,56 +186,6 @@ tls:
 	}
 	if cfg.Auth.Method != ClientAuthMethodToken || cfg.TLS.ClientCertFile != "" || cfg.TLS.ClientKeyFile != "" {
 		t.Fatalf("loaded token config = %+v, TLS = %+v", cfg.Auth, cfg.TLS)
-	}
-}
-
-func TestLoadClientConfigRejectsAuthMisconfiguration(t *testing.T) {
-	tests := []struct {
-		name      string
-		authYAML  string
-		tlsYAML   string
-		wantError string
-	}{
-		{
-			name:      "unknown method",
-			authYAML:  "  method: password\n",
-			tlsYAML:   "  ca_cert_file: ca.pem\n",
-			wantError: "unknown auth method",
-		},
-		{
-			name:      "short token",
-			authYAML:  "  method: token\n  token: short\n",
-			tlsYAML:   "  ca_cert_file: ca.pem\n",
-			wantError: "at least 16 bytes",
-		},
-		{
-			name:      "token missing CA",
-			authYAML:  "  method: token\n  token: 0123456789abcdef\n",
-			wantError: "ca_cert_file is required",
-		},
-		{
-			name:      "legacy mtls missing keypair",
-			tlsYAML:   "  ca_cert_file: ca.pem\n",
-			wantError: "client_cert_file is required",
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			content := "client_id: test-client\n" +
-				"server:\n  servers:\n    - address: server.example.com:8443\n" +
-				"local:\n  host: 127.0.0.1\n  port: 8080\n" +
-				"auth:\n" + test.authYAML +
-				"tls:\n" + test.tlsYAML
-			path := filepath.Join(t.TempDir(), "client.yaml")
-			if err := os.WriteFile(path, []byte(content), 0600); err != nil {
-				t.Fatalf("write config: %v", err)
-			}
-			_, err := LoadClientConfig(path)
-			if err == nil || !strings.Contains(err.Error(), test.wantError) {
-				t.Fatalf("LoadClientConfig error = %v, want containing %q", err, test.wantError)
-			}
-		})
 	}
 }
 

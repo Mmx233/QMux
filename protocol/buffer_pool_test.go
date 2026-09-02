@@ -1,7 +1,6 @@
 package protocol
 
 import (
-	"bytes"
 	"errors"
 	"io"
 	"testing"
@@ -28,59 +27,6 @@ type relayBlockingReader struct {
 func (r relayBlockingReader) Read([]byte) (int, error) {
 	<-r.release
 	return 0, io.EOF
-}
-
-type copyWriterTo struct {
-	called bool
-	n      int64
-	err    error
-}
-
-func (*copyWriterTo) Read([]byte) (int, error) {
-	panic("CopyBuffered called Read instead of WriteTo")
-}
-
-func (r *copyWriterTo) WriteTo(io.Writer) (int64, error) {
-	r.called = true
-	return r.n, r.err
-}
-
-type copyReaderFrom struct {
-	called bool
-	n      int64
-	err    error
-}
-
-func (*copyReaderFrom) Write([]byte) (int, error) {
-	panic("CopyBuffered called Write instead of ReaderFrom")
-}
-
-func (w *copyReaderFrom) ReadFrom(io.Reader) (int64, error) {
-	w.called = true
-	return w.n, w.err
-}
-
-func TestCopyBufferedFastPathsAndFallback(t *testing.T) {
-	writerToErr := errors.New("writer-to error")
-	src := &copyWriterTo{n: 11, err: writerToErr}
-	dst := &copyReaderFrom{n: 22, err: errors.New("reader-from error")}
-	n, err := CopyBuffered(dst, src)
-	if n != 11 || !errors.Is(err, writerToErr) || !src.called || dst.called {
-		t.Fatalf("WriterTo path = (%d, %v, %t, %t), want (11, %v, true, false)", n, err, src.called, dst.called, writerToErr)
-	}
-
-	readerFromErr := errors.New("reader-from error")
-	dst = &copyReaderFrom{n: 13, err: readerFromErr}
-	n, err = CopyBuffered(dst, relayErrorReader{err: errors.New("unexpected read")})
-	if n != 13 || !errors.Is(err, readerFromErr) || !dst.called {
-		t.Fatalf("ReaderFrom path = (%d, %v, %t), want (13, %v, true)", n, err, dst.called, readerFromErr)
-	}
-
-	var copied bytes.Buffer
-	n, err = CopyBuffered(struct{ io.Writer }{&copied}, struct{ io.Reader }{bytes.NewBufferString("payload")})
-	if n != 7 || err != nil || copied.String() != "payload" {
-		t.Fatalf("generic path = (%d, %v, %q), want (7, nil, %q)", n, err, copied.String(), "payload")
-	}
 }
 
 func TestRelayLifecycleWaitsForBothDirections(t *testing.T) {

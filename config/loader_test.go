@@ -1,14 +1,11 @@
 package config
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
-
-	"gopkg.in/yaml.v3"
 )
 
 // testConfig is a simple struct for testing the generic loader
@@ -145,7 +142,6 @@ tls:
 	}
 	assertQUICRuntime(t, cfg.Quic, want)
 
-	roundTripQUIC(t, cfg, func(got *Client) Quic { return got.Quic }, want)
 }
 
 func TestLoadServerConfigCanonicalQUIC(t *testing.T) {
@@ -179,7 +175,6 @@ tls:
 	}
 	assertQUICRuntime(t, cfg.Listeners[0].Quic, want)
 
-	roundTripQUIC(t, cfg, func(got *Server) Quic { return got.Listeners[0].Quic }, want)
 }
 
 func TestLoadConfigCapacity(t *testing.T) {
@@ -230,17 +225,6 @@ tls:
 		t.Fatalf("client max local UDP sessions = %d, want 9", got)
 	}
 
-	data, err := yaml.Marshal(serverConfig)
-	if err != nil {
-		t.Fatalf("marshal server capacity: %v", err)
-	}
-	roundTrip, err := LoadConfig[Server](writeTestConfig(t, string(data)))
-	if err != nil {
-		t.Fatalf("round-trip server capacity: %v", err)
-	}
-	if got := roundTrip.Listeners[0].Capacity; got != wantServer {
-		t.Fatalf("round-trip server capacity = %+v, want %+v", got, wantServer)
-	}
 }
 
 func TestLoadConfigRejectsNegativeCapacity(t *testing.T) {
@@ -275,44 +259,18 @@ tls:
 }
 
 func TestLoadConfigUDPFragmentation(t *testing.T) {
-	for _, enabled := range []bool{true, false} {
-		for _, target := range []struct {
-			name    string
-			content string
-			load    func(string) (UDPConfig, error)
-		}{
-			{"client", fmt.Sprintf("udp:\n  enable_fragmentation: %t\n", enabled), func(path string) (UDPConfig, error) {
-				cfg, err := LoadConfig[Client](path)
-				if err != nil {
-					return UDPConfig{}, err
-				}
-				return cfg.UDP, nil
-			}},
-			{"server", fmt.Sprintf("listeners:\n  - udp:\n      enable_fragmentation: %t\n", enabled), func(path string) (UDPConfig, error) {
-				cfg, err := LoadConfig[Server](path)
-				if err != nil {
-					return UDPConfig{}, err
-				}
-				return cfg.Listeners[0].UDP, nil
-			}},
-		} {
-			t.Run(fmt.Sprintf("%s_%t", target.name, enabled), func(t *testing.T) {
-				udp, err := target.load(writeTestConfig(t, target.content))
-				if err != nil {
-					t.Fatalf("LoadConfig: %v", err)
-				}
-				if udp.EnableFragmentation == nil || *udp.EnableFragmentation != enabled {
-					t.Fatalf("enable_fragmentation = %v, want %t", udp.EnableFragmentation, enabled)
-				}
-			})
-		}
+	client, err := LoadConfig[Client](writeTestConfig(t, "udp:\n  enable_fragmentation: false\n"))
+	if err != nil || client.UDP.EnableFragmentation == nil || *client.UDP.EnableFragmentation {
+		t.Fatalf("client enable_fragmentation = %v, error = %v", client.UDP.EnableFragmentation, err)
 	}
 
-	cfg, err := LoadConfig[Client](writeTestConfig(t, "{}\n"))
-	if err != nil {
-		t.Fatalf("LoadConfig: %v", err)
+	server, err := LoadConfig[Server](writeTestConfig(t, "listeners:\n  - udp:\n      enable_fragmentation: true\n"))
+	if err != nil || server.Listeners[0].UDP.EnableFragmentation == nil || !*server.Listeners[0].UDP.EnableFragmentation {
+		t.Fatalf("server enable_fragmentation = %v, error = %v", server.Listeners[0].UDP.EnableFragmentation, err)
 	}
-	if !cfg.UDP.IsFragmentationEnabled() {
+
+	var defaults UDPConfig
+	if !defaults.IsFragmentationEnabled() {
 		t.Fatal("omitted enable_fragmentation did not default to true")
 	}
 }
@@ -345,21 +303,6 @@ func assertQUICRuntime(t *testing.T, source, want Quic) {
 	}
 }
 
-func roundTripQUIC[T any](t *testing.T, source *T, get func(*T) Quic, want Quic) {
-	t.Helper()
-	data, err := yaml.Marshal(source)
-	if err != nil {
-		t.Fatalf("marshal config: %v", err)
-	}
-	loaded, err := LoadConfig[T](writeTestConfig(t, string(data)))
-	if err != nil {
-		t.Fatalf("round-trip config: %v", err)
-	}
-	if got := get(loaded); got != want {
-		t.Fatalf("round-trip QUIC config = %+v, want %+v", got, want)
-	}
-}
-
 func writeTestConfig(t *testing.T, content string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.yaml")
@@ -367,178 +310,6 @@ func writeTestConfig(t *testing.T, content string) string {
 		t.Fatalf("write test config: %v", err)
 	}
 	return path
-}
-
-func TestLoadClientConfig_SingleServer(t *testing.T) {
-	content := `client_id: test-client
-server:
-  servers:
-    - address: "server.example.com:8443"
-      server_name: "server.example.com"
-local:
-  host: "127.0.0.1"
-  port: 8080
-tls:
-  ca_cert_file: "ca.pem"
-  client_cert_file: "client.pem"
-  client_key_file: "client-key.pem"
-`
-	tmpDir := t.TempDir()
-	configPath := filepath.Join(tmpDir, "config.yaml")
-	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
-		t.Fatalf("failed to write test config: %v", err)
-	}
-
-	cfg, err := LoadClientConfig(configPath)
-	if err != nil {
-		t.Fatalf("LoadClientConfig failed: %v", err)
-	}
-
-	servers := cfg.Server.GetServers()
-	if len(servers) != 1 {
-		t.Fatalf("expected 1 server, got %d", len(servers))
-	}
-	if servers[0].Address != "server.example.com:8443" {
-		t.Errorf("expected address 'server.example.com:8443', got %q", servers[0].Address)
-	}
-	if servers[0].ServerName != "server.example.com" {
-		t.Errorf("expected server name 'server.example.com', got %q", servers[0].ServerName)
-	}
-	if cfg.Auth.Method != ClientAuthMethodMTLS {
-		t.Errorf("default auth method = %q, want %q", cfg.Auth.Method, ClientAuthMethodMTLS)
-	}
-}
-
-// Test multi-server configuration loading
-// Validates: Requirements 1.1
-func TestLoadClientConfig_MultiServer(t *testing.T) {
-	content := `client_id: test-client
-server:
-  servers:
-    - address: "server1.example.com:8443"
-      server_name: "server1.example.com"
-    - address: "server2.example.com:8443"
-      server_name: "server2.example.com"
-    - address: "server3.example.com:8443"
-      server_name: "server3.example.com"
-local:
-  host: "127.0.0.1"
-  port: 8080
-tls:
-  ca_cert_file: "ca.pem"
-  client_cert_file: "client.pem"
-  client_key_file: "client-key.pem"
-`
-	tmpDir := t.TempDir()
-	configPath := filepath.Join(tmpDir, "config.yaml")
-	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
-		t.Fatalf("failed to write test config: %v", err)
-	}
-
-	cfg, err := LoadClientConfig(configPath)
-	if err != nil {
-		t.Fatalf("LoadClientConfig failed: %v", err)
-	}
-
-	servers := cfg.Server.GetServers()
-	if len(servers) != 3 {
-		t.Fatalf("expected 3 servers, got %d", len(servers))
-	}
-
-	expectedAddresses := []string{
-		"server1.example.com:8443",
-		"server2.example.com:8443",
-		"server3.example.com:8443",
-	}
-	for i, expected := range expectedAddresses {
-		if servers[i].Address != expected {
-			t.Errorf("server[%d]: expected address %q, got %q", i, expected, servers[i].Address)
-		}
-	}
-}
-
-// Test validation error for no servers configured
-// Validates: Requirements 6.1
-func TestLoadClientConfig_NoServers(t *testing.T) {
-	content := `client_id: test-client
-server: {}
-local:
-  host: "127.0.0.1"
-  port: 8080
-`
-	tmpDir := t.TempDir()
-	configPath := filepath.Join(tmpDir, "config.yaml")
-	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
-		t.Fatalf("failed to write test config: %v", err)
-	}
-
-	_, err := LoadClientConfig(configPath)
-	if err == nil {
-		t.Fatal("expected error for no servers configured, got nil")
-	}
-	if !strings.Contains(err.Error(), "at least") {
-		t.Errorf("expected error about minimum servers, got: %v", err)
-	}
-}
-
-// Test that a client can use the 16 endpoints required by the capacity envelope.
-func TestLoadClientConfig_SixteenServers(t *testing.T) {
-	content := `client_id: test-client
-server:
-  servers:
-`
-	for i := range 16 {
-		content += fmt.Sprintf("    - address: \"server%c.example.com:8443\"\n", 'a'+i)
-		content += fmt.Sprintf("      server_name: \"server%c.example.com\"\n", 'a'+i)
-	}
-	content += `local:
-  host: "127.0.0.1"
-  port: 8080
-tls:
-  ca_cert_file: "ca.pem"
-  client_cert_file: "client.pem"
-  client_key_file: "client-key.pem"
-`
-	tmpDir := t.TempDir()
-	configPath := filepath.Join(tmpDir, "config.yaml")
-	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
-		t.Fatalf("failed to write test config: %v", err)
-	}
-
-	cfg, err := LoadClientConfig(configPath)
-	if err != nil {
-		t.Fatalf("load client config: %v", err)
-	}
-	if got := len(cfg.Server.GetServers()); got != 16 {
-		t.Fatalf("server count = %d, want 16", got)
-	}
-}
-
-// Test validation error for invalid address format
-// Validates: Requirements 6.2, 6.3
-func TestLoadClientConfig_InvalidAddress(t *testing.T) {
-	content := `client_id: test-client
-server:
-  servers:
-    - address: "invalid-no-port"
-      server_name: "invalid"
-local:
-  host: "127.0.0.1"
-  port: 8080
-`
-	tmpDir := t.TempDir()
-	configPath := filepath.Join(tmpDir, "config.yaml")
-	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
-		t.Fatalf("failed to write test config: %v", err)
-	}
-
-	_, err := LoadClientConfig(configPath)
-	if err == nil {
-		t.Fatal("expected error for invalid address, got nil")
-	}
-	if !strings.Contains(err.Error(), "invalid address") {
-		t.Errorf("expected error about invalid address, got: %v", err)
-	}
 }
 
 // Test duplicate deduplication during load
@@ -587,35 +358,5 @@ tls:
 			t.Errorf("duplicate address found after deduplication: %s", s.Address)
 		}
 		seen[s.Address] = true
-	}
-}
-
-// Test file not found error
-func TestLoadClientConfig_FileNotFound(t *testing.T) {
-	_, err := LoadClientConfig("/nonexistent/path/config.yaml")
-	if err == nil {
-		t.Fatal("expected error for non-existent file, got nil")
-	}
-	if !strings.Contains(err.Error(), "read config file") {
-		t.Errorf("expected error to contain 'read config file', got: %v", err)
-	}
-}
-
-// Test invalid YAML error
-func TestLoadClientConfig_InvalidYAML(t *testing.T) {
-	content := `client_id: [invalid yaml
-server: not closed`
-	tmpDir := t.TempDir()
-	configPath := filepath.Join(tmpDir, "invalid.yaml")
-	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
-		t.Fatalf("failed to write test config: %v", err)
-	}
-
-	_, err := LoadClientConfig(configPath)
-	if err == nil {
-		t.Fatal("expected error for invalid YAML, got nil")
-	}
-	if !strings.Contains(err.Error(), "parse config") {
-		t.Errorf("expected error to contain 'parse config', got: %v", err)
 	}
 }

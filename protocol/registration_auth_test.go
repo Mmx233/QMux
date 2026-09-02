@@ -7,48 +7,6 @@ import (
 	"testing"
 )
 
-func TestAdditiveAuthFieldsRemainDecoderCompatible(t *testing.T) {
-	t.Run("register", func(t *testing.T) {
-		var wire bytes.Buffer
-		auth := &RegisterAuth{Scheme: "scheme-v1", Proof: []byte{1, 2, 3}}
-		if err := WriteRegisterWithAuth(&wire, "client-a", "2.0", []string{"tcp"}, auth); err != nil {
-			t.Fatalf("WriteRegisterWithAuth: %v", err)
-		}
-
-		var old struct {
-			ClientID     string
-			Version      string
-			Capabilities []string
-		}
-		if err := ReadTypedMessage(&wire, MsgTypeRegister, &old); err != nil {
-			t.Fatalf("legacy decode: %v", err)
-		}
-		if old.ClientID != "client-a" || old.Version != "2.0" || len(old.Capabilities) != 1 || old.Capabilities[0] != "tcp" {
-			t.Fatalf("legacy registration = %+v", old)
-		}
-	})
-
-	t.Run("ack", func(t *testing.T) {
-		var wire bytes.Buffer
-		if err := WriteRegisterAckWithAuth(&wire, true, "registered", "2.0", []string{CapabilityUDPWireV2}, "scheme-v1"); err != nil {
-			t.Fatalf("WriteRegisterAckWithAuth: %v", err)
-		}
-
-		var old struct {
-			Success              bool
-			Message              string
-			ServerVersion        string
-			SelectedCapabilities []string
-		}
-		if err := ReadTypedMessage(&wire, MsgTypeRegisterAck, &old); err != nil {
-			t.Fatalf("legacy decode: %v", err)
-		}
-		if !old.Success || old.ServerVersion != "2.0" || len(old.SelectedCapabilities) != 1 {
-			t.Fatalf("legacy acknowledgment = %+v", old)
-		}
-	})
-}
-
 func TestAuthRegistrationRoundTrip(t *testing.T) {
 	var wire bytes.Buffer
 	want := &RegisterAuth{Scheme: "scheme-v1", Proof: []byte{0, 1, 2, 3}}

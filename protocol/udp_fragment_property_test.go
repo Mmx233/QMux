@@ -60,7 +60,8 @@ func TestFragmentReassemblyRoundTrip_OutOfOrder_Property(t *testing.T) {
 			order[i], order[j] = order[j], order[i]
 		}
 
-		assembler := NewFragmentAssembler()
+		assembler := NewShardedFragmentAssembler(16)
+		defer assembler.Close()
 		var got []byte
 		for _, i := range order {
 			fragment, err := DecodeUDPDatagram(results[i].Data)

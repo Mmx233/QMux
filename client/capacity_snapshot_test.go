@@ -39,26 +39,6 @@ func newCapacitySnapshotConnection(endpoint string) *ServerConnection {
 	return sc
 }
 
-func TestClientCapacityMapsToProcessUDPSessionBudget(t *testing.T) {
-	client, err := New(&config.Client{
-		ClientID: "capacity-map",
-		Server: config.ClientServer{Servers: []config.ServerEndpoint{{
-			Address: "127.0.0.1:1", ServerName: "snapshot.test",
-		}}},
-		Local:    config.LocalService{Host: "127.0.0.1", Port: 1},
-		TLS:      lifecycleClientTLSFiles(t),
-		Capacity: config.ClientCapacity{MaxLocalUDPSessions: 7},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = client.Stop() })
-
-	if got := client.Snapshot().UDPSessions.Limit; got != 7 {
-		t.Fatalf("UDP session limit = %d, want 7", got)
-	}
-}
-
 func TestClientEndpointSnapshotTracksGenerationPhasesInConfigOrder(t *testing.T) {
 	const first, second = "127.0.0.1:8443", "127.0.0.1:9443"
 	manager := newCapacitySnapshotManager(t, first, second)

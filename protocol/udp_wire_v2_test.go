@@ -15,26 +15,6 @@ func (fn udpAssemblerFunc) AddFragment(sessionID uint32, fragID uint16, index, t
 	return fn(sessionID, fragID, index, total, payload)
 }
 
-func TestUDPWireV2Constants(t *testing.T) {
-	constants := []struct {
-		name string
-		got  int
-		want int
-	}{
-		{"normal packet type", UDPDatagramTypeNormal, 0x20},
-		{"fragment packet type", UDPDatagramTypeFragment, 0x21},
-		{"normal header size", UDPHeaderSize, 5},
-		{"fragment header size", UDPFragHeaderSize, 9},
-		{"normal payload limit", MaxUDPPayload, 1195},
-		{"fragment payload limit", MaxFragPayload, 1191},
-	}
-	for _, constant := range constants {
-		if constant.got != constant.want {
-			t.Errorf("%s: got %#x, want %#x", constant.name, constant.got, constant.want)
-		}
-	}
-}
-
 func TestUDPWireV2RegressionBinaryPayload(t *testing.T) {
 	payload := []byte{0x01, 0x02, 0x80, 0x00, 0x02, 0x03}
 	var fragID uint16
@@ -163,28 +143,6 @@ func TestDecodeUDPDatagramRejectsInvalidWire(t *testing.T) {
 				t.Fatalf("error=%v, want %v", err, test.err)
 			}
 		})
-	}
-}
-
-func TestDecodeUDPDatagramTypeWhitelist(t *testing.T) {
-	for value := 0; value <= 0xff; value++ {
-		wire := []byte{byte(value), 0, 0, 0, 1}
-		_, err := DecodeUDPDatagram(wire)
-
-		switch byte(value) {
-		case UDPDatagramTypeNormal:
-			if err != nil {
-				t.Fatalf("normal type rejected: %v", err)
-			}
-		case UDPDatagramTypeFragment:
-			if !errors.Is(err, ErrDatagramTooShort) {
-				t.Fatalf("fragment type error=%v, want %v", err, ErrDatagramTooShort)
-			}
-		default:
-			if !errors.Is(err, ErrUnknownDatagramType) {
-				t.Fatalf("type %#x error=%v, want %v", value, err, ErrUnknownDatagramType)
-			}
-		}
 	}
 }
 

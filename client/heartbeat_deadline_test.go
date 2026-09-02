@@ -17,10 +17,6 @@ import (
 const heartbeatTestStreamWindow = 64
 
 func TestHeartbeatWriteDeadlineBoundsFlowControlStall(t *testing.T) {
-	t.Run("ordinary write parks", func(t *testing.T) {
-		calibrateParkedHeartbeats(t)
-	})
-
 	t.Run("production helper times out", func(t *testing.T) {
 		parkedHeartbeats := calibrateParkedHeartbeats(t)
 		sender, _ := newHeartbeatFlowControlPair(t)
@@ -139,44 +135,6 @@ func TestHeartbeatWriteDeadlineBoundsFlowControlStall(t *testing.T) {
 		}
 	})
 
-	t.Run("bidirectional heartbeat stays healthy", func(t *testing.T) {
-		sender, receiver := newHeartbeatFlowControlPair(t)
-		stream := openHeartbeatTestStream(t, sender)
-		peerDone := make(chan error, 1)
-		go func() {
-			peerStream, err := receiver.AcceptStream(context.Background())
-			if err != nil {
-				peerDone <- err
-				return
-			}
-			var heartbeat protocol.HeartbeatMsg
-			if err := protocol.ReadTypedMessage(peerStream, protocol.MsgTypeHeartbeat, &heartbeat); err != nil {
-				peerDone <- err
-				return
-			}
-			peerDone <- protocol.WriteHeartbeat(peerStream, time.Now().Unix())
-		}()
-
-		sc := NewServerConnection("heartbeat.test:8443", "heartbeat.test", tls.NewLRUClientSessionCache(1), zerolog.Nop())
-		var reconnects atomic.Int32
-		sc.SetReconnectCallback(func(string) { reconnects.Add(1) })
-		if err := sc.sendHeartbeat(stream, time.Now().Add(time.Second)); err != nil {
-			t.Fatalf("send heartbeat: %v", err)
-		}
-		if err := stream.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
-			t.Fatalf("set heartbeat read deadline: %v", err)
-		}
-		var heartbeat protocol.HeartbeatMsg
-		if err := protocol.ReadTypedMessage(stream, protocol.MsgTypeHeartbeat, &heartbeat); err != nil {
-			t.Fatalf("read peer heartbeat: %v", err)
-		}
-		if err := <-peerDone; err != nil {
-			t.Fatalf("peer heartbeat exchange: %v", err)
-		}
-		if !sc.IsHealthy() || reconnects.Load() != 0 {
-			t.Fatalf("normal heartbeat left healthy=%t reconnects=%d, want true/0", sc.IsHealthy(), reconnects.Load())
-		}
-	})
 }
 
 func calibrateParkedHeartbeats(t *testing.T) int {

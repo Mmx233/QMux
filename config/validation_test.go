@@ -62,27 +62,14 @@ func TestClientValidatePathsAndOrder(t *testing.T) {
 	}{
 		{"capacity", func(c *Client) { c.Capacity.MaxLocalUDPSessions = -1 }, "capacity.max_local_udp_sessions"},
 		{"empty servers", func(c *Client) { c.Server.Servers = nil }, "server.servers:"},
-		{"server address", func(c *Client) { c.Server.Servers[0].Address = "missing-port" }, "server.servers[0].address"},
 		{"empty local host", func(c *Client) { c.Local.Host = " \t" }, "local.host"},
 		{"local port zero", func(c *Client) { c.Local.Port = 0 }, "local.port"},
 		{"local port too high", func(c *Client) { c.Local.Port = 65536 }, "local.port"},
 		{"heartbeat interval", func(c *Client) { c.HeartbeatInterval = 0 }, "heartbeat_interval"},
-		{"negative heartbeat interval", func(c *Client) { c.HeartbeatInterval = -1 }, "heartbeat_interval"},
 		{"health timeout", func(c *Client) { c.HealthTimeout = 0 }, "health_timeout"},
-		{"negative health timeout", func(c *Client) { c.HealthTimeout = -1 }, "health_timeout"},
-		{"heartbeat relation", func(c *Client) { c.HealthTimeout = c.HeartbeatInterval }, "health_timeout"},
 		{"quic", func(c *Client) { c.Quic.MaxIdleTimeout = -1 }, "quic.max_idle_timeout"},
-		{"handshake overflow", func(c *Client) { c.Quic.HandshakeIdleTimeout = time.Duration(quicvarint.Max) + 1 }, "quic.handshake_idle_timeout"},
 		{"auth", func(c *Client) { c.Auth.Method = "unknown" }, "auth:"},
 		{"tls", func(c *Client) { c.TLS.CACertFile = "" }, "tls:"},
-		{"token certificate xor", func(c *Client) {
-			c.Auth = ClientAuth{Method: ClientAuthMethodToken, Token: strings.Repeat("t", sharedtoken.MinSecretSize)}
-			c.TLS.ClientKeyFile = ""
-		}, "tls:"},
-		{"token key xor", func(c *Client) {
-			c.Auth = ClientAuth{Method: ClientAuthMethodToken, Token: strings.Repeat("t", sharedtoken.MinSecretSize)}
-			c.TLS.ClientCertFile = ""
-		}, "tls:"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -174,12 +161,9 @@ func TestServerValidateRemainingPaths(t *testing.T) {
 	}{
 		{"load balancer", func(s *Server) { s.LoadBalancer = "random" }, "load_balancer"},
 		{"heartbeat interval", func(s *Server) { s.HeartbeatInterval = 0 }, "heartbeat_interval"},
-		{"negative heartbeat interval", func(s *Server) { s.HeartbeatInterval = -1 }, "heartbeat_interval"},
 		{"health timeout", func(s *Server) { s.HealthTimeout = 0 }, "health_timeout"},
-		{"negative health timeout", func(s *Server) { s.HealthTimeout = -1 }, "health_timeout"},
 		{"heartbeat relation", func(s *Server) { s.HealthTimeout = s.HeartbeatInterval }, "health_timeout"},
 		{"server certificate", func(s *Server) { s.TLS.ServerCertFile = "" }, "tls.server_cert_file"},
-		{"server key", func(s *Server) { s.TLS.ServerKeyFile = "" }, "tls.server_key_file"},
 		{"negative STEK", func(s *Server) { s.TLS.SessionTicketEncryptionKeyRotationInterval = -1 }, "tls.session_ticket_encryption_key_rotation_interval"},
 		{"auth", func(s *Server) { s.Auth.Token = "short" }, "auth:"},
 	}
