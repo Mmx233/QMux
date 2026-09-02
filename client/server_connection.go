@@ -697,6 +697,7 @@ func (sc *ServerConnection) RegisterWithAuth(ctx context.Context, clientID strin
 	if err != nil {
 		return registrationIOError(ctx, "open control stream", err)
 	}
+	stream.SetPriority(0, true)
 
 	committed := false
 	defer func() {

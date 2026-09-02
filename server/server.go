@@ -622,6 +622,7 @@ func (s *Server) handleConnectionPending(
 		logger.Error().Err(err).Msg("accept control stream failed")
 		return
 	}
+	controlStream.SetPriority(0, true)
 	if err := controlStream.SetDeadline(registrationDeadline); err != nil {
 		logger.Error().Err(err).Msg("set registration stream deadline failed")
 		return
