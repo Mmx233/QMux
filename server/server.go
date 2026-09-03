@@ -9,7 +9,6 @@ import (
 	"net"
 	"slices"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/Mmx233/QMux/config"
@@ -75,42 +74,36 @@ type HandshakeSnapshot struct {
 
 type handshakeStats struct {
 	mu               sync.Mutex
-	current          atomic.Int64
-	highWater        atomic.Int64
-	accountingFaults atomic.Uint64
+	current          int64
+	highWater        int64
+	accountingFaults uint64
 }
 
 func (s *handshakeStats) snapshot() HandshakeSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return HandshakeSnapshot{
-		Current:          s.current.Load(),
-		HighWater:        s.highWater.Load(),
-		AccountingFaults: s.accountingFaults.Load(),
+		Current:          s.current,
+		HighWater:        s.highWater,
+		AccountingFaults: s.accountingFaults,
 	}
 }
 
 func (s *handshakeStats) start() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	current := s.current.Add(1)
-	for high := s.highWater.Load(); current > high && !s.highWater.CompareAndSwap(high, current); high = s.highWater.Load() {
-	}
+	s.current++
+	s.highWater = max(s.highWater, s.current)
 }
 
 func (s *handshakeStats) finish() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for {
-		current := s.current.Load()
-		if current == 0 {
-			s.accountingFaults.Add(1)
-			return
-		}
-		if s.current.CompareAndSwap(current, current-1) {
-			return
-		}
+	if s.current == 0 {
+		s.accountingFaults++
+		return
 	}
+	s.current--
 }
 
 func (s *handshakeStats) tracer(context.Context, bool, quic.ConnectionID) qlogwriter.Trace {

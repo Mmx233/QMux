@@ -94,17 +94,19 @@ func TestUDPSessionBudgetBoundsSharedHandlersBeforeDial(t *testing.T) {
 			t.Fatalf("handler %d error = %v, want errClientUDPSessionLimit", id, err)
 		}
 	}
-	if held, drops := budget.permitsHeld.Load(), budget.limitDrops.Load(); held != 1 || drops != 2 {
-		t.Fatalf("shared UDP budget = %d held/%d drops, want 1/2", held, drops)
+	snapshot := budget.snapshot()
+	if snapshot.Permits != 1 || snapshot.CapacityDrops != 2 {
+		t.Fatalf("shared UDP budget = %d held/%d drops, want 1/2", snapshot.Permits, snapshot.CapacityDrops)
 	}
-	if high := budget.maxPermitsHeld.Load(); high != 1 {
-		t.Fatalf("shared UDP budget high-water = %d, want 1", high)
+	if snapshot.HighWater != 1 {
+		t.Fatalf("shared UDP budget high-water = %d, want 1", snapshot.HighWater)
 	}
 
 	release()
 	release()
-	if held, faults := budget.permitsHeld.Load(), budget.accountingFaults.Load(); held != 0 || faults != 0 {
-		t.Fatalf("released UDP budget = %d held/%d faults, want zero", held, faults)
+	snapshot = budget.snapshot()
+	if snapshot.Permits != 0 || snapshot.AccountingFaults != 0 {
+		t.Fatalf("released UDP budget = %d held/%d faults, want zero", snapshot.Permits, snapshot.AccountingFaults)
 	}
 }
 
@@ -116,7 +118,7 @@ func TestUDPSessionBudgetAccountingFaultFailsClosedAndDrainsExisting(t *testing.
 	}
 	budget.publish()
 	budget.mu.Lock()
-	budget.accountingFaults.Add(1)
+	budget.accountingFaults++
 	budget.mu.Unlock()
 
 	before := budget.snapshot()
@@ -134,6 +136,49 @@ func TestUDPSessionBudgetAccountingFaultFailsClosedAndDrainsExisting(t *testing.
 	if final.Current != 0 || final.Permits != 0 || final.AccountingFaults != 1 || final.CapacityDrops != 0 {
 		t.Fatalf("drained fault snapshot = %+v, want zero current/permits, one fault, and no capacity drops", final)
 	}
+
+	t.Run("token present held underflow", func(t *testing.T) {
+		budget := newUDPSessionBudget(1)
+		release, ok := budget.acquire()
+		if !ok {
+			t.Fatal("initial UDP session budget acquisition failed")
+		}
+		budget.mu.Lock()
+		budget.permitsHeld = 0
+		budget.mu.Unlock()
+		release()
+		snapshot := budget.snapshot()
+		if snapshot.Permits != 0 || len(budget.slots) != 0 || snapshot.AccountingFaults != 1 {
+			t.Fatalf("held underflow snapshot = %+v, slots=%d, want restored zero held, empty channel, and one fault",
+				snapshot, len(budget.slots))
+		}
+	})
+
+	t.Run("missing token", func(t *testing.T) {
+		budget := newUDPSessionBudget(1)
+		release, ok := budget.acquire()
+		if !ok {
+			t.Fatal("initial UDP session budget acquisition failed")
+		}
+		budget.mu.Lock()
+		<-budget.slots
+		budget.mu.Unlock()
+		release()
+		snapshot := budget.snapshot()
+		if snapshot.Permits != 1 || len(budget.slots) != 0 || snapshot.AccountingFaults != 1 {
+			t.Fatalf("missing-token snapshot = %+v, slots=%d, want held unchanged, empty channel, and one fault",
+				snapshot, len(budget.slots))
+		}
+	})
+
+	t.Run("published active underflow", func(t *testing.T) {
+		budget := newUDPSessionBudget(1)
+		budget.unpublish()
+		snapshot := budget.snapshot()
+		if snapshot.Current != 0 || snapshot.AccountingFaults != 1 {
+			t.Fatalf("published underflow snapshot = %+v, want restored zero current and one fault", snapshot)
+		}
+	})
 }
 
 func TestUDPHandlerCloseUsesExactSessionPointer(t *testing.T) {
@@ -167,8 +212,8 @@ func TestUDPHandlerCloseUsesExactSessionPointer(t *testing.T) {
 	if got, ok := handler.sessions.Load(current.id); !ok || got != current {
 		t.Fatalf("stale close changed replacement = (%p, %v), want (%p, true)", got, ok, current)
 	}
-	if active := budget.publishedActive.Load(); active != 1 {
-		t.Fatalf("published sessions after stale close = %d, want 1", active)
+	if snapshot := budget.snapshot(); snapshot.Current != 1 {
+		t.Fatalf("published sessions after stale close = %d, want 1", snapshot.Current)
 	}
 	if err := currentConn.SetReadDeadline(time.Now()); err != nil {
 		t.Fatalf("set current session socket deadline after stale close: %v", err)
@@ -184,8 +229,9 @@ func TestUDPHandlerCloseUsesExactSessionPointer(t *testing.T) {
 
 	handler.closeSession(current)
 	release() // Direct test sessions have no reader goroutine to own this release.
-	if active, held, faults := budget.publishedActive.Load(), budget.permitsHeld.Load(), budget.accountingFaults.Load(); active != 0 || held != 0 || faults != 0 {
-		t.Fatalf("exact close budget = %d active/%d held/%d faults, want zero", active, held, faults)
+	if snapshot := budget.snapshot(); snapshot.Current != 0 || snapshot.Permits != 0 || snapshot.AccountingFaults != 0 {
+		t.Fatalf("exact close budget = %d active/%d held/%d faults, want zero",
+			snapshot.Current, snapshot.Permits, snapshot.AccountingFaults)
 	}
 }
 
@@ -235,14 +281,15 @@ func TestUDPHandlerDuplicatePublicationReleasesLoser(t *testing.T) {
 	if first == nil || second != first {
 		t.Fatalf("duplicate creators returned (%p, %p), want one exact session", first, second)
 	}
-	if active, held := budget.publishedActive.Load(), budget.permitsHeld.Load(); active != 1 || held != 1 {
-		t.Fatalf("duplicate publication budget = %d active/%d held, want 1/1", active, held)
+	if snapshot := budget.snapshot(); snapshot.Current != 1 || snapshot.Permits != 1 {
+		t.Fatalf("duplicate publication budget = %d active/%d held, want 1/1", snapshot.Current, snapshot.Permits)
 	}
 
 	handler.Stop()
 	handler.wait()
-	if active, held, faults := budget.publishedActive.Load(), budget.permitsHeld.Load(), budget.accountingFaults.Load(); active != 0 || held != 0 || faults != 0 {
-		t.Fatalf("duplicate publication cleanup = %d active/%d held/%d faults, want zero", active, held, faults)
+	if snapshot := budget.snapshot(); snapshot.Current != 0 || snapshot.Permits != 0 || snapshot.AccountingFaults != 0 {
+		t.Fatalf("duplicate publication cleanup = %d active/%d held/%d faults, want zero",
+			snapshot.Current, snapshot.Permits, snapshot.AccountingFaults)
 	}
 }
 
@@ -299,8 +346,8 @@ func TestUDPHandlerStopJoinsBlockedReceiveSessionAndAssembler(t *testing.T) {
 	if _, err := handler.getOrCreateSession(8, clientConn); !errors.Is(err, errClientUDPSessionLimit) {
 		t.Fatalf("create UDP session over cap error = %v, want errClientUDPSessionLimit", err)
 	}
-	if active, held := budget.publishedActive.Load(), budget.permitsHeld.Load(); active != 1 || held != 1 {
-		t.Fatalf("live UDP budget = %d active/%d held, want 1/1", active, held)
+	if snapshot := budget.snapshot(); snapshot.Current != 1 || snapshot.Permits != 1 {
+		t.Fatalf("live UDP budget = %d active/%d held, want 1/1", snapshot.Current, snapshot.Permits)
 	}
 	if _, err := handler.fragmentAssembler.AddFragment(7, 3, 0, 2, []byte("pending")); err != nil {
 		t.Fatalf("create pending fragment group: %v", err)
@@ -335,11 +382,13 @@ func TestUDPHandlerStopJoinsBlockedReceiveSessionAndAssembler(t *testing.T) {
 	if _, err := session.localConn.Read(make([]byte, 1)); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("session socket read after Stop error = %v, want net.ErrClosed", err)
 	}
-	if active, held, faults := budget.publishedActive.Load(), budget.permitsHeld.Load(), budget.accountingFaults.Load(); active != 0 || held != 0 || faults != 0 {
-		t.Fatalf("stopped UDP budget = %d active/%d held/%d faults, want zero", active, held, faults)
+	snapshot := budget.snapshot()
+	if snapshot.Current != 0 || snapshot.Permits != 0 || snapshot.AccountingFaults != 0 {
+		t.Fatalf("stopped UDP budget = %d active/%d held/%d faults, want zero",
+			snapshot.Current, snapshot.Permits, snapshot.AccountingFaults)
 	}
-	if drops, high := budget.limitDrops.Load(), budget.maxPermitsHeld.Load(); drops != 1 || high != 1 {
-		t.Fatalf("UDP budget counters = %d drops/%d high-water, want 1/1", drops, high)
+	if snapshot.CapacityDrops != 1 || snapshot.HighWater != 1 {
+		t.Fatalf("UDP budget counters = %d drops/%d high-water, want 1/1", snapshot.CapacityDrops, snapshot.HighWater)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"reflect"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -168,6 +169,23 @@ func TestServerConnectionCloseIsIdempotent(t *testing.T) {
 	}
 }
 
+func pooledDatagramBacking(t testing.TB, datagrams []protocol.DatagramResult) int64 {
+	t.Helper()
+	var backing int64
+	for i := range datagrams {
+		if datagrams[i].Buffer == nil {
+			t.Fatalf("datagram %d has no pooled buffer", i)
+		}
+		buffer := *datagrams[i].Buffer
+		if len(buffer) != protocol.DatagramBufferSize || cap(buffer) != protocol.DatagramBufferSize {
+			t.Fatalf("datagram %d buffer = len %d/cap %d, want %d/%d", i,
+				len(buffer), cap(buffer), protocol.DatagramBufferSize, protocol.DatagramBufferSize)
+		}
+		backing += int64(cap(buffer))
+	}
+	return backing
+}
+
 func TestClientDsendSnapshotOwnsAndReleasesBatch(t *testing.T) {
 	stats := &clientDsendStats{}
 	handler := newUDPHandler("127.0.0.1", 1, true, zerolog.Nop(), nil, stats)
@@ -177,16 +195,13 @@ func TestClientDsendSnapshotOwnsAndReleasesBatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantBacking := datagramBackingBytes(datagrams)
-	if wantBacking != int64(len(datagrams)*protocol.MaxDatagramSize) {
-		t.Fatalf("pooled backing = %d, want %d", wantBacking, len(datagrams)*protocol.MaxDatagramSize)
+	wantBacking := pooledDatagramBacking(t, datagrams)
+	if wantBacking != int64(len(datagrams)*protocol.DatagramBufferSize) {
+		t.Fatalf("pooled backing = %d, want %d", wantBacking, len(datagrams)*protocol.DatagramBufferSize)
 	}
 	if got := stats.load(); got.OwnedItems != int64(len(datagrams)) || got.OwnedBacking != wantBacking ||
 		got.OwnedItemsHighWater != int64(len(datagrams)) || got.OwnedBackingHighWater != wantBacking {
 		t.Fatalf("fragmented Dsend = %+v, want %d items/%d backing", got, len(datagrams), wantBacking)
-	}
-	if got := datagramBackingBytes([]protocol.DatagramResult{{Data: make([]byte, 7)}}); got != 7 {
-		t.Fatalf("unpooled backing = %d, want 7", got)
 	}
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -233,6 +248,55 @@ func TestClientDsendSnapshotOwnsAndReleasesBatch(t *testing.T) {
 	}
 	if got := stats.load(); got.FragmentDrops != 1 {
 		t.Fatalf("fragment drops = %+v", got)
+	}
+}
+
+func TestClientDsendBackingProjectionForPooledBatches(t *testing.T) {
+	originalDatagramSize := protocol.DatagramBufferSize
+	originalReadSize := protocol.ReadBufferSize
+	originalFragmentSize := protocol.FragmentBufferSize
+	t.Cleanup(func() {
+		if err := protocol.InitBufferPool(originalDatagramSize, originalReadSize, originalFragmentSize); err != nil {
+			t.Errorf("restore UDP buffer pool: %v", err)
+		}
+	})
+
+	for _, datagramSize := range []int{protocol.DefaultDatagramBufferSize, protocol.DefaultDatagramBufferSize + 512} {
+		t.Run(strconv.Itoa(datagramSize), func(t *testing.T) {
+			if err := protocol.InitBufferPool(datagramSize, protocol.DefaultReadBufferSize, protocol.DefaultFragmentBufferSize); err != nil {
+				t.Fatalf("initialize UDP buffer pool: %v", err)
+			}
+			for _, payloadSize := range []int{1, protocol.DefaultReadBufferSize} {
+				stats := &clientDsendStats{}
+				handler := newUDPHandler("127.0.0.1", 1, true, zerolog.Nop(), nil, stats)
+				var counter atomic.Uint32
+				datagrams, err := handler.fragmentDatagrams(1, make([]byte, payloadSize), &counter)
+				if err != nil {
+					handler.Stop()
+					t.Fatal(err)
+				}
+				actualBacking := pooledDatagramBacking(t, datagrams)
+				wantItems := int64(len(datagrams))
+				wantBacking := wantItems * int64(datagramSize)
+				if snapshot := stats.load(); actualBacking != wantBacking ||
+					snapshot.OwnedItems != wantItems || snapshot.OwnedBacking != wantBacking ||
+					snapshot.OwnedItemsHighWater != wantItems || snapshot.OwnedBackingHighWater != wantBacking {
+					handler.Stop()
+					t.Fatalf("payload %d projection = %+v, actual backing %d, want %d items/%d backing",
+						payloadSize, snapshot, actualBacking, wantItems, wantBacking)
+				}
+				if err := handler.sendDatagrams(datagrams, func([]byte) error { return nil }); err != nil {
+					handler.Stop()
+					t.Fatal(err)
+				}
+				if snapshot := stats.load(); snapshot.OwnedItems != 0 || snapshot.OwnedBacking != 0 ||
+					snapshot.OwnedItemsHighWater != wantItems || snapshot.OwnedBackingHighWater != wantBacking {
+					handler.Stop()
+					t.Fatalf("payload %d released projection = %+v", payloadSize, snapshot)
+				}
+				handler.Stop()
+			}
+		})
 	}
 }
 
@@ -313,5 +377,131 @@ func TestClientSnapshotAggregatesLiveAndRetiredAssemblers(t *testing.T) {
 	got := client.Snapshot()
 	if got.LiveAssemblers != 0 || got.Fragments.RetainedGroups != 0 || got.Fragments.RetainedBackingBytes != 0 || got.Fragments.GroupCapacityDrops != 1 {
 		t.Fatalf("retired fragment snapshot = %+v", got)
+	}
+}
+
+func TestClientDsendSnapshotConcurrentBestEffort(t *testing.T) {
+	const producers = 8
+	stats := &clientDsendStats{}
+	handler := newUDPHandler("127.0.0.1", 1, true, zerolog.Nop(), nil, stats)
+	t.Cleanup(handler.Stop)
+	start := make(chan struct{})
+	var workers sync.WaitGroup
+	for range producers {
+		workers.Go(func() {
+			var counter atomic.Uint32
+			<-start
+			for range 200 {
+				datagrams, err := handler.fragmentDatagrams(1, make([]byte, 1000), &counter)
+				if err != nil {
+					t.Errorf("fragment datagrams: %v", err)
+					return
+				}
+				if err := handler.sendDatagrams(datagrams, func([]byte) error { return nil }); err != nil {
+					t.Errorf("send datagrams: %v", err)
+					return
+				}
+			}
+		})
+	}
+	done := make(chan struct{})
+	go func() {
+		workers.Wait()
+		close(done)
+	}()
+	close(start)
+
+	for {
+		snapshot := stats.load()
+		bufferSize := int64(protocol.DatagramBufferSize)
+		if snapshot.OwnedItems < 0 || snapshot.OwnedBacking < 0 ||
+			snapshot.OwnedBacking != snapshot.OwnedItems*bufferSize ||
+			snapshot.OwnedBackingHighWater != snapshot.OwnedItemsHighWater*bufferSize ||
+			snapshot.OwnedItemsHighWater < snapshot.OwnedItems ||
+			snapshot.OwnedBackingHighWater < snapshot.OwnedBacking {
+			t.Fatalf("invalid moving Dsend snapshot = %+v", snapshot)
+		}
+		select {
+		case <-done:
+			if snapshot = stats.load(); snapshot.OwnedItems != 0 || snapshot.OwnedBacking != 0 || snapshot.Workers != 0 ||
+				snapshot.OwnedItemsHighWater == 0 || snapshot.OwnedBackingHighWater == 0 {
+				t.Fatalf("quiescent Dsend snapshot = %+v", snapshot)
+			}
+			return
+		default:
+		}
+	}
+}
+
+func TestClientDsendHighWaterAggregatePeak(t *testing.T) {
+	const producers = 8
+	stats := &clientDsendStats{}
+	handler := newUDPHandler("127.0.0.1", 1, true, zerolog.Nop(), nil, stats)
+	t.Cleanup(handler.Stop)
+	acquired := make(chan struct{}, producers)
+	release := make(chan struct{})
+	var workers sync.WaitGroup
+	for i := range producers {
+		workers.Go(func() {
+			var counter atomic.Uint32
+			datagrams, err := handler.fragmentDatagrams(uint32(i+1), make([]byte, 1000), &counter)
+			if err != nil {
+				t.Errorf("fragment datagrams: %v", err)
+				acquired <- struct{}{}
+				return
+			}
+			acquired <- struct{}{}
+			<-release
+			if err := handler.sendDatagrams(datagrams, func([]byte) error { return nil }); err != nil {
+				t.Errorf("send datagrams: %v", err)
+			}
+		})
+	}
+	for range producers {
+		<-acquired
+	}
+	wantItems := int64(producers)
+	wantBacking := wantItems * int64(protocol.DatagramBufferSize)
+	if got := stats.load(); got.OwnedItems != wantItems || got.OwnedBacking != wantBacking ||
+		got.OwnedItemsHighWater != wantItems || got.OwnedBackingHighWater != wantBacking {
+		t.Fatalf("aggregate Dsend peak = %+v, want %d items/%d backing", got, wantItems, wantBacking)
+	}
+	if items := stats.ownedItemsHighWater.Load(); items != wantItems {
+		t.Fatalf("stored Dsend item high-water = %d, want %d", items, wantItems)
+	}
+	close(release)
+	workers.Wait()
+	if got := stats.load(); got.OwnedItems != 0 || got.OwnedBacking != 0 ||
+		got.OwnedItemsHighWater != wantItems || got.OwnedBackingHighWater != wantBacking {
+		t.Fatalf("released aggregate Dsend peak = %+v", got)
+	}
+}
+
+func BenchmarkClientDsendFragmentRelease(b *testing.B) {
+	stats := &clientDsendStats{}
+	handler := newUDPHandler("127.0.0.1", 1, true, zerolog.Nop(), nil, stats)
+	b.Cleanup(handler.Stop)
+	payload := make([]byte, 1000)
+	send := func([]byte) error { return nil }
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		var counter atomic.Uint32
+		for pb.Next() {
+			datagrams, err := handler.fragmentDatagrams(1, payload, &counter)
+			if err != nil {
+				b.Errorf("fragment datagrams: %v", err)
+				return
+			}
+			if err := handler.sendDatagrams(datagrams, send); err != nil {
+				b.Errorf("send datagrams: %v", err)
+				return
+			}
+		}
+	})
+	b.StopTimer()
+	if snapshot := stats.load(); snapshot.OwnedItems != 0 || snapshot.OwnedBacking != 0 {
+		b.Fatalf("Dsend ownership after benchmark = %+v, want zero", snapshot)
 	}
 }

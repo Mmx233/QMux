@@ -34,11 +34,11 @@ func setUDPSocketBuffer(logger zerolog.Logger, name string, setter func(int) err
 type udpSessionBudget struct {
 	mu               sync.Mutex
 	slots            chan struct{}
-	permitsHeld      atomic.Int64
-	publishedActive  atomic.Int64
-	maxPermitsHeld   atomic.Int64
-	limitDrops       atomic.Uint64
-	accountingFaults atomic.Uint64
+	permitsHeld      int64
+	publishedActive  int64
+	maxPermitsHeld   int64
+	limitDrops       uint64
+	accountingFaults uint64
 }
 
 func (b *udpSessionBudget) snapshot() UDPSessionSnapshot {
@@ -48,47 +48,52 @@ func (b *udpSessionBudget) snapshot() UDPSessionSnapshot {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return UDPSessionSnapshot{
-		Current:          b.publishedActive.Load(),
-		Permits:          b.permitsHeld.Load(),
-		HighWater:        b.maxPermitsHeld.Load(),
+		Current:          b.publishedActive,
+		Permits:          b.permitsHeld,
+		HighWater:        b.maxPermitsHeld,
 		Limit:            int64(cap(b.slots)),
-		CapacityDrops:    b.limitDrops.Load(),
-		AccountingFaults: b.accountingFaults.Load(),
+		CapacityDrops:    b.limitDrops,
+		AccountingFaults: b.accountingFaults,
 	}
 }
 
 type clientDsendStats struct {
-	mu       sync.Mutex
-	snapshot DSendSnapshot
+	ownedItems          atomic.Int64
+	ownedItemsHighWater atomic.Int64
+	workers             atomic.Int64
+	sendErrors          atomic.Uint64
+	fragmentDrops       atomic.Uint64
 }
 
-func (s *clientDsendStats) releaseDatagrams(datagrams []protocol.DatagramResult, items, backing int64) {
-	s.mu.Lock()
+func (s *clientDsendStats) releaseDatagrams(datagrams []protocol.DatagramResult, items int64) {
 	protocol.ReleaseDatagramResults(datagrams)
-	s.snapshot.OwnedItems -= items
-	s.snapshot.OwnedBacking -= backing
-	s.mu.Unlock()
+	s.ownedItems.Add(-items)
 }
 
 func (s *clientDsendStats) worker(delta int64) {
-	s.mu.Lock()
-	s.snapshot.Workers += delta
-	s.mu.Unlock()
+	s.workers.Add(delta)
 }
 
 func (s *clientDsendStats) sendError() {
-	s.mu.Lock()
-	s.snapshot.SendErrors++
-	s.mu.Unlock()
+	s.sendErrors.Add(1)
 }
 
 func (s *clientDsendStats) load() DSendSnapshot {
 	if s == nil {
 		return DSendSnapshot{}
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.snapshot
+	ownedItems := s.ownedItems.Load()
+	ownedItemsHighWater := max(s.ownedItemsHighWater.Load(), ownedItems)
+	bufferSize := int64(protocol.DatagramBufferSize)
+	return DSendSnapshot{
+		OwnedItems:            ownedItems,
+		OwnedBacking:          ownedItems * bufferSize,
+		OwnedItemsHighWater:   ownedItemsHighWater,
+		OwnedBackingHighWater: ownedItemsHighWater * bufferSize,
+		Workers:               s.workers.Load(),
+		SendErrors:            s.sendErrors.Load(),
+		FragmentDrops:         s.fragmentDrops.Load(),
+	}
 }
 
 func newUDPSessionBudget(limit int) *udpSessionBudget {
@@ -101,28 +106,29 @@ func newUDPSessionBudget(limit int) *udpSessionBudget {
 func (b *udpSessionBudget) acquire() (func(), bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.accountingFaults.Load() != 0 {
+	if b.accountingFaults != 0 {
 		return nil, false
 	}
 	select {
 	case b.slots <- struct{}{}:
-		held := b.permitsHeld.Add(1)
-		updateUDPMax(&b.maxPermitsHeld, held)
+		b.permitsHeld++
+		b.maxPermitsHeld = max(b.maxPermitsHeld, b.permitsHeld)
 		return sync.OnceFunc(func() {
 			b.mu.Lock()
 			defer b.mu.Unlock()
 			select {
 			case <-b.slots:
-				if b.permitsHeld.Add(-1) < 0 {
-					b.permitsHeld.Add(1)
-					b.accountingFaults.Add(1)
+				b.permitsHeld--
+				if b.permitsHeld < 0 {
+					b.permitsHeld++
+					b.accountingFaults++
 				}
 			default:
-				b.accountingFaults.Add(1)
+				b.accountingFaults++
 			}
 		}), true
 	default:
-		b.limitDrops.Add(1)
+		b.limitDrops++
 		return nil, false
 	}
 }
@@ -130,23 +136,16 @@ func (b *udpSessionBudget) acquire() (func(), bool) {
 func (b *udpSessionBudget) publish() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.publishedActive.Add(1)
+	b.publishedActive++
 }
 
 func (b *udpSessionBudget) unpublish() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.publishedActive.Add(-1) < 0 {
-		b.publishedActive.Add(1)
-		b.accountingFaults.Add(1)
-	}
-}
-
-func updateUDPMax(counter *atomic.Int64, value int64) {
-	for current := counter.Load(); value > current; current = counter.Load() {
-		if counter.CompareAndSwap(current, value) {
-			return
-		}
+	b.publishedActive--
+	if b.publishedActive < 0 {
+		b.publishedActive++
+		b.accountingFaults++
 	}
 }
 
@@ -468,30 +467,28 @@ func (h *UDPHandler) readLocalResponses(session *UDPSession) {
 }
 
 func (h *UDPHandler) fragmentDatagrams(sessionID uint32, payload []byte, counter *atomic.Uint32) ([]protocol.DatagramResult, error) {
-	h.dsendStats.mu.Lock()
-	defer h.dsendStats.mu.Unlock()
 	datagrams, err := protocol.FragmentUDPPooled(sessionID, payload, counter, h.enableFragmentation)
 	if err != nil {
-		h.dsendStats.snapshot.FragmentDrops++
+		h.dsendStats.fragmentDrops.Add(1)
 		return nil, err
 	}
-	h.dsendStats.snapshot.OwnedItems += int64(len(datagrams))
-	h.dsendStats.snapshot.OwnedBacking += datagramBackingBytes(datagrams)
-	h.dsendStats.snapshot.OwnedItemsHighWater = max(
-		h.dsendStats.snapshot.OwnedItemsHighWater,
-		h.dsendStats.snapshot.OwnedItems,
-	)
-	h.dsendStats.snapshot.OwnedBackingHighWater = max(
-		h.dsendStats.snapshot.OwnedBackingHighWater,
-		h.dsendStats.snapshot.OwnedBacking,
-	)
+	items := int64(len(datagrams))
+	updateClientDsendMax(&h.dsendStats.ownedItemsHighWater, h.dsendStats.ownedItems.Add(items))
 	return datagrams, nil
 }
 
+func updateClientDsendMax(counter *atomic.Int64, value int64) {
+	for current := counter.Load(); value > current; current = counter.Load() {
+		if counter.CompareAndSwap(current, value) {
+			return
+		}
+	}
+}
+
 func (h *UDPHandler) sendDatagrams(datagrams []protocol.DatagramResult, send func([]byte) error) error {
-	items, backing := int64(len(datagrams)), datagramBackingBytes(datagrams)
+	items := int64(len(datagrams))
 	defer func() {
-		h.dsendStats.releaseDatagrams(datagrams, items, backing)
+		h.dsendStats.releaseDatagrams(datagrams, items)
 	}()
 	for i := range datagrams {
 		if err := send(datagrams[i].Data); err != nil {
@@ -500,18 +497,6 @@ func (h *UDPHandler) sendDatagrams(datagrams []protocol.DatagramResult, send fun
 		}
 	}
 	return nil
-}
-
-func datagramBackingBytes(datagrams []protocol.DatagramResult) int64 {
-	var total int64
-	for i := range datagrams {
-		if datagrams[i].Buffer != nil {
-			total += int64(cap(*datagrams[i].Buffer))
-		} else {
-			total += int64(len(datagrams[i].Data))
-		}
-	}
-	return total
 }
 
 // closeSession closes a UDP session

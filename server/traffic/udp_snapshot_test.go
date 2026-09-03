@@ -3,7 +3,7 @@ package traffic
 import (
 	"context"
 	"errors"
-	"net"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -20,12 +20,12 @@ func TestUDPAdmissionSnapshotOwnedSendState(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	queued := &udpSender{ownedFrames: 2, ownedBacking: 20}
-	inFlight := &udpSender{ownedFrames: 3, ownedBacking: 30, inFlightFrames: 3}
+	queued := &udpSender{ownedFrames: 2}
+	selected := &udpSender{ownedFrames: 3}
 	handler := &UDPHandler{
 		senders: map[*pool.ClientConn]*udpSender{
 			{}: queued,
-			{}: inFlight,
+			{}: selected,
 		},
 		fragmentAssembler: assembler,
 	}
@@ -39,9 +39,13 @@ func TestUDPAdmissionSnapshotOwnedSendState(t *testing.T) {
 	handler.senderStats.publicWriteDrops.Store(7)
 
 	snapshot := handler.snapshot()
-	if snapshot.DSendItems != 5 || snapshot.DSendBackingBytes != 50 || snapshot.DSendWorkers != 2 {
-		t.Fatalf("Dsend items/backing/workers = %d/%d/%d, want 5/50/2",
-			snapshot.DSendItems, snapshot.DSendBackingBytes, snapshot.DSendWorkers)
+	wantBacking := int64(5 * protocol.DatagramBufferSize)
+	if snapshot.DSendItems != 5 || snapshot.DSendBackingBytes != wantBacking ||
+		snapshot.DSendItemsHighWater != 5 || snapshot.DSendBackingBytesHighWater != wantBacking ||
+		snapshot.DSendWorkers != 2 {
+		t.Fatalf("Dsend current/high/workers = %d/%d/%d/%d/%d, want 5/%d/5/%d/2",
+			snapshot.DSendItems, snapshot.DSendBackingBytes, snapshot.DSendItemsHighWater,
+			snapshot.DSendBackingBytesHighWater, snapshot.DSendWorkers, wantBacking, wantBacking)
 	}
 	if snapshot.DSendErrors != 1 || snapshot.QueueFullDrops != 2 || snapshot.NoEligibleDrops != 3 ||
 		snapshot.FragmentDrops != 4 || snapshot.DecodeDrops != 5 || snapshot.UnknownSessionDrops != 6 ||
@@ -56,38 +60,42 @@ func TestUDPAdmissionSnapshotOwnedSendState(t *testing.T) {
 func TestUDPAdmissionSnapshotDsendHighWaterSurvivesRelease(t *testing.T) {
 	client := &pool.ClientConn{}
 	sender := &udpSender{
-		client:    client,
-		queue:     make(chan udpSendBatch, 1),
-		done:      make(chan struct{}),
-		accepting: true,
+		client: client,
+		queue:  make(chan udpSendBatch, 1),
+		done:   make(chan struct{}),
 	}
 	handler := &UDPHandler{senders: map[*pool.ClientConn]*udpSender{client: sender}}
-	batch := udpSendBatch{
-		datagrams: []protocol.DatagramResult{{Data: make([]byte, 11)}, {Data: make([]byte, 13)}},
-		backing:   24,
-	}
+	batch := fragmentUDPSenderBatch(t, 1, make([]byte, protocol.MaxUDPPayload+1))
+	wantItems := int64(len(batch.datagrams))
+	wantBacking := wantItems * int64(protocol.DatagramBufferSize)
 	if got := handler.enqueueSender(sender, batch); got != udpEnqueued {
 		t.Fatalf("enqueue result = %v, want %v", got, udpEnqueued)
 	}
-	if got := handler.snapshot(); got.DSendItems != 2 || got.DSendBackingBytes != 24 ||
-		got.DSendItemsHighWater != 2 || got.DSendBackingBytesHighWater != 24 {
+	if got := handler.snapshot(); got.DSendItems != wantItems || got.DSendBackingBytes != wantBacking ||
+		got.DSendItemsHighWater != wantItems || got.DSendBackingBytesHighWater != wantBacking {
 		t.Fatalf("owned Dsend snapshot = %+v", got)
 	}
 
 	handler.releaseSenderBatch(sender, <-sender.queue)
 	if got := handler.snapshot(); got.DSendItems != 0 || got.DSendBackingBytes != 0 ||
-		got.DSendItemsHighWater != 2 || got.DSendBackingBytesHighWater != 24 {
+		got.DSendItemsHighWater != wantItems || got.DSendBackingBytesHighWater != wantBacking {
 		t.Fatalf("released Dsend snapshot = %+v", got)
+	}
+	handler.lifecycleMu.Lock()
+	delete(handler.senders, client)
+	handler.lifecycleMu.Unlock()
+	if got := handler.snapshot(); got.DSendItems != 0 || got.DSendBackingBytes != 0 ||
+		got.DSendItemsHighWater != wantItems || got.DSendBackingBytesHighWater != wantBacking {
+		t.Fatalf("deleted-sender Dsend snapshot = %+v", got)
 	}
 }
 
 func TestUDPAdmissionSnapshotDsendHighWaterSharesOwnedCut(t *testing.T) {
 	client := &pool.ClientConn{}
 	sender := &udpSender{
-		client:    client,
-		queue:     make(chan udpSendBatch, 1),
-		done:      make(chan struct{}),
-		accepting: true,
+		client: client,
+		queue:  make(chan udpSendBatch, 1),
+		done:   make(chan struct{}),
 	}
 	handler := &UDPHandler{senders: map[*pool.ClientConn]*udpSender{client: sender}}
 
@@ -104,10 +112,7 @@ func TestUDPAdmissionSnapshotDsendHighWaterSharesOwnedCut(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 
-	batch := udpSendBatch{
-		datagrams: []protocol.DatagramResult{{Data: make([]byte, 9)}},
-		backing:   9,
-	}
+	batch := fragmentUDPSenderBatch(t, 1, []byte("snapshot cut"))
 	if got := handler.enqueueSenderLocked(sender, batch); got != udpEnqueued {
 		sender.mu.Unlock()
 		t.Fatalf("enqueue result = %v, want %v", got, udpEnqueued)
@@ -115,9 +120,11 @@ func TestUDPAdmissionSnapshotDsendHighWaterSharesOwnedCut(t *testing.T) {
 	sender.mu.Unlock()
 
 	snapshot := <-snapshotDone
-	if snapshot.DSendItems != 1 || snapshot.DSendBackingBytes != 9 ||
+	wantBacking := int64(len(batch.datagrams)) * int64(protocol.DatagramBufferSize)
+	if snapshot.DSendItems != int64(len(batch.datagrams)) || snapshot.DSendBackingBytes != wantBacking ||
 		snapshot.DSendItems > snapshot.DSendItemsHighWater ||
-		snapshot.DSendBackingBytes > snapshot.DSendBackingBytesHighWater {
+		snapshot.DSendBackingBytes > snapshot.DSendBackingBytesHighWater ||
+		snapshot.DSendBackingBytesHighWater != snapshot.DSendItemsHighWater*int64(protocol.DatagramBufferSize) {
 		t.Fatalf("Dsend current/high-water snapshot = %+v", snapshot)
 	}
 	handler.releaseSenderBatch(sender, <-sender.queue)
@@ -201,11 +208,11 @@ func TestUDPAdmissionSnapshotSessionTeardown(t *testing.T) {
 		handler.wait()
 	}()
 
-	first, err := handler.createSession(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1})
+	first, err := handler.createSession(netip.MustParseAddrPort("127.0.0.1:1"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := handler.createSession(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 2})
+	second, err := handler.createSession(netip.MustParseAddrPort("127.0.0.1:2"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,8 +237,12 @@ func TestManagerUDPAdmissionSnapshotsConfiguredOrder(t *testing.T) {
 	}}, nil, zerolog.Nop())
 	udp := &UDPHandler{senders: make(map[*pool.ClientConn]*udpSender)}
 	both := &UDPHandler{senders: make(map[*pool.ClientConn]*udpSender)}
-	udp.sessionStats.current.Store(11)
-	both.sessionStats.current.Store(22)
+	udp.sessionStats.mu.Lock()
+	udp.sessionStats.current = 11
+	udp.sessionStats.mu.Unlock()
+	both.sessionStats.mu.Lock()
+	both.sessionStats.current = 22
+	both.sessionStats.mu.Unlock()
 	manager.listeners = []*Listener{{}, {udpHandler: udp}, {udpHandler: both}}
 
 	snapshots := manager.UDPAdmissionSnapshots()

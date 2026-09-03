@@ -67,7 +67,7 @@ func TestAcceptTCPReturnsOnNetErrClosed(t *testing.T) {
 	}
 }
 
-func relayLifecycleTLSConfigs(t *testing.T) (*tls.Config, *tls.Config) {
+func relayLifecycleTLSConfigs(t testing.TB) (*tls.Config, *tls.Config) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {

@@ -24,8 +24,11 @@ const (
 
 var errNoTCPStreamCapacity = errors.New("no TCP stream capacity")
 
-// TCPAdmissionSnapshot is a point-in-time, value-only view of one listener's
-// TCP setup and relay admission state.
+// TCPAdmissionSnapshot is a value-only view of one listener's TCP setup and
+// relay admission state. The six current and high-water fields share one exact
+// locked cut. Cumulative fields are independent atomic samples and are not
+// collectively linearizable with each other or the gauges while traffic is
+// moving; gauges and cumulative totals are exact when quiescent.
 type TCPAdmissionSnapshot struct {
 	FlowLimit                    int64
 	FlowCurrent                  int64
@@ -68,12 +71,12 @@ const (
 
 type tcpAdmissionStats struct {
 	mu                           sync.Mutex
-	flowCurrent                  atomic.Int64
-	flowHighWater                atomic.Int64
-	setupCurrent                 atomic.Int64
-	setupHighWater               atomic.Int64
-	activeCurrent                atomic.Int64
-	activeHighWater              atomic.Int64
+	flowCurrent                  int64
+	flowHighWater                int64
+	setupCurrent                 int64
+	setupHighWater               int64
+	activeCurrent                int64
+	activeHighWater              int64
 	attempts                     atomic.Uint64
 	retries                      atomic.Uint64
 	streamLimitAttempts          atomic.Uint64
@@ -92,44 +95,39 @@ type tcpAdmissionStats struct {
 
 func (s *tcpAdmissionStats) snapshot() TCPAdmissionSnapshot {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return TCPAdmissionSnapshot{
-		FlowCurrent:                  s.flowCurrent.Load(),
-		FlowHighWater:                s.flowHighWater.Load(),
-		SetupCurrent:                 s.setupCurrent.Load(),
-		SetupHighWater:               s.setupHighWater.Load(),
-		ActiveCurrent:                s.activeCurrent.Load(),
-		ActiveHighWater:              s.activeHighWater.Load(),
-		Attempts:                     s.attempts.Load(),
-		Retries:                      s.retries.Load(),
-		StreamLimitAttempts:          s.streamLimitAttempts.Load(),
-		AckFailureAttempts:           s.ackFailureAttempts.Load(),
-		Committed:                    s.committed.Load(),
-		FlowCapacity:                 s.flowCapacity.Load(),
-		ListenerCapacity:             s.listenerCapacity.Load(),
-		Unavailable:                  s.unavailable.Load(),
-		GenerationConnectionCapacity: s.generationConnectionCapacity.Load(),
-		GenerationSetupCapacity:      s.generationSetupCapacity.Load(),
-		PeerStreamLimit:              s.peerStreamLimit.Load(),
-		Deadline:                     s.deadline.Load(),
-		SetupFailure:                 s.setupFailure.Load(),
-		Canceled:                     s.canceled.Load(),
+	snapshot := TCPAdmissionSnapshot{
+		FlowCurrent:     s.flowCurrent,
+		FlowHighWater:   s.flowHighWater,
+		SetupCurrent:    s.setupCurrent,
+		SetupHighWater:  s.setupHighWater,
+		ActiveCurrent:   s.activeCurrent,
+		ActiveHighWater: s.activeHighWater,
 	}
+	s.mu.Unlock()
+	snapshot.Attempts = s.attempts.Load()
+	snapshot.Retries = s.retries.Load()
+	snapshot.StreamLimitAttempts = s.streamLimitAttempts.Load()
+	snapshot.AckFailureAttempts = s.ackFailureAttempts.Load()
+	snapshot.Committed = s.committed.Load()
+	snapshot.FlowCapacity = s.flowCapacity.Load()
+	snapshot.ListenerCapacity = s.listenerCapacity.Load()
+	snapshot.Unavailable = s.unavailable.Load()
+	snapshot.GenerationConnectionCapacity = s.generationConnectionCapacity.Load()
+	snapshot.GenerationSetupCapacity = s.generationSetupCapacity.Load()
+	snapshot.PeerStreamLimit = s.peerStreamLimit.Load()
+	snapshot.Deadline = s.deadline.Load()
+	snapshot.SetupFailure = s.setupFailure.Load()
+	snapshot.Canceled = s.canceled.Load()
+	return snapshot
 }
 
 func (s *tcpAdmissionStats) finishActive() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.activeCurrent.Add(-1)
+	s.activeCurrent--
 }
 
 func (s *tcpAdmissionStats) finish(result tcpTerminalResult) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.finishLocked(result)
-}
-
-func (s *tcpAdmissionStats) finishLocked(result tcpTerminalResult) {
 	switch result {
 	case tcpTerminalCommitted:
 		s.committed.Add(1)
@@ -164,7 +162,7 @@ func (p *tcpSetupPermit) release() {
 		stats := &p.listener.tcpAdmission
 		stats.mu.Lock()
 		<-p.listener.tcpSetupSlots
-		stats.setupCurrent.Add(-1)
+		stats.setupCurrent--
 		stats.mu.Unlock()
 	})
 }
@@ -174,9 +172,9 @@ func (p *tcpSetupPermit) activate() {
 		stats := &p.listener.tcpAdmission
 		stats.mu.Lock()
 		<-p.listener.tcpSetupSlots
-		stats.setupCurrent.Add(-1)
-		current := stats.activeCurrent.Add(1)
-		updateAtomicMax(&stats.activeHighWater, current)
+		stats.setupCurrent--
+		stats.activeCurrent++
+		stats.activeHighWater = max(stats.activeHighWater, stats.activeCurrent)
 		stats.mu.Unlock()
 	})
 }
@@ -189,8 +187,6 @@ func (l *Listener) tcpAdmissionSnapshot() TCPAdmissionSnapshot {
 }
 
 func (s *tcpAdmissionStats) attempt(retry bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.attempts.Add(1)
 	if retry {
 		s.retries.Add(1)
@@ -198,14 +194,10 @@ func (s *tcpAdmissionStats) attempt(retry bool) {
 }
 
 func (s *tcpAdmissionStats) streamLimitAttempt() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.streamLimitAttempts.Add(1)
 }
 
 func (s *tcpAdmissionStats) ackFailureAttempt() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.ackFailureAttempts.Add(1)
 }
 
@@ -369,8 +361,8 @@ func (l *Listener) acquireTCPSetup() (*tcpSetupPermit, bool) {
 	defer stats.mu.Unlock()
 	select {
 	case l.tcpSetupSlots <- struct{}{}:
-		current := stats.setupCurrent.Add(1)
-		updateAtomicMax(&stats.setupHighWater, current)
+		stats.setupCurrent++
+		stats.setupHighWater = max(stats.setupHighWater, stats.setupCurrent)
 		return &tcpSetupPermit{listener: l}, true
 	default:
 		return nil, false
@@ -389,13 +381,13 @@ func (l *Listener) addTCPFlow(conn net.Conn) (*tcpFlow, bool) {
 		return nil, false
 	}
 	if len(l.flows) >= l.tcpFlowLimit {
-		stats.finishLocked(tcpTerminalFlowCapacity)
+		stats.finish(tcpTerminalFlowCapacity)
 		flow.abort()
 		return nil, false
 	}
 	l.flows[flow] = struct{}{}
-	current := stats.flowCurrent.Add(1)
-	updateAtomicMax(&stats.flowHighWater, current)
+	stats.flowCurrent++
+	stats.flowHighWater = max(stats.flowHighWater, stats.flowCurrent)
 	return flow, true
 }
 
@@ -407,7 +399,7 @@ func (l *Listener) removeTCPFlow(flow *tcpFlow) {
 	defer l.flowsMu.Unlock()
 	if _, ok := l.flows[flow]; ok {
 		delete(l.flows, flow)
-		stats.flowCurrent.Add(-1)
+		stats.flowCurrent--
 	}
 }
 

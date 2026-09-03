@@ -430,8 +430,51 @@ func (p *pathFaultProxy) snapshot() pathFaultProxySnapshot {
 }
 
 type pathStateExpectation struct {
-	dsendItemsHighWater   int64
-	dsendBackingHighWater int64
+	clientDSendItemsHighWater   int64
+	clientDSendBackingHighWater int64
+}
+
+type serverDSendObservation struct {
+	initialized      bool
+	regressed        bool
+	itemsHighWater   int64
+	backingHighWater int64
+}
+
+func (o *serverDSendObservation) matches(items, backing, itemsHighWater, backingHighWater int64) bool {
+	bufferSize := int64(protocol.DatagramBufferSize)
+	if items < 0 || backing < 0 || itemsHighWater < items || backingHighWater < backing ||
+		backing != items*bufferSize ||
+		backingHighWater != itemsHighWater*bufferSize {
+		return false
+	}
+	if o.initialized && (itemsHighWater < o.itemsHighWater || backingHighWater < o.backingHighWater) {
+		o.regressed = true
+	}
+	if o.regressed {
+		return false
+	}
+	o.initialized = true
+	o.itemsHighWater = itemsHighWater
+	o.backingHighWater = backingHighWater
+	return items == 0 && backing == 0
+}
+
+func TestServerDSendObservationLatchesHighWaterRegression(t *testing.T) {
+	bufferSize := int64(protocol.DatagramBufferSize)
+	var observation serverDSendObservation
+	if !observation.matches(0, 0, 1, bufferSize) {
+		t.Fatal("initial quiescent observation did not match")
+	}
+	if observation.matches(1, bufferSize, 2, 2*bufferSize) {
+		t.Fatal("nonzero current ownership matched stable state")
+	}
+	if observation.matches(0, 0, 1, bufferSize) {
+		t.Fatal("regressed quiescent observation matched")
+	}
+	if !observation.regressed || observation.itemsHighWater != 2 || observation.backingHighWater != 2*bufferSize {
+		t.Fatalf("latched observation = %+v, want retained item/backing high-water 2/%d", observation, 2*bufferSize)
+	}
 }
 
 func pathStateMatches(
@@ -439,6 +482,7 @@ func pathStateMatches(
 	clientInstance *client.Client,
 	proxy *pathFaultProxy,
 	expect pathStateExpectation,
+	serverDSend *serverDSendObservation,
 ) bool {
 	serverSnapshot := serverRun.Snapshot()
 	clientSnapshot := clientInstance.Snapshot()
@@ -450,6 +494,12 @@ func pathStateMatches(
 	endpoint := clientSnapshot.Endpoints[0]
 	pool := route.PoolCapacity
 	udp := route.UDPAdmission
+	serverDSendMatches := serverDSend.matches(
+		udp.DSendItems,
+		udp.DSendBackingBytes,
+		udp.DSendItemsHighWater,
+		udp.DSendBackingBytesHighWater,
+	)
 	return route.Listening && route.Ready && route.TCPEligibleClients == 1 && route.UDPEligibleClients == 1 &&
 		endpoint.Handshaking == 0 && endpoint.Pending == 0 && endpoint.Registered == 1 && endpoint.Retiring == 0 &&
 		endpoint.GenerationHighWater == 1 && endpoint.AccountingFaults == 0 &&
@@ -457,8 +507,8 @@ func pathStateMatches(
 		clientSnapshot.UDPSessions.HighWater == 1 && clientSnapshot.UDPSessions.CapacityDrops == 0 &&
 		clientSnapshot.UDPSessions.AccountingFaults == 0 && clientSnapshot.LiveAssemblers == 1 &&
 		clientSnapshot.DSend.Workers == 1 && clientSnapshot.DSend.OwnedItems == 0 &&
-		clientSnapshot.DSend.OwnedBacking == 0 && clientSnapshot.DSend.OwnedItemsHighWater == expect.dsendItemsHighWater &&
-		clientSnapshot.DSend.OwnedBackingHighWater == expect.dsendBackingHighWater &&
+		clientSnapshot.DSend.OwnedBacking == 0 && clientSnapshot.DSend.OwnedItemsHighWater == expect.clientDSendItemsHighWater &&
+		clientSnapshot.DSend.OwnedBackingHighWater == expect.clientDSendBackingHighWater &&
 		clientSnapshot.DSend.SendErrors == 0 && clientSnapshot.DSend.FragmentDrops == 0 &&
 		clientSnapshot.Fragments.RetainedGroups == 0 && clientSnapshot.Fragments.RetainedBackingBytes == 0 &&
 		clientSnapshot.Fragments.GroupCapacityDrops == 0 && clientSnapshot.Fragments.ByteCapacityDrops == 0 &&
@@ -472,8 +522,7 @@ func pathStateMatches(
 		pool.UDPSessionsPerGeneration.CapacityDrops == 0 && route.Handshake.Current == 0 && route.Handshake.AccountingFaults == 0 &&
 		udp.SessionsCurrent == 1 && udp.SessionPermits == 1 && udp.SessionHighWater == 1 &&
 		udp.ListenerCapacityDrops == 0 && udp.GenerationCapacityDrops == 0 && udp.AccountingFaults == 0 &&
-		udp.DSendItems == 0 && udp.DSendBackingBytes == 0 && udp.DSendItemsHighWater == expect.dsendItemsHighWater &&
-		udp.DSendBackingBytesHighWater == expect.dsendBackingHighWater && udp.DSendWorkers == 1 &&
+		serverDSendMatches && udp.DSendWorkers == 1 &&
 		udp.DSendErrors == 0 && udp.QueueFullDrops == 0 && udp.NoEligibleDrops == 0 && udp.FragmentDrops == 0 &&
 		udp.DecodeDrops == 0 && udp.UnknownSessionDrops == 0 && udp.PublicWriteDrops == 0 &&
 		udp.Fragment.RetainedGroups == 0 && udp.Fragment.RetainedBackingBytes == 0 &&
@@ -488,6 +537,7 @@ func waitForStablePathState(
 	clientInstance *client.Client,
 	proxyRun *pathFaultProxyRun,
 	expect pathStateExpectation,
+	serverDSend *serverDSendObservation,
 	runs ...*faultRun,
 ) error {
 	var stableSince time.Time
@@ -495,7 +545,7 @@ func waitForStablePathState(
 		return fmt.Sprintf("stable QUIC path state; server=%+v client=%+v proxy=%+v",
 			serverRun.Snapshot(), clientInstance.Snapshot(), proxyRun.snapshot())
 	}, func(time.Duration) bool {
-		if !pathStateMatches(serverRun, clientInstance, proxyRun.pathFaultProxy, expect) {
+		if !pathStateMatches(serverRun, clientInstance, proxyRun.pathFaultProxy, expect, serverDSend) {
 			stableSince = time.Time{}
 			return false
 		}
@@ -626,11 +676,12 @@ func TestQUICPathFaultMatrix_MTLS(t *testing.T) {
 	defer func() { _ = heldTCP.Close() }()
 
 	smallState := pathStateExpectation{
-		dsendItemsHighWater:   1,
-		dsendBackingHighWater: int64(protocol.DatagramBufferSize),
+		clientDSendItemsHighWater:   1,
+		clientDSendBackingHighWater: int64(protocol.DatagramBufferSize),
 	}
+	var serverDSend serverDSendObservation
 	allRuns := []*faultRun{serverRun.run, proxyRun.run, clientRun}
-	if err := waitForStablePathState(testCtx, serverRun, clientInstance, proxyRun, smallState, allRuns...); err != nil {
+	if err := waitForStablePathState(testCtx, serverRun, clientInstance, proxyRun, smallState, &serverDSend, allRuns...); err != nil {
 		t.Fatalf("path fault warm state: %v", err)
 	}
 	timeline.add("baseline ready: one generation, held TCP, persistent UDP, source port %d", proxyRun.snapshot().ActiveSourcePort)
@@ -677,7 +728,7 @@ func TestQUICPathFaultMatrix_MTLS(t *testing.T) {
 		if err := probeHeldTCP(heldTCP, tcpSequence, pathRecoveryBound); err != nil {
 			t.Fatalf("%s held TCP recovery: %v", fault.name, err)
 		}
-		if err := waitForStablePathState(testCtx, serverRun, clientInstance, proxyRun, smallState, allRuns...); err != nil {
+		if err := waitForStablePathState(testCtx, serverRun, clientInstance, proxyRun, smallState, &serverDSend, allRuns...); err != nil {
 			t.Fatalf("%s stable recovery: %v", fault.name, err)
 		}
 		timeline.add("%s blackhole recovered on the original generation", fault.name)
@@ -710,7 +761,7 @@ func TestQUICPathFaultMatrix_MTLS(t *testing.T) {
 		if err := probeHeldTCP(heldTCP, tcpSequence, pathRecoveryBound); err != nil {
 			t.Fatalf("NAT rebind %d held TCP recovery: %v", cycle, err)
 		}
-		if err := waitForStablePathState(testCtx, serverRun, clientInstance, proxyRun, smallState, allRuns...); err != nil {
+		if err := waitForStablePathState(testCtx, serverRun, clientInstance, proxyRun, smallState, &serverDSend, allRuns...); err != nil {
 			t.Fatalf("NAT rebind %d stable state: %v", cycle, err)
 		}
 		timeline.add("NAT rebind %d recovered %d -> %d in %s", cycle, oldPort, newPort, time.Since(started))
@@ -746,8 +797,8 @@ func TestQUICPathFaultMatrix_MTLS(t *testing.T) {
 	}
 
 	largeState := pathStateExpectation{
-		dsendItemsHighWater:   2,
-		dsendBackingHighWater: 2 * int64(protocol.DatagramBufferSize),
+		clientDSendItemsHighWater:   2,
+		clientDSendBackingHighWater: 2 * int64(protocol.DatagramBufferSize),
 	}
 	fragmentCleanupBound := 2*protocol.FragmentTimeout + pathHeartbeatInterval
 	if err := waitForFault(testCtx, fragmentCleanupBound, func() string {
@@ -758,7 +809,7 @@ func TestQUICPathFaultMatrix_MTLS(t *testing.T) {
 	}, allRuns...); err != nil {
 		t.Fatalf("incomplete fragment cleanup: %v", err)
 	}
-	if err := waitForStablePathState(testCtx, serverRun, clientInstance, proxyRun, largeState, allRuns...); err != nil {
+	if err := waitForStablePathState(testCtx, serverRun, clientInstance, proxyRun, largeState, &serverDSend, allRuns...); err != nil {
 		t.Fatalf("final stable path state: %v", err)
 	}
 	timeline.add("size-selective fault recovered; fragment state and owned buffers returned")

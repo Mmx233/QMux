@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -407,7 +408,7 @@ func TestTCPFlowCounterMatchesOwnedMapDuringTransitions(t *testing.T) {
 		default:
 			listener.tcpAdmission.mu.Lock()
 			listener.flowsMu.Lock()
-			current := listener.tcpAdmission.flowCurrent.Load()
+			current := listener.tcpAdmission.flowCurrent
 			owned := int64(len(listener.flows))
 			listener.flowsMu.Unlock()
 			listener.tcpAdmission.mu.Unlock()
@@ -1331,4 +1332,111 @@ func TestTCPConnectionScopedOpenFailureUsesBackup(t *testing.T) {
 		t.Fatalf("close backup TCP flow: %v", err)
 	}
 	waitForActiveConnections(t, setup.backup, 1)
+}
+
+func TestTCPAdmissionSnapshotConcurrentCumulativeSamples(t *testing.T) {
+	const (
+		producers  = 8
+		iterations = 1000
+		terminals  = 10
+	)
+	var stats tcpAdmissionStats
+	stats.mu.Lock()
+	stats.flowCurrent, stats.flowHighWater = 1, 2
+	stats.setupCurrent, stats.setupHighWater = 3, 4
+	stats.activeCurrent, stats.activeHighWater = 5, 6
+	stats.mu.Unlock()
+
+	cumulative := func(snapshot TCPAdmissionSnapshot) [14]uint64 {
+		return [14]uint64{
+			snapshot.Attempts,
+			snapshot.Retries,
+			snapshot.StreamLimitAttempts,
+			snapshot.AckFailureAttempts,
+			snapshot.Committed,
+			snapshot.FlowCapacity,
+			snapshot.ListenerCapacity,
+			snapshot.Unavailable,
+			snapshot.GenerationConnectionCapacity,
+			snapshot.GenerationSetupCapacity,
+			snapshot.PeerStreamLimit,
+			snapshot.Deadline,
+			snapshot.SetupFailure,
+			snapshot.Canceled,
+		}
+	}
+
+	start := make(chan struct{})
+	var producersWG sync.WaitGroup
+	for worker := range producers {
+		producersWG.Go(func() {
+			<-start
+			for iteration := range iterations {
+				stats.attempt(true)
+				stats.streamLimitAttempt()
+				stats.ackFailureAttempt()
+				stats.finish(tcpTerminalResult((worker*iterations + iteration) % terminals))
+			}
+		})
+	}
+	done := make(chan struct{})
+	go func() {
+		producersWG.Wait()
+		close(done)
+	}()
+	close(start)
+
+	previous := cumulative(stats.snapshot())
+	var regressed bool
+	for {
+		current := cumulative(stats.snapshot())
+		for i := range current {
+			if current[i] < previous[i] {
+				regressed = true
+			}
+		}
+		previous = current
+		select {
+		case <-done:
+			final := stats.snapshot()
+			if regressed {
+				t.Fatal("moving cumulative snapshot regressed")
+			}
+			if final.FlowCurrent != 1 || final.FlowHighWater != 2 ||
+				final.SetupCurrent != 3 || final.SetupHighWater != 4 ||
+				final.ActiveCurrent != 5 || final.ActiveHighWater != 6 {
+				t.Fatalf("gauge cut = %+v", final)
+			}
+			const total = uint64(producers * iterations)
+			want := [14]uint64{
+				total, total, total, total,
+				total / terminals, total / terminals, total / terminals, total / terminals, total / terminals,
+				total / terminals, total / terminals, total / terminals, total / terminals, total / terminals,
+			}
+			if got := cumulative(final); got != want {
+				t.Fatalf("final cumulative snapshot = %v, want %v", got, want)
+			}
+			return
+		default:
+		}
+	}
+}
+
+func BenchmarkTCPAdmissionMetrics(b *testing.B) {
+	var stats tcpAdmissionStats
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			stats.attempt(false)
+			stats.finish(tcpTerminalCommitted)
+		}
+	})
+	b.StopTimer()
+	snapshot := stats.snapshot()
+	if snapshot.Attempts != uint64(b.N) || snapshot.Committed != uint64(b.N) {
+		b.Fatalf("TCP admission totals = %d attempts/%d committed, want %d/%d",
+			snapshot.Attempts, snapshot.Committed, b.N, b.N)
+	}
 }

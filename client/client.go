@@ -116,7 +116,12 @@ type UDPSessionSnapshot struct {
 	AccountingFaults uint64
 }
 
-// DSendSnapshot describes client-owned application datagram sends.
+// DSendSnapshot describes client-owned application datagram sends. OwnedItems
+// and OwnedBacking are one sample and projection pair; their high-water fields
+// are another. During traffic those pairs are not collectively linearizable
+// with workers, errors, drops, or other subsystems. Cumulative counts and
+// high-water marks are exact; current ownership and workers are exact when
+// DSend producers and workers are quiescent.
 type DSendSnapshot struct {
 	OwnedItems            int64
 	OwnedBacking          int64
@@ -799,7 +804,10 @@ func (c *Client) retireUDPHandler(endpoint string, handler *UDPHandler) {
 	c.udpHandlers.CompareAndDelete(endpoint, handler)
 }
 
-// Snapshot takes exact subsystem-local cuts. Cross-subsystem reconciliation is
+// Snapshot takes subsystem-local cuts. The two DSend ownership projection pairs
+// are internally consistent but not collectively linearizable with each other,
+// other DSend fields, or other subsystems while traffic moves. Quiescent and
+// cumulative DSend semantics remain exact. Cross-subsystem reconciliation is
 // exact only after the client is quiescent.
 func (c *Client) Snapshot() Snapshot {
 	var snapshot Snapshot

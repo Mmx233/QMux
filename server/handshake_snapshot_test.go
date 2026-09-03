@@ -44,6 +44,11 @@ func TestHandshakeTraceStartsAndEndsOnce(t *testing.T) {
 	if got := stats.snapshot(); got != (HandshakeSnapshot{HighWater: 1}) {
 		t.Fatalf("close-terminal snapshot = %+v", got)
 	}
+
+	stats.finish()
+	if got := stats.snapshot(); got != (HandshakeSnapshot{HighWater: 1, AccountingFaults: 1}) {
+		t.Fatalf("underflow snapshot = %+v", got)
+	}
 }
 
 func TestRouteSnapshotIncludesHandshakeAndPoolCapacity(t *testing.T) {

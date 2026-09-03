@@ -96,19 +96,23 @@ func InitBufferPool(datagramSize, readSize, fragmentSize int) error {
 }
 
 // GetDatagramBuffer returns a buffer for datagram operations.
-// The returned buffer has a length of exactly DatagramBufferSize.
+// The returned buffer has length and capacity exactly DatagramBufferSize.
 // Callers must call PutDatagramBuffer when done to return the buffer to the pool.
 func GetDatagramBuffer() *[]byte {
 	return udpPool.datagramPool.Get().(*[]byte)
 }
 
 // PutDatagramBuffer returns a datagram buffer to the pool.
-// If buf is nil or has incorrect size, it is silently discarded.
+// If buf is nil or its length or capacity is not DatagramBufferSize, it is discarded.
 func PutDatagramBuffer(buf *[]byte) {
-	if buf == nil || len(*buf) != DatagramBufferSize {
+	if !datagramBufferPoolable(buf) {
 		return
 	}
 	udpPool.datagramPool.Put(buf)
+}
+
+func datagramBufferPoolable(buf *[]byte) bool {
+	return buf != nil && len(*buf) == DatagramBufferSize && cap(*buf) == DatagramBufferSize
 }
 
 // GetReadBuffer returns a buffer for UDP read operations.
