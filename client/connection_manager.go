@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -13,11 +14,9 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// Default backoff configuration
 const (
-	InitialBackoff                  = 5 * time.Second
-	MaxBackoff                      = 60 * time.Second
-	BackoffFactor                   = 2
+	initialReconnectDelay           = 5 * time.Second
+	maxReconnectDelay               = 60 * time.Second
 	defaultConnectionAttemptTimeout = 30 * time.Second
 )
 
@@ -302,21 +301,25 @@ func (cm *ConnectionManager) rollbackPublication(sc *ServerConnection) {
 	}
 }
 
-// CalculateBackoff calculates the backoff duration for a given attempt number.
-// The backoff follows: 5s, 10s, 20s, 40s, 60s (max)
-func CalculateBackoff(attempt int) time.Duration {
-	if attempt <= 0 {
-		return InitialBackoff
+func reconnectDelay(attempt int, int64n func(int64) int64) time.Duration {
+	delayCap := initialReconnectDelay
+	for attempt > 0 && delayCap < maxReconnectDelay {
+		delayCap = min(delayCap*2, maxReconnectDelay)
+		attempt--
 	}
+	half := delayCap / 2
+	return half + time.Duration(int64n(int64(half)))
+}
 
-	backoff := InitialBackoff
-	for range attempt {
-		backoff *= BackoffFactor
-		if backoff > MaxBackoff {
-			return MaxBackoff
-		}
+func waitForReconnect(ctx, managerCtx context.Context, delay time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-managerCtx.Done():
+		return false
+	case <-time.After(delay):
+		return true
 	}
-	return backoff
 }
 
 // startReconnection starts a reconnection goroutine for a server if not already reconnecting.
@@ -403,20 +406,15 @@ func (cm *ConnectionManager) reconnectionLoop(ctx context.Context, serverAddr st
 		default:
 		}
 
-		backoff := CalculateBackoff(attempt)
+		backoff := reconnectDelay(attempt, rand.Int64N)
 		cm.logger.Info().
 			Str("server", serverAddr).
 			Int("attempt", attempt+1).
 			Dur("backoff", backoff).
 			Msg("scheduling reconnection attempt")
 
-		// Wait for backoff duration
-		select {
-		case <-ctx.Done():
+		if !waitForReconnect(ctx, cm.ctx, backoff) {
 			return
-		case <-cm.ctx.Done():
-			return
-		case <-time.After(backoff):
 		}
 
 		sc, err := cm.connectAndRegister(ctx, *endpoint)
