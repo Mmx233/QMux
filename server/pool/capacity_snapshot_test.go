@@ -2,6 +2,7 @@ package pool
 
 import (
 	"errors"
+	"reflect"
 	"testing"
 )
 
@@ -137,7 +138,8 @@ func assertCapacity(t *testing.T, p *ConnectionPool, want CapacitySnapshot) {
 	got.TCPConnectionsPerGeneration = LimitSnapshot{}
 	got.PendingTCPSetupsPerGeneration = LimitSnapshot{}
 	got.UDPSessionsPerGeneration = LimitSnapshot{}
-	if got != want {
+	got.Healthy = 0 // This helper checks ownership rather than health.
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Snapshot() = %+v, want %+v", got, want)
 	}
 }

@@ -74,6 +74,38 @@ func assertNoUDPSessions(t *testing.T, handler *UDPHandler) {
 	}
 }
 
+func TestUDPDecodeErrorsIgnoreClosedAssembler(t *testing.T) {
+	handler := NewUDPHandler("127.0.0.1", 1, true, zerolog.Nop())
+	t.Cleanup(handler.Stop)
+	var fragmentID uint16
+	datagrams, err := protocol.FragmentUDP(1, make([]byte, protocol.MaxUDPPayload+1), &fragmentID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A queued valid fragment can still be decoded after Stop closes the assembler.
+	handler.Stop()
+	_, _, _, err = protocol.DecodeAndAssembleUDPDatagram(datagrams[0], handler.fragmentAssembler)
+	if !errors.Is(err, protocol.ErrFragmentAssemblerClosed) {
+		t.Fatalf("decode after Stop = %v, want closed assembler", err)
+	}
+	for _, ignored := range []error{err, errors.Join(errors.New("wrapped"), err), protocol.ErrFragmentAssemblerFull} {
+		handler.recordDecodeError(ignored)
+	}
+	if got := handler.sessionBudget.snapshot().DecodeDrops; got != 0 {
+		t.Fatalf("resource errors counted as decode drops: %d", got)
+	}
+
+	_, _, _, err = protocol.DecodeAndAssembleUDPDatagram(nil, handler.fragmentAssembler)
+	if !errors.Is(err, protocol.ErrDatagramTooShort) {
+		t.Fatalf("malformed datagram error = %v", err)
+	}
+	handler.recordDecodeError(err)
+	if got := handler.sessionBudget.snapshot().DecodeDrops; got != 1 {
+		t.Fatalf("malformed decode drops = %d, want 1", got)
+	}
+}
+
 func TestUDPSessionBudgetBoundsSharedHandlersBeforeDial(t *testing.T) {
 	if got := cap(newUDPSessionBudget(0).slots); got != config.DefaultMaxLocalUDPSessions {
 		t.Fatalf("default UDP session limit = %d, want %d", got, config.DefaultMaxLocalUDPSessions)

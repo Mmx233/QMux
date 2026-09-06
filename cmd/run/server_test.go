@@ -10,13 +10,11 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/Mmx233/QMux/server"
 )
 
 func TestAdminHandler(t *testing.T) {
 	ready := false
-	handler := newAdminHandler(func() bool { return ready })
+	handler := newAdminHandler(func() bool { return ready }, nil)
 	tests := []struct {
 		name       string
 		path       string
@@ -45,6 +43,23 @@ func TestAdminHandler(t *testing.T) {
 	}
 }
 
+func TestAdminMetrics(t *testing.T) {
+	handler := newAdminHandler(func() bool { return false }, nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
+	}
+	if contentType := response.Header().Get("Content-Type"); !strings.HasPrefix(contentType, "text/plain;") {
+		t.Fatalf("content type = %q, want Prometheus text format", contentType)
+	}
+	for _, metric := range []string{"# TYPE go_goroutines gauge\n", "\ngo_goroutines ", "# TYPE promhttp_metric_handler_requests_total counter\n"} {
+		if !strings.Contains(response.Body.String(), metric) {
+			t.Errorf("metrics response is missing %q", metric)
+		}
+	}
+}
+
 func TestAdminBindFailureDoesNotStartCore(t *testing.T) {
 	occupied, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -63,8 +78,9 @@ func TestAdminBindFailureDoesNotStartCore(t *testing.T) {
 			started.Store(true)
 			return nil
 		},
-		func() server.Snapshot { return server.Snapshot{} },
+		func() bool { return false },
 		occupied.Addr().String(),
+		nil,
 	)
 	if err == nil || !strings.Contains(err.Error(), "listen admin") {
 		t.Fatalf("runServerComponents() error = %v, want admin bind failure", err)
@@ -79,8 +95,9 @@ func TestRunServerComponentsWithoutAdmin(t *testing.T) {
 	err := runServerComponents(
 		context.Background(),
 		func(context.Context) error { return coreErr },
-		func() server.Snapshot { return server.Snapshot{} },
+		func() bool { return false },
 		"",
+		nil,
 	)
 	if !errors.Is(err, coreErr) {
 		t.Fatalf("runServerComponents() error = %v, want %v", err, coreErr)
@@ -104,8 +121,9 @@ func TestRunServerComponentsCancellationJoinsCoreAndAdmin(t *testing.T) {
 				<-releaseCore
 				return context.Cause(ctx)
 			},
-			func() server.Snapshot { return server.Snapshot{} },
+			func() bool { return false },
 			adminAddr,
+			nil,
 		)
 	}()
 	<-coreStarted
@@ -142,8 +160,9 @@ func TestRunServerComponentsReportsCoreErrorAfterCancellation(t *testing.T) {
 				<-ctx.Done()
 				return coreErr
 			},
-			func() server.Snapshot { return server.Snapshot{} },
+			func() bool { return false },
 			"",
+			nil,
 		)
 	}()
 	<-coreStarted
@@ -168,8 +187,9 @@ func TestRunServerComponentsCoreErrorShutsDownAdmin(t *testing.T) {
 	err := runServerComponents(
 		context.Background(),
 		func(context.Context) error { return coreErr },
-		func() server.Snapshot { return server.Snapshot{} },
+		func() bool { return false },
 		adminAddr,
+		nil,
 	)
 	if !errors.Is(err, coreErr) {
 		t.Fatalf("runServerComponents() error = %v, want %v", err, coreErr)

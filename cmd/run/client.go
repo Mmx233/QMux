@@ -12,6 +12,7 @@ import (
 
 	"github.com/Mmx233/QMux/client"
 	"github.com/Mmx233/QMux/config"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
 )
@@ -53,6 +54,7 @@ func runClient(_ *cobra.Command, _ []string) error {
 		c.Stop,
 		cfg.AdminAddress,
 		c.Ready,
+		newClientCollector(c.Snapshot),
 	)
 	if err != nil {
 		return err
@@ -62,8 +64,8 @@ func runClient(_ *cobra.Command, _ []string) error {
 	return nil
 }
 
-func runClientComponents(run, stop func() error, adminAddr string, ready func() bool) error {
-	adminServer, adminListener, err := newAdminServer(adminAddr, ready)
+func runClientComponents(run, stop func() error, adminAddr string, ready func() bool, collector prometheus.Collector) error {
+	adminServer, adminListener, err := newAdminServer(adminAddr, ready, collector)
 	if err != nil {
 		return err
 	}

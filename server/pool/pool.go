@@ -9,12 +9,15 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Mmx233/QMux/internal/stats"
 	"github.com/quic-go/quic-go"
 	"github.com/rs/zerolog"
 )
 
 // ConnectionPool manages client connections for a QUIC listener
 type ConnectionPool struct {
+	Transport            stats.Transport
+	Registrations        stats.Operation
 	mu                   sync.RWMutex
 	clients              map[string]*ClientConn // clientID -> selectable connection
 	reservations         map[string]*Reservation
@@ -47,14 +50,17 @@ type ClientConn struct {
 	Conn          *quic.Conn
 	ControlStream *quic.Stream
 	RegisteredAt  time.Time
+	LastHeartbeat atomic.Int64
 	Metadata      ClientMetadata
 
 	// Connection tracking
 	ActiveConns atomic.Int64
 	TotalConns  atomic.Uint64
 	tcpPending  atomic.Int64
-	tcpActive   atomic.Int64
-	udpSessions atomic.Int64
+	// Only accessed under the owning pool's mu. Pending stays atomic because
+	// the cached load balancer also reads it without that lock.
+	tcpActive   int64
+	udpSessions int64
 	tcpStreamID atomic.Int64
 	tcpOpened   atomic.Bool
 
@@ -173,6 +179,10 @@ type LimitSnapshot struct {
 // CapacitySnapshot is a point-in-time, value-only view of generation and
 // traffic accounting for one QUIC listener.
 type CapacitySnapshot struct {
+	Healthy                       int
+	OldestHeartbeat               time.Time
+	QUIC                          stats.TransportSnapshot
+	Registrations                 stats.OperationSnapshot
 	ServerPending                 int64
 	Reservations                  int
 	Registered                    int
@@ -432,7 +442,7 @@ func (r *Retirement) TCPDrained() <-chan int64 {
 }
 
 func (p *ConnectionPool) signalTCPDrainedLocked(retirement *Retirement) {
-	if retirement == nil || retirement.drainSent || retirement.conn.tcpPending.Load()+retirement.conn.tcpActive.Load() != 0 {
+	if retirement == nil || retirement.drainSent || retirement.conn.tcpPending.Load()+retirement.conn.tcpActive != 0 {
 		return
 	}
 	fence := int64(-1)
@@ -461,7 +471,7 @@ func (r *Retirement) Done() bool {
 func (p *ConnectionPool) finalizeRetirementLocked(conn *ClientConn) {
 	retirement := p.retiring[conn]
 	if retirement != nil && retirement.done && conn.tcpPending.Load() == 0 &&
-		conn.tcpActive.Load() == 0 && conn.udpSessions.Load() == 0 {
+		conn.tcpActive == 0 && conn.udpSessions == 0 {
 		delete(p.retiring, conn)
 	}
 }
@@ -541,7 +551,7 @@ func (p *ConnectionPool) ReserveUDP() (*ClientConn, error) {
 			continue
 		}
 		hasEligible = true
-		if conn.udpSessions.Load() < p.limits.MaxUDPSessionsPerGeneration {
+		if conn.udpSessions < p.limits.MaxUDPSessionsPerGeneration {
 			eligible = append(eligible, conn)
 		}
 	}
@@ -560,8 +570,8 @@ func (p *ConnectionPool) ReserveUDP() (*ClientConn, error) {
 	if slices.Index(eligible, selected) < 0 {
 		return nil, fmt.Errorf("load balancer selected a client outside the UDP candidate set")
 	}
-	current := selected.udpSessions.Add(1)
-	p.udpSessions.observe(current)
+	selected.udpSessions++
+	p.udpSessions.observe(selected.udpSessions)
 	return selected, nil
 }
 
@@ -572,11 +582,11 @@ func (p *ConnectionPool) ReleaseUDP(conn *ClientConn) bool {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if conn.udpSessions.Load() <= 0 {
+	if conn.udpSessions <= 0 {
 		p.accountingFaults++
 		return false
 	}
-	conn.udpSessions.Add(-1)
+	conn.udpSessions--
 	p.finalizeRetirementLocked(conn)
 	return true
 }
@@ -676,7 +686,7 @@ func (a *TCPAdmission) Next() (*TCPLease, error) {
 		}
 		pending := conn.tcpPending.Add(1)
 		a.pool.pendingTCPSetups.observe(pending)
-		a.pool.tcpConnections.observe(pending + conn.tcpActive.Load())
+		a.pool.tcpConnections.observe(pending + conn.tcpActive)
 		return &TCPLease{pool: a.pool, conn: conn, state: tcpLeasePending}, nil
 	}
 	if atConnectionCapacity {
@@ -691,7 +701,7 @@ func (a *TCPAdmission) Next() (*TCPLease, error) {
 }
 
 func (p *ConnectionPool) tcpCapacityErrorLocked(conn *ClientConn) error {
-	if conn.tcpPending.Load()+conn.tcpActive.Load() >= p.limits.MaxTCPConnectionsPerGeneration {
+	if conn.tcpPending.Load()+conn.tcpActive >= p.limits.MaxTCPConnectionsPerGeneration {
 		return ErrTCPGenerationConnectionCapacity
 	}
 	if conn.tcpPending.Load() >= p.limits.MaxPendingTCPSetupsPerGeneration {
@@ -734,7 +744,7 @@ func (l *TCPLease) Commit() bool {
 
 	// Lock-free load balancing may briefly overcount, but must never undercount.
 	l.conn.ActiveConns.Add(1)
-	l.conn.tcpActive.Add(1)
+	l.conn.tcpActive++
 	l.conn.TotalConns.Add(1)
 	l.conn.tcpPending.Add(-1)
 	l.state = tcpLeaseActive
@@ -754,7 +764,7 @@ func (l *TCPLease) Release() bool {
 		l.conn.tcpPending.Add(-1)
 	case tcpLeaseActive:
 		l.conn.ActiveConns.Add(-1)
-		l.conn.tcpActive.Add(-1)
+		l.conn.tcpActive--
 	case tcpLeaseReleased:
 		return false
 	}
@@ -768,7 +778,6 @@ func (l *TCPLease) Release() bool {
 // generations held in retirement.
 func (p *ConnectionPool) Snapshot() CapacitySnapshot {
 	p.mu.RLock()
-	defer p.mu.RUnlock()
 	clientGenerations := p.clientGenerationCountLocked()
 	snapshot := CapacitySnapshot{
 		ServerPending:        p.serverPending,
@@ -782,8 +791,8 @@ func (p *ConnectionPool) Snapshot() CapacitySnapshot {
 	var maxTCPConnections, maxPendingTCPSetups, maxUDPSessions int64
 	add := func(conn *ClientConn) {
 		tcpPending := conn.tcpPending.Load()
-		tcpActive := conn.tcpActive.Load()
-		udpSessions := conn.udpSessions.Load()
+		tcpActive := conn.tcpActive
+		udpSessions := conn.udpSessions
 		snapshot.TCPPending += tcpPending
 		snapshot.TCPActive += tcpActive
 		snapshot.UDPSessions += udpSessions
@@ -793,6 +802,15 @@ func (p *ConnectionPool) Snapshot() CapacitySnapshot {
 	}
 	for _, conn := range p.clients {
 		add(conn)
+		if conn.healthy.Load() {
+			snapshot.Healthy++
+		}
+		if ns := conn.LastHeartbeat.Load(); ns != 0 {
+			heartbeat := time.Unix(0, ns)
+			if snapshot.OldestHeartbeat.IsZero() || heartbeat.Before(snapshot.OldestHeartbeat) {
+				snapshot.OldestHeartbeat = heartbeat
+			}
+		}
 	}
 	for conn := range p.retiring {
 		add(conn)
@@ -800,6 +818,9 @@ func (p *ConnectionPool) Snapshot() CapacitySnapshot {
 	snapshot.TCPConnectionsPerGeneration = p.tcpConnections.snapshot(maxTCPConnections, p.limits.MaxTCPConnectionsPerGeneration)
 	snapshot.PendingTCPSetupsPerGeneration = p.pendingTCPSetups.snapshot(maxPendingTCPSetups, p.limits.MaxPendingTCPSetupsPerGeneration)
 	snapshot.UDPSessionsPerGeneration = p.udpSessions.snapshot(maxUDPSessions, p.limits.MaxUDPSessionsPerGeneration)
+	p.mu.RUnlock()
+	snapshot.QUIC = p.Transport.Snapshot()
+	snapshot.Registrations = p.Registrations.Snapshot()
 	return snapshot
 }
 

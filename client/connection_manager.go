@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Mmx233/QMux/config"
+	"github.com/Mmx233/QMux/internal/stats"
 	"github.com/quic-go/quic-go"
 	"github.com/rs/zerolog"
 )
@@ -75,6 +77,10 @@ type clientEndpointPhases struct {
 	retiring            int64
 	generationHighWater int64
 	accountingFaults    uint64
+	transport           stats.Transport
+	connect             stats.Operation
+	registration        stats.Operation
+	reconnectAttempts   atomic.Uint64
 }
 
 // NewConnectionManager creates a new ConnectionManager instance.
@@ -211,14 +217,21 @@ func (cm *ConnectionManager) connectAndRegister(ctx context.Context, endpoint co
 	cm.publishMu.Lock()
 	cm.trackGenerationLocked(sc, clientGenerationHandshaking)
 	cm.publishMu.Unlock()
-	if err := sc.Connect(attemptCtx, cm.baseTLSConfig, cm.quicConfig); err != nil {
+	observed := &cm.endpoints[sc.capacityEndpoint]
+	started := observed.connect.Start()
+	err := sc.Connect(attemptCtx, cm.baseTLSConfig, cm.quicConfig)
+	observed.connect.Finish(started, stats.Result(err, "dial_error"))
+	if err != nil {
 		_ = sc.Close()
 		return nil, err
 	}
 	cm.publishMu.Lock()
 	cm.moveGenerationLocked(sc, clientGenerationHandshaking, clientGenerationPending)
 	cm.publishMu.Unlock()
-	if err := sc.RegisterWithAuth(attemptCtx, cm.config.ClientID, cm.config.Auth); err != nil {
+	started = observed.registration.Start()
+	err = sc.RegisterWithAuth(attemptCtx, cm.config.ClientID, cm.config.Auth)
+	observed.registration.Finish(started, stats.Result(err, "protocol_error"))
+	if err != nil {
 		_ = sc.Close()
 		return nil, err
 	}
@@ -417,6 +430,12 @@ func (cm *ConnectionManager) reconnectionLoop(ctx context.Context, serverAddr st
 			return
 		}
 
+		for i := range cm.endpoints {
+			if cm.endpoints[i].endpoint == endpoint.Address {
+				cm.endpoints[i].reconnectAttempts.Add(1)
+				break
+			}
+		}
 		sc, err := cm.connectAndRegister(ctx, *endpoint)
 		if err != nil {
 			cm.logger.Warn().
@@ -510,6 +529,7 @@ func (cm *ConnectionManager) trackGenerationLocked(sc *ServerConnection, phase c
 	for i := range cm.endpoints {
 		if cm.endpoints[i].endpoint == sc.ServerAddr() {
 			sc.capacityEndpoint = i
+			sc.transportStats.Store(&cm.endpoints[i].transport)
 			sc.capacityPhase = phase
 			cm.addGenerationLocked(sc, phase, 1)
 			if !sc.setOnClosed(func() { cm.generationClosed(sc) }) {
@@ -595,7 +615,6 @@ func (cm *ConnectionManager) generationFaultLocked(sc *ServerConnection) {
 
 func (cm *ConnectionManager) endpointSnapshot() []EndpointSnapshot {
 	cm.publishMu.Lock()
-	defer cm.publishMu.Unlock()
 	snapshot := make([]EndpointSnapshot, len(cm.endpoints))
 	for i := range cm.endpoints {
 		endpoint := &cm.endpoints[i]
@@ -607,6 +626,21 @@ func (cm *ConnectionManager) endpointSnapshot() []EndpointSnapshot {
 			Retiring:            endpoint.retiring,
 			GenerationHighWater: endpoint.generationHighWater,
 			AccountingFaults:    endpoint.accountingFaults,
+		}
+	}
+	cm.publishMu.Unlock()
+	for i := range snapshot {
+		endpoint := &cm.endpoints[i]
+		snapshot[i].QUIC = endpoint.transport.Snapshot()
+		snapshot[i].Connect = endpoint.connect.Snapshot()
+		snapshot[i].Registration = endpoint.registration.Snapshot()
+		snapshot[i].ReconnectAttempts = endpoint.reconnectAttempts.Load()
+		cm.reconnectMu.Lock()
+		snapshot[i].Reconnecting = cm.reconnecting[endpoint.endpoint]
+		cm.reconnectMu.Unlock()
+		if connection := cm.GetConnection(endpoint.endpoint); connection != nil {
+			snapshot[i].Healthy = connection.IsHealthy()
+			snapshot[i].LastHeartbeat = connection.LastReceivedFromServer()
 		}
 	}
 	return snapshot

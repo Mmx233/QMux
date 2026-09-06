@@ -15,6 +15,7 @@ import (
 	"math/big"
 	"net"
 	"reflect"
+	"strconv"
 	"testing"
 	"time"
 
@@ -94,6 +95,69 @@ func TestTokenRegistrationTransaction(t *testing.T) {
 	}
 	eventually(t, time.Second, func() bool { return harness.pool.Count() == 1 })
 	assertPendingRegistrationAvailable(t, harness.pool)
+}
+
+func TestRegistrationFailureMetrics(t *testing.T) {
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	for _, test := range []struct {
+		name              string
+		occupied          int
+		clientID          string
+		commitFault       bool
+		wantResult        string
+		wantCapacityDrops uint64
+	}{
+		{name: "duplicate ID", occupied: 1, clientID: "0", wantResult: "error"},
+		{name: "generation capacity", occupied: config.DefaultMaxClientGenerations, clientID: "new", wantResult: "capacity", wantCapacityDrops: 1},
+		{name: "commit accounting fault", clientID: "new", commitFault: true, wantResult: "error"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			authenticator, err := tokenauth.New(secret)
+			if err != nil {
+				t.Fatal(err)
+			}
+			harness := newRegistrationHarness(t, authenticator, 2*time.Second, func(connectionPool *pool.ConnectionPool) registrationAckWriter {
+				return func(w io.Writer, success bool, message, version string, capabilities []string, scheme string) error {
+					if success && test.commitFault {
+						// Trigger the existing accounting guard after Reserve, before Commit.
+						if connectionPool.ReleaseUDP(&pool.ClientConn{}) {
+							t.Error("unowned UDP release succeeded")
+						}
+					}
+					return protocol.WriteRegisterAckWithAuth(w, success, message, version, capabilities, scheme)
+				}
+			})
+			for i := range test.occupied {
+				if err := harness.pool.Add(&pool.ClientConn{ID: strconv.Itoa(i)}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			capabilities := []string{protocol.CapabilityUDPWireV2}
+			proof, err := sharedtoken.Compute(secret, sharedtoken.Transcript{
+				ClientID: test.clientID, Version: protocol.ProtocolVersion, Capabilities: capabilities,
+			}, harness.client.ConnectionState().TLS)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := protocol.WriteRegisterWithAuth(harness.openStream(t), test.clientID, protocol.ProtocolVersion, capabilities, &protocol.RegisterAuth{
+				Scheme: sharedtoken.Scheme, Proof: proof,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			harness.waitForHandler(t)
+			snapshot := harness.pool.Snapshot()
+			result := snapshot.Registrations
+			if result.Attempts != 1 || result.Duration.Count != 1 || len(result.Results) != 1 || result.Results[test.wantResult] != 1 {
+				t.Fatalf("registration metrics = %+v, want one %s result", result, test.wantResult)
+			}
+			if got := snapshot.ClientGenerations.CapacityDrops; got != test.wantCapacityDrops {
+				t.Fatalf("generation capacity drops = %d, want %d", got, test.wantCapacityDrops)
+			}
+			if test.commitFault && snapshot.AccountingFaults != 1 {
+				t.Fatalf("accounting faults = %d, want 1", snapshot.AccountingFaults)
+			}
+		})
+	}
 }
 
 func TestRegistrationReservationIsNotSelectableBeforeAck(t *testing.T) {

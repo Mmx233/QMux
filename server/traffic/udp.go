@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,7 +27,7 @@ var errUDPListenerCapacity = errors.New("UDP listener session capacity reached")
 
 // UDPAdmissionSnapshot is a value-only view of one listener's UDP admission,
 // admitted application send ownership, and fragment assembly state. DSend
-// current values are exact at the snapshot cut. DSend high-water values are
+// current values sample senders independently. DSend high-water values are
 // the greatest aggregate current observed by a snapshot during the listener's
 // lifetime, so a completed burst between snapshots may not be represented.
 type UDPAdmissionSnapshot struct {
@@ -96,7 +95,6 @@ type udpSenderStats struct {
 	decodeDrops      atomic.Uint64
 	unknownSession   atomic.Uint64
 	publicWriteDrops atomic.Uint64
-	workers          atomic.Int64
 }
 
 type udpSessionStats struct {
@@ -187,8 +185,8 @@ type UDPHandler struct {
 	senderWG    sync.WaitGroup
 	senderStats udpSenderStats
 
-	// dsendItemsHighWater is protected by lifecycleMu and updated only by snapshot.
-	dsendItemsHighWater int64
+	// Updated only by monitoring, not on the packet path.
+	dsendItemsHighWater atomic.Int64
 }
 
 // bindUDP stages a UDP socket without starting handler goroutines.
@@ -506,7 +504,6 @@ func (h *UDPHandler) senderFor(client *pool.ClientConn) *udpSender {
 	}
 	h.senders[client] = sender
 	h.senderWG.Add(1)
-	h.senderStats.workers.Add(1)
 	go h.runSender(sender)
 	return sender
 }
@@ -552,21 +549,23 @@ func (h *UDPHandler) snapshot() UDPAdmissionSnapshot {
 	h.lifecycleMu.Lock()
 	senders := make([]*udpSender, 0, len(h.senders))
 	for _, sender := range h.senders {
-		sender.mu.Lock()
 		senders = append(senders, sender)
 	}
+	snapshot.DSendWorkers = int64(len(h.senders))
+	h.lifecycleMu.Unlock()
 	for _, sender := range senders {
+		sender.mu.Lock()
 		snapshot.DSendItems += sender.ownedFrames
-	}
-	snapshot.DSendBackingBytes = snapshot.DSendItems * int64(protocol.DatagramBufferSize)
-	h.dsendItemsHighWater = max(h.dsendItemsHighWater, snapshot.DSendItems)
-	snapshot.DSendItemsHighWater = h.dsendItemsHighWater
-	snapshot.DSendBackingBytesHighWater = snapshot.DSendItemsHighWater * int64(protocol.DatagramBufferSize)
-	snapshot.DSendWorkers = h.senderStats.workers.Load()
-	for _, sender := range slices.Backward(senders) {
 		sender.mu.Unlock()
 	}
-	h.lifecycleMu.Unlock()
+	snapshot.DSendBackingBytes = snapshot.DSendItems * int64(protocol.DatagramBufferSize)
+	for high := h.dsendItemsHighWater.Load(); high < snapshot.DSendItems; high = h.dsendItemsHighWater.Load() {
+		if h.dsendItemsHighWater.CompareAndSwap(high, snapshot.DSendItems) {
+			break
+		}
+	}
+	snapshot.DSendItemsHighWater = h.dsendItemsHighWater.Load()
+	snapshot.DSendBackingBytesHighWater = snapshot.DSendItemsHighWater * int64(protocol.DatagramBufferSize)
 
 	if h.fragmentAssembler != nil {
 		snapshot.Fragment = h.fragmentAssembler.Snapshot()
@@ -575,7 +574,7 @@ func (h *UDPHandler) snapshot() UDPAdmissionSnapshot {
 }
 
 func (h *UDPHandler) recordDecodeError(err error) {
-	if !errors.Is(err, protocol.ErrFragmentAssemblerFull) {
+	if !errors.Is(err, protocol.ErrFragmentAssemblerFull) && !errors.Is(err, protocol.ErrFragmentAssemblerClosed) {
 		h.senderStats.decodeDrops.Add(1)
 	}
 }
@@ -656,7 +655,6 @@ func (h *UDPHandler) finishSender(sender *udpSender) {
 			h.afterSenderDelete()
 		}
 	}
-	h.senderStats.workers.Add(-1)
 	h.lifecycleMu.Unlock()
 	close(sender.done)
 	h.senderWG.Done()

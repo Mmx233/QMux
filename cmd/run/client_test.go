@@ -40,6 +40,7 @@ func TestRunClientComponentsAdminBindFailureDoesNotRunClient(t *testing.T) {
 		func() error { return nil },
 		occupied.Addr().String(),
 		func() bool { return false },
+		nil,
 	)
 	if err == nil || !strings.Contains(err.Error(), "listen admin") {
 		t.Fatalf("runClientComponents() error = %v, want admin bind failure", err)
@@ -57,6 +58,7 @@ func TestRunClientComponentsClientExitReleasesAdmin(t *testing.T) {
 		func() error { return errors.New("unexpected stop") },
 		adminAddr,
 		func() bool { return false },
+		nil,
 	)
 	if !errors.Is(err, want) {
 		t.Fatalf("runClientComponents() error = %v, want %v", err, want)

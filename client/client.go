@@ -7,9 +7,11 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Mmx233/QMux/config"
+	"github.com/Mmx233/QMux/internal/stats"
 	"github.com/Mmx233/QMux/protocol"
 	"github.com/quic-go/quic-go"
 	"github.com/rs/zerolog"
@@ -35,6 +37,10 @@ type Client struct {
 	localConns  sync.Map // connID -> net.Conn
 	udpBudget   *udpSessionBudget
 	dsendStats  *clientDsendStats
+	tcpSetups   stats.Operation
+	tcpDials    stats.Operation
+	tcpPending  atomic.Int64
+	tcpActive   atomic.Int64
 	logger      zerolog.Logger
 
 	udpMu            sync.Mutex
@@ -88,6 +94,8 @@ type targetResult struct {
 
 // Snapshot is a value-only view of client capacity ownership.
 type Snapshot struct {
+	Ready          bool
+	TCP            TCPActivitySnapshot
 	Endpoints      []EndpointSnapshot
 	UDPSessions    UDPSessionSnapshot
 	DSend          DSendSnapshot
@@ -104,6 +112,18 @@ type EndpointSnapshot struct {
 	Retiring            int64
 	GenerationHighWater int64
 	AccountingFaults    uint64
+	Healthy             bool
+	LastHeartbeat       time.Time
+	Reconnecting        bool
+	ReconnectAttempts   uint64
+	QUIC                stats.TransportSnapshot
+	Connect             stats.OperationSnapshot
+	Registration        stats.OperationSnapshot
+}
+
+type TCPActivitySnapshot struct {
+	Pending, Active int64
+	Setups, Dials   stats.OperationSnapshot
 }
 
 // UDPSessionSnapshot describes process-wide client UDP session admission.
@@ -114,6 +134,10 @@ type UDPSessionSnapshot struct {
 	Limit            int64
 	CapacityDrops    uint64
 	AccountingFaults uint64
+	DecodeDrops      uint64
+	CreateErrors     uint64
+	ReadErrors       uint64
+	WriteErrors      uint64
 }
 
 // DSendSnapshot describes client-owned application datagram sends. OwnedItems
@@ -376,6 +400,19 @@ func (runtime *connectionRuntime) setFence(fence int64) error {
 
 // handleStream handles a single stream from server
 func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *ServerConnection, runtimes ...*connectionRuntime) {
+	setupStarted := c.tcpSetups.Start()
+	c.tcpPending.Add(1)
+	setupFinished := false
+	setupResult := "protocol_error"
+	defer func() {
+		if !setupFinished {
+			c.tcpPending.Add(-1)
+			if ctx.Err() != nil {
+				setupResult = stats.Result(ctx.Err(), setupResult)
+			}
+			c.tcpSetups.Finish(setupStarted, setupResult)
+		}
+	}()
 	relayOwnsStream := false
 	defer func() {
 		if !relayOwnsStream {
@@ -383,7 +420,7 @@ func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *Serv
 			stream.CancelWrite(0)
 		}
 	}()
-	setupDeadline := time.Now().Add(tcpSetupTimeout)
+	setupDeadline := setupStarted.Add(tcpSetupTimeout)
 	if err := stream.SetDeadline(setupDeadline); err != nil {
 		c.logger.Error().Err(err).Str("server", sc.ServerAddr()).Msg("set TCP setup deadline failed")
 		return
@@ -392,6 +429,7 @@ func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *Serv
 	// Read NewConn message
 	var msg protocol.NewConnMsg
 	if err := protocol.ReadTypedMessage(stream, protocol.MsgTypeNewConn, &msg); err != nil {
+		setupResult = stats.Result(err, "protocol_error")
 		c.logger.Error().Err(err).Str("server", sc.ServerAddr()).Msg("read NewConn message failed")
 		return
 	}
@@ -417,9 +455,12 @@ func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *Serv
 	// Connect to local service
 	localAddr := net.JoinHostPort(c.config.Local.Host, strconv.Itoa(c.config.Local.Port))
 	dialCtx, cancelDial := context.WithDeadline(ctx, setupDeadline)
+	dialStarted := c.tcpDials.Start()
 	localConn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", localAddr)
+	c.tcpDials.Finish(dialStarted, stats.Result(err, "dial_error"))
 	cancelDial()
 	if err != nil {
+		setupResult = stats.Result(err, "dial_error")
 		logger.Error().Err(err).Str("local_addr", localAddr).Msg("dial local service failed")
 		return
 	}
@@ -451,6 +492,7 @@ func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *Serv
 		defer runtimes[0].localConns.Delete(msg.ConnID)
 	}
 	if err := protocol.WriteNewConnAck(stream, msg.ConnID); err != nil {
+		setupResult = stats.Result(err, "ack_error")
 		logger.Error().Err(err).Msg("write NewConn acknowledgment failed")
 		return
 	}
@@ -460,6 +502,11 @@ func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *Serv
 	}
 
 	logger.Info().Str("local_addr", localAddr).Msg("connected to local service")
+	c.tcpPending.Add(-1)
+	c.tcpActive.Add(1)
+	setupFinished = true
+	c.tcpSetups.Finish(setupStarted, "success")
+	defer c.tcpActive.Add(-1)
 
 	var streamMu sync.Mutex
 	aborted := false
@@ -800,6 +847,7 @@ func (c *Client) retireUDPHandler(endpoint string, handler *UDPHandler) {
 	fragment := handler.fragmentAssembler.Snapshot()
 	c.retiredFragments.GroupCapacityDrops += fragment.GroupCapacityDrops
 	c.retiredFragments.ByteCapacityDrops += fragment.ByteCapacityDrops
+	c.retiredFragments.ExpiredGroups += fragment.ExpiredGroups
 	delete(c.liveUDPHandlers, handler)
 	c.udpHandlers.CompareAndDelete(endpoint, handler)
 }
@@ -812,22 +860,31 @@ func (c *Client) retireUDPHandler(endpoint string, handler *UDPHandler) {
 func (c *Client) Snapshot() Snapshot {
 	var snapshot Snapshot
 	if c.connMgr != nil {
+		if c.config != nil {
+			snapshot.Ready = c.Ready()
+		}
 		snapshot.Endpoints = c.connMgr.endpointSnapshot()
 	}
+	snapshot.TCP = TCPActivitySnapshot{Pending: c.tcpPending.Load(), Active: c.tcpActive.Load(), Setups: c.tcpSetups.Snapshot(), Dials: c.tcpDials.Snapshot()}
 	snapshot.UDPSessions = c.udpBudget.snapshot()
 	snapshot.DSend = c.dsendStats.load()
 
 	c.udpMu.Lock()
 	snapshot.LiveAssemblers = len(c.liveUDPHandlers)
 	snapshot.Fragments = c.retiredFragments
+	handlers := make([]*UDPHandler, 0, len(c.liveUDPHandlers))
 	for handler := range c.liveUDPHandlers {
+		handlers = append(handlers, handler)
+	}
+	c.udpMu.Unlock()
+	for _, handler := range handlers {
 		fragment := handler.fragmentAssembler.Snapshot()
 		snapshot.Fragments.RetainedGroups += fragment.RetainedGroups
 		snapshot.Fragments.RetainedBackingBytes += fragment.RetainedBackingBytes
 		snapshot.Fragments.GroupCapacityDrops += fragment.GroupCapacityDrops
 		snapshot.Fragments.ByteCapacityDrops += fragment.ByteCapacityDrops
+		snapshot.Fragments.ExpiredGroups += fragment.ExpiredGroups
 	}
-	c.udpMu.Unlock()
 	return snapshot
 }
 

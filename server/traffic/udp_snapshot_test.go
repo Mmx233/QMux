@@ -29,7 +29,6 @@ func TestUDPAdmissionSnapshotOwnedSendState(t *testing.T) {
 		},
 		fragmentAssembler: assembler,
 	}
-	handler.senderStats.workers.Store(2)
 	handler.senderStats.sendErrors.Store(1)
 	handler.senderStats.queueFullDrops.Store(2)
 	handler.senderStats.noEligibleDrops.Store(3)
@@ -90,7 +89,7 @@ func TestUDPAdmissionSnapshotDsendHighWaterSurvivesRelease(t *testing.T) {
 	}
 }
 
-func TestUDPAdmissionSnapshotDsendHighWaterSharesOwnedCut(t *testing.T) {
+func TestUDPAdmissionSnapshotDsendHighWaterCoversSample(t *testing.T) {
 	client := &pool.ClientConn{}
 	sender := &udpSender{
 		client: client,
@@ -102,16 +101,6 @@ func TestUDPAdmissionSnapshotDsendHighWaterSharesOwnedCut(t *testing.T) {
 	sender.mu.Lock()
 	snapshotDone := make(chan UDPAdmissionSnapshot, 1)
 	go func() { snapshotDone <- handler.snapshot() }()
-	deadline := time.Now().Add(time.Second)
-	for handler.lifecycleMu.TryLock() {
-		handler.lifecycleMu.Unlock()
-		if time.Now().After(deadline) {
-			sender.mu.Unlock()
-			t.Fatal("snapshot did not reach the sender ownership cut")
-		}
-		time.Sleep(time.Millisecond)
-	}
-
 	batch := fragmentUDPSenderBatch(t, 1, []byte("snapshot cut"))
 	if got := handler.enqueueSenderLocked(sender, batch); got != udpEnqueued {
 		sender.mu.Unlock()
@@ -130,7 +119,7 @@ func TestUDPAdmissionSnapshotDsendHighWaterSharesOwnedCut(t *testing.T) {
 	handler.releaseSenderBatch(sender, <-sender.queue)
 }
 
-func TestUDPAdmissionSnapshotSenderDeleteIsOneExactCut(t *testing.T) {
+func TestUDPAdmissionSnapshotSenderRegistryAfterDeletion(t *testing.T) {
 	client := &pool.ClientConn{}
 	sender := &udpSender{client: client, done: make(chan struct{})}
 	deleted := make(chan struct{})
@@ -142,7 +131,6 @@ func TestUDPAdmissionSnapshotSenderDeleteIsOneExactCut(t *testing.T) {
 			<-release
 		},
 	}
-	handler.senderStats.workers.Store(1)
 	handler.senderWG.Add(1)
 
 	go handler.finishSender(sender)
@@ -157,12 +145,9 @@ func TestUDPAdmissionSnapshotSenderDeleteIsOneExactCut(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("sender delete transition was not reached")
 	}
-	if got := handler.senderStats.workers.Load(); got != 1 {
-		t.Fatalf("workers inside delete transition = %d, want 1", got)
-	}
 	if handler.lifecycleMu.TryLock() {
 		handler.lifecycleMu.Unlock()
-		t.Fatal("sender delete transition released lifecycle lock before worker decrement")
+		t.Fatal("sender deletion released the registry lock before completion")
 	}
 
 	snapshotDone := make(chan UDPAdmissionSnapshot, 1)
@@ -175,12 +160,14 @@ func TestUDPAdmissionSnapshotSenderDeleteIsOneExactCut(t *testing.T) {
 	<-sender.done
 }
 
-func TestUDPAdmissionCapacityDropIsNotAlsoDecodeDrop(t *testing.T) {
+func TestUDPAdmissionResourceErrorsAreNotDecodeDrops(t *testing.T) {
 	handler := &UDPHandler{}
-	handler.recordDecodeError(protocol.ErrFragmentAssemblerFull)
-	handler.recordDecodeError(errors.Join(errors.New("wrapped"), protocol.ErrFragmentAssemblerFull))
+	for _, err := range []error{protocol.ErrFragmentAssemblerFull, protocol.ErrFragmentAssemblerClosed} {
+		handler.recordDecodeError(err)
+		handler.recordDecodeError(errors.Join(errors.New("wrapped"), err))
+	}
 	if got := handler.senderStats.decodeDrops.Load(); got != 0 {
-		t.Fatalf("capacity decode drops = %d, want 0", got)
+		t.Fatalf("resource decode drops = %d, want 0", got)
 	}
 	handler.recordDecodeError(errors.New("malformed datagram"))
 	if got := handler.senderStats.decodeDrops.Load(); got != 1 {

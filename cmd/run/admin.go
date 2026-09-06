@@ -7,6 +7,10 @@ import (
 	"net"
 	"net/http"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const (
@@ -14,7 +18,7 @@ const (
 	adminShutdownTimeout   = 5 * time.Second
 )
 
-func newAdminServer(address string, ready func() bool) (*http.Server, net.Listener, error) {
+func newAdminServer(address string, ready func() bool, collector prometheus.Collector) (*http.Server, net.Listener, error) {
 	if address == "" {
 		return nil, nil, nil
 	}
@@ -23,7 +27,7 @@ func newAdminServer(address string, ready func() bool) (*http.Server, net.Listen
 		return nil, nil, fmt.Errorf("listen admin on %s: %w", address, err)
 	}
 	return &http.Server{
-		Handler:           newAdminHandler(ready),
+		Handler:           newAdminHandler(ready, collector),
 		ReadHeaderTimeout: adminReadHeaderTimeout,
 	}, listener, nil
 }
@@ -37,8 +41,14 @@ func shutdownAdmin(server *http.Server) error {
 	return server.Shutdown(ctx)
 }
 
-func newAdminHandler(ready func() bool) http.Handler {
+func newAdminHandler(ready func() bool, collector prometheus.Collector) http.Handler {
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	if collector != nil {
+		registry.MustRegister(collector)
+	}
 	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", promhttp.InstrumentMetricHandler(registry, promhttp.HandlerFor(registry, promhttp.HandlerOpts{})))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeAdminResponse(w, http.StatusOK, "ok\n")
 	})

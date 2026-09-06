@@ -71,6 +71,7 @@ type FragmentSnapshot struct {
 	RetainedBackingBytes int64
 	GroupCapacityDrops   uint64
 	ByteCapacityDrops    uint64
+	ExpiredGroups        uint64
 }
 
 func writeUDPHeader(dst []byte, sessionID uint32) {
@@ -400,6 +401,7 @@ type ShardedFragmentAssembler struct {
 	retainedBytes  atomic.Int64
 	groupDrops     atomic.Uint64
 	byteDrops      atomic.Uint64
+	expiredGroups  atomic.Uint64
 	maxGroups      int
 	maxBytes       int64
 
@@ -440,29 +442,17 @@ func (sfa *ShardedFragmentAssembler) getShard(key fragmentKey) *fragmentShard {
 	return &sfa.shards[sfa.shardIndex(key)]
 }
 
-// Snapshot returns an exact cut of retained state without exposing fragment IDs.
+// Snapshot samples capacity ownership without blocking fragment processing.
+// Fields can reflect different instants, including in-progress reservations;
+// retained values are exact once producers and cleanup are quiescent.
 func (sfa *ShardedFragmentAssembler) Snapshot() FragmentSnapshot {
-	sfa.lifecycleMu.RLock()
-	for i := range sfa.shards {
-		sfa.shards[i].mu.Lock()
+	return FragmentSnapshot{
+		RetainedGroups:       sfa.retainedGroups.Load(),
+		RetainedBackingBytes: sfa.retainedBytes.Load(),
+		GroupCapacityDrops:   sfa.groupDrops.Load(),
+		ByteCapacityDrops:    sfa.byteDrops.Load(),
+		ExpiredGroups:        sfa.expiredGroups.Load(),
 	}
-
-	snapshot := FragmentSnapshot{
-		GroupCapacityDrops: sfa.groupDrops.Load(),
-		ByteCapacityDrops:  sfa.byteDrops.Load(),
-	}
-	for i := range sfa.shards {
-		snapshot.RetainedGroups += int64(len(sfa.shards[i].fragments))
-		for _, group := range sfa.shards[i].fragments {
-			snapshot.RetainedBackingBytes += group.retainedBytes
-		}
-	}
-
-	for i := len(sfa.shards); i > 0; i-- {
-		sfa.shards[i-1].mu.Unlock()
-	}
-	sfa.lifecycleMu.RUnlock()
-	return snapshot
 }
 
 func reserveFragmentCapacity(counter *atomic.Int64, amount, limit int64) bool {
@@ -496,6 +486,9 @@ func (sfa *ShardedFragmentAssembler) cleanupLoop() {
 				shard := &sfa.shards[i]
 				shard.mu.Lock()
 				releasedGroups, releasedBytes := cleanupExpiredFragmentGroups(shard.fragments, now)
+				if releasedGroups > 0 {
+					sfa.expiredGroups.Add(uint64(releasedGroups))
+				}
 				sfa.retainedGroups.Add(-releasedGroups)
 				sfa.retainedBytes.Add(-releasedBytes)
 				shard.mu.Unlock()

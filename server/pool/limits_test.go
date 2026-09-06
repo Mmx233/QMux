@@ -225,8 +225,8 @@ func TestTCPGenerationLimitsReasonsPhasesAndRecovery(t *testing.T) {
 	if !recovered.Release() || !active.Release() {
 		t.Fatal("Release() rejected held TCP lease")
 	}
-	if client.tcpPending.Load() != 0 || client.tcpActive.Load() != 0 {
-		t.Fatalf("TCP current after recovery = %d", client.tcpPending.Load()+client.tcpActive.Load())
+	if client.tcpPending.Load() != 0 || client.tcpActive != 0 {
+		t.Fatalf("TCP current after recovery = %d", client.tcpPending.Load()+client.tcpActive)
 	}
 
 	setupLimits := defaultLimits()
@@ -304,7 +304,7 @@ func TestTCPPendingSetupDefaultLimitTwoXAndRecovery(t *testing.T) {
 	wantFinal := wantSaturated
 	wantFinal.Current = 0
 	if snapshot := p.Snapshot(); snapshot.TCPPending != 0 || snapshot.TCPActive != 0 ||
-		snapshot.PendingTCPSetupsPerGeneration != wantFinal || client.tcpPending.Load() != 0 || client.tcpActive.Load() != 0 {
+		snapshot.PendingTCPSetupsPerGeneration != wantFinal || client.tcpPending.Load() != 0 || client.tcpActive != 0 {
 		t.Fatalf("final pending setup snapshot = %+v", snapshot)
 	}
 }

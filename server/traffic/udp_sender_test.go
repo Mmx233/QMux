@@ -371,9 +371,9 @@ func TestUDPSenderRejectsOversizedPacketBeforeSessionLookup(t *testing.T) {
 		if sessions, sessionsByID := syncMapLen(&handler.sessions), syncMapLen(&handler.sessionsByID); sessions != 0 || sessionsByID != 0 {
 			t.Fatalf("sessions after oversized packet = (%d addresses, %d IDs), want zero", sessions, sessionsByID)
 		}
-		if len(handler.senders) != 0 || handler.senderStats.workers.Load() != 0 {
+		if len(handler.senders) != 0 || handler.snapshot().DSendWorkers != 0 {
 			t.Fatalf("sender state after oversized packet = (%d senders, %d workers), want zero",
-				len(handler.senders), handler.senderStats.workers.Load())
+				len(handler.senders), handler.snapshot().DSendWorkers)
 		}
 	})
 
@@ -404,9 +404,9 @@ func TestUDPSenderRejectsOversizedPacketBeforeSessionLookup(t *testing.T) {
 		if got := handler.senderStats.fragmentDrops.Load(); got != 1 {
 			t.Fatalf("fragment drops = %d, want 1", got)
 		}
-		if len(handler.senders) != 0 || handler.senderStats.workers.Load() != 0 {
+		if len(handler.senders) != 0 || handler.snapshot().DSendWorkers != 0 {
 			t.Fatalf("sender state after oversized packet = (%d senders, %d workers), want zero",
-				len(handler.senders), handler.senderStats.workers.Load())
+				len(handler.senders), handler.snapshot().DSendWorkers)
 		}
 	})
 }
@@ -438,9 +438,9 @@ func TestUDPSenderFragmentFailureClosesPublishedSession(t *testing.T) {
 	if got := handler.senderStats.fragmentDrops.Load(); got != 1 {
 		t.Fatalf("fragment drops = %d, want 1", got)
 	}
-	if len(handler.senders) != 0 || handler.senderStats.workers.Load() != 0 {
+	if len(handler.senders) != 0 || handler.snapshot().DSendWorkers != 0 {
 		t.Fatalf("sender state after fragment failure = (%d senders, %d workers), want zero",
-			len(handler.senders), handler.senderStats.workers.Load())
+			len(handler.senders), handler.snapshot().DSendWorkers)
 	}
 }
 
@@ -657,7 +657,7 @@ func TestUDPSenderBlackholeIsolationAndManagerRetirement(t *testing.T) {
 		t.Fatalf("Manager.Wait did not return after QUIC generation retirement: %v", context.Cause(ctx))
 	}
 	managerStopped = true
-	if got := handler.senderStats.workers.Load(); got != 0 {
+	if got := handler.snapshot().DSendWorkers; got != 0 {
 		t.Fatalf("sender workers after Manager.Wait = %d, want 0", got)
 	}
 	hotSender.mu.Lock()
@@ -1090,9 +1090,9 @@ func TestUDPServerSenderCancellationRaceDrainsExactly(t *testing.T) {
 	sender.mu.Lock()
 	frames := sender.ownedFrames
 	sender.mu.Unlock()
-	if got != nil || handler.senderStats.workers.Load() != 0 || frames != 0 || len(sender.queue) != 0 {
+	if got != nil || handler.snapshot().DSendWorkers != 0 || frames != 0 || len(sender.queue) != 0 {
 		t.Fatalf("racing sender final residue: sender=%p workers=%d owned=%d queue=%d",
-			got, handler.senderStats.workers.Load(), frames, len(sender.queue))
+			got, handler.snapshot().DSendWorkers, frames, len(sender.queue))
 	}
 }
 

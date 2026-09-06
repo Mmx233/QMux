@@ -11,6 +11,7 @@ import (
 
 	"github.com/Mmx233/QMux/config"
 	"github.com/Mmx233/QMux/server"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
 )
@@ -38,7 +39,7 @@ func runServer(_ *cobra.Command, _ []string) error {
 	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 	logger.Info().Msg("starting QMux server")
-	err = runServerComponents(ctx, srv.Start, srv.Snapshot, cfg.AdminAddress)
+	err = runServerComponents(ctx, srv.Start, srv.Ready, cfg.AdminAddress, newServerCollector(srv.Snapshot))
 	if ctx.Err() != nil && errors.Is(err, context.Cause(ctx)) {
 		err = nil
 	}
@@ -53,14 +54,15 @@ func runServer(_ *cobra.Command, _ []string) error {
 func runServerComponents(
 	ctx context.Context,
 	start func(context.Context) error,
-	snapshot func() server.Snapshot,
+	ready func() bool,
 	adminAddr string,
+	collector prometheus.Collector,
 ) error {
 	if cause := context.Cause(ctx); cause != nil {
 		return cause
 	}
 
-	adminServer, adminListener, err := newAdminServer(adminAddr, func() bool { return snapshot().Ready })
+	adminServer, adminListener, err := newAdminServer(adminAddr, ready, collector)
 	if err != nil {
 		return err
 	}

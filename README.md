@@ -71,7 +71,7 @@ qmux generate config client -o client.yaml
 Edit `server.yaml`:
 
 ```yaml
-admin_address: "127.0.0.1:9090" # Optional; omit to disable health endpoints
+admin_address: "127.0.0.1:9090" # Optional; omit to disable admin endpoints
 
 listeners:
   - quic_addr: "0.0.0.0:8443"    # QUIC control port
@@ -101,7 +101,7 @@ tls:
 Edit `client.yaml`:
 
 ```yaml
-admin_address: "127.0.0.1:9090" # Optional; omit to disable health endpoints
+admin_address: "127.0.0.1:9090" # Optional; omit to disable admin endpoints
 
 capacity:
   max_local_udp_sessions: 256
@@ -154,7 +154,9 @@ qmux run client -c client.yaml
 
 Now external traffic to `your-server-ip:8080` will be forwarded to your local service on port 3000.
 
-The optional `admin_address` enables unauthenticated `GET /healthz` and `GET /readyz` endpoints, so bind it only to loopback or a protected management network. Server readiness requires every configured route to be listening with an eligible client for each enabled protocol. Client readiness requires a healthy registered connection to every configured server endpoint. Failed readiness returns `503 not ready`; liveness returns `200 ok` while the admin listener is running. These endpoints do not probe the local service; use a business-port blackbox check for the end-to-end data path.
+The optional `admin_address` enables unauthenticated `GET /healthz`, `GET /readyz`, and `GET /metrics` endpoints on both server and client, so bind it only to loopback or a protected management network. Server readiness requires every configured route to be listening with an eligible client for each enabled protocol. Client readiness requires a healthy registered connection to every configured server endpoint. Failed readiness returns `503 not ready`; liveness returns `200 ok` while the admin listener is running. These endpoints do not probe the local service; use a business-port blackbox check for the end-to-end data path.
+
+`GET /metrics` exposes Prometheus metrics for runtime, connections, and traffic. QMux metrics use the `qmux_server_` and `qmux_client_` prefixes.
 
 ## Authentication
 

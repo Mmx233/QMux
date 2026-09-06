@@ -34,7 +34,7 @@ func TestUDPAdmissionCapAndReleaseUnderflow(t *testing.T) {
 	if got := p.Snapshot().UDPSessionsPerGeneration; got != (LimitSnapshot{Current: 2, HighWater: 2, Limit: 2, CapacityDrops: 1}) {
 		t.Fatalf("UDP session snapshot = %+v", got)
 	}
-	if got := client.udpSessions.Load(); got != 2 {
+	if got := client.udpSessions; got != 2 {
 		t.Fatalf("held UDP sessions = %d, want 2", got)
 	}
 	if !p.ReleaseUDP(client) || !p.ReleaseUDP(client) {
@@ -43,7 +43,7 @@ func TestUDPAdmissionCapAndReleaseUnderflow(t *testing.T) {
 	if p.ReleaseUDP(client) {
 		t.Fatal("ReleaseUDP() accepted an underflow")
 	}
-	if got := client.udpSessions.Load(); got != 0 {
+	if got := client.udpSessions; got != 0 {
 		t.Fatalf("UDP sessions after underflow compensation = %d, want 0", got)
 	}
 	if got := p.Snapshot().UDPSessionsPerGeneration; got.Current != 0 || got.HighWater != 2 || got.CapacityDrops != 1 {
@@ -145,7 +145,7 @@ func TestUDPAdmissionConcurrentNoOvershoot(t *testing.T) {
 	if got := len(held); got != int(limit) {
 		t.Fatalf("successful reservations = %d, want %d", got, limit)
 	}
-	if got := client.udpSessions.Load(); got != limit {
+	if got := client.udpSessions; got != limit {
 		t.Fatalf("generation high water = %d, want %d", got, limit)
 	}
 	for _, selected := range held {
@@ -153,7 +153,7 @@ func TestUDPAdmissionConcurrentNoOvershoot(t *testing.T) {
 			t.Fatal("ReleaseUDP() rejected a held concurrent reservation")
 		}
 	}
-	if got := client.udpSessions.Load(); got != 0 {
+	if got := client.udpSessions; got != 0 {
 		t.Fatalf("UDP sessions after release = %d, want 0", got)
 	}
 }
@@ -180,8 +180,8 @@ func TestUDPAdmissionStaleExactGenerationAndEligibility(t *testing.T) {
 	if !p.ReleaseUDP(stale) {
 		t.Fatal("ReleaseUDP(stale) rejected its exact reservation")
 	}
-	if stale.udpSessions.Load() != 0 || fresh.udpSessions.Load() != 0 {
-		t.Fatalf("stale/fresh UDP sessions = %d/%d, want 0/0", stale.udpSessions.Load(), fresh.udpSessions.Load())
+	if stale.udpSessions != 0 || fresh.udpSessions != 0 {
+		t.Fatalf("stale/fresh UDP sessions = %d/%d, want 0/0", stale.udpSessions, fresh.udpSessions)
 	}
 }
 
@@ -194,7 +194,7 @@ func TestUDPAdmissionRejectsBalancerResultOutsideCandidates(t *testing.T) {
 	if _, err := p.ReserveUDP(); err == nil {
 		t.Fatal("ReserveUDP() accepted a balancer result outside the candidate set")
 	}
-	if client.udpSessions.Load() != 0 {
+	if client.udpSessions != 0 {
 		t.Fatal("invalid balancer result consumed UDP capacity")
 	}
 }

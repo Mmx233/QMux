@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Mmx233/QMux/config"
+	"github.com/Mmx233/QMux/internal/stats"
 	"github.com/Mmx233/QMux/protocol"
 	"github.com/Mmx233/QMux/server/auth"
 	"github.com/Mmx233/QMux/server/pool"
@@ -353,6 +354,36 @@ func (s *Server) Snapshot() Snapshot {
 	return snapshot
 }
 
+// Ready checks route availability without collecting traffic or transport metrics.
+func (s *Server) Ready() bool {
+	if s.trafficManager == nil || !s.trafficManager.Running() || len(s.config.Listeners) == 0 {
+		return false
+	}
+	for _, listener := range s.config.Listeners {
+		p := s.pools[listener.QuicAddr]
+		if p == nil {
+			return false
+		}
+		switch listener.Protocol {
+		case "tcp":
+			if p.EligibleCount("tcp") == 0 {
+				return false
+			}
+		case "udp":
+			if p.EligibleCount("udp") == 0 {
+				return false
+			}
+		case "both":
+			if p.EligibleCount("tcp") == 0 || p.EligibleCount("udp") == 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func superviseServer(
 	ctx context.Context,
 	trafficManager trafficLifecycle,
@@ -545,10 +576,12 @@ func (s *Server) startListener(ctx context.Context, listenerConf config.QuicList
 			return fmt.Errorf("accept connection: %w", err)
 		}
 		poolInst := s.pools[listenerConf.QuicAddr]
+		poolInst.Transport.Add(conn)
 		pending := poolInst.BeginPending()
 		if pending == nil {
 			logger.Warn().Str("remote", conn.RemoteAddr().String()).Msg("pending registration limit reached")
 			_ = conn.CloseWithError(registrationErrorCode, registrationFailureReason)
+			poolInst.Transport.Remove(conn)
 			continue
 		}
 
@@ -580,6 +613,8 @@ func (s *Server) handleConnectionPending(
 	pending *pool.Reservation,
 ) {
 	poolInst := s.pools[quicAddr]
+	poolInst.Transport.Add(conn)
+	defer poolInst.Transport.Remove(conn)
 	if pending == nil {
 		_ = conn.CloseWithError(registrationErrorCode, registrationFailureReason)
 		return
@@ -615,6 +650,15 @@ func (s *Server) handleConnectionPending(
 	}
 	registrationCtx, cancelRegistration := context.WithTimeout(ctx, timeout)
 	defer cancelRegistration()
+	registrationStarted := poolInst.Registrations.Start()
+	registrationResult := "protocol_error"
+	finishRegistration := sync.OnceFunc(func() {
+		if registrationResult != "success" && registrationCtx.Err() != nil {
+			registrationResult = stats.Result(registrationCtx.Err(), registrationResult)
+		}
+		poolInst.Registrations.Finish(registrationStarted, registrationResult)
+	})
+	defer finishRegistration()
 	registrationDeadline, _ := registrationCtx.Deadline()
 	// A completed handshake is the freshness boundary for exporter-bound auth.
 	select {
@@ -630,6 +674,7 @@ func (s *Server) handleConnectionPending(
 	// Accept control stream (first stream from client)
 	controlStream, err := conn.AcceptStream(registrationCtx)
 	if err != nil {
+		registrationResult = stats.Result(err, "protocol_error")
 		logger.Error().Err(err).Msg("accept control stream failed")
 		return
 	}
@@ -669,6 +714,7 @@ func (s *Server) handleConnectionPending(
 		&regMsg,
 		protocol.MaxRegistrationPayloadSize,
 	); err != nil {
+		registrationResult = stats.Result(err, "protocol_error")
 		logger.Error().Err(err).Msg("read registration failed")
 		return
 	}
@@ -685,6 +731,7 @@ func (s *Server) handleConnectionPending(
 		authRegistration.Proof = regMsg.Auth.Proof
 	}
 	if err := s.authenticator.Verify(conn.ConnectionState().TLS, authRegistration); err != nil {
+		registrationResult = "auth_error"
 		logger.Error().Err(err).Msg("authentication failed")
 		return
 	}
@@ -721,6 +768,10 @@ func (s *Server) handleConnectionPending(
 	// Reserve the client ID without publishing it to traffic selection. The
 	// connection becomes visible only after the success Ack is on the wire.
 	if err := pending.Reserve(clientConn); err != nil {
+		registrationResult = "error"
+		if errors.Is(err, pool.ErrClientGenerationCapacity) {
+			registrationResult = "capacity"
+		}
 		logger.Error().Err(err).Msg("reserve pool entry failed")
 		_ = s.writeRegisterAck(controlStream, false, "registration unavailable", protocol.ProtocolVersion, nil, "")
 		return
@@ -735,14 +786,18 @@ func (s *Server) handleConnectionPending(
 		selectedCapabilities,
 		selectedAuthScheme,
 	); err != nil {
+		registrationResult = stats.Result(err, "ack_error")
 		logger.Error().Err(err).Msg("send ack failed")
 		return
 	}
 	if err := poolInst.Commit(pending); err != nil {
+		registrationResult = "error"
 		logger.Error().Err(err).Msg("commit pool entry failed")
 		return
 	}
 	registered = clientConn
+	registrationResult = "success"
+	finishRegistration()
 	closeReason = "control stream ended"
 
 	// Stop registration cancellation before clearing the transaction deadline.
@@ -881,6 +936,7 @@ func (s *Server) handleControlStream(
 					}
 				}
 				logger.Debug().Msg("heartbeat received from client")
+				clientConn.LastHeartbeat.Store(time.Now().UnixNano())
 				healthExpiry = time.Now().Add(s.config.HealthTimeout)
 				heartbeatDeadline = time.After(time.Until(healthExpiry))
 			case protocol.MsgTypeDrainRequest:

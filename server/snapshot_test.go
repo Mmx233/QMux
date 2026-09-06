@@ -88,7 +88,14 @@ func TestSnapshotRequiresEveryRoute(t *testing.T) {
 		{QuicAddr: "route-both", TrafficAddr: "127.0.0.1:0", Protocol: "both"},
 	}
 	srv := newSnapshotTestServer(t, listeners)
-	if snapshot := srv.Snapshot(); snapshot.Ready {
+	readSnapshot := func() Snapshot {
+		snapshot := srv.Snapshot()
+		if got := srv.Ready(); got != snapshot.Ready {
+			t.Fatalf("Ready() = %v, snapshot readiness = %v", got, snapshot.Ready)
+		}
+		return snapshot
+	}
+	if snapshot := readSnapshot(); snapshot.Ready {
 		t.Fatal("server was ready before traffic listeners started")
 	}
 
@@ -98,42 +105,42 @@ func TestSnapshotRequiresEveryRoute(t *testing.T) {
 	defer srv.trafficManager.Stop()
 
 	addSnapshotClient(t, srv.pools["route-tcp"], "tcp", "tcp")
-	if snapshot := srv.Snapshot(); snapshot.Ready || !snapshot.Routes[0].Ready || snapshot.Routes[1].Ready {
+	if snapshot := readSnapshot(); snapshot.Ready || !snapshot.Routes[0].Ready || snapshot.Routes[1].Ready {
 		t.Fatalf("one eligible route snapshot = %+v, want global not ready", snapshot)
 	}
 
 	bothTCP := addSnapshotClient(t, srv.pools["route-both"], "both-tcp", "tcp")
-	if snapshot := srv.Snapshot(); snapshot.Ready || snapshot.Routes[1].Ready {
+	if snapshot := readSnapshot(); snapshot.Ready || snapshot.Routes[1].Ready {
 		t.Fatalf("both route with only TCP snapshot = %+v, want not ready", snapshot)
 	}
 	bothUDP := addSnapshotClient(t, srv.pools["route-both"], "both-udp", "udp")
-	if snapshot := srv.Snapshot(); !snapshot.Ready || !snapshot.Routes[1].Ready {
+	if snapshot := readSnapshot(); !snapshot.Ready || !snapshot.Routes[1].Ready {
 		t.Fatalf("all eligible routes snapshot = %+v, want ready", snapshot)
 	}
 
 	if !srv.pools["route-both"].MarkUnhealthy(bothUDP) {
 		t.Fatal("mark UDP client unhealthy")
 	}
-	if snapshot := srv.Snapshot(); snapshot.Ready {
+	if snapshot := readSnapshot(); snapshot.Ready {
 		t.Fatalf("snapshot = %+v after UDP became unhealthy, want not ready", snapshot)
 	}
 	if !srv.pools["route-both"].MarkHealthy(bothUDP) {
 		t.Fatal("mark UDP client healthy")
 	}
-	if !srv.Snapshot().Ready {
+	if !readSnapshot().Ready {
 		t.Fatal("server did not become ready after eligibility recovered")
 	}
 
-	if !srv.pools["route-both"].Remove(bothTCP) || srv.Snapshot().Ready {
+	if !srv.pools["route-both"].Remove(bothTCP) || readSnapshot().Ready {
 		t.Fatal("removing the only eligible TCP client did not clear readiness")
 	}
 	addSnapshotClient(t, srv.pools["route-both"], "both-tcp-replacement", "tcp")
-	if !srv.Snapshot().Ready {
+	if !readSnapshot().Ready {
 		t.Fatal("server did not become ready before traffic listeners closed")
 	}
 
 	srv.trafficManager.Close()
-	if snapshot := srv.Snapshot(); snapshot.Ready || snapshot.Routes[0].Listening || snapshot.Routes[1].Listening {
+	if snapshot := readSnapshot(); snapshot.Ready || snapshot.Routes[0].Listening || snapshot.Routes[1].Listening {
 		t.Fatalf("closing snapshot = %+v, want not listening and not ready", snapshot)
 	}
 }

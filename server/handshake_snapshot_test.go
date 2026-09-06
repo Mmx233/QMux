@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"reflect"
 	"testing"
 
 	"github.com/Mmx233/QMux/config"
@@ -74,7 +75,7 @@ func TestRouteSnapshotIncludesHandshakeAndPoolCapacity(t *testing.T) {
 	if route.Handshake != (HandshakeSnapshot{Current: 1, HighWater: 1}) {
 		t.Fatalf("Handshake = %+v", route.Handshake)
 	}
-	if route.PoolCapacity != (pool.CapacitySnapshot{
+	if !reflect.DeepEqual(route.PoolCapacity, pool.CapacitySnapshot{
 		ServerPending: 1,
 		PendingRegistrations: pool.LimitSnapshot{
 			Current:   1,

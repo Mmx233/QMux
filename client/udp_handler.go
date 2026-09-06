@@ -39,6 +39,10 @@ type udpSessionBudget struct {
 	maxPermitsHeld   int64
 	limitDrops       uint64
 	accountingFaults uint64
+	decodeDrops      atomic.Uint64
+	createErrors     atomic.Uint64
+	readErrors       atomic.Uint64
+	writeErrors      atomic.Uint64
 }
 
 func (b *udpSessionBudget) snapshot() UDPSessionSnapshot {
@@ -46,8 +50,7 @@ func (b *udpSessionBudget) snapshot() UDPSessionSnapshot {
 		return UDPSessionSnapshot{}
 	}
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	return UDPSessionSnapshot{
+	snapshot := UDPSessionSnapshot{
 		Current:          b.publishedActive,
 		Permits:          b.permitsHeld,
 		HighWater:        b.maxPermitsHeld,
@@ -55,6 +58,12 @@ func (b *udpSessionBudget) snapshot() UDPSessionSnapshot {
 		CapacityDrops:    b.limitDrops,
 		AccountingFaults: b.accountingFaults,
 	}
+	b.mu.Unlock()
+	snapshot.DecodeDrops = b.decodeDrops.Load()
+	snapshot.CreateErrors = b.createErrors.Load()
+	snapshot.ReadErrors = b.readErrors.Load()
+	snapshot.WriteErrors = b.writeErrors.Load()
+	return snapshot
 }
 
 type clientDsendStats struct {
@@ -307,6 +316,7 @@ func (h *UDPHandler) receiveDatagrams(quicConn *quic.Conn) {
 		// Validate and, if needed, reassemble the datagram.
 		sessionID, payload, complete, err := protocol.DecodeAndAssembleUDPDatagram(dgram, h.fragmentAssembler)
 		if err != nil {
+			h.recordDecodeError(err)
 			h.logger.Debug().Err(err).Msg("process datagram failed")
 			continue
 		}
@@ -320,6 +330,9 @@ func (h *UDPHandler) receiveDatagrams(quicConn *quic.Conn) {
 			if errors.Is(err, errClientUDPSessionLimit) {
 				continue
 			}
+			if h.ctx.Err() == nil {
+				h.sessionBudget.createErrors.Add(1)
+			}
 			h.logger.Error().Err(err).Uint32("session_id", sessionID).Msg("get session failed")
 			continue
 		}
@@ -328,10 +341,19 @@ func (h *UDPHandler) receiveDatagrams(quicConn *quic.Conn) {
 
 		// Forward to local service
 		if _, err := session.localConn.Write(payload); err != nil {
+			if h.ctx.Err() == nil {
+				h.sessionBudget.writeErrors.Add(1)
+			}
 			h.logger.Debug().Err(err).Uint32("session_id", sessionID).Msg("write to local failed")
 			h.closeSession(session)
 			continue
 		}
+	}
+}
+
+func (h *UDPHandler) recordDecodeError(err error) {
+	if !errors.Is(err, protocol.ErrFragmentAssemblerFull) && !errors.Is(err, protocol.ErrFragmentAssemblerClosed) {
+		h.sessionBudget.decodeDrops.Add(1)
 	}
 }
 
@@ -436,6 +458,9 @@ func (h *UDPHandler) readLocalResponses(session *UDPSession) {
 					}
 					protocol.PutReadBuffer(bufPtr)
 					continue
+				}
+				if h.ctx.Err() == nil && !errors.Is(err, net.ErrClosed) {
+					h.sessionBudget.readErrors.Add(1)
 				}
 				h.logger.Debug().Err(err).Uint32("session_id", session.id).Msg("read from local failed")
 				protocol.PutReadBuffer(bufPtr)

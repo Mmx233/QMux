@@ -13,6 +13,7 @@ import (
 
 	sharedtoken "github.com/Mmx233/QMux/auth/token"
 	"github.com/Mmx233/QMux/config"
+	"github.com/Mmx233/QMux/internal/stats"
 	"github.com/Mmx233/QMux/protocol"
 	"github.com/quic-go/quic-go"
 	"github.com/rs/zerolog"
@@ -52,9 +53,10 @@ type ReconnectionCallback func(serverAddr string)
 // Each ServerConnection maintains its own TLS session cache to ensure
 // session tickets are isolated between different servers.
 type ServerConnection struct {
-	serverAddr   string
-	serverName   string
-	sessionCache tls.ClientSessionCache
+	serverAddr     string
+	serverName     string
+	sessionCache   tls.ClientSessionCache
+	transportStats atomic.Pointer[stats.Transport]
 
 	conn          atomic.Pointer[quic.Conn]
 	controlStream atomic.Pointer[quic.Stream]
@@ -185,6 +187,7 @@ func (sc *ServerConnection) Connect(ctx context.Context, baseTLSConfig *tls.Conf
 	}
 
 	sc.conn.Store(conn)
+	sc.transportStats.Load().Add(conn)
 	sc.state.Store(int32(StateConnected))
 	sc.logger.Info().Msg("connected to server")
 
@@ -883,6 +886,7 @@ func (sc *ServerConnection) Close() error {
 
 		if conn := sc.conn.Swap(nil); conn != nil {
 			sc.closeErr = conn.CloseWithError(0, "shutdown")
+			sc.transportStats.Load().Remove(conn)
 			sc.logger.Info().Msg("connection closed")
 		}
 		sc.closeMu.Lock()
