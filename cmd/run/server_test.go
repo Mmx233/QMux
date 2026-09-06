@@ -16,7 +16,7 @@ import (
 
 func TestAdminHandler(t *testing.T) {
 	ready := false
-	handler := newAdminHandler(func() server.Snapshot { return server.Snapshot{Ready: ready} })
+	handler := newAdminHandler(func() bool { return ready })
 	tests := []struct {
 		name       string
 		path       string
@@ -24,7 +24,7 @@ func TestAdminHandler(t *testing.T) {
 		wantStatus int
 		wantBody   string
 	}{
-		{name: "healthy", path: "/healthyz", wantStatus: http.StatusOK, wantBody: "ok\n"},
+		{name: "healthy", path: "/healthz", wantStatus: http.StatusOK, wantBody: "ok\n"},
 		{name: "not ready", path: "/readyz", wantStatus: http.StatusServiceUnavailable, wantBody: "not ready\n"},
 		{name: "ready", path: "/readyz", setReady: true, wantStatus: http.StatusOK, wantBody: "ok\n"},
 		{name: "unknown", path: "/unknown", wantStatus: http.StatusNotFound},

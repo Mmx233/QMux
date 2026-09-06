@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -21,6 +22,47 @@ import (
 	"github.com/Mmx233/QMux/config"
 	"gopkg.in/yaml.v3"
 )
+
+func TestRunClientComponentsAdminBindFailureDoesNotRunClient(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := occupied.Close(); err != nil {
+			t.Errorf("close occupied admin address: %v", err)
+		}
+	}()
+
+	ran := false
+	err = runClientComponents(
+		func() error { ran = true; return nil },
+		func() error { return nil },
+		occupied.Addr().String(),
+		func() bool { return false },
+	)
+	if err == nil || !strings.Contains(err.Error(), "listen admin") {
+		t.Fatalf("runClientComponents() error = %v, want admin bind failure", err)
+	}
+	if ran {
+		t.Fatal("client ran after admin bind failure")
+	}
+}
+
+func TestRunClientComponentsClientExitReleasesAdmin(t *testing.T) {
+	adminAddr := freeAdminAddress(t)
+	want := errors.New("client failed")
+	err := runClientComponents(
+		func() error { return want },
+		func() error { return errors.New("unexpected stop") },
+		adminAddr,
+		func() bool { return false },
+	)
+	if !errors.Is(err, want) {
+		t.Fatalf("runClientComponents() error = %v, want %v", err, want)
+	}
+	assertAddressReusable(t, adminAddr)
+}
 
 func TestCoordinateClientSignals(t *testing.T) {
 	t.Run("prequeued first signal filters stopped Start", func(t *testing.T) {

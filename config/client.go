@@ -15,6 +15,7 @@ import (
 )
 
 type Client struct {
+	AdminAddress      string         `yaml:"admin_address"`
 	ClientID          string         `yaml:"client_id"`
 	Server            ClientServer   `yaml:"server"`
 	Local             LocalService   `yaml:"local"`
@@ -75,6 +76,11 @@ func (c *Client) ApplyDefaults() {
 
 // Validate validates the client configuration.
 func (c *Client) Validate() error {
+	if c.AdminAddress != "" {
+		if err := validateListenerAddress(c.AdminAddress); err != nil {
+			return fmt.Errorf("admin_address: %w", err)
+		}
+	}
 	if err := c.Capacity.Validate("capacity"); err != nil {
 		return err
 	}

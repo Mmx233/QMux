@@ -17,9 +17,10 @@ import (
 )
 
 type Server struct {
-	Listeners []QuicListener `yaml:"listeners"`
-	Auth      ServerAuth     `yaml:"auth"`
-	TLS       ServerTLS      `yaml:"tls"`
+	AdminAddress string         `yaml:"admin_address"`
+	Listeners    []QuicListener `yaml:"listeners"`
+	Auth         ServerAuth     `yaml:"auth"`
+	TLS          ServerTLS      `yaml:"tls"`
 
 	// Load balancer algorithm: "least-connections" (default) or "round-robin"
 	LoadBalancer string `yaml:"load_balancer"`
@@ -242,6 +243,14 @@ func (s *Server) Validate() error {
 		}
 		claims[key] = field
 		return nil
+	}
+	if s.AdminAddress != "" {
+		if err := validateListenerAddress(s.AdminAddress); err != nil {
+			return fmt.Errorf("admin_address: %w", err)
+		}
+		if err := claim("tcp", s.AdminAddress, "admin_address"); err != nil {
+			return err
+		}
 	}
 
 	for i, listener := range s.Listeners {

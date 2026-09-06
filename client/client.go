@@ -845,6 +845,14 @@ func (c *Client) HealthyConnectionCount() int {
 	return c.connMgr.HealthyCount()
 }
 
+// Ready reports whether the running client has a healthy connection to every configured server.
+func (c *Client) Ready() bool {
+	c.lifecycleMu.Lock()
+	running := c.started && !c.stopping
+	c.lifecycleMu.Unlock()
+	return running && c.connMgr.HealthyCount() == len(c.config.Server.GetServers())
+}
+
 // TotalConnectionCount returns the total number of server connections.
 func (c *Client) TotalConnectionCount() int {
 	return c.connMgr.TotalCount()

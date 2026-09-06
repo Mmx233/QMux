@@ -3,6 +3,8 @@ package run
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -44,13 +46,62 @@ func runClient(_ *cobra.Command, _ []string) error {
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(signals)
 	logger.Info().Msg("starting QMux client")
-	err = coordinateClientSignals(c.Start, c.Shutdown, c.Stop, signals, func() { signal.Stop(signals) })
+	err = runClientComponents(
+		func() error {
+			return coordinateClientSignals(c.Start, c.Shutdown, c.Stop, signals, func() { signal.Stop(signals) })
+		},
+		c.Stop,
+		cfg.AdminAddress,
+		c.Ready,
+	)
 	if err != nil {
 		return err
 	}
 
 	logger.Info().Msg("client stopped")
 	return nil
+}
+
+func runClientComponents(run, stop func() error, adminAddr string, ready func() bool) error {
+	adminServer, adminListener, err := newAdminServer(adminAddr, ready)
+	if err != nil {
+		return err
+	}
+	if adminServer == nil {
+		return run()
+	}
+
+	clientDone := make(chan error, 1)
+	adminDone := make(chan error, 1)
+	go func() { clientDone <- run() }()
+	go func() { adminDone <- adminServer.Serve(adminListener) }()
+
+	select {
+	case clientErr := <-clientDone:
+		shutdownErr := shutdownAdmin(adminServer)
+		adminErr := <-adminDone
+		if errors.Is(adminErr, http.ErrServerClosed) {
+			adminErr = nil
+		} else if adminErr != nil {
+			adminErr = fmt.Errorf("serve admin: %w", adminErr)
+		}
+		if shutdownErr != nil {
+			shutdownErr = fmt.Errorf("shutdown admin: %w", shutdownErr)
+		}
+		return errors.Join(clientErr, adminErr, shutdownErr)
+	case adminErr := <-adminDone:
+		if adminErr == nil {
+			adminErr = errors.New("admin server stopped")
+		} else {
+			adminErr = fmt.Errorf("serve admin: %w", adminErr)
+		}
+		stopErr := stop()
+		clientErr := signalStartError(<-clientDone)
+		if shutdownErr := shutdownAdmin(adminServer); shutdownErr != nil {
+			adminErr = errors.Join(adminErr, fmt.Errorf("shutdown admin: %w", shutdownErr))
+		}
+		return errors.Join(adminErr, stopErr, clientErr)
+	}
 }
 
 func coordinateClientSignals(

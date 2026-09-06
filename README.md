@@ -71,6 +71,8 @@ qmux generate config client -o client.yaml
 Edit `server.yaml`:
 
 ```yaml
+admin_address: "127.0.0.1:9090" # Optional; omit to disable health endpoints
+
 listeners:
   - quic_addr: "0.0.0.0:8443"    # QUIC control port
     traffic_addr: "0.0.0.0:8080" # Traffic forwarding port
@@ -99,6 +101,8 @@ tls:
 Edit `client.yaml`:
 
 ```yaml
+admin_address: "127.0.0.1:9090" # Optional; omit to disable health endpoints
+
 capacity:
   max_local_udp_sessions: 256
 
@@ -144,16 +148,13 @@ For multi-listener deployments, calculate the aggregate budget from the actual l
 # Start server (on public server)
 qmux run server -c server.yaml
 
-# Optionally expose liveness/readiness on loopback
-qmux run server -c server.yaml --admin-address 127.0.0.1:9090
-
 # Start client (on machine behind NAT)
 qmux run client -c client.yaml
 ```
 
 Now external traffic to `your-server-ip:8080` will be forwarded to your local service on port 3000.
 
-The admin listener is disabled by default and serves `GET /healthyz` and `GET /readyz` when enabled. It has no authentication, so bind it only to loopback or a protected management network. Readiness returns `200 ok` only when every configured route is listening and has an eligible client for each enabled protocol; otherwise it returns `503 not ready`. QMux only reports this state. Any load-balancer or scheduler action remains external, and a business-port blackbox check remains the end-to-end data-path test.
+The optional `admin_address` enables unauthenticated `GET /healthz` and `GET /readyz` endpoints, so bind it only to loopback or a protected management network. Server readiness requires every configured route to be listening with an eligible client for each enabled protocol. Client readiness requires a healthy registered connection to every configured server endpoint. Failed readiness returns `503 not ready`; liveness returns `200 ok` while the admin listener is running. These endpoints do not probe the local service; use a business-port blackbox check for the end-to-end data path.
 
 ## Authentication
 

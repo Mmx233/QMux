@@ -4,13 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/Mmx233/QMux/config"
 	"github.com/Mmx233/QMux/server"
@@ -18,23 +15,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const (
-	adminReadHeaderTimeout = 5 * time.Second
-	adminShutdownTimeout   = 5 * time.Second
-)
-
-var (
-	adminAddress string
-	serverCmd    = &cobra.Command{
-		Use:   "server",
-		Short: "Start server",
-		Args:  cobra.NoArgs,
-		RunE:  runServer,
-	}
-)
-
-func init() {
-	serverCmd.Flags().StringVar(&adminAddress, "admin-address", "", "admin health listener address")
+var serverCmd = &cobra.Command{
+	Use:   "server",
+	Short: "Start server",
+	Args:  cobra.NoArgs,
+	RunE:  runServer,
 }
 
 func runServer(_ *cobra.Command, _ []string) error {
@@ -53,7 +38,7 @@ func runServer(_ *cobra.Command, _ []string) error {
 	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 	logger.Info().Msg("starting QMux server")
-	err = runServerComponents(ctx, srv.Start, srv.Snapshot, adminAddress)
+	err = runServerComponents(ctx, srv.Start, srv.Snapshot, cfg.AdminAddress)
 	if ctx.Err() != nil && errors.Is(err, context.Cause(ctx)) {
 		err = nil
 	}
@@ -75,18 +60,9 @@ func runServerComponents(
 		return cause
 	}
 
-	var adminServer *http.Server
-	var adminListener net.Listener
-	var err error
-	if adminAddr != "" {
-		adminListener, err = net.Listen("tcp", adminAddr)
-		if err != nil {
-			return fmt.Errorf("listen admin on %s: %w", adminAddr, err)
-		}
-		adminServer = &http.Server{
-			Handler:           newAdminHandler(snapshot),
-			ReadHeaderTimeout: adminReadHeaderTimeout,
-		}
+	adminServer, adminListener, err := newAdminServer(adminAddr, func() bool { return snapshot().Ready })
+	if err != nil {
+		return err
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
@@ -132,13 +108,8 @@ func runServerComponents(
 	}
 
 	cancel()
-	if adminServer != nil {
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), adminShutdownTimeout)
-		shutdownErr := adminServer.Shutdown(shutdownCtx)
-		shutdownCancel()
-		if shutdownErr != nil {
-			unexpectedErr = errors.Join(unexpectedErr, fmt.Errorf("shutdown admin: %w", shutdownErr))
-		}
+	if shutdownErr := shutdownAdmin(adminServer); shutdownErr != nil {
+		unexpectedErr = errors.Join(unexpectedErr, fmt.Errorf("shutdown admin: %w", shutdownErr))
 	}
 
 	if !coreJoined {
@@ -159,25 +130,4 @@ func runServerComponents(
 		return errors.Join(result, unexpectedErr)
 	}
 	return result
-}
-
-func newAdminHandler(snapshot func() server.Snapshot) http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthyz", func(w http.ResponseWriter, _ *http.Request) {
-		writeAdminResponse(w, http.StatusOK, "ok\n")
-	})
-	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
-		if snapshot().Ready {
-			writeAdminResponse(w, http.StatusOK, "ok\n")
-			return
-		}
-		writeAdminResponse(w, http.StatusServiceUnavailable, "not ready\n")
-	})
-	return mux
-}
-
-func writeAdminResponse(w http.ResponseWriter, status int, body string) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(status)
-	_, _ = io.WriteString(w, body)
 }

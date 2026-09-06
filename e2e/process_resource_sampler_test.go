@@ -931,11 +931,11 @@ func startPERF003CaseAttempt(t *testing.T, env *perf003Environment, protocol str
 	}
 
 	quicPort, trafficPort, adminPort := getFreePort(t), getFreePort(t), getFreePort(t)
-	serverPath, clientPath, err := writePERF003Configs(t, env.certDir, protocol, threads, attempt, serverPort, quicPort, trafficPort)
+	serverPath, clientPath, err := writePERF003Configs(t, env.certDir, protocol, threads, attempt, serverPort, quicPort, trafficPort, adminPort)
 	if err != nil {
 		return result, err
 	}
-	serverCommand := exec.Command(env.binaryPath, "run", "server", "-c", serverPath, "--admin-address", fmt.Sprintf("127.0.0.1:%d", adminPort))
+	serverCommand := exec.Command(env.binaryPath, "run", "server", "-c", serverPath)
 	qmuxServer, err := startBenchmarkProcess("qmux-server", serverCommand)
 	if err != nil {
 		return result, err
@@ -944,7 +944,7 @@ func startPERF003CaseAttempt(t *testing.T, env *perf003Environment, protocol str
 	result.persistent = append(result.persistent, qmuxServer)
 	result.targetPort = trafficPort
 	result.readyURL = fmt.Sprintf("http://127.0.0.1:%d/readyz", adminPort)
-	if err := pollPERF003Endpoint(result, strings.Replace(result.readyURL, "/readyz", "/healthyz", 1), 5*time.Second); err != nil {
+	if err := pollPERF003Endpoint(result, strings.Replace(result.readyURL, "/readyz", "/healthz", 1), 5*time.Second); err != nil {
 		return result, err
 	}
 	if err := pollPERF003Log(qmuxServer, "QUIC listener started", 5*time.Second); err != nil {
@@ -1002,7 +1002,7 @@ func pollPERF003TCP(process *benchmarkProcess, port int, timeout time.Duration) 
 	return fmt.Errorf("TCP port %d did not become ready within %s", port, timeout)
 }
 
-func writePERF003Configs(t *testing.T, certDir, protocol string, threads, attempt, localPort, quicPort, trafficPort int) (string, string, error) {
+func writePERF003Configs(t *testing.T, certDir, protocol string, threads, attempt, localPort, quicPort, trafficPort, adminPort int) (string, string, error) {
 	t.Helper()
 	qmuxProtocol := protocol
 	if protocol == "udp" {
@@ -1010,9 +1010,10 @@ func writePERF003Configs(t *testing.T, certDir, protocol string, threads, attemp
 	}
 	quic := getOptimizedQuicConfig()
 	serverConfig := &config.Server{
-		Listeners: []config.QuicListener{{QuicAddr: fmt.Sprintf("127.0.0.1:%d", quicPort), TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort), Protocol: qmuxProtocol, Quic: quic}},
-		Auth:      config.ServerAuth{Method: "mtls", CACertFile: filepath.Join(certDir, "ca.crt")},
-		TLS:       config.ServerTLS{ServerCertFile: filepath.Join(certDir, "server.crt"), ServerKeyFile: filepath.Join(certDir, "server.key")},
+		AdminAddress: fmt.Sprintf("127.0.0.1:%d", adminPort),
+		Listeners:    []config.QuicListener{{QuicAddr: fmt.Sprintf("127.0.0.1:%d", quicPort), TrafficAddr: fmt.Sprintf("127.0.0.1:%d", trafficPort), Protocol: qmuxProtocol, Quic: quic}},
+		Auth:         config.ServerAuth{Method: "mtls", CACertFile: filepath.Join(certDir, "ca.crt")},
+		TLS:          config.ServerTLS{ServerCertFile: filepath.Join(certDir, "server.crt"), ServerKeyFile: filepath.Join(certDir, "server.key")},
 	}
 	clientConfig := &config.Client{
 		ClientID: fmt.Sprintf("perf003-%s-%d-%d", protocol, threads, attempt),
