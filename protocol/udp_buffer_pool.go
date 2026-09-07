@@ -14,7 +14,7 @@ const (
 	DefaultReadBufferSize = 65535
 
 	// DefaultFragmentBufferSize is the default size for fragment storage
-	// Calculated as: DatagramSize - FragmentHeaderSize (9 bytes)
+	// Calculated as: DatagramSize - FragmentHeaderSize (15 bytes)
 	DefaultFragmentBufferSize = DefaultDatagramBufferSize - UDPFragHeaderSize
 )
 

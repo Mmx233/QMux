@@ -10,8 +10,8 @@ import (
 )
 
 type fragmentAssemblerHarness struct {
-	add        func(sessionID uint32, fragID uint16, index, total uint8, payload []byte) ([]byte, error)
-	group      func(sessionID uint32, fragID uint16) *fragmentGroup
+	add        func(sessionID uint32, fragID uint64, index, total uint8, payload []byte) ([]byte, error)
+	group      func(sessionID uint32, fragID uint64) *fragmentGroup
 	groupCount func() int
 	cleanup    func(time.Time)
 	setLimits  func(int, int64)
@@ -25,7 +25,7 @@ func fragmentAssemblerHarnesses() map[string]func() fragmentAssemblerHarness {
 			assembler := &FragmentAssembler{fragments: make(map[fragmentKey]*fragmentGroup)}
 			return fragmentAssemblerHarness{
 				add: assembler.AddFragment,
-				group: func(sessionID uint32, fragID uint16) *fragmentGroup {
+				group: func(sessionID uint32, fragID uint64) *fragmentGroup {
 					return assembler.fragments[fragmentKey{sessionID: sessionID, fragID: fragID}]
 				},
 				groupCount: func() int {
@@ -54,7 +54,7 @@ func fragmentAssemblerHarnesses() map[string]func() fragmentAssemblerHarness {
 			}
 			return fragmentAssemblerHarness{
 				add: assembler.AddFragment,
-				group: func(sessionID uint32, fragID uint16) *fragmentGroup {
+				group: func(sessionID uint32, fragID uint64) *fragmentGroup {
 					key := fragmentKey{sessionID: sessionID, fragID: fragID}
 					return assembler.getShard(key).fragments[key]
 				},
@@ -194,7 +194,7 @@ func TestFragmentAssemblersDropGroupOnTotalMismatch(t *testing.T) {
 	}
 }
 
-func addSameFragmentIDForTwoSessions(t *testing.T, harness fragmentAssemblerHarness, fragID uint16) (*fragmentGroup, *fragmentGroup) {
+func addSameFragmentIDForTwoSessions(t *testing.T, harness fragmentAssemblerHarness, fragID uint64) (*fragmentGroup, *fragmentGroup) {
 	t.Helper()
 	if _, err := harness.add(1, fragID, 0, 2, []byte("A")); err != nil {
 		t.Fatal(err)

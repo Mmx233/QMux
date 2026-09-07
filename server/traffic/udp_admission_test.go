@@ -1,14 +1,17 @@
 package traffic
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"math"
 	"net"
 	"net/netip"
 	"testing"
 	"time"
 
 	"github.com/Mmx233/QMux/config"
+	"github.com/Mmx233/QMux/protocol"
 	"github.com/Mmx233/QMux/server/pool"
 	"github.com/quic-go/quic-go"
 	"github.com/rs/zerolog"
@@ -254,6 +257,9 @@ func TestUDPAdmissionDuplicateRollbackAndPostPublishRecheck(t *testing.T) {
 	if client.ActiveConns.Load() != 1 || client.TotalConns.Load() != 1 {
 		t.Fatalf("duplicate active/total = %d/%d, want 1/1", client.ActiveConns.Load(), client.TotalConns.Load())
 	}
+	if got := handler.epochAllocator.Load(); got != 1 || duplicate.epoch != 1 {
+		t.Fatalf("duplicate lookup epochs = allocated %d/session %d, want 1/1", got, duplicate.epoch)
+	}
 	if syncMapLen(&handler.sessions) != 1 || syncMapLen(&handler.sessionsByID) != 1 {
 		t.Fatal("duplicate publication changed the primary or secondary session map")
 	}
@@ -274,6 +280,74 @@ func TestUDPAdmissionDuplicateRollbackAndPostPublishRecheck(t *testing.T) {
 	if snapshot := handler.sessionStats.snapshot(); snapshot.SessionHighWater != 2 || snapshot.AccountingFaults != 0 {
 		t.Fatalf("high-water/faults = %d/%d, want 2/0",
 			snapshot.SessionHighWater, snapshot.AccountingFaults)
+	}
+}
+
+func TestUDPAdmissionEpochExhaustionCleansCandidateAndKeepsExistingSession(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pair := newUDPSenderQUICPair(t, ctx)
+	connectionPool := pool.New("epoch-exhaustion", pool.NewRoundRobinBalancer(), zerolog.Nop())
+	defer connectionPool.Stop()
+	client := &pool.ClientConn{
+		ID:       "epoch-client",
+		Conn:     pair.server,
+		Metadata: pool.ClientMetadata{Capabilities: []string{"udp"}},
+	}
+	if err := connectionPool.Add(client); err != nil {
+		t.Fatal(err)
+	}
+	packetConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newUDPAdmissionUnitHandler(connectionPool, 2)
+	handler.packetConn = packetConn
+	handler.enableFragmentation = true
+	handler.fragmentAssembler = protocol.NewShardedFragmentAssembler(protocol.DefaultShardCount)
+	handler.senders = make(map[*pool.ClientConn]*udpSender)
+	handler.epochAllocator.Store(math.MaxUint32 - 1)
+	defer func() {
+		handler.close()
+		handler.wait()
+	}()
+
+	addr := netip.MustParseAddrPort("127.0.0.1:32001")
+	existing, err := handler.createSession(addr)
+	if err != nil || existing == nil {
+		t.Fatalf("last epoch session = (%p, %v), want non-nil", existing, err)
+	}
+	if existing.epoch != math.MaxUint32 {
+		t.Fatalf("last session epoch = %d, want %d", existing.epoch, uint32(math.MaxUint32))
+	}
+	if failed, err := handler.createSession(netip.MustParseAddrPort("127.0.0.1:32002")); failed != nil || !errors.Is(err, errUDPEpochExhausted) {
+		t.Fatalf("exhausted session creation = (%p, %v)", failed, err)
+	}
+	if got, err := handler.createSession(addr); err != nil || got != existing {
+		t.Fatalf("existing session after exhaustion = (%p, %v), want %p", got, err, existing)
+	}
+	poolSnapshot := connectionPool.Snapshot()
+	snapshot := handler.snapshot()
+	if snapshot.SessionsCurrent != 1 || snapshot.SessionPermits != 1 || snapshot.AccountingFaults != 0 ||
+		syncMapLen(&handler.sessions) != 1 || syncMapLen(&handler.sessionsByID) != 1 ||
+		client.ActiveConns.Load() != 1 || client.TotalConns.Load() != 1 ||
+		poolSnapshot.UDPSessions != 1 || handler.nextSessionID.Load() != 1 {
+		t.Fatalf("exhaustion cleanup = snapshot %+v maps %d/%d active/total %d/%d pool UDP %d next ID %d",
+			snapshot, syncMapLen(&handler.sessions), syncMapLen(&handler.sessionsByID),
+			client.ActiveConns.Load(), client.TotalConns.Load(), poolSnapshot.UDPSessions, handler.nextSessionID.Load())
+	}
+
+	want := []byte("existing session remains healthy")
+	handler.processPacket(want, addr)
+	receiveCtx, cancelReceive := context.WithTimeout(ctx, 3*time.Second)
+	defer cancelReceive()
+	wire, err := pair.peer.ReceiveDatagram(receiveCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := protocol.DecodeUDPDatagram(wire)
+	if err != nil || parsed.SessionID != existing.id || !bytes.Equal(parsed.Payload, want) {
+		t.Fatalf("existing session datagram = session %d payload %q error %v", parsed.SessionID, parsed.Payload, err)
 	}
 }
 

@@ -23,7 +23,10 @@ const (
 	maxUDPSenderQueuedBacking = 512 << 10
 )
 
-var errUDPListenerCapacity = errors.New("UDP listener session capacity reached")
+var (
+	errUDPListenerCapacity = errors.New("UDP listener session capacity reached")
+	errUDPEpochExhausted   = errors.New("UDP session epoch exhausted")
+)
 
 // UDPAdmissionSnapshot is a value-only view of one listener's UDP admission,
 // admitted application send ownership, and fragment assembly state. DSend
@@ -56,11 +59,12 @@ type UDPAdmissionSnapshot struct {
 // UDPSession represents a UDP session using QUIC datagrams.
 type UDPSession struct {
 	id               uint32
+	epoch            uint32
 	clientAddr       netip.AddrPort
 	lastActive       atomic.Int64
 	client           *pool.ClientConn
 	sender           *udpSender
-	fragIDCounter    atomic.Uint32
+	fragmentSequence atomic.Uint32
 	releaseAdmission func()
 }
 
@@ -165,10 +169,11 @@ type UDPHandler struct {
 	ctx                 context.Context
 	cancel              context.CancelFunc
 
-	nextSessionID atomic.Uint32
-	sessionLimit  int64
-	sessionSlots  chan struct{}
-	sessionStats  udpSessionStats
+	nextSessionID  atomic.Uint32
+	epochAllocator atomic.Uint32
+	sessionLimit   int64
+	sessionSlots   chan struct{}
+	sessionStats   udpSessionStats
 
 	fragmentAssembler   *protocol.ShardedFragmentAssembler
 	closeOnce           sync.Once
@@ -329,8 +334,9 @@ func (h *UDPHandler) sendDatagrams(session *UDPSession, data []byte) {
 
 	datagrams, err := protocol.FragmentUDPPooled(
 		session.id,
+		session.epoch,
 		data,
-		&session.fragIDCounter,
+		&session.fragmentSequence,
 		h.enableFragmentation,
 	)
 	if err != nil {
@@ -385,9 +391,19 @@ func (h *UDPHandler) createSession(addr netip.AddrPort) (*UDPSession, error) {
 			releaseAdmission()
 		}
 	}()
+	if sessionI, ok := h.sessions.Load(addr); ok {
+		session := sessionI.(*UDPSession)
+		session.updateLastActive()
+		return session, nil
+	}
+	epoch, ok := protocol.AllocateUDPEpoch(&h.epochAllocator)
+	if !ok {
+		return nil, errUDPEpochExhausted
+	}
 
 	session := &UDPSession{
 		id:               h.nextSessionID.Add(1),
+		epoch:            epoch,
 		clientAddr:       addr,
 		client:           client,
 		releaseAdmission: releaseAdmission,

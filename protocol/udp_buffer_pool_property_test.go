@@ -149,7 +149,7 @@ func TestInitBufferPoolDatagramSizeValidation(t *testing.T) {
 				const sessionID uint32 = 0x12345678
 				payload := bytes.Repeat([]byte{0xa5}, MaxUDPPayload)
 				var counter atomic.Uint32
-				results, fragmentErr := FragmentUDPPooled(sessionID, payload, &counter, true)
+				results, fragmentErr := FragmentUDPPooled(sessionID, 1, payload, &counter, true)
 				if fragmentErr != nil {
 					t.Fatalf("FragmentUDPPooled: %v", fragmentErr)
 				}

@@ -1,8 +1,11 @@
 package client
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
+	"math"
 	"net"
 	"sync"
 	"testing"
@@ -62,6 +65,31 @@ func awaitUDPHandler(t *testing.T, done <-chan struct{}, event string) {
 	}
 }
 
+func awaitClientUDPCondition(t *testing.T, description string, condition func() bool) {
+	t.Helper()
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for !condition() {
+		select {
+		case <-deadline.C:
+			t.Fatalf("timed out waiting for %s", description)
+		case <-ticker.C:
+		}
+	}
+}
+
+func literalClientUDPFragment(sessionID uint32, fragmentID uint64, index, total byte, payload []byte) []byte {
+	wire := make([]byte, protocol.UDPFragHeaderSize+len(payload))
+	wire[0] = 0x22
+	binary.BigEndian.PutUint32(wire[1:5], sessionID)
+	binary.BigEndian.PutUint64(wire[5:13], fragmentID)
+	wire[13], wire[14] = index, total
+	copy(wire[protocol.UDPFragHeaderSize:], payload)
+	return wire
+}
+
 func assertNoUDPSessions(t *testing.T, handler *UDPHandler) {
 	t.Helper()
 	count := 0
@@ -77,8 +105,8 @@ func assertNoUDPSessions(t *testing.T, handler *UDPHandler) {
 func TestUDPDecodeErrorsIgnoreClosedAssembler(t *testing.T) {
 	handler := NewUDPHandler("127.0.0.1", 1, true, zerolog.Nop())
 	t.Cleanup(handler.Stop)
-	var fragmentID uint16
-	datagrams, err := protocol.FragmentUDP(1, make([]byte, protocol.MaxUDPPayload+1), &fragmentID, true)
+	var fragmentSequence uint32
+	datagrams, err := protocol.FragmentUDP(1, 1, make([]byte, protocol.MaxUDPPayload+1), &fragmentSequence, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -316,12 +344,193 @@ func TestUDPHandlerDuplicatePublicationReleasesLoser(t *testing.T) {
 	if snapshot := budget.snapshot(); snapshot.Current != 1 || snapshot.Permits != 1 {
 		t.Fatalf("duplicate publication budget = %d active/%d held, want 1/1", snapshot.Current, snapshot.Permits)
 	}
+	if got := handler.epochAllocator.Load(); got != 2 || first.epoch == 0 {
+		t.Fatalf("duplicate publication epochs = allocated %d/winner %d, want 2/nonzero", got, first.epoch)
+	}
 
 	handler.Stop()
 	handler.wait()
 	if snapshot := budget.snapshot(); snapshot.Current != 0 || snapshot.Permits != 0 || snapshot.AccountingFaults != 0 {
 		t.Fatalf("duplicate publication cleanup = %d active/%d held/%d faults, want zero",
 			snapshot.Current, snapshot.Permits, snapshot.AccountingFaults)
+	}
+}
+
+func TestUDPHandlerRecreatesSameSessionIDWithIsolatedEpoch(t *testing.T) {
+	backend, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = backend.Close() })
+	handler := newUDPHandler("127.0.0.1", backend.LocalAddr().(*net.UDPAddr).Port, true, zerolog.Nop(), newUDPSessionBudget(1))
+	handler.ctx = context.Background()
+	handler.started = true
+	defer handler.stopAndWait()
+
+	const sessionID = uint32(77)
+	oldSession, err := handler.getOrCreateSession(sessionID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldPayload := bytes.Repeat([]byte{0xa1}, protocol.MaxUDPPayload+1)
+	oldFragments, err := handler.fragmentDatagrams(sessionID, oldSession.epoch, oldPayload, &oldSession.fragmentSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delayedOld := append([]byte(nil), oldFragments[1].Data...)
+	parsedOld, err := protocol.DecodeUDPDatagram(oldFragments[0].Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, complete, err := protocol.DecodeAndAssembleUDPDatagram(oldFragments[0].Data, handler.fragmentAssembler)
+	handler.dsendStats.releaseDatagrams(oldFragments, int64(len(oldFragments)))
+	if err != nil || complete || uint32(parsedOld.FragmentID) != 1 {
+		t.Fatalf("old first fragment = identity %#x complete %v error %v", parsedOld.FragmentID, complete, err)
+	}
+
+	handler.closeSession(oldSession)
+	awaitClientUDPCondition(t, "old session permit release", func() bool {
+		snapshot := handler.sessionBudget.snapshot()
+		return snapshot.Current == 0 && snapshot.Permits == 0 && handler.dsendStats.load().Workers == 0
+	})
+	newSession, err := handler.getOrCreateSession(sessionID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newSession == oldSession || newSession.epoch == oldSession.epoch {
+		t.Fatalf("recreated session = %p epoch %d, old = %p epoch %d", newSession, newSession.epoch, oldSession, oldSession.epoch)
+	}
+
+	newPayload := bytes.Repeat([]byte{0xb2}, protocol.MaxUDPPayload+1)
+	newFragments, err := handler.fragmentDatagrams(sessionID, newSession.epoch, newPayload, &newSession.fragmentSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsedNew, err := protocol.DecodeUDPDatagram(newFragments[0].Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []byte
+	for _, fragment := range newFragments {
+		_, got, complete, err = protocol.DecodeAndAssembleUDPDatagram(fragment.Data, handler.fragmentAssembler)
+		if err != nil {
+			break
+		}
+	}
+	handler.dsendStats.releaseDatagrams(newFragments, int64(len(newFragments)))
+	if err != nil || !complete || !bytes.Equal(got, newPayload) || uint32(parsedNew.FragmentID) != 1 {
+		t.Fatalf("new first packet = identity %#x bytes %d complete %v error %v", parsedNew.FragmentID, len(got), complete, err)
+	}
+	if parsedOld.FragmentID == parsedNew.FragmentID || handler.fragmentAssembler.Snapshot().RetainedGroups != 1 {
+		t.Fatal("recreated session identity mixed with retained old partial")
+	}
+	_, got, complete, err = protocol.DecodeAndAssembleUDPDatagram(delayedOld, handler.fragmentAssembler)
+	if err != nil || !complete || !bytes.Equal(got, oldPayload) {
+		t.Fatalf("delayed old completion = bytes %d complete %v error %v", len(got), complete, err)
+	}
+}
+
+func TestUDPHandlerEpochExhaustionCleansCandidateAndKeepsExistingSession(t *testing.T) {
+	backend, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = backend.Close() })
+	budget := newUDPSessionBudget(2)
+	handler := newUDPHandler("127.0.0.1", backend.LocalAddr().(*net.UDPAddr).Port, true, zerolog.Nop(), budget)
+	handler.ctx = context.Background()
+	handler.started = true
+	handler.epochAllocator.Store(math.MaxUint32 - 1)
+	defer handler.stopAndWait()
+
+	existing, err := handler.getOrCreateSession(1, nil)
+	if err != nil || existing == nil {
+		t.Fatalf("last epoch session = (%p, %v), want non-nil", existing, err)
+	}
+	if existing.epoch != math.MaxUint32 {
+		t.Fatalf("last session epoch = %d, want %d", existing.epoch, uint32(math.MaxUint32))
+	}
+	if failed, err := handler.getOrCreateSession(2, nil); failed != nil || !errors.Is(err, errClientUDPEpochExhausted) {
+		t.Fatalf("exhausted session creation = (%p, %v)", failed, err)
+	}
+	if got, err := handler.getOrCreateSession(1, nil); err != nil || got != existing {
+		t.Fatalf("existing session after exhaustion = (%p, %v), want %p", got, err, existing)
+	}
+	snapshot := budget.snapshot()
+	if snapshot.Current != 1 || snapshot.Permits != 1 || snapshot.AccountingFaults != 0 || handler.dsendStats.load().Workers != 1 {
+		t.Fatalf("exhaustion cleanup = budget %+v workers %d", snapshot, handler.dsendStats.load().Workers)
+	}
+	datagrams, err := handler.fragmentDatagrams(existing.id, existing.epoch, make([]byte, protocol.MaxUDPPayload+1), &existing.fragmentSequence)
+	if err != nil {
+		t.Fatalf("existing session fragmentation after exhaustion: %v", err)
+	}
+	parsed, err := protocol.DecodeUDPDatagram(datagrams[0].Data)
+	handler.dsendStats.releaseDatagrams(datagrams, int64(len(datagrams)))
+	if err != nil || parsed.FragmentID != uint64(math.MaxUint32)<<32|1 {
+		t.Fatalf("existing identity after exhaustion = %#x, error %v", parsed.FragmentID, err)
+	}
+}
+
+func TestUDPHandlerReceivesLiteralWidenedFragmentsAndRejectsLegacy(t *testing.T) {
+	backend, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = backend.Close() })
+	clientConn, serverConn := newUDPHandlerQUICPair(t)
+	handler := NewUDPHandler("127.0.0.1", backend.LocalAddr().(*net.UDPAddr).Port, true, zerolog.Nop())
+	handler.Start(context.Background(), clientConn)
+	defer handler.stopAndWait()
+
+	legacy := literalClientUDPFragment(9, 0x1122334455667788, 0, 2, []byte("legacy"))
+	legacy[0] = 0x21
+	if _, err := protocol.DecodeUDPDatagram(legacy); !errors.Is(err, protocol.ErrUnknownDatagramType) {
+		t.Fatalf("legacy decode error = %v", err)
+	}
+	if err := serverConn.SendDatagram(legacy); err != nil {
+		t.Fatal(err)
+	}
+	awaitClientUDPCondition(t, "legacy fragment rejection", func() bool {
+		return handler.sessionBudget.snapshot().DecodeDrops == 1
+	})
+	if snapshot := handler.fragmentAssembler.Snapshot(); snapshot.RetainedGroups != 0 || snapshot.RetainedBackingBytes != 0 {
+		t.Fatalf("legacy fragment retained state: %+v", snapshot)
+	}
+
+	const low = uint64(0x55667788)
+	oldID := uint64(0x11223344)<<32 | low
+	newID := uint64(0x88776655)<<32 | low
+	if err := serverConn.SendDatagram(literalClientUDPFragment(9, oldID, 0, 2, []byte("old-"))); err != nil {
+		t.Fatal(err)
+	}
+	awaitClientUDPCondition(t, "old widened partial retention", func() bool {
+		return handler.fragmentAssembler.Snapshot().RetainedGroups == 1
+	})
+	for _, wire := range [][]byte{
+		literalClientUDPFragment(9, newID, 0, 2, []byte("new-")),
+		literalClientUDPFragment(9, newID, 1, 2, []byte("payload")),
+	} {
+		if err := serverConn.SendDatagram(wire); err != nil {
+			t.Fatal(err)
+		}
+	}
+	buf := make([]byte, 64)
+	if err := backend.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	n, _, err := backend.ReadFromUDP(buf)
+	if err != nil || !bytes.Equal(buf[:n], []byte("new-payload")) {
+		t.Fatalf("new widened payload = %q, error %v", buf[:n], err)
+	}
+	if snapshot := handler.fragmentAssembler.Snapshot(); snapshot.RetainedGroups != 1 {
+		t.Fatalf("new identity changed old partial: %+v", snapshot)
+	}
+	if err := serverConn.SendDatagram(literalClientUDPFragment(9, oldID, 1, 2, []byte("payload"))); err != nil {
+		t.Fatal(err)
+	}
+	n, _, err = backend.ReadFromUDP(buf)
+	if err != nil || !bytes.Equal(buf[:n], []byte("old-payload")) {
+		t.Fatalf("old widened payload = %q, error %v", buf[:n], err)
 	}
 }
 

@@ -42,7 +42,7 @@ func FuzzFragmentAssemblersNeverPanic(f *testing.F) {
 		assemblers := []UDPFragmentAssembler{regular, sharded}
 		for offset := 0; offset+5 <= len(sequence); offset += 5 {
 			sessionID := uint32(sequence[offset])
-			fragID := uint16(sequence[offset+1])
+			fragID := uint64(sequence[offset+1])<<32 | uint64(sequence[offset+1])
 			index := sequence[offset+2]
 			total := sequence[offset+3]
 			payload := sequence[offset+4 : offset+5]

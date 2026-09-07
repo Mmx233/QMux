@@ -191,7 +191,7 @@ func TestClientDsendSnapshotOwnsAndReleasesBatch(t *testing.T) {
 	handler := newUDPHandler("127.0.0.1", 1, true, zerolog.Nop(), nil, stats)
 	t.Cleanup(handler.Stop)
 	var counter atomic.Uint32
-	datagrams, err := handler.fragmentDatagrams(1, make([]byte, protocol.MaxUDPPayload+1), &counter)
+	datagrams, err := handler.fragmentDatagrams(1, 1, make([]byte, protocol.MaxUDPPayload+1), &counter)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +230,7 @@ func TestClientDsendSnapshotOwnsAndReleasesBatch(t *testing.T) {
 		t.Fatalf("released Dsend = %+v", got)
 	}
 
-	datagrams, err = handler.fragmentDatagrams(2, []byte("payload"), &counter)
+	datagrams, err = handler.fragmentDatagrams(2, 1, []byte("payload"), &counter)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +243,7 @@ func TestClientDsendSnapshotOwnsAndReleasesBatch(t *testing.T) {
 	}
 
 	handler.enableFragmentation = false
-	if _, err := handler.fragmentDatagrams(3, make([]byte, protocol.MaxUDPPayload+1), &counter); !errors.Is(err, protocol.ErrFragmentationDisabled) {
+	if _, err := handler.fragmentDatagrams(3, 1, make([]byte, protocol.MaxUDPPayload+1), &counter); !errors.Is(err, protocol.ErrFragmentationDisabled) {
 		t.Fatalf("fragment error = %v", err)
 	}
 	if got := stats.load(); got.FragmentDrops != 1 {
@@ -270,7 +270,7 @@ func TestClientDsendBackingProjectionForPooledBatches(t *testing.T) {
 				stats := &clientDsendStats{}
 				handler := newUDPHandler("127.0.0.1", 1, true, zerolog.Nop(), nil, stats)
 				var counter atomic.Uint32
-				datagrams, err := handler.fragmentDatagrams(1, make([]byte, payloadSize), &counter)
+				datagrams, err := handler.fragmentDatagrams(1, 1, make([]byte, payloadSize), &counter)
 				if err != nil {
 					handler.Stop()
 					t.Fatal(err)
@@ -392,7 +392,7 @@ func TestClientDsendSnapshotConcurrentBestEffort(t *testing.T) {
 			var counter atomic.Uint32
 			<-start
 			for range 200 {
-				datagrams, err := handler.fragmentDatagrams(1, make([]byte, 1000), &counter)
+				datagrams, err := handler.fragmentDatagrams(1, 1, make([]byte, 1000), &counter)
 				if err != nil {
 					t.Errorf("fragment datagrams: %v", err)
 					return
@@ -444,7 +444,7 @@ func TestClientDsendHighWaterAggregatePeak(t *testing.T) {
 	for i := range producers {
 		workers.Go(func() {
 			var counter atomic.Uint32
-			datagrams, err := handler.fragmentDatagrams(uint32(i+1), make([]byte, 1000), &counter)
+			datagrams, err := handler.fragmentDatagrams(uint32(i+1), 1, make([]byte, 1000), &counter)
 			if err != nil {
 				t.Errorf("fragment datagrams: %v", err)
 				acquired <- struct{}{}
@@ -489,7 +489,7 @@ func BenchmarkClientDsendFragmentRelease(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		var counter atomic.Uint32
 		for pb.Next() {
-			datagrams, err := handler.fragmentDatagrams(1, payload, &counter)
+			datagrams, err := handler.fragmentDatagrams(1, 1, payload, &counter)
 			if err != nil {
 				b.Errorf("fragment datagrams: %v", err)
 				return

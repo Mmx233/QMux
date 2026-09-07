@@ -23,7 +23,10 @@ const (
 	udpSocketBufferSize = 4 * 1024 * 1024
 )
 
-var errClientUDPSessionLimit = errors.New("client UDP session limit reached")
+var (
+	errClientUDPSessionLimit   = errors.New("client UDP session limit reached")
+	errClientUDPEpochExhausted = errors.New("client UDP session epoch exhausted")
+)
 
 func setUDPSocketBuffer(logger zerolog.Logger, name string, setter func(int) error) {
 	if err := setter(udpSocketBufferSize); err != nil {
@@ -160,11 +163,12 @@ func (b *udpSessionBudget) unpublish() {
 
 // UDPSession represents a client-side UDP session
 type UDPSession struct {
-	id            uint32
-	localConn     *net.UDPConn
-	quicConn      *quic.Conn
-	lastActive    atomic.Int64
-	fragIDCounter atomic.Uint32 // Changed from uint16 + mutex for lock-free operation
+	id               uint32
+	epoch            uint32
+	localConn        *net.UDPConn
+	quicConn         *quic.Conn
+	lastActive       atomic.Int64
+	fragmentSequence atomic.Uint32
 }
 
 func (s *UDPSession) updateLastActive() {
@@ -194,6 +198,7 @@ type UDPHandler struct {
 	fixedWG              sync.WaitGroup
 	readerWG             sync.WaitGroup
 	sessionBudget        *udpSessionBudget
+	epochAllocator       atomic.Uint32
 	beforeSessionPublish func()
 	dsendStats           *clientDsendStats
 	done                 chan struct{}
@@ -388,9 +393,15 @@ func (h *UDPHandler) getOrCreateSession(sessionID uint32, quicConn *quic.Conn) (
 	// Increase UDP buffer sizes to handle large packets
 	setUDPSocketBuffer(h.logger, "read", localConn.SetReadBuffer)
 	setUDPSocketBuffer(h.logger, "write", localConn.SetWriteBuffer)
+	epoch, ok := protocol.AllocateUDPEpoch(&h.epochAllocator)
+	if !ok {
+		_ = localConn.Close()
+		return nil, errClientUDPEpochExhausted
+	}
 
 	session := &UDPSession{
 		id:        sessionID,
+		epoch:     epoch,
 		localConn: localConn,
 		quicConn:  quicConn,
 	}
@@ -472,7 +483,7 @@ func (h *UDPHandler) readLocalResponses(session *UDPSession) {
 		session.updateLastActive()
 
 		// Fragment and send datagrams using pooled fragmentation (no mutex needed - atomic counter)
-		datagrams, err := h.fragmentDatagrams(session.id, buf[:n], &session.fragIDCounter)
+		datagrams, err := h.fragmentDatagrams(session.id, session.epoch, buf[:n], &session.fragmentSequence)
 
 		if err != nil {
 			h.logger.Debug().Err(err).Uint32("session_id", session.id).Int("size", n).Msg("fragment UDP failed")
@@ -491,8 +502,8 @@ func (h *UDPHandler) readLocalResponses(session *UDPSession) {
 	}
 }
 
-func (h *UDPHandler) fragmentDatagrams(sessionID uint32, payload []byte, counter *atomic.Uint32) ([]protocol.DatagramResult, error) {
-	datagrams, err := protocol.FragmentUDPPooled(sessionID, payload, counter, h.enableFragmentation)
+func (h *UDPHandler) fragmentDatagrams(sessionID, epoch uint32, payload []byte, sequence *atomic.Uint32) ([]protocol.DatagramResult, error) {
+	datagrams, err := protocol.FragmentUDPPooled(sessionID, epoch, payload, sequence, h.enableFragmentation)
 	if err != nil {
 		h.dsendStats.fragmentDrops.Add(1)
 		return nil, err

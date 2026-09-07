@@ -1,7 +1,9 @@
 package traffic
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -136,13 +138,23 @@ func awaitUDPCondition(t *testing.T, timeout time.Duration, description string, 
 func fragmentUDPSenderBatch(t *testing.T, sessionID uint32, payload []byte) udpSendBatch {
 	t.Helper()
 	var counter atomic.Uint32
-	datagrams, err := protocol.FragmentUDPPooled(sessionID, payload, &counter, true)
+	datagrams, err := protocol.FragmentUDPPooled(sessionID, 1, payload, &counter, true)
 	if err != nil {
 		t.Fatalf("fragment UDP sender batch: %v", err)
 	}
 	return udpSendBatch{
 		datagrams: datagrams,
 	}
+}
+
+func literalServerUDPFragment(sessionID uint32, fragmentID uint64, index, total byte, payload []byte) []byte {
+	wire := make([]byte, protocol.UDPFragHeaderSize+len(payload))
+	wire[0] = 0x22
+	binary.BigEndian.PutUint32(wire[1:5], sessionID)
+	binary.BigEndian.PutUint64(wire[5:13], fragmentID)
+	wire[13], wire[14] = index, total
+	copy(wire[protocol.UDPFragHeaderSize:], payload)
+	return wire
 }
 
 func datagramBackingBytes(datagrams []protocol.DatagramResult) int64 {
@@ -280,7 +292,7 @@ func TestUDPSenderFragmentsBeforeAdmissionLock(t *testing.T) {
 		close(done)
 	}()
 	awaitUDPCondition(t, time.Second, "fragmentation before sender admission lock", func() bool {
-		return session.fragIDCounter.Load() != 0
+		return session.fragmentSequence.Load() != 0
 	})
 	if sender.ownedFrames != 0 {
 		t.Fatalf("ownership while admission lock is held = %d frames, want zero", sender.ownedFrames)
@@ -471,7 +483,7 @@ func echoOneUDPDatagram(ctx context.Context, conn *quic.Conn) <-chan error {
 			return
 		}
 		var counter atomic.Uint32
-		response, err := protocol.FragmentUDPPooled(sessionID, payload, &counter, true)
+		response, err := protocol.FragmentUDPPooled(sessionID, 1, payload, &counter, true)
 		if err != nil {
 			done <- fmt.Errorf("fragment QUIC echo: %w", err)
 			return
@@ -874,6 +886,103 @@ func TestUDPReceiverUsesExactGenerationBeforeFragmentRetention(t *testing.T) {
 	}
 }
 
+func TestUDPReceiverAcceptsLiteralWidenedFragmentsAndRejectsLegacy(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pair := newUDPSenderQUICPair(t, ctx)
+	packetConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		_ = packetConn.Close()
+		t.Fatal(err)
+	}
+	handlerCtx, cancelHandler := context.WithCancel(ctx)
+	handler := &UDPHandler{
+		packetConn:        packetConn,
+		logger:            zerolog.Nop(),
+		ctx:               handlerCtx,
+		cancel:            cancelHandler,
+		fragmentAssembler: protocol.NewShardedFragmentAssembler(protocol.DefaultShardCount),
+		receivers:         make(map[*quic.Conn]struct{}),
+		senders:           make(map[*pool.ClientConn]*udpSender),
+	}
+	client := &pool.ClientConn{ID: "literal-wire", Conn: pair.server}
+	client.ActiveConns.Store(1)
+	session := &UDPSession{
+		id:         71,
+		clientAddr: canonicalUDPAddrPort(sink.LocalAddr().(*net.UDPAddr).AddrPort()),
+		client:     client,
+	}
+	handler.sessions.Store(session.clientAddr, session)
+	handler.sessionsByID.Store(session.id, session)
+	handler.sessionStats.publish()
+	handler.receivers[pair.server] = struct{}{}
+	handler.receiverWG.Add(1)
+	go handler.receiveDatagrams(pair.server)
+	defer func() {
+		handler.close()
+		handler.wait()
+		_ = sink.Close()
+	}()
+
+	legacy := literalServerUDPFragment(session.id, 0x1122334455667788, 0, 2, []byte("legacy"))
+	legacy[0] = 0x21
+	if _, err := protocol.DecodeUDPDatagram(legacy); !errors.Is(err, protocol.ErrUnknownDatagramType) {
+		t.Fatalf("legacy decode error = %v", err)
+	}
+	if err := pair.peer.SendDatagram(legacy); err != nil {
+		t.Fatal(err)
+	}
+	awaitUDPCondition(t, 3*time.Second, "legacy fragment rejection", func() bool {
+		return handler.senderStats.decodeDrops.Load() == 1
+	})
+	if snapshot := handler.fragmentAssembler.Snapshot(); snapshot.RetainedGroups != 0 || snapshot.RetainedBackingBytes != 0 {
+		t.Fatalf("legacy fragment retained state: %+v", snapshot)
+	}
+
+	const low = uint64(0x55667788)
+	oldID := uint64(0x11223344)<<32 | low
+	newID := uint64(0x88776655)<<32 | low
+	if err := pair.peer.SendDatagram(literalServerUDPFragment(session.id, oldID, 0, 2, []byte("old-"))); err != nil {
+		t.Fatal(err)
+	}
+	awaitUDPCondition(t, 3*time.Second, "old widened partial retention", func() bool {
+		return handler.fragmentAssembler.Snapshot().RetainedGroups == 1
+	})
+	for _, wire := range [][]byte{
+		literalServerUDPFragment(session.id, newID, 0, 2, []byte("new-")),
+		literalServerUDPFragment(session.id, newID, 1, 2, []byte("payload")),
+	} {
+		if err := pair.peer.SendDatagram(wire); err != nil {
+			t.Fatal(err)
+		}
+	}
+	buf := make([]byte, 64)
+	if err := sink.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	n, _, err := sink.ReadFromUDP(buf)
+	if err != nil || !bytes.Equal(buf[:n], []byte("new-payload")) {
+		t.Fatalf("new widened payload = %q, error %v", buf[:n], err)
+	}
+	if snapshot := handler.fragmentAssembler.Snapshot(); snapshot.RetainedGroups != 1 {
+		t.Fatalf("new identity changed old partial: %+v", snapshot)
+	}
+	if err := pair.peer.SendDatagram(literalServerUDPFragment(session.id, oldID, 1, 2, []byte("payload"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	n, _, err = sink.ReadFromUDP(buf)
+	if err != nil || !bytes.Equal(buf[:n], []byte("old-payload")) {
+		t.Fatalf("old widened payload = %q, error %v", buf[:n], err)
+	}
+}
+
 func TestUDPPooledBackingFormula(t *testing.T) {
 	originalDatagramSize := protocol.DatagramBufferSize
 	originalReadSize := protocol.ReadBufferSize
@@ -890,7 +999,7 @@ func TestUDPPooledBackingFormula(t *testing.T) {
 		}
 		for _, payloadSize := range []int{1000, 65535} {
 			var counter atomic.Uint32
-			datagrams, err := protocol.FragmentUDPPooled(1, make([]byte, payloadSize), &counter, true)
+			datagrams, err := protocol.FragmentUDPPooled(1, 1, make([]byte, payloadSize), &counter, true)
 			if err != nil {
 				t.Fatalf("fragment %d-byte payload with %d-byte datagrams: %v", payloadSize, datagramSize, err)
 			}
@@ -985,9 +1094,9 @@ func TestUDPServerSessionCachesExactSender(t *testing.T) {
 		staleSender.mu.Lock()
 		frames := staleSender.ownedFrames
 		staleSender.mu.Unlock()
-		if staleSender.stopped.Load() || session.fragIDCounter.Load() != 0 || len(staleSender.queue) != 0 || frames != 0 {
+		if staleSender.stopped.Load() || session.fragmentSequence.Load() != 0 || len(staleSender.queue) != 0 || frames != 0 {
 			t.Fatalf("pre-canceled admission: stopped=%v frag=%d queue=%d owned=%d",
-				staleSender.stopped.Load(), session.fragIDCounter.Load(), len(staleSender.queue), frames)
+				staleSender.stopped.Load(), session.fragmentSequence.Load(), len(staleSender.queue), frames)
 		}
 		if syncMapLen(&handler.sessions) != 0 || syncMapLen(&handler.sessionsByID) != 0 || stale.ActiveConns.Load() != 0 {
 			t.Fatalf("pre-canceled exact close: maps=%d/%d active=%d",

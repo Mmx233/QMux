@@ -8,10 +8,28 @@ import (
 )
 
 func TestFragmentUDPPooledRejectsOversizedPacket(t *testing.T) {
-	data := make([]byte, 256*MaxFragPayload)
+	maxPacket := make([]byte, 255*MaxFragPayload)
+	var plainSequence uint32
+	plain, err := FragmentUDP(12345, 1, maxPacket, &plainSequence, true)
+	if err != nil || len(plain) != 255 || plainSequence != 1 {
+		t.Fatalf("maximum non-pooled packet = %d fragments, sequence %d, error %v", len(plain), plainSequence, err)
+	}
 	var counter atomic.Uint32
-	if _, err := FragmentUDPPooled(12345, data, &counter, true); !errors.Is(err, ErrPacketTooLarge) {
+	pooled, err := FragmentUDPPooled(12345, 1, maxPacket, &counter, true)
+	if err != nil || len(pooled) != 255 || counter.Load() != 1 {
+		t.Fatalf("maximum pooled packet = %d fragments, sequence %d, error %v", len(pooled), counter.Load(), err)
+	}
+	ReleaseDatagramResults(pooled)
+
+	data := make([]byte, 256*MaxFragPayload)
+	if _, err := FragmentUDPPooled(12345, 1, data, &counter, true); !errors.Is(err, ErrPacketTooLarge) {
 		t.Fatalf("expected ErrPacketTooLarge, got %v", err)
+	}
+	if _, err := FragmentUDP(12345, 1, data, &plainSequence, true); !errors.Is(err, ErrPacketTooLarge) {
+		t.Fatalf("non-pooled oversized error = %v, want %v", err, ErrPacketTooLarge)
+	}
+	if counter.Load() != 1 || plainSequence != 1 {
+		t.Fatalf("oversized packet consumed identity: pooled %d/non-pooled %d", counter.Load(), plainSequence)
 	}
 }
 
@@ -63,7 +81,7 @@ func BenchmarkFragmentUDPPooled_SmallPacket(b *testing.B) {
 	data := make([]byte, 500)
 	var counter atomic.Uint32
 	for b.Loop() {
-		results, _ := FragmentUDPPooled(12345, data, &counter, true)
+		results, _ := FragmentUDPPooled(12345, 1, data, &counter, true)
 		ReleaseDatagramResults(results)
 	}
 }
@@ -72,14 +90,14 @@ func BenchmarkFragmentUDPPooled_LargePacket(b *testing.B) {
 	data := make([]byte, 5000)
 	var counter atomic.Uint32
 	for b.Loop() {
-		results, _ := FragmentUDPPooled(12345, data, &counter, true)
+		results, _ := FragmentUDPPooled(12345, 1, data, &counter, true)
 		ReleaseDatagramResults(results)
 	}
 }
 
 type benchmarkFragment struct {
 	sessionID uint32
-	fragID    uint16
+	fragID    uint64
 	index     uint8
 	total     uint8
 	payload   []byte
@@ -96,7 +114,7 @@ func makeBenchmarkFragmentSets(tb testing.TB, count int) [][]benchmarkFragment {
 
 		var counter atomic.Uint32
 		counter.Store(uint32(setIndex * 1000))
-		results, err := FragmentUDPPooled(uint32(12345+setIndex), data, &counter, true)
+		results, err := FragmentUDPPooled(uint32(12345+setIndex), uint32(setIndex+1), data, &counter, true)
 		if err != nil {
 			tb.Fatalf("fragment benchmark set %d: %v", setIndex, err)
 		}

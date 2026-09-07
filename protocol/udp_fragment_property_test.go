@@ -21,7 +21,7 @@ func TestPooledFragmentLifecycle_Property(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		data := drawFragmentPropertyData(t, 0, 10*1024)
 		var counter atomic.Uint32
-		results, err := FragmentUDPPooled(rapid.Uint32().Draw(t, "sessionID"), data, &counter, true)
+		results, err := FragmentUDPPooled(rapid.Uint32().Draw(t, "sessionID"), rapid.Uint32().Draw(t, "epoch"), data, &counter, true)
 		if err != nil {
 			t.Fatalf("FragmentUDPPooled: %v", err)
 		}
@@ -45,7 +45,7 @@ func TestFragmentReassemblyRoundTrip_OutOfOrder_Property(t *testing.T) {
 		sessionID := rapid.Uint32().Draw(t, "sessionID")
 		data := drawFragmentPropertyData(t, MaxUDPPayload+1, 20*1024)
 		var counter atomic.Uint32
-		results, err := FragmentUDPPooled(sessionID, data, &counter, true)
+		results, err := FragmentUDPPooled(sessionID, rapid.Uint32().Draw(t, "epoch"), data, &counter, true)
 		if err != nil {
 			t.Fatalf("FragmentUDPPooled: %v", err)
 		}
@@ -95,13 +95,13 @@ func TestFragmentIDConcurrentUniqueness(t *testing.T) {
 
 	data := make([]byte, MaxUDPPayload+1)
 	var counter atomic.Uint32
-	ids := make(chan uint16, total)
+	ids := make(chan uint64, total)
 	errs := make(chan error, total)
 	var wg sync.WaitGroup
 	for range goroutines {
 		wg.Go(func() {
 			for range callsPerGoroutine {
-				results, err := FragmentUDPPooled(1, data, &counter, true)
+				results, err := FragmentUDPPooled(1, 7, data, &counter, true)
 				if err != nil {
 					errs <- err
 					continue
@@ -123,7 +123,7 @@ func TestFragmentIDConcurrentUniqueness(t *testing.T) {
 	}
 	close(ids)
 
-	seen := make(map[uint16]struct{}, total)
+	seen := make(map[uint64]struct{}, total)
 	for id := range ids {
 		if _, duplicate := seen[id]; duplicate {
 			t.Fatalf("duplicate fragment ID %d", id)
