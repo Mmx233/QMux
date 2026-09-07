@@ -16,6 +16,7 @@ var (
 
 func init() {
 	Cmd.PersistentFlags().StringVarP(&configFile, "config", "c", "config.yaml", "output config file path")
+	Cmd.PersistentFlags().StringVarP(&configFile, "output", "o", "config.yaml", "output config file path")
 	Cmd.AddCommand(ServerCmd)
 	Cmd.AddCommand(ClientCmd)
 }
