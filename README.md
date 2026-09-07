@@ -1,7 +1,7 @@
 # QMux
 
 [![Lisense](https://img.shields.io/github/license/Mmx233/QMux)](https://github.com/Mmx233/QMux/blob/main/LICENSE)
-[![Test Status](https://img.shields.io/github/actions/workflow/status/Mmx233/QMux/test.yml)](https://github.com/Mmx233/QMux/actions/workflows/test.yml)
+[![Test Status](https://img.shields.io/github/actions/workflow/status/Mmx233/QMux/test.yml?label=test)](https://github.com/Mmx233/QMux/actions/workflows/test.yml)
 [![Release](https://img.shields.io/github/v/release/Mmx233/QMux?color=blueviolet&include_prereleases)](https://github.com/Mmx233/QMux/releases)
 [![Dockerhub](https://img.shields.io/docker/pulls/mmx233/qmux)](https://hub.docker.com/repository/docker/mmx233/qmux)
 
@@ -109,7 +109,7 @@ capacity:
 server:
   servers:
     - address: "your-server-ip:8443"
-      server_name: "qmux-server"
+      server_name: "your-server-domain.com"
 
 local:
   host: "127.0.0.1"
