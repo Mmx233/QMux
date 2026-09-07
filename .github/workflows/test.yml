@@ -28,7 +28,7 @@ jobs:
       - name: Full non-E2E race suite
         timeout-minutes: 20
         run: >-
-          go test -race ./auth/... ./client/... ./cmd/... ./config/... ./protocol/... ./server/...
+          go test -race ./auth/... ./client/... ./cmd/... ./config/... ./internal/... ./protocol/... ./server/...
           -count=1 -timeout=15m
 
       - name: Functional E2E fault matrix
