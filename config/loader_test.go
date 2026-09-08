@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -105,6 +106,112 @@ func TestTypedLoadersAddSemanticValidation(t *testing.T) {
 	}
 	if _, err := LoadServerConfig(serverPath); err == nil || !strings.Contains(err.Error(), "listeners") {
 		t.Fatalf("typed server load error = %v, want listeners path", err)
+	}
+}
+
+func TestQuicValidateEffectiveReceiveWindows(t *testing.T) {
+	tests := []struct {
+		name      string
+		quic      Quic
+		errorPath string
+	}{
+		{"stream max below effective initial", Quic{MaxStreamReceiveWindow: defaultInitialStreamReceiveWindow - 1}, "quic.initial_stream_receive_window"},
+		{"stream initial above effective max", Quic{InitialStreamReceiveWindow: defaultMaxStreamReceiveWindow + 1}, "quic.initial_stream_receive_window"},
+		{"connection max below effective initial", Quic{MaxConnectionReceiveWindow: defaultInitialConnectionReceiveWindow - 1}, "quic.initial_connection_receive_window"},
+		{"connection initial above effective max", Quic{InitialConnectionReceiveWindow: defaultMaxConnectionReceiveWindow + 1}, "quic.initial_connection_receive_window"},
+		{"all omitted", Quic{}, ""},
+		{"stream max equals effective initial", Quic{MaxStreamReceiveWindow: defaultInitialStreamReceiveWindow}, ""},
+		{"stream max above effective initial", Quic{MaxStreamReceiveWindow: defaultInitialStreamReceiveWindow + 1}, ""},
+		{"stream initial equals effective max", Quic{InitialStreamReceiveWindow: defaultMaxStreamReceiveWindow}, ""},
+		{"stream initial below effective max", Quic{InitialStreamReceiveWindow: defaultMaxStreamReceiveWindow - 1}, ""},
+		{"connection max equals effective initial", Quic{MaxConnectionReceiveWindow: defaultInitialConnectionReceiveWindow}, ""},
+		{"connection max above effective initial", Quic{MaxConnectionReceiveWindow: defaultInitialConnectionReceiveWindow + 1}, ""},
+		{"connection initial equals effective max", Quic{InitialConnectionReceiveWindow: defaultMaxConnectionReceiveWindow}, ""},
+		{"connection initial below effective max", Quic{InitialConnectionReceiveWindow: defaultMaxConnectionReceiveWindow - 1}, ""},
+		{"explicit coherent pairs", Quic{InitialStreamReceiveWindow: 1, MaxStreamReceiveWindow: 2, InitialConnectionReceiveWindow: 3, MaxConnectionReceiveWindow: 4}, ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := test.quic.Validate("quic")
+			if test.errorPath == "" {
+				if err != nil {
+					t.Fatalf("Validate() error = %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.errorPath) {
+				t.Fatalf("Validate() error = %v, want path %q", err, test.errorPath)
+			}
+		})
+	}
+}
+
+func TestTypedLoadersRejectEffectiveReceiveWindowInversion(t *testing.T) {
+	clientYAML := func(field string, value uint64) string {
+		return fmt.Sprintf(`server:
+  servers:
+    - address: "server.example.com:8443"
+local:
+  host: "127.0.0.1"
+  port: 8080
+quic:
+  %s: %d
+`, field, value)
+	}
+	serverYAML := func(field string, value uint64) string {
+		return fmt.Sprintf(`listeners:
+  - quic_addr: "127.0.0.1:8443"
+    traffic_addr: "127.0.0.1:8080"
+    protocol: tcp
+    %s: %d
+`, field, value)
+	}
+	tests := []struct {
+		name    string
+		content string
+		load    func(string) error
+		path    string
+	}{
+		{"client stream max-only", clientYAML("max_stream_receive_window", defaultInitialStreamReceiveWindow-1), func(path string) error {
+			_, err := LoadClientConfig(path)
+			return err
+		}, "quic.initial_stream_receive_window"},
+		{"client stream initial-only", clientYAML("initial_stream_receive_window", defaultMaxStreamReceiveWindow+1), func(path string) error {
+			_, err := LoadClientConfig(path)
+			return err
+		}, "quic.initial_stream_receive_window"},
+		{"client connection max-only", clientYAML("max_connection_receive_window", defaultInitialConnectionReceiveWindow-1), func(path string) error {
+			_, err := LoadClientConfig(path)
+			return err
+		}, "quic.initial_connection_receive_window"},
+		{"client connection initial-only", clientYAML("initial_connection_receive_window", defaultMaxConnectionReceiveWindow+1), func(path string) error {
+			_, err := LoadClientConfig(path)
+			return err
+		}, "quic.initial_connection_receive_window"},
+		{"server stream max-only", serverYAML("max_stream_receive_window", defaultInitialStreamReceiveWindow-1), func(path string) error {
+			_, err := LoadServerConfig(path)
+			return err
+		}, "listeners[0].initial_stream_receive_window"},
+		{"server stream initial-only", serverYAML("initial_stream_receive_window", defaultMaxStreamReceiveWindow+1), func(path string) error {
+			_, err := LoadServerConfig(path)
+			return err
+		}, "listeners[0].initial_stream_receive_window"},
+		{"server connection max-only", serverYAML("max_connection_receive_window", defaultInitialConnectionReceiveWindow-1), func(path string) error {
+			_, err := LoadServerConfig(path)
+			return err
+		}, "listeners[0].initial_connection_receive_window"},
+		{"server connection initial-only", serverYAML("initial_connection_receive_window", defaultMaxConnectionReceiveWindow+1), func(path string) error {
+			_, err := LoadServerConfig(path)
+			return err
+		}, "listeners[0].initial_connection_receive_window"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := test.load(writeTestConfig(t, test.content))
+			if err == nil || !strings.Contains(err.Error(), test.path) {
+				t.Fatalf("load error = %v, want path %q", err, test.path)
+			}
+		})
 	}
 }
 

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"cmp"
 	"fmt"
 	"net"
 	"time"
@@ -14,6 +15,12 @@ const (
 
 	// Match quic-go's maxStreams clamp instead of silently accepting a truncated value.
 	maxIncomingStreams = int64(1 << 60)
+
+	// Keep these aligned with quic-go v0.62.0's internal/protocol defaults when upgrading.
+	defaultInitialStreamReceiveWindow     = 512 * 1024
+	defaultMaxStreamReceiveWindow         = 6 * 1024 * 1024
+	defaultInitialConnectionReceiveWindow = 768 * 1024
+	defaultMaxConnectionReceiveWindow     = 15 * 1024 * 1024
 )
 
 type Listen struct {
@@ -77,12 +84,11 @@ func (q Quic) Validate(path string) error {
 			return fmt.Errorf("%s.%s must not exceed %d", path, window.name, uint64(quicvarint.Max))
 		}
 	}
-	if q.InitialStreamReceiveWindow != 0 && q.MaxStreamReceiveWindow != 0 &&
-		q.InitialStreamReceiveWindow > q.MaxStreamReceiveWindow {
+	effective := q.GetConfig()
+	if effective.InitialStreamReceiveWindow > effective.MaxStreamReceiveWindow {
 		return fmt.Errorf("%s.initial_stream_receive_window must not exceed %s.max_stream_receive_window", path, path)
 	}
-	if q.InitialConnectionReceiveWindow != 0 && q.MaxConnectionReceiveWindow != 0 &&
-		q.InitialConnectionReceiveWindow > q.MaxConnectionReceiveWindow {
+	if effective.InitialConnectionReceiveWindow > effective.MaxConnectionReceiveWindow {
 		return fmt.Errorf("%s.initial_connection_receive_window must not exceed %s.max_connection_receive_window", path, path)
 	}
 	return nil
@@ -93,10 +99,10 @@ func (q Quic) GetConfig() *quic.Config {
 		q.MaxIdleTimeout = DefaultMaxIdleTimeout
 	}
 	return &quic.Config{
-		InitialStreamReceiveWindow:     q.InitialStreamReceiveWindow,
-		MaxStreamReceiveWindow:         q.MaxStreamReceiveWindow,
-		InitialConnectionReceiveWindow: q.InitialConnectionReceiveWindow,
-		MaxConnectionReceiveWindow:     q.MaxConnectionReceiveWindow,
+		InitialStreamReceiveWindow:     cmp.Or(q.InitialStreamReceiveWindow, defaultInitialStreamReceiveWindow),
+		MaxStreamReceiveWindow:         cmp.Or(q.MaxStreamReceiveWindow, defaultMaxStreamReceiveWindow),
+		InitialConnectionReceiveWindow: cmp.Or(q.InitialConnectionReceiveWindow, defaultInitialConnectionReceiveWindow),
+		MaxConnectionReceiveWindow:     cmp.Or(q.MaxConnectionReceiveWindow, defaultMaxConnectionReceiveWindow),
 		MaxIncomingStreams:             q.MaxIncomingStreams,
 		KeepAlivePeriod:                q.KeepAlivePeriod,
 		HandshakeIdleTimeout:           q.HandshakeIdleTimeout,

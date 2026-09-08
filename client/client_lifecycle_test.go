@@ -64,6 +64,28 @@ func TestNewRejectsNilAndSemanticErrorsBeforeCredentials(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "local.host") || strings.Contains(err.Error(), "credentials") {
 		t.Fatalf("New(invalid) error = %v, want local.host before credentials", err)
 	}
+	tests := []struct {
+		name string
+		quic config.Quic
+		path string
+	}{
+		{"stream max-only", config.Quic{MaxStreamReceiveWindow: 512*1024 - 1}, "quic.initial_stream_receive_window"},
+		{"stream initial-only", config.Quic{InitialStreamReceiveWindow: 6*1024*1024 + 1}, "quic.initial_stream_receive_window"},
+		{"connection max-only", config.Quic{MaxConnectionReceiveWindow: 768*1024 - 1}, "quic.initial_connection_receive_window"},
+		{"connection initial-only", config.Quic{InitialConnectionReceiveWindow: 15*1024*1024 + 1}, "quic.initial_connection_receive_window"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := New(&config.Client{
+				Server: config.ClientServer{Servers: []config.ServerEndpoint{{Address: "server.example.com:8443"}}},
+				Local:  config.LocalService{Host: "127.0.0.1", Port: 8080},
+				Quic:   test.quic,
+			})
+			if err == nil || !strings.Contains(err.Error(), test.path) || strings.Contains(err.Error(), "credentials") {
+				t.Fatalf("New() error = %v, want %s before credentials", err, test.path)
+			}
+		})
+	}
 }
 
 func TestNewDeduplicatesBeforeCredentialIO(t *testing.T) {
