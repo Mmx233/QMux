@@ -31,13 +31,6 @@ type iperf3Result struct {
 			LostPackets int     `json:"lost_packets"`
 			Packets     int     `json:"packets"`
 		} `json:"sum"`
-		Streams []struct {
-			UDP struct {
-				JitterMs    float64 `json:"jitter_ms"`
-				LostPackets int     `json:"lost_packets"`
-				Packets     int     `json:"packets"`
-			} `json:"udp"`
-		} `json:"streams"`
 	} `json:"end"`
 }
 
@@ -165,7 +158,7 @@ func runIperf3DirectBaseline(t *testing.T, protocol string, threads int) {
 	}
 
 	result := parseIperf3Output(t, output)
-	reportIperf3Result(t, fmt.Sprintf("Direct %s %d-thread", strings.ToUpper(protocol), threads), result, protocol)
+	reportIperf3Result(t.Logf, fmt.Sprintf("Direct %s %d-thread", strings.ToUpper(protocol), threads), result, protocol)
 }
 
 // ============================================
@@ -192,7 +185,7 @@ func runIperf3ThroughQMux(t *testing.T, certDir string, protocol string, threads
 	}
 
 	result := parseIperf3Output(t, output)
-	reportIperf3Result(t, fmt.Sprintf("QMux %s %d-thread", strings.ToUpper(protocol), threads), result, protocol)
+	reportIperf3Result(t.Logf, fmt.Sprintf("QMux %s %d-thread", strings.ToUpper(protocol), threads), result, protocol)
 }
 
 // ============================================
@@ -208,23 +201,43 @@ func parseIperf3Output(t *testing.T, output []byte) *iperf3Result {
 	return &result
 }
 
-func reportIperf3Result(t *testing.T, label string, result *iperf3Result, protocol string) {
+func reportIperf3Result(logf func(string, ...any), label string, result *iperf3Result, protocol string) {
 	sentMbps := result.End.SumSent.BitsPerSecond / 1e6
 	recvMbps := result.End.SumReceived.BitsPerSecond / 1e6
 	sentMB := float64(result.End.SumSent.Bytes) / 1024 / 1024
 	recvMB := float64(result.End.SumReceived.Bytes) / 1024 / 1024
 
-	if protocol == "udp" && len(result.End.Streams) > 0 {
-		stream := result.End.Streams[0]
+	if protocol == "udp" {
+		sum := result.End.Sum
 		lossPercent := float64(0)
-		if stream.UDP.Packets > 0 {
-			lossPercent = float64(stream.UDP.LostPackets) / float64(stream.UDP.Packets) * 100
+		if sum.Packets > 0 {
+			lossPercent = float64(sum.LostPackets) / float64(sum.Packets) * 100
 		}
-		t.Logf("%s: %.2f Mbps sent, %.2f Mbps recv (%.2f MB sent, %.2f MB recv, jitter: %.3fms, loss: %.2f%%)",
-			label, sentMbps, recvMbps, sentMB, recvMB, stream.UDP.JitterMs, lossPercent)
+		logf("%s: %.2f Mbps sent, %.2f Mbps recv (%.2f MB sent, %.2f MB recv, jitter: %.3fms, loss: %.2f%%)",
+			label, sentMbps, recvMbps, sentMB, recvMB, sum.JitterMs, lossPercent)
 	} else {
-		t.Logf("%s: %.2f Mbps sent, %.2f Mbps recv (%.2f MB sent, %.2f MB recv)",
+		logf("%s: %.2f Mbps sent, %.2f Mbps recv (%.2f MB sent, %.2f MB recv)",
 			label, sentMbps, recvMbps, sentMB, recvMB)
+	}
+}
+
+func TestReportIperf3ResultUDPAggregate(t *testing.T) {
+	result := parseIperf3Output(t, []byte(`{"end":{
+		"sum_sent":{"bits_per_second":2000000,"bytes":2097152},
+		"sum_received":{"bits_per_second":1000000,"bytes":1048576},
+		"sum":{"jitter_ms":3,"lost_packets":200,"packets":2000},
+		"streams":[
+			{"udp":{"jitter_ms":1,"lost_packets":0,"packets":1000}},
+			{"udp":{"jitter_ms":5,"lost_packets":200,"packets":1000}}
+		]
+	}}`))
+	var got string
+	reportIperf3Result(func(format string, args ...any) {
+		got = fmt.Sprintf(format, args...)
+	}, "UDP aggregate", result, "udp")
+	const want = "UDP aggregate: 2.00 Mbps sent, 1.00 Mbps recv (2.00 MB sent, 1.00 MB recv, jitter: 3.000ms, loss: 10.00%)"
+	if got != want {
+		t.Fatalf("report = %q, want %q", got, want)
 	}
 }
 
