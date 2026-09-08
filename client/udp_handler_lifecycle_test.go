@@ -5,17 +5,23 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"io"
 	"math"
 	"net"
+	"os"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Mmx233/QMux/config"
+	"github.com/Mmx233/QMux/internal/testutil"
 	"github.com/Mmx233/QMux/protocol"
 	"github.com/quic-go/quic-go"
 	"github.com/rs/zerolog"
 )
+
+const clientUDPResolverChild = "QMUX_CLIENT_UDP_RESOLVER_CHILD"
 
 func newUDPHandlerQUICPair(t *testing.T) (*quic.Conn, *quic.Conn) {
 	t.Helper()
@@ -81,13 +87,12 @@ func awaitClientUDPCondition(t *testing.T, description string, condition func() 
 }
 
 func literalClientUDPFragment(sessionID uint32, fragmentID uint64, index, total byte, payload []byte) []byte {
-	wire := make([]byte, protocol.UDPFragHeaderSize+len(payload))
-	wire[0] = 0x22
-	binary.BigEndian.PutUint32(wire[1:5], sessionID)
-	binary.BigEndian.PutUint64(wire[5:13], fragmentID)
-	wire[13], wire[14] = index, total
-	copy(wire[protocol.UDPFragHeaderSize:], payload)
-	return wire
+	wire := make([]byte, 0, 15+len(payload))
+	wire = append(wire, 0x22)
+	wire = binary.BigEndian.AppendUint32(wire, sessionID)
+	wire = binary.BigEndian.AppendUint64(wire, fragmentID)
+	wire = append(wire, index, total)
+	return append(wire, payload...)
 }
 
 func assertNoUDPSessions(t *testing.T, handler *UDPHandler) {
@@ -99,6 +104,48 @@ func assertNoUDPSessions(t *testing.T, handler *UDPHandler) {
 	})
 	if count != 0 {
 		t.Fatalf("handler retained %d UDP sessions", count)
+	}
+}
+
+func TestUDPHandlerHostnameResolveCancellationReleasesResources(t *testing.T) {
+	if os.Getenv(clientUDPResolverChild) != "" {
+		runUDPHandlerResolverChild(t)
+		return
+	}
+	testutil.RunResolverCancellationProcess(t, clientUDPResolverChild)
+}
+
+func runUDPHandlerResolverChild(t *testing.T) {
+	var entered sync.Once
+	net.DefaultResolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			entered.Do(func() { _, _ = fmt.Fprintln(os.Stdout, "resolver-entered") })
+			<-ctx.Done()
+			return nil, context.Cause(ctx)
+		},
+	}
+
+	budget := newUDPSessionBudget(1)
+	handler := newUDPHandler("lif002-client.qmux.invalid", 9, true, zerolog.Nop(), budget)
+	handler.ctx, handler.cancel = context.WithCancel(context.Background())
+	handler.started = true
+	go func() {
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		handler.Stop()
+	}()
+
+	_, err := handler.getOrCreateSession(1, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("session creation error = %v, want context.Canceled", err)
+	}
+	handler.wait()
+	assertNoUDPSessions(t, handler)
+	if snapshot := budget.snapshot(); snapshot.Current != 0 || snapshot.Permits != 0 {
+		t.Fatalf("canceled session budget = %+v, want no current session or permit", snapshot)
+	}
+	if workers := handler.dsendStats.load().Workers; workers != 0 {
+		t.Fatalf("canceled session workers = %d, want 0", workers)
 	}
 }
 
@@ -466,8 +513,11 @@ func TestUDPHandlerEpochExhaustionCleansCandidateAndKeepsExistingSession(t *test
 	}
 	parsed, err := protocol.DecodeUDPDatagram(datagrams[0].Data)
 	handler.dsendStats.releaseDatagrams(datagrams, int64(len(datagrams)))
-	if err != nil || parsed.FragmentID != uint64(math.MaxUint32)<<32|1 {
-		t.Fatalf("existing identity after exhaustion = %#x, error %v", parsed.FragmentID, err)
+	if err != nil {
+		t.Fatalf("decode existing identity after exhaustion: %v", err)
+	}
+	if parsed.FragmentID != uint64(math.MaxUint32)<<32|1 {
+		t.Fatalf("existing identity after exhaustion = %#x", parsed.FragmentID)
 	}
 }
 
@@ -519,8 +569,11 @@ func TestUDPHandlerReceivesLiteralWidenedFragmentsAndRejectsLegacy(t *testing.T)
 		t.Fatal(err)
 	}
 	n, _, err := backend.ReadFromUDP(buf)
-	if err != nil || !bytes.Equal(buf[:n], []byte("new-payload")) {
-		t.Fatalf("new widened payload = %q, error %v", buf[:n], err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(buf[:n]); got != "new-payload" {
+		t.Fatalf("new widened payload = %q", got)
 	}
 	if snapshot := handler.fragmentAssembler.Snapshot(); snapshot.RetainedGroups != 1 {
 		t.Fatalf("new identity changed old partial: %+v", snapshot)
@@ -529,8 +582,11 @@ func TestUDPHandlerReceivesLiteralWidenedFragmentsAndRejectsLegacy(t *testing.T)
 		t.Fatal(err)
 	}
 	n, _, err = backend.ReadFromUDP(buf)
-	if err != nil || !bytes.Equal(buf[:n], []byte("old-payload")) {
-		t.Fatalf("old widened payload = %q, error %v", buf[:n], err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(buf[:n]); got != "old-payload" {
+		t.Fatalf("old widened payload = %q", got)
 	}
 }
 

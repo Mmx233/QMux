@@ -196,14 +196,34 @@ type UDPHandler struct {
 
 // bindUDP stages a UDP socket without starting handler goroutines.
 func (l *Listener) bindUDP() error {
-	addr, err := net.ResolveUDPAddr("udp", l.Addr)
-	if err != nil {
-		return fmt.Errorf("resolve UDP addr: %w", err)
+	var conn *net.UDPConn
+	host, _, splitErr := net.SplitHostPort(l.Addr)
+	isHostname := false
+	if splitErr == nil && host != "" {
+		_, parseErr := netip.ParseAddr(host)
+		isHostname = parseErr != nil
 	}
-
-	conn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		return fmt.Errorf("listen UDP: %w", err)
+	if isHostname {
+		listenConfig := net.ListenConfig{}
+		packetConn, err := listenConfig.ListenPacket(l.ctx, "udp", l.Addr)
+		if err != nil {
+			return fmt.Errorf("listen UDP: %w", err)
+		}
+		var ok bool
+		conn, ok = packetConn.(*net.UDPConn)
+		if !ok {
+			_ = packetConn.Close()
+			return fmt.Errorf("listen UDP returned %T, want *net.UDPConn", packetConn)
+		}
+	} else {
+		addr, err := net.ResolveUDPAddr("udp", l.Addr)
+		if err != nil {
+			return fmt.Errorf("resolve UDP addr: %w", err)
+		}
+		conn, err = net.ListenUDP("udp", addr)
+		if err != nil {
+			return fmt.Errorf("listen UDP: %w", err)
+		}
 	}
 
 	bufferSetters := []struct {

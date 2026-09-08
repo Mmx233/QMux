@@ -38,6 +38,7 @@ func TestRunClientComponentsAdminBindFailureDoesNotRunClient(t *testing.T) {
 	err = runClientComponents(
 		func() error { ran = true; return nil },
 		func() error { return nil },
+		make(chan os.Signal, 2),
 		occupied.Addr().String(),
 		func() bool { return false },
 		nil,
@@ -56,6 +57,7 @@ func TestRunClientComponentsClientExitReleasesAdmin(t *testing.T) {
 	err := runClientComponents(
 		func() error { return want },
 		func() error { return errors.New("unexpected stop") },
+		make(chan os.Signal, 2),
 		adminAddr,
 		func() bool { return false },
 		nil,
@@ -225,8 +227,10 @@ func TestFinishClientSignalResultQueuedForce(t *testing.T) {
 }
 
 const (
-	runClientTestConfig = "QMUX_RUN_CLIENT_TEST_CONFIG"
-	runClientSignalTest = "QMUX_RUN_CLIENT_SIGNAL_TEST"
+	runClientTestConfig        = "QMUX_RUN_CLIENT_TEST_CONFIG"
+	runClientSignalTest        = "QMUX_RUN_CLIENT_SIGNAL_TEST"
+	runClientAdminPrequeueTest = "QMUX_RUN_CLIENT_ADMIN_PREQUEUE_TEST"
+	runClientAdminSignalTest   = "QMUX_RUN_CLIENT_ADMIN_SIGNAL_TEST"
 )
 
 type runClientTestBuffer struct {
@@ -251,6 +255,149 @@ type runClientTestProcess struct {
 	stderr  runClientTestBuffer
 	done    chan struct{}
 	err     error
+}
+
+func TestClientAdminSignalHandoff(t *testing.T) {
+	if os.Getenv(runClientAdminPrequeueTest) != "" {
+		runClientAdminPrequeueChild(t)
+		return
+	}
+	if os.Getenv(runClientAdminSignalTest) != "" {
+		runClientAdminSignalChild()
+		return
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("SIGTERM is not supported on Windows")
+	}
+
+	t.Run("prequeued first signal", func(t *testing.T) {
+		process := startRunTestProcess(t, "TestClientAdminSignalHandoff", runClientAdminPrequeueTest+"=1")
+		process.waitForLogs(t, "prequeue-ready")
+		if err := process.command.Process.Signal(syscall.SIGTERM); err != nil {
+			t.Fatalf("prequeue signal: %v", err)
+		}
+		if err, exited := process.wait(time.Second); !exited {
+			t.Fatalf("prequeued client admin child did not exit:\n%s", process.stderr.String())
+		} else if err != nil {
+			t.Fatalf("prequeued client admin child failed: %v\n%s", err, process.stderr.String())
+		}
+		logs := process.stderr.String()
+		if !strings.Contains(logs, "prequeued-coordinator") {
+			t.Fatalf("prequeued signal did not reach coordinator:\n%s", logs)
+		}
+	})
+
+	t.Run("during bind retains graceful and force signals", func(t *testing.T) {
+		process := startRunTestProcess(t, "TestClientAdminSignalHandoff", runClientAdminSignalTest+"=1")
+		process.waitForLogs(t, "resolver-entered")
+		if err := process.command.Process.Signal(syscall.SIGTERM); err != nil {
+			t.Fatalf("send first signal: %v", err)
+		}
+		process.waitForLogs(t, "shutdown-blocked")
+		if err := process.command.Process.Signal(syscall.SIGTERM); err != nil {
+			t.Fatalf("send second signal: %v", err)
+		}
+		process.waitForLogs(t, "stop-blocked")
+		if err := process.command.Process.Signal(syscall.SIGTERM); err != nil {
+			t.Fatalf("send third signal: %v", err)
+		}
+		err, exited := process.wait(time.Second)
+		if !exited {
+			t.Fatalf("client admin child survived third SIGTERM:\n%s", process.stderr.String())
+		}
+		var exitError *exec.ExitError
+		if !errors.As(err, &exitError) {
+			t.Fatalf("client admin child wait error = %T %v, want signal exit", err, err)
+		}
+		status, ok := exitError.Sys().(syscall.WaitStatus)
+		if !ok || !status.Signaled() || status.Signal() != syscall.SIGTERM {
+			t.Fatalf("client admin child exit status = %v, want SIGTERM", exitError.ProcessState)
+		}
+	})
+}
+
+func installRunAdminResolver() {
+	var entered sync.Once
+	net.DefaultResolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			entered.Do(func() { _, _ = fmt.Fprintln(os.Stderr, "resolver-entered") })
+			<-ctx.Done()
+			return nil, context.Cause(ctx)
+		},
+	}
+}
+
+func runClientAdminPrequeueChild(t *testing.T) {
+	installRunAdminResolver()
+	signals := make(chan os.Signal, 2)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	_, _ = fmt.Fprintln(os.Stderr, "prequeue-ready")
+	deadline := time.Now().Add(3 * time.Second)
+	for len(signals) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("first signal was not queued")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	startRelease := make(chan struct{})
+	err := runClientComponents(
+		func() error {
+			return coordinateClientSignals(
+				func(context.Context) error {
+					<-startRelease
+					return client.ErrClientStopped
+				},
+				func(context.Context) error {
+					_, _ = fmt.Fprintln(os.Stderr, "prequeued-coordinator")
+					close(startRelease)
+					return nil
+				},
+				func() error { return errors.New("unexpected force") },
+				signals,
+				func() { signal.Stop(signals) },
+			)
+		},
+		func() error { return nil },
+		signals,
+		"lif002-client-admin.qmux.invalid:9",
+		func() bool { return false },
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func runClientAdminSignalChild() {
+	installRunAdminResolver()
+	signals := make(chan os.Signal, 2)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	_ = runClientComponents(
+		func() error {
+			return coordinateClientSignals(
+				func(context.Context) error { select {} },
+				func(context.Context) error {
+					_, _ = fmt.Fprintln(os.Stderr, "shutdown-blocked")
+					select {}
+				},
+				func() error {
+					_, _ = fmt.Fprintln(os.Stderr, "stop-blocked")
+					select {}
+				},
+				signals,
+				func() { signal.Stop(signals) },
+			)
+		},
+		func() error { return nil },
+		signals,
+		"lif002-client-admin.qmux.invalid:9",
+		func() bool { return false },
+		nil,
+	)
 }
 
 func TestRunClientLifecycle(t *testing.T) {
@@ -369,20 +516,33 @@ func writeRunClientTestConfig(t *testing.T, caPath string) string {
 
 func startRunClientTestProcess(t *testing.T, path string, extraEnv ...string) *runClientTestProcess {
 	t.Helper()
+	if path != "" {
+		extraEnv = append(extraEnv, runClientTestConfig+"="+path)
+	}
+	return startRunTestProcess(t, "TestRunClientLifecycle", extraEnv...)
+}
+
+func startRunTestProcess(t *testing.T, testName string, extraEnv ...string) *runClientTestProcess {
+	t.Helper()
 	process := &runClientTestProcess{done: make(chan struct{})}
-	process.command = exec.Command(os.Args[0], "-test.run=^TestRunClientLifecycle$")
+	process.command = exec.Command(os.Args[0], "-test.run=^"+testName+"$")
+	replaced := map[string]struct{}{
+		"GORACE":            {},
+		runClientTestConfig: {},
+		runClientSignalTest: {},
+	}
+	for _, value := range extraEnv {
+		key, _, _ := strings.Cut(value, "=")
+		replaced[key] = struct{}{}
+	}
 	for _, value := range process.command.Environ() {
-		if !strings.HasPrefix(value, runClientTestConfig+"=") &&
-			!strings.HasPrefix(value, runClientSignalTest+"=") &&
-			!strings.HasPrefix(value, "GORACE=") {
+		key, _, _ := strings.Cut(value, "=")
+		if _, exists := replaced[key]; !exists {
 			process.command.Env = append(process.command.Env, value)
 		}
 	}
 	// The race runtime otherwise adds a one-second delay after runClient returns.
 	process.command.Env = append(process.command.Env, extraEnv...)
-	if path != "" {
-		process.command.Env = append(process.command.Env, runClientTestConfig+"="+path)
-	}
 	process.command.Env = append(process.command.Env,
 		"GORACE="+strings.TrimSpace(os.Getenv("GORACE")+" atexit_sleep_ms=0"))
 	process.command.Stderr = &process.stderr

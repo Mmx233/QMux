@@ -3,18 +3,24 @@ package traffic
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Mmx233/QMux/config"
+	"github.com/Mmx233/QMux/internal/testutil"
 	"github.com/Mmx233/QMux/protocol"
 	"github.com/Mmx233/QMux/server/pool"
 	"github.com/rs/zerolog"
 	"go.uber.org/goleak"
 )
+
+const trafficResolverChild = "QMUX_TRAFFIC_RESOLVER_CHILD"
 
 func testPool(t *testing.T, quicAddr string) *pool.ConnectionPool {
 	t.Helper()
@@ -313,6 +319,98 @@ func TestManagerCancelWhileStartingRollsBackStagedSockets(t *testing.T) {
 
 	reboundTCP, reboundUDP := bindTestTCPAndUDP(t, trafficAddr)
 	closeTestTCPAndUDP(t, reboundTCP, reboundUDP)
+}
+
+func TestManagerHostnameResolveCancellationRollsBackStagedUDP(t *testing.T) {
+	if os.Getenv(trafficResolverChild) != "" {
+		runTrafficResolverChild(t)
+		return
+	}
+	testutil.RunResolverCancellationProcess(t, trafficResolverChild)
+}
+
+func TestListenerBindUDPPreservesLiteralAndEmptyHost(t *testing.T) {
+	for _, test := range testutil.UDPLiteralBindCases(t) {
+		t.Run(test.Name, func(t *testing.T) {
+			addr, err := net.ResolveUDPAddr("udp", test.Address)
+			if err != nil {
+				t.Fatal(err)
+			}
+			probe, err := net.ListenUDP("udp", addr)
+			if err != nil {
+				if test.Optional {
+					t.Skipf("address family unavailable: %v", err)
+				}
+				t.Fatal(err)
+			}
+			want := probe.LocalAddr().(*net.UDPAddr)
+			if err := probe.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			listener := &Listener{Addr: test.Address, ctx: ctx, logger: zerolog.Nop()}
+			if err := listener.bindUDP(); err != nil {
+				t.Fatalf("bind canceled-context %s: %v", test.Address, err)
+			}
+			got := listener.UDPConn.LocalAddr().(*net.UDPAddr)
+			if got.IP.String() != want.IP.String() || got.Zone != want.Zone {
+				_ = listener.UDPConn.Close()
+				t.Fatalf("bound address = %s, want family/address %s", got, want)
+			}
+			if err := listener.UDPConn.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func runTrafficResolverChild(t *testing.T) {
+	var entered sync.Once
+	net.DefaultResolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			entered.Do(func() { _, _ = fmt.Fprintln(os.Stdout, "resolver-entered") })
+			<-ctx.Done()
+			return nil, context.Cause(ctx)
+		},
+	}
+
+	reservation, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stagedAddr := *reservation.LocalAddr().(*net.UDPAddr)
+	if err := reservation.Close(); err != nil {
+		t.Fatal(err)
+	}
+	firstPool := testPool(t, "staged")
+	blockedPool := testPool(t, "blocked")
+	manager := NewManager(&config.Server{Listeners: []config.QuicListener{
+		{QuicAddr: "staged", TrafficAddr: stagedAddr.String(), Protocol: "udp"},
+		{QuicAddr: "blocked", TrafficAddr: "lif002-traffic.qmux.invalid:9", Protocol: "udp"},
+	}}, map[string]*pool.ConnectionPool{
+		"staged":  firstPool,
+		"blocked": blockedPool,
+	}, zerolog.Nop())
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		cancel()
+	}()
+
+	if err := manager.Start(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Manager.Start error = %v, want context.Canceled", err)
+	}
+	waitManager(t, manager)
+	rebound, err := net.ListenUDP("udp", &stagedAddr)
+	if err != nil {
+		t.Fatalf("staged UDP address was not rolled back: %v", err)
+	}
+	if err := rebound.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestManagerWaitJoinsCommittedListenerHandlers(t *testing.T) {

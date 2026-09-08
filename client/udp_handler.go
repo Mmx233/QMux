@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"strconv"
 	"sync"
@@ -380,14 +381,24 @@ func (h *UDPHandler) getOrCreateSession(sessionID uint32, quicConn *quic.Conn) (
 	}()
 
 	// Slow path: create new session
-	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(h.localHost, strconv.Itoa(h.localPort)))
+	addr, _, err := resolveServerAddress(
+		h.ctx,
+		net.DefaultResolver,
+		net.JoinHostPort(h.localHost, strconv.Itoa(h.localPort)),
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	localConn, err := net.DialUDP("udp", nil, addr)
+	dialer := net.Dialer{}
+	conn, err := dialer.DialContext(h.ctx, "udp", addr)
 	if err != nil {
 		return nil, err
+	}
+	localConn, ok := conn.(*net.UDPConn)
+	if !ok {
+		_ = conn.Close()
+		return nil, fmt.Errorf("dial UDP returned %T, want *net.UDPConn", conn)
 	}
 
 	// Increase UDP buffer sizes to handle large packets
@@ -430,7 +441,7 @@ func (h *UDPHandler) getOrCreateSession(sessionID uint32, quicConn *quic.Conn) (
 	creatorOwnsPermit = false
 	h.lifecycleMu.Unlock()
 
-	h.logger.Debug().Uint32("session_id", sessionID).Str("local_addr", addr.String()).Msg("UDP session created")
+	h.logger.Debug().Uint32("session_id", sessionID).Str("local_addr", addr).Msg("UDP session created")
 
 	// Start reading responses from local service
 	go func() {

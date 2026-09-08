@@ -3,14 +3,21 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"net"
+	"os"
 	"slices"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Mmx233/QMux/config"
+	"github.com/Mmx233/QMux/internal/testutil"
+	"github.com/rs/zerolog"
 )
+
+const serverResolverChild = "QMUX_SERVER_RESOLVER_CHILD"
 
 type lifecycleTraffic struct {
 	mu       sync.Mutex
@@ -143,6 +150,83 @@ func TestSuperviseServerTrafficStartupFailureIsJoined(t *testing.T) {
 	if events := manager.snapshot(); !slices.Equal(events, []string{"traffic-start", "traffic-close", "traffic-wait"}) {
 		t.Fatalf("lifecycle events = %v, want traffic startup rollback and join", events)
 	}
+}
+
+func TestSuperviseServerCancelsRealListenerHostnameResolve(t *testing.T) {
+	if os.Getenv(serverResolverChild) != "" {
+		runServerResolverChild(t)
+		return
+	}
+	testutil.RunResolverCancellationProcess(t, serverResolverChild)
+}
+
+func TestStartListenerPreservesLiteralAndEmptyHost(t *testing.T) {
+	certificate, _ := registrationTestCertificate(t)
+	srv := &Server{
+		config: &config.Server{
+			Auth: config.ServerAuth{Method: "token"},
+			TLS:  config.ServerTLS{ServerCert: certificate},
+		},
+		logger: zerolog.Nop(),
+	}
+	for _, test := range testutil.UDPLiteralBindCases(t) {
+		t.Run(test.Name, func(t *testing.T) {
+			addr, err := net.ResolveUDPAddr("udp", test.Address)
+			if err != nil {
+				t.Fatal(err)
+			}
+			probe, err := net.ListenUDP("udp", addr)
+			if err != nil {
+				if test.Optional {
+					t.Skipf("address family unavailable: %v", err)
+				}
+				t.Fatal(err)
+			}
+			if err := probe.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			if err := srv.startListener(ctx, config.QuicListener{QuicAddr: test.Address}); err != nil {
+				t.Fatalf("start canceled-context listener on %s: %v", test.Address, err)
+			}
+		})
+	}
+}
+
+func runServerResolverChild(t *testing.T) {
+	var entered sync.Once
+	net.DefaultResolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			entered.Do(func() { _, _ = fmt.Fprintln(os.Stdout, "resolver-entered") })
+			<-ctx.Done()
+			return nil, context.Cause(ctx)
+		},
+	}
+
+	manager := &lifecycleTraffic{}
+	srv := &Server{logger: zerolog.Nop()}
+	listener := config.QuicListener{QuicAddr: "lif002-server.qmux.invalid:9"}
+	ctx, cancel := context.WithCancelCause(context.Background())
+	want := errors.New("caller requested resolver shutdown")
+	go func() {
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		cancel(want)
+	}()
+	err := superviseServer(ctx, manager, []config.QuicListener{listener}, func(ctx context.Context, listener config.QuicListener) error {
+		manager.record("listener-start")
+		err := srv.startListener(ctx, listener)
+		manager.record("listener-exit")
+		return err
+	})
+	if !errors.Is(err, want) {
+		t.Fatalf("superviseServer error = %v, want caller cause %v", err, want)
+	}
+	events := manager.snapshot()
+	assertLifecycleEventBefore(t, events, "traffic-close", "listener-exit")
+	assertLifecycleEventBefore(t, events, "listener-exit", "traffic-wait")
 }
 
 func waitForLifecycleSignals(t *testing.T, signals <-chan struct{}, count int) {

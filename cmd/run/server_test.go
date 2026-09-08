@@ -3,14 +3,22 @@ package run
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/signal"
+	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
+
+const runServerAdminResolverChild = "QMUX_RUN_SERVER_ADMIN_RESOLVER_CHILD"
 
 func TestAdminHandler(t *testing.T) {
 	ready := false
@@ -87,6 +95,63 @@ func TestAdminBindFailureDoesNotStartCore(t *testing.T) {
 	}
 	if started.Load() {
 		t.Fatal("core started after admin bind failure")
+	}
+}
+
+func TestServerAdminHostnameResolveCancellation(t *testing.T) {
+	if os.Getenv(runServerAdminResolverChild) != "" {
+		runServerAdminResolverChildProcess(t)
+		return
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("SIGTERM is not supported on Windows")
+	}
+
+	process := startRunTestProcess(t, "TestServerAdminHostnameResolveCancellation", runServerAdminResolverChild+"=1")
+	process.waitForLogs(t, "resolver-entered")
+	if err := process.command.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("signal server admin resolver child: %v", err)
+	}
+	if err, exited := process.wait(time.Second); !exited {
+		t.Fatalf("server admin resolver child did not exit after SIGTERM:\n%s", process.stderr.String())
+	} else if err != nil {
+		t.Fatalf("server admin resolver child failed: %v\n%s", err, process.stderr.String())
+	}
+}
+
+func runServerAdminResolverChildProcess(t *testing.T) {
+	var entered sync.Once
+	net.DefaultResolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			entered.Do(func() { _, _ = fmt.Fprintln(os.Stderr, "resolver-entered") })
+			<-ctx.Done()
+			return nil, context.Cause(ctx)
+		},
+	}
+
+	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	var started atomic.Bool
+	err := runServerComponents(
+		ctx,
+		func(context.Context) error {
+			started.Store(true)
+			return nil
+		},
+		func() bool { return false },
+		"lif002-server-admin.qmux.invalid:9",
+		nil,
+	)
+	if started.Load() {
+		t.Fatal("server core started while admin bind was canceled")
+	}
+	cause := context.Cause(ctx)
+	if cause == nil || !errors.Is(err, cause) {
+		t.Fatalf("server admin error = %v, want owner cause %v", err, cause)
+	}
+	if !strings.Contains(err.Error(), "listen admin on lif002-server-admin.qmux.invalid:9") {
+		t.Fatalf("server admin error lost address wrapper: %v", err)
 	}
 }
 

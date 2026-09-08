@@ -62,7 +62,7 @@ func runServerComponents(
 		return cause
 	}
 
-	adminServer, adminListener, err := newAdminServer(adminAddr, ready, collector)
+	adminServer, adminListener, err := newAdminServer(ctx, adminAddr, ready, collector)
 	if err != nil {
 		return err
 	}

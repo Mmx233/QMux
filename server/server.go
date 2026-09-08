@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"slices"
 	"sync"
 	"time"
@@ -480,16 +481,35 @@ func configureSessionTicketKeyRotation(
 func (s *Server) startListener(ctx context.Context, listenerConf config.QuicListener) error {
 	logger := s.logger.With().Str("quic_addr", listenerConf.QuicAddr).Logger()
 
-	// Parse QUIC address
-	udpAddr, err := net.ResolveUDPAddr("udp", listenerConf.QuicAddr)
-	if err != nil {
-		return fmt.Errorf("resolve QUIC address: %w", err)
-	}
-
 	// Create UDP listener
-	udpConn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		return fmt.Errorf("listen UDP: %w", err)
+	var udpConn *net.UDPConn
+	host, _, splitErr := net.SplitHostPort(listenerConf.QuicAddr)
+	isHostname := false
+	if splitErr == nil && host != "" {
+		_, parseErr := netip.ParseAddr(host)
+		isHostname = parseErr != nil
+	}
+	if isHostname {
+		listenConfig := net.ListenConfig{}
+		packetConn, err := listenConfig.ListenPacket(ctx, "udp", listenerConf.QuicAddr)
+		if err != nil {
+			return fmt.Errorf("listen UDP: %w", err)
+		}
+		var ok bool
+		udpConn, ok = packetConn.(*net.UDPConn)
+		if !ok {
+			_ = packetConn.Close()
+			return fmt.Errorf("listen UDP returned %T, want *net.UDPConn", packetConn)
+		}
+	} else {
+		addr, err := net.ResolveUDPAddr("udp", listenerConf.QuicAddr)
+		if err != nil {
+			return fmt.Errorf("resolve QUIC address: %w", err)
+		}
+		udpConn, err = net.ListenUDP("udp", addr)
+		if err != nil {
+			return fmt.Errorf("listen UDP: %w", err)
+		}
 	}
 	defer func() { _ = udpConn.Close() }()
 

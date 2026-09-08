@@ -2,6 +2,7 @@ package run
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -18,12 +19,16 @@ const (
 	adminShutdownTimeout   = 5 * time.Second
 )
 
-func newAdminServer(address string, ready func() bool, collector prometheus.Collector) (*http.Server, net.Listener, error) {
+func newAdminServer(ctx context.Context, address string, ready func() bool, collector prometheus.Collector) (*http.Server, net.Listener, error) {
 	if address == "" {
 		return nil, nil, nil
 	}
-	listener, err := net.Listen("tcp", address)
+	listenConfig := net.ListenConfig{}
+	listener, err := listenConfig.Listen(ctx, "tcp", address)
 	if err != nil {
+		if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+			err = context.Cause(ctx)
+		}
 		return nil, nil, fmt.Errorf("listen admin on %s: %w", address, err)
 	}
 	return &http.Server{

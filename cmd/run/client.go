@@ -52,6 +52,7 @@ func runClient(_ *cobra.Command, _ []string) error {
 			return coordinateClientSignals(c.Start, c.Shutdown, c.Stop, signals, func() { signal.Stop(signals) })
 		},
 		c.Stop,
+		signals,
 		cfg.AdminAddress,
 		c.Ready,
 		newClientCollector(c.Snapshot),
@@ -64,9 +65,15 @@ func runClient(_ *cobra.Command, _ []string) error {
 	return nil
 }
 
-func runClientComponents(run, stop func() error, adminAddr string, ready func() bool, collector prometheus.Collector) error {
-	adminServer, adminListener, err := newAdminServer(adminAddr, ready, collector)
+func runClientComponents(run, stop func() error, signals chan os.Signal, adminAddr string, ready func() bool, collector prometheus.Collector) error {
+	bindCtx, stopBindSignals := clientAdminBindContext(signals)
+	adminServer, adminListener, err := newAdminServer(bindCtx, adminAddr, ready, collector)
+	bindCanceled := err != nil && bindCtx.Err() != nil && errors.Is(err, context.Cause(bindCtx))
+	stopBindSignals()
 	if err != nil {
+		if bindCanceled {
+			return run()
+		}
 		return err
 	}
 	if adminServer == nil {
@@ -103,6 +110,36 @@ func runClientComponents(run, stop func() error, adminAddr string, ready func() 
 			adminErr = errors.Join(adminErr, fmt.Errorf("shutdown admin: %w", shutdownErr))
 		}
 		return errors.Join(adminErr, stopErr, clientErr)
+	}
+}
+
+func clientAdminBindContext(signals chan os.Signal) (context.Context, func()) {
+	signalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	bindCtx, cancelBind := context.WithCancel(signalCtx)
+
+	queued := make([]os.Signal, 0, cap(signals))
+drain:
+	for range cap(signals) {
+		select {
+		case sig := <-signals:
+			queued = append(queued, sig)
+		default:
+			break drain
+		}
+	}
+	for _, sig := range queued {
+		select {
+		case signals <- sig:
+		default:
+		}
+	}
+	if len(queued) != 0 {
+		cancelBind()
+	}
+
+	return bindCtx, func() {
+		stopSignals()
+		cancelBind()
 	}
 }
 
