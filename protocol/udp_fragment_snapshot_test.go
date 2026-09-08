@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strconv"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -40,6 +41,33 @@ func TestShardedFragmentAssemblerSnapshotCapacityReasons(t *testing.T) {
 	if got := assembler.Snapshot(); got != want {
 		t.Fatalf("Snapshot() after Close = %+v, want %+v", got, want)
 	}
+}
+
+func TestShardedFragmentAssemblerSnapshotExpiration(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		assembler := NewShardedFragmentAssembler(1)
+		defer assembler.Close()
+		if _, err := assembler.AddFragment(1, 1, 0, 2, []byte("fragment")); err != nil {
+			t.Fatal(err)
+		}
+		want := FragmentSnapshot{RetainedGroups: 1, RetainedBackingBytes: int64(FragmentBufferSize)}
+		if got := assembler.Snapshot(); got != want {
+			t.Fatalf("Snapshot() before expiration = %+v, want %+v", got, want)
+		}
+
+		synctest.Wait()
+		// Expiration requires age > FragmentTimeout, so allow two cleanup ticks.
+		time.Sleep(2 * FragmentTimeout)
+		synctest.Wait()
+		want = FragmentSnapshot{ExpiredGroups: 1}
+		if got := assembler.Snapshot(); got != want {
+			t.Fatalf("Snapshot() after expiration = %+v, want %+v", got, want)
+		}
+		assembler.Close()
+		if got := assembler.Snapshot(); got != want {
+			t.Fatalf("Snapshot() after Close = %+v, want %+v", got, want)
+		}
+	})
 }
 
 func TestFragmentSnapshotDoesNotWaitForShardLocks(t *testing.T) {
