@@ -12,6 +12,26 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
+func TestTransportSnapshotAddTraffic(t *testing.T) {
+	q := quic.ConnectionStats{
+		BytesSent: 100, BytesReceived: 200,
+		PacketsSent: 10, PacketsReceived: 20,
+		BytesLost: 30, PacketsLost: 3,
+	}
+	var got TransportSnapshot
+	got.addTraffic(q)
+	got.addTraffic(q)
+
+	want := TransportSnapshot{
+		SentBytes: 200, ReceivedBytes: 400,
+		SentPackets: 20, ReceivedPackets: 40,
+		LostBytes: 60, LostPackets: 6,
+	}
+	if got != want {
+		t.Fatalf("traffic snapshot = %+v, want %+v", got, want)
+	}
+}
+
 func TestTransportRetainsClosedConnections(t *testing.T) {
 	certServer := httptest.NewTLSServer(http.NotFoundHandler())
 	defer certServer.Close()
