@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"testing"
@@ -27,6 +28,73 @@ type relayBlockingReader struct {
 func (r relayBlockingReader) Read([]byte) (int, error) {
 	<-r.release
 	return 0, io.EOF
+}
+
+type copyWriterTo struct {
+	io.Reader
+	called bool
+	n      int64
+	err    error
+}
+
+func (r *copyWriterTo) WriteTo(io.Writer) (int64, error) {
+	r.called = true
+	return r.n, r.err
+}
+
+type copyReaderFrom struct {
+	io.Writer
+	called bool
+	n      int64
+	err    error
+}
+
+func (w *copyReaderFrom) ReadFrom(io.Reader) (int64, error) {
+	w.called = true
+	return w.n, w.err
+}
+
+type copyBufferReader struct {
+	io.Reader
+	bufferSize int
+}
+
+func (r *copyBufferReader) Read(p []byte) (int, error) {
+	r.bufferSize = len(p)
+	return r.Reader.Read(p)
+}
+
+func TestCopyBufferedDispatchAndPooledBuffer(t *testing.T) {
+	writerToErr := errors.New("writer-to error")
+	src := &copyWriterTo{n: 11, err: writerToErr}
+	dst := &copyReaderFrom{n: 22, err: errors.New("reader-from error")}
+	n, err := CopyBuffered(dst, src, false)
+	if n != 11 || !errors.Is(err, writerToErr) || !src.called || dst.called {
+		t.Fatalf("WriterTo path = (%d, %v, %t, %t), want (11, %v, true, false)", n, err, src.called, dst.called, writerToErr)
+	}
+
+	readerFromErr := errors.New("reader-from error")
+	dst = &copyReaderFrom{n: 13, err: readerFromErr}
+	n, err = CopyBuffered(dst, relayErrorReader{err: errors.New("unexpected read")}, false)
+	if n != 13 || !errors.Is(err, readerFromErr) || !dst.called {
+		t.Fatalf("ReaderFrom path = (%d, %v, %t), want (13, %v, true)", n, err, dst.called, readerFromErr)
+	}
+
+	var copied bytes.Buffer
+	pooledSrc := &copyBufferReader{Reader: bytes.NewBufferString("payload")}
+	n, err = CopyBuffered(struct{ io.Writer }{&copied}, pooledSrc, false)
+	if n != 7 || err != nil || copied.String() != "payload" || pooledSrc.bufferSize != CopyBufferSize {
+		t.Fatalf("fallback path = (%d, %v, %q, %d), want (7, nil, %q, %d)", n, err, copied.String(), pooledSrc.bufferSize, "payload", CopyBufferSize)
+	}
+
+	copied.Reset()
+	pooledSrc = &copyBufferReader{Reader: bytes.NewBufferString("payload")}
+	src = &copyWriterTo{Reader: pooledSrc, n: 11, err: writerToErr}
+	dst = &copyReaderFrom{Writer: &copied, n: 13, err: readerFromErr}
+	n, err = CopyBuffered(dst, src, true)
+	if n != 7 || err != nil || copied.String() != "payload" || pooledSrc.bufferSize != CopyBufferSize || src.called || dst.called {
+		t.Fatalf("forced path = (%d, %v, %q, %d, %t, %t), want (7, nil, %q, %d, false, false)", n, err, copied.String(), pooledSrc.bufferSize, src.called, dst.called, "payload", CopyBufferSize)
+	}
 }
 
 func TestRelayLifecycleWaitsForBothDirections(t *testing.T) {

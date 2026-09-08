@@ -75,14 +75,22 @@ func PutCopyBuffer(buf *[]byte) {
 	copyBufferPool.Put(buf)
 }
 
-// CopyBuffered uses WriterTo or ReaderFrom when available, and a pooled 512KB buffer otherwise.
+type readerOnly struct{ io.Reader }
+type writerOnly struct{ io.Writer }
+
+// CopyBuffered uses WriterTo or ReaderFrom when available, unless forcePooledBuffer requires the pooled 512KB buffer.
 // Returns the number of bytes copied and any error encountered.
-func CopyBuffered(dst io.Writer, src io.Reader) (int64, error) {
-	if wt, ok := src.(io.WriterTo); ok {
-		return wt.WriteTo(dst)
-	}
-	if rf, ok := dst.(io.ReaderFrom); ok {
-		return rf.ReadFrom(src)
+func CopyBuffered(dst io.Writer, src io.Reader, forcePooledBuffer bool) (int64, error) {
+	if !forcePooledBuffer {
+		if wt, ok := src.(io.WriterTo); ok {
+			return wt.WriteTo(dst)
+		}
+		if rf, ok := dst.(io.ReaderFrom); ok {
+			return rf.ReadFrom(src)
+		}
+	} else {
+		dst = writerOnly{dst}
+		src = readerOnly{src}
 	}
 	bufPtr := GetCopyBuffer()
 	defer PutCopyBuffer(bufPtr)
@@ -108,7 +116,7 @@ func StartRelay(a, b io.ReadWriter, onAToBComplete, onBToAComplete func(error) e
 
 func (r *RelayLifecycle) copy(index int, dst io.Writer, src io.Reader, onComplete func(error) error) {
 	defer r.wg.Done()
-	_, copyErr := CopyBuffered(dst, src)
+	_, copyErr := CopyBuffered(dst, src, true)
 	var callbackErr error
 	if onComplete != nil {
 		callbackErr = onComplete(copyErr)
