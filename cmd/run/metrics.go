@@ -155,13 +155,10 @@ func newServerCollector(snapshot func() server.Snapshot) prometheus.Collector {
 	c.defineFragments("listener")
 	c.defineUDP("listener")
 	for name, help := range map[string]string{
-		"route_ready":                                 "Whether this configured traffic route is ready.",
-		"route_listening":                             "Whether the traffic manager is running for this configured route.",
-		"quic_handshakes":                             "Pre-accept QUIC handshakes currently owned.",
-		"quic_handshakes_high_water":                  "Lifetime peak concurrent pre-accept QUIC handshakes.",
-		"quic_handshake_accounting_faults_total":      "Internal handshake ownership accounting faults.",
-		"pending_registrations":                       "Accepted connections whose registration has not committed.",
-		"healthy_clients":                             "Healthy currently registered client generations, irrespective of protocol capability.",
+		"route_ready":           "Whether this configured traffic route is ready.",
+		"route_listening":       "Whether the traffic manager is running for this configured route.",
+		"pending_registrations": "Accepted connections whose registration has not committed.",
+		"healthy_clients":       "Healthy currently registered client generations, irrespective of protocol capability.",
 		"oldest_heartbeat_received_timestamp_seconds": "Oldest last received heartbeat among current registered generations; zero if none has received one.",
 		"pool_accounting_faults_total":                "Internal connection pool accounting faults.",
 		"tcp_flow_connections":                        "Total admitted TCP flows, including setup and active relay ownership.",
@@ -198,9 +195,6 @@ func newServerCollector(snapshot func() server.Snapshot) prometheus.Collector {
 			c.gauge(ch, "route_listening", number(r.Listening), l)
 			c.gauge(ch, "eligible_clients", float64(r.TCPEligibleClients), l, "tcp")
 			c.gauge(ch, "eligible_clients", float64(r.UDPEligibleClients), l, "udp")
-			c.gauge(ch, "quic_handshakes", float64(r.Handshake.Current), l)
-			c.gauge(ch, "quic_handshakes_high_water", float64(r.Handshake.HighWater), l)
-			c.counter(ch, "quic_handshake_accounting_faults_total", r.Handshake.AccountingFaults, l)
 			p := r.PoolCapacity
 			c.transport(ch, p.QUIC, l)
 			c.operation(ch, "registration", p.Registrations, l)

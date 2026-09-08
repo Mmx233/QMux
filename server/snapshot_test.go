@@ -2,6 +2,7 @@ package server
 
 import (
 	"net"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -12,6 +13,42 @@ import (
 	"github.com/Mmx233/QMux/server/traffic"
 	"github.com/rs/zerolog"
 )
+
+func TestRouteSnapshotIncludesPoolCapacity(t *testing.T) {
+	const addr = "route"
+	p := pool.New(addr, pool.NewRoundRobinBalancer(), zerolog.Nop())
+	defer p.Stop()
+	pending := p.BeginPending()
+	defer p.Abort(pending)
+
+	s := &Server{
+		config: &config.Server{Listeners: []config.QuicListener{{QuicAddr: addr, Protocol: "tcp"}}},
+		pools:  map[string]*pool.ConnectionPool{addr: p},
+	}
+	route := s.Snapshot().Routes[0]
+	if !reflect.DeepEqual(route.PoolCapacity, pool.CapacitySnapshot{
+		ServerPending: 1,
+		PendingRegistrations: pool.LimitSnapshot{
+			Current:   1,
+			HighWater: 1,
+			Limit:     config.DefaultMaxPendingRegistrations,
+		},
+		ClientGenerations: pool.LimitSnapshot{
+			Limit: config.DefaultMaxClientGenerations,
+		},
+		TCPConnectionsPerGeneration: pool.LimitSnapshot{
+			Limit: config.DefaultMaxTCPConnectionsPerGeneration,
+		},
+		PendingTCPSetupsPerGeneration: pool.LimitSnapshot{
+			Limit: config.DefaultMaxPendingTCPSetupsPerGeneration,
+		},
+		UDPSessionsPerGeneration: pool.LimitSnapshot{
+			Limit: config.DefaultMaxUDPSessionsPerGeneration,
+		},
+	}) {
+		t.Fatalf("PoolCapacity = %+v", route.PoolCapacity)
+	}
+}
 
 func TestNewValidatesListenersBeforeCertificates(t *testing.T) {
 	if _, err := New(nil); err == nil || !strings.Contains(err.Error(), "server config is nil") {

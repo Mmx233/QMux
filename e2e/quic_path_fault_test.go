@@ -519,7 +519,7 @@ func pathStateMatches(
 		pool.TCPConnectionsPerGeneration.Current == 1 && pool.TCPConnectionsPerGeneration.CapacityDrops == 0 &&
 		pool.PendingTCPSetupsPerGeneration.Current == 0 && pool.PendingTCPSetupsPerGeneration.CapacityDrops == 0 &&
 		pool.UDPSessionsPerGeneration.Current == 1 && pool.UDPSessionsPerGeneration.HighWater == 1 &&
-		pool.UDPSessionsPerGeneration.CapacityDrops == 0 && route.Handshake.Current == 0 && route.Handshake.AccountingFaults == 0 &&
+		pool.UDPSessionsPerGeneration.CapacityDrops == 0 &&
 		udp.SessionsCurrent == 1 && udp.SessionPermits == 1 && udp.SessionHighWater == 1 &&
 		udp.ListenerCapacityDrops == 0 && udp.GenerationCapacityDrops == 0 && udp.AccountingFaults == 0 &&
 		serverDSendMatches && udp.DSendWorkers == 1 &&

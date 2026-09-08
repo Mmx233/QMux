@@ -20,8 +20,6 @@ import (
 	"github.com/Mmx233/QMux/server/tls/stek"
 	"github.com/Mmx233/QMux/server/traffic"
 	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/qlog"
-	"github.com/quic-go/quic-go/qlogwriter"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
@@ -37,7 +35,6 @@ const (
 type Server struct {
 	config               *config.Server
 	pools                map[string]*pool.ConnectionPool // quicAddr -> pool
-	handshakes           map[string]*handshakeStats      // quicAddr -> pre-Accept handshakes
 	trafficManager       *traffic.Manager
 	authenticator        auth.Auth
 	registrationTimeout  time.Duration
@@ -61,89 +58,8 @@ type RouteSnapshot struct {
 	UDPEligibleClients int
 	TCPAdmission       traffic.TCPAdmissionSnapshot
 	UDPAdmission       traffic.UDPAdmissionSnapshot
-	Handshake          HandshakeSnapshot
 	PoolCapacity       pool.CapacitySnapshot
 	Ready              bool
-}
-
-// HandshakeSnapshot is a point-in-time, value-only view of pre-Accept QUIC
-// handshakes for one listener.
-type HandshakeSnapshot struct {
-	Current          int64
-	HighWater        int64
-	AccountingFaults uint64
-}
-
-type handshakeStats struct {
-	mu               sync.Mutex
-	current          int64
-	highWater        int64
-	accountingFaults uint64
-}
-
-func (s *handshakeStats) snapshot() HandshakeSnapshot {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return HandshakeSnapshot{
-		Current:          s.current,
-		HighWater:        s.highWater,
-		AccountingFaults: s.accountingFaults,
-	}
-}
-
-func (s *handshakeStats) start() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.current++
-	s.highWater = max(s.highWater, s.current)
-}
-
-func (s *handshakeStats) finish() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.current == 0 {
-		s.accountingFaults++
-		return
-	}
-	s.current--
-}
-
-func (s *handshakeStats) tracer(context.Context, bool, quic.ConnectionID) qlogwriter.Trace {
-	return &handshakeTrace{stats: s}
-}
-
-type handshakeTrace struct {
-	stats *handshakeStats
-	start sync.Once
-	end   sync.Once
-}
-
-func (t *handshakeTrace) AddProducer() qlogwriter.Recorder {
-	t.start.Do(t.stats.start)
-	return &handshakeRecorder{trace: t}
-}
-
-func (*handshakeTrace) SupportsSchemas(string) bool { return true }
-
-func (t *handshakeTrace) finish() {
-	t.end.Do(t.stats.finish)
-}
-
-type handshakeRecorder struct {
-	trace *handshakeTrace
-	once  sync.Once
-}
-
-func (r *handshakeRecorder) RecordEvent(event qlogwriter.Event) {
-	switch event.(type) {
-	case qlog.ALPNInformation, *qlog.ALPNInformation:
-		r.trace.finish()
-	}
-}
-
-func (r *handshakeRecorder) Close() error {
-	r.once.Do(r.trace.finish)
-	return nil
 }
 
 type registrationAckWriter func(
@@ -230,7 +146,6 @@ func New(conf *config.Server) (*Server, error) {
 
 	// Create connection pools for each listener
 	pools := make(map[string]*pool.ConnectionPool) // quicAddr -> pool
-	handshakes := make(map[string]*handshakeStats, len(ownedConfig.Listeners))
 	for _, listener := range ownedConfig.Listeners {
 		var balancer pool.LoadBalancer
 		switch ownedConfig.LoadBalancer {
@@ -242,7 +157,6 @@ func New(conf *config.Server) (*Server, error) {
 		p := pool.NewWithLimits(listener.QuicAddr, balancer, logger, poolLimitsFromCapacity(listener.Capacity))
 
 		pools[listener.QuicAddr] = p
-		handshakes[listener.QuicAddr] = &handshakeStats{}
 		logger.Info().
 			Str("quic_addr", listener.QuicAddr).
 			Str("balancer", balancer.Name()).
@@ -252,7 +166,6 @@ func New(conf *config.Server) (*Server, error) {
 	srv := &Server{
 		config:               &ownedConfig,
 		pools:                pools,
-		handshakes:           handshakes,
 		authenticator:        authenticator,
 		registrationTimeout:  registrationTimeout,
 		writeRegistrationAck: protocol.WriteRegisterAckWithAuth,
@@ -345,9 +258,6 @@ func (s *Server) Snapshot() Snapshot {
 				route.UDPEligibleClients = connectionPool.EligibleCount("udp")
 				route.Ready = listening && route.TCPEligibleClients > 0 && route.UDPEligibleClients > 0
 			}
-		}
-		if handshakes := s.handshakes[listener.QuicAddr]; handshakes != nil {
-			route.Handshake = handshakes.snapshot()
 		}
 		snapshot.Routes = append(snapshot.Routes, route)
 		snapshot.Ready = snapshot.Ready && route.Ready
@@ -549,11 +459,6 @@ func (s *Server) startListener(ctx context.Context, listenerConf config.QuicList
 
 	// Get QUIC config
 	quicConf := listenerConf.GetConfig()
-	handshakes := s.handshakes[listenerConf.QuicAddr]
-	if handshakes == nil {
-		handshakes = &handshakeStats{}
-	}
-	quicConf.Tracer = handshakes.tracer
 
 	// Create QUIC transport
 	tr := quic.Transport{

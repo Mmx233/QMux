@@ -584,8 +584,7 @@ func TestSessionTicketRotationModeLogs(t *testing.T) {
 						SessionTicketEncryptionKeyRotationOverlap:  test.overlap,
 					},
 				},
-				handshakes: make(map[string]*handshakeStats),
-				logger:     zerolog.New(capture),
+				logger: zerolog.New(capture),
 			}
 			listener := config.QuicListener{
 				QuicAddr: "127.0.0.1:0", TrafficAddr: "127.0.0.1:0", Protocol: "tcp",
