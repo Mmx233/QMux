@@ -20,7 +20,7 @@ type fragmentLifecycleHarness struct {
 func fragmentLifecycleHarnesses() map[string]func() fragmentLifecycleHarness {
 	return map[string]func() fragmentLifecycleHarness{
 		"regular": func() fragmentLifecycleHarness {
-			assembler := NewFragmentAssembler()
+			assembler := NewFragmentAssembler(0, 0)
 			return fragmentLifecycleHarness{
 				add: func() ([]byte, error) {
 					return assembler.AddFragment(1, 7, 0, 2, []byte("pending"))
@@ -42,7 +42,7 @@ func fragmentLifecycleHarnesses() map[string]func() fragmentLifecycleHarness {
 			}
 		},
 		"sharded": func() fragmentLifecycleHarness {
-			assembler := NewShardedFragmentAssembler(4)
+			assembler := NewShardedFragmentAssembler(4, 0, 0)
 			return fragmentLifecycleHarness{
 				add: func() ([]byte, error) {
 					return assembler.AddFragment(1, 7, 0, 2, []byte("pending"))

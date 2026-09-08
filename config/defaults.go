@@ -26,15 +26,22 @@ const (
 	// DefaultSessionTicketEncryptionKeyRotationOverlap is the default number of old keys retained.
 	DefaultSessionTicketEncryptionKeyRotationOverlap uint8 = 7
 
-	DefaultMaxClientGenerations             = 16
-	DefaultMaxPendingRegistrations          = 128
-	DefaultMaxTCPConnections                = 128
-	DefaultMaxPendingTCPSetups              = 128
-	DefaultMaxTCPConnectionsPerGeneration   = 100
-	DefaultMaxPendingTCPSetupsPerGeneration = 16
-	DefaultMaxUDPSessions                   = 1024
-	DefaultMaxUDPSessionsPerGeneration      = 256
-	DefaultMaxLocalUDPSessions              = 256
+	DefaultMaxClientGenerations                              = 16
+	DefaultMaxPendingRegistrations                           = 128
+	DefaultMaxTCPConnections                                 = 128
+	DefaultMaxPendingTCPSetups                               = 128
+	DefaultMaxTCPConnectionsPerGeneration                    = 100
+	DefaultMaxPendingTCPSetupsPerGeneration                  = 16
+	DefaultMaxUDPSessions                                    = 1024
+	DefaultMaxUDPSessionsPerGeneration                       = 256
+	DefaultMaxLocalUDPSessions                               = 256
+	DefaultTCPCopyBufferSize                                 = 128 << 10
+	DefaultMaxUDPFragmentGroupsPerHandler                    = 4096
+	DefaultMaxUDPFragmentBackingBytesPerHandler        int64 = 64 << 20
+	DefaultMaxUDPSenderQueuedFramesPerGeneration             = 256
+	DefaultMaxUDPSenderQueuedBackingBytesPerGeneration int64 = 512 << 10
+	DefaultMaxUDPFragmentGroups                              = 4096
+	DefaultMaxUDPFragmentBackingBytes                  int64 = 64 << 20
 )
 
 // DefaultCapabilities lists the default supported protocols

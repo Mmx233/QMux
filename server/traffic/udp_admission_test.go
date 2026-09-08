@@ -20,6 +20,9 @@ import (
 func newUDPAdmissionUnitHandler(p *pool.ConnectionPool, limit int) *UDPHandler {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &UDPHandler{
+		maxSenderQueuedFrames:       int64(config.DefaultMaxUDPSenderQueuedFramesPerGeneration),
+		maxSenderQueuedBackingBytes: config.DefaultMaxUDPSenderQueuedBackingBytesPerGeneration,
+
 		pool:         p,
 		ctx:          ctx,
 		cancel:       cancel,
@@ -81,7 +84,10 @@ func TestUDPProcessPacketCanonicalMappedHit(t *testing.T) {
 	session := &UDPSession{id: 7, clientAddr: native, client: client, sender: sender}
 	session.lastActive.Store(1)
 	client.ActiveConns.Store(1)
-	handler := &UDPHandler{ctx: handlerCtx, logger: zerolog.Nop(), enableFragmentation: true}
+	handler := &UDPHandler{
+		maxSenderQueuedFrames:       int64(config.DefaultMaxUDPSenderQueuedFramesPerGeneration),
+		maxSenderQueuedBackingBytes: config.DefaultMaxUDPSenderQueuedBackingBytesPerGeneration,
+		ctx:                         handlerCtx, logger: zerolog.Nop(), enableFragmentation: true}
 	handler.nextSessionID.Store(19)
 	handler.sessions.Store(native, session)
 	handler.sessionsByID.Store(session.id, session)
@@ -142,8 +148,14 @@ func TestUDPAdmissionListenerLimitWiring(t *testing.T) {
 		QuicAddr:    quicAddr,
 		TrafficAddr: "127.0.0.1:0",
 		Protocol:    "udp",
-		Capacity:    config.ListenerCapacity{MaxUDPSessions: 2},
-	}}}, map[string]*pool.ConnectionPool{quicAddr: connectionPool}, zerolog.Nop())
+		Capacity: config.ListenerCapacity{
+			MaxUDPSessions:                              2,
+			MaxUDPSenderQueuedFramesPerGeneration:       math.MaxInt,
+			MaxUDPSenderQueuedBackingBytesPerGeneration: 2 * int64(protocol.DatagramBufferSize),
+			MaxUDPFragmentGroups:                        1,
+			MaxUDPFragmentBackingBytes:                  int64(protocol.FragmentBufferSize),
+		},
+	}}}, map[string]*pool.ConnectionPool{quicAddr: connectionPool}, newTestCopyBufferPool(), zerolog.Nop())
 	if err := manager.Start(ctx); err != nil {
 		cancel()
 		t.Fatalf("start UDP admission manager: %v", err)
@@ -158,6 +170,19 @@ func TestUDPAdmissionListenerLimitWiring(t *testing.T) {
 	}
 	if snapshot := manager.UDPAdmissionSnapshots()[0]; snapshot.SessionLimit != 2 {
 		t.Fatalf("UDP snapshot session limit = %d, want 2", snapshot.SessionLimit)
+	}
+	handler := listener.udpHandler
+	if handler.maxSenderQueuedFrames != int64(math.MaxInt) ||
+		handler.maxSenderQueuedBackingBytes != 2*int64(protocol.DatagramBufferSize) ||
+		handler.senderFrameLimit() != 2 {
+		t.Fatalf("sender limits = %d/%d (effective %d)", handler.maxSenderQueuedFrames,
+			handler.maxSenderQueuedBackingBytes, handler.senderFrameLimit())
+	}
+	if _, err := handler.fragmentAssembler.AddFragment(1, 1, 0, 2, []byte("accepted")); err != nil {
+		t.Fatalf("first configured fragment group: %v", err)
+	}
+	if _, err := handler.fragmentAssembler.AddFragment(2, 1, 0, 2, []byte("rejected")); !errors.Is(err, protocol.ErrFragmentAssemblerFull) {
+		t.Fatalf("second configured fragment group error = %v, want %v", err, protocol.ErrFragmentAssemblerFull)
 	}
 }
 
@@ -304,7 +329,7 @@ func TestUDPAdmissionEpochExhaustionCleansCandidateAndKeepsExistingSession(t *te
 	handler := newUDPAdmissionUnitHandler(connectionPool, 2)
 	handler.packetConn = packetConn
 	handler.enableFragmentation = true
-	handler.fragmentAssembler = protocol.NewShardedFragmentAssembler(protocol.DefaultShardCount)
+	handler.fragmentAssembler = protocol.NewShardedFragmentAssembler(protocol.DefaultShardCount, 0, 0)
 	handler.senders = make(map[*pool.ClientConn]*udpSender)
 	handler.epochAllocator.Store(math.MaxUint32 - 1)
 	defer func() {

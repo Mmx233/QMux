@@ -219,7 +219,7 @@ func startRelayLifecycleManager(
 		QuicAddr:    quicAddr,
 		TrafficAddr: "127.0.0.1:0",
 		Protocol:    "tcp",
-	}}}, map[string]*pool.ConnectionPool{quicAddr: connectionPool}, zerolog.Nop())
+	}}}, map[string]*pool.ConnectionPool{quicAddr: connectionPool}, newTestCopyBufferPool(), zerolog.Nop())
 	t.Cleanup(func() {
 		cancelManager()
 		manager.Stop()

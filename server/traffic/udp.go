@@ -17,10 +17,8 @@ import (
 )
 
 const (
-	udpSessionTimeout         = 5 * time.Minute
-	udpCleanupInterval        = 30 * time.Second
-	maxUDPSenderQueuedFrames  = 256
-	maxUDPSenderQueuedBacking = 512 << 10
+	udpSessionTimeout  = 5 * time.Minute
+	udpCleanupInterval = 30 * time.Second
 )
 
 var (
@@ -169,11 +167,13 @@ type UDPHandler struct {
 	ctx                 context.Context
 	cancel              context.CancelFunc
 
-	nextSessionID  atomic.Uint32
-	epochAllocator atomic.Uint32
-	sessionLimit   int64
-	sessionSlots   chan struct{}
-	sessionStats   udpSessionStats
+	nextSessionID               atomic.Uint32
+	epochAllocator              atomic.Uint32
+	sessionLimit                int64
+	sessionSlots                chan struct{}
+	sessionStats                udpSessionStats
+	maxSenderQueuedFrames       int64
+	maxSenderQueuedBackingBytes int64
 
 	fragmentAssembler   *protocol.ShardedFragmentAssembler
 	closeOnce           sync.Once
@@ -248,18 +248,24 @@ func (l *Listener) startUDPHandler() {
 	conn := l.UDPConn.(*net.UDPConn)
 	ctx, cancel := context.WithCancel(l.ctx)
 	handler := &UDPHandler{
-		pool:                l.Pool,
-		packetConn:          conn,
-		addr:                l.Addr,
-		enableFragmentation: l.EnableFragmentation,
-		logger:              l.logger,
-		ctx:                 ctx,
-		cancel:              cancel,
-		sessionLimit:        int64(l.udpSessionLimit),
-		sessionSlots:        make(chan struct{}, l.udpSessionLimit),
-		fragmentAssembler:   protocol.NewShardedFragmentAssembler(protocol.DefaultShardCount),
-		receivers:           make(map[*quic.Conn]struct{}),
-		senders:             make(map[*pool.ClientConn]*udpSender),
+		pool:                        l.Pool,
+		packetConn:                  conn,
+		addr:                        l.Addr,
+		enableFragmentation:         l.EnableFragmentation,
+		logger:                      l.logger,
+		ctx:                         ctx,
+		cancel:                      cancel,
+		sessionLimit:                int64(l.udpSessionLimit),
+		sessionSlots:                make(chan struct{}, l.udpSessionLimit),
+		maxSenderQueuedFrames:       int64(l.udpSenderQueuedFramesPerGeneration),
+		maxSenderQueuedBackingBytes: l.udpSenderQueuedBackingBytesPerGeneration,
+		fragmentAssembler: protocol.NewShardedFragmentAssembler(
+			protocol.DefaultShardCount,
+			l.udpFragmentGroups,
+			l.udpFragmentBackingBytes,
+		),
+		receivers: make(map[*quic.Conn]struct{}),
+		senders:   make(map[*pool.ClientConn]*udpSender),
 	}
 	l.udpHandler = handler
 
@@ -536,13 +542,17 @@ func (h *UDPHandler) senderFor(client *pool.ClientConn) *udpSender {
 
 	sender := &udpSender{
 		client: client,
-		queue:  make(chan udpSendBatch, maxUDPSenderQueuedFrames),
+		queue:  make(chan udpSendBatch, int(h.senderFrameLimit())),
 		done:   make(chan struct{}),
 	}
 	h.senders[client] = sender
 	h.senderWG.Add(1)
 	go h.runSender(sender)
 	return sender
+}
+
+func (h *UDPHandler) senderFrameLimit() int64 {
+	return min(h.maxSenderQueuedFrames, h.maxSenderQueuedBackingBytes/int64(protocol.DatagramBufferSize))
 }
 
 func (h *UDPHandler) enqueueSender(sender *udpSender, batch udpSendBatch) udpEnqueueResult {
@@ -556,12 +566,12 @@ func (h *UDPHandler) enqueueSenderLocked(sender *udpSender, batch udpSendBatch) 
 	if sender.stopped.Load() {
 		return udpSenderUnavailable
 	}
-	nextFrames := sender.ownedFrames + frames
-	if nextFrames > maxUDPSenderQueuedFrames ||
-		nextFrames*int64(protocol.DatagramBufferSize) > maxUDPSenderQueuedBacking {
+	effectiveLimit := h.senderFrameLimit()
+	if frames > effectiveLimit-sender.ownedFrames {
 		return udpQueueFull
 	}
 
+	nextFrames := sender.ownedFrames + frames
 	sender.ownedFrames = nextFrames
 	select {
 	case sender.queue <- batch:

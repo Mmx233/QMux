@@ -60,7 +60,7 @@ func TestFragmentReassemblyRoundTrip_OutOfOrder_Property(t *testing.T) {
 			order[i], order[j] = order[j], order[i]
 		}
 
-		assembler := NewShardedFragmentAssembler(16)
+		assembler := NewShardedFragmentAssembler(16, 0, 0)
 		defer assembler.Close()
 		var got []byte
 		for _, i := range order {

@@ -75,7 +75,7 @@ func startTCPAdmissionManagerWithCapacity(
 		TrafficAddr: "127.0.0.1:0",
 		Protocol:    "tcp",
 		Capacity:    capacity,
-	}}}, map[string]*pool.ConnectionPool{quicAddr: connectionPool}, zerolog.Nop())
+	}}}, map[string]*pool.ConnectionPool{quicAddr: connectionPool}, newTestCopyBufferPool(), zerolog.Nop())
 	t.Cleanup(func() {
 		cancel()
 		manager.Stop()
@@ -113,15 +113,16 @@ func startTCPFallbackSetup(t *testing.T, ctx context.Context, primaryWindow uint
 	}
 	listenerCtx, cancelListener := context.WithCancel(context.Background())
 	listener := &Listener{
-		Addr:          strings.Repeat("destination", 8*1024),
-		Pool:          connectionPool,
-		ctx:           listenerCtx,
-		cancel:        cancelListener,
-		logger:        zerolog.Nop(),
-		flows:         make(map[*tcpFlow]struct{}),
-		tcpFlowLimit:  config.DefaultMaxTCPConnections,
-		tcpSetupLimit: config.DefaultMaxPendingTCPSetups,
-		tcpSetupSlots: make(chan struct{}, config.DefaultMaxPendingTCPSetups),
+		Addr:           strings.Repeat("destination", 8*1024),
+		Pool:           connectionPool,
+		copyBufferPool: newTestCopyBufferPool(),
+		ctx:            listenerCtx,
+		cancel:         cancelListener,
+		logger:         zerolog.Nop(),
+		flows:          make(map[*tcpFlow]struct{}),
+		tcpFlowLimit:   config.DefaultMaxTCPConnections,
+		tcpSetupLimit:  config.DefaultMaxPendingTCPSetups,
+		tcpSetupSlots:  make(chan struct{}, config.DefaultMaxPendingTCPSetups),
 	}
 	t.Cleanup(listener.close)
 	return &tcpFallbackSetup{
@@ -276,15 +277,16 @@ func startBlockedNewConn(
 	listenerCtx, cancelListener := context.WithCancel(context.Background())
 	t.Cleanup(cancelListener)
 	listener := &Listener{
-		Addr:          strings.Repeat("destination", 8*1024),
-		Pool:          connectionPool,
-		ctx:           listenerCtx,
-		cancel:        cancelListener,
-		logger:        zerolog.Nop(),
-		flows:         make(map[*tcpFlow]struct{}),
-		tcpFlowLimit:  config.DefaultMaxTCPConnections,
-		tcpSetupLimit: config.DefaultMaxPendingTCPSetups,
-		tcpSetupSlots: make(chan struct{}, config.DefaultMaxPendingTCPSetups),
+		Addr:           strings.Repeat("destination", 8*1024),
+		Pool:           connectionPool,
+		copyBufferPool: newTestCopyBufferPool(),
+		ctx:            listenerCtx,
+		cancel:         cancelListener,
+		logger:         zerolog.Nop(),
+		flows:          make(map[*tcpFlow]struct{}),
+		tcpFlowLimit:   config.DefaultMaxTCPConnections,
+		tcpSetupLimit:  config.DefaultMaxPendingTCPSetups,
+		tcpSetupSlots:  make(chan struct{}, config.DefaultMaxPendingTCPSetups),
 	}
 	release, ok := listener.acquireTCPSetup()
 	if !ok {

@@ -127,7 +127,7 @@ func runUDPHandlerResolverChild(t *testing.T) {
 	}
 
 	budget := newUDPSessionBudget(1)
-	handler := newUDPHandler("lif002-client.qmux.invalid", 9, true, zerolog.Nop(), budget)
+	handler := newUDPHandler("lif002-client.qmux.invalid", 9, true, config.DefaultMaxUDPFragmentGroupsPerHandler, config.DefaultMaxUDPFragmentBackingBytesPerHandler, zerolog.Nop(), budget)
 	handler.ctx, handler.cancel = context.WithCancel(context.Background())
 	handler.started = true
 	go func() {
@@ -150,7 +150,7 @@ func runUDPHandlerResolverChild(t *testing.T) {
 }
 
 func TestUDPDecodeErrorsIgnoreClosedAssembler(t *testing.T) {
-	handler := NewUDPHandler("127.0.0.1", 1, true, zerolog.Nop())
+	handler := NewUDPHandler("127.0.0.1", 1, true, config.DefaultMaxUDPFragmentGroupsPerHandler, config.DefaultMaxUDPFragmentBackingBytesPerHandler, zerolog.Nop())
 	t.Cleanup(handler.Stop)
 	var fragmentSequence uint32
 	datagrams, err := protocol.FragmentUDP(1, 1, make([]byte, protocol.MaxUDPPayload+1), &fragmentSequence, true)
@@ -191,8 +191,8 @@ func TestUDPSessionBudgetBoundsSharedHandlersBeforeDial(t *testing.T) {
 	if !ok {
 		t.Fatal("initial UDP session budget acquisition failed")
 	}
-	first := newUDPHandler("invalid.invalid", 1, true, zerolog.Nop(), budget)
-	second := newUDPHandler("invalid.invalid", 1, true, zerolog.Nop(), budget)
+	first := newUDPHandler("invalid.invalid", 1, true, config.DefaultMaxUDPFragmentGroupsPerHandler, config.DefaultMaxUDPFragmentBackingBytesPerHandler, zerolog.Nop(), budget)
+	second := newUDPHandler("invalid.invalid", 1, true, config.DefaultMaxUDPFragmentGroupsPerHandler, config.DefaultMaxUDPFragmentBackingBytesPerHandler, zerolog.Nop(), budget)
 	t.Cleanup(first.Stop)
 	t.Cleanup(second.Stop)
 
@@ -308,7 +308,7 @@ func TestUDPHandlerCloseUsesExactSessionPointer(t *testing.T) {
 		_ = staleConn.Close()
 	})
 
-	handler := newUDPHandler("127.0.0.1", 1, true, zerolog.Nop(), budget)
+	handler := newUDPHandler("127.0.0.1", 1, true, config.DefaultMaxUDPFragmentGroupsPerHandler, config.DefaultMaxUDPFragmentBackingBytesPerHandler, zerolog.Nop(), budget)
 	t.Cleanup(handler.Stop)
 	stale := &UDPSession{id: 7, localConn: staleConn}
 	current := &UDPSession{id: 7, localConn: currentConn}
@@ -354,6 +354,8 @@ func TestUDPHandlerDuplicatePublicationReleasesLoser(t *testing.T) {
 		"127.0.0.1",
 		backend.LocalAddr().(*net.UDPAddr).Port,
 		true,
+		config.DefaultMaxUDPFragmentGroupsPerHandler,
+		config.DefaultMaxUDPFragmentBackingBytesPerHandler,
 		zerolog.Nop(),
 		budget,
 	)
@@ -409,7 +411,7 @@ func TestUDPHandlerRecreatesSameSessionIDWithIsolatedEpoch(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = backend.Close() })
-	handler := newUDPHandler("127.0.0.1", backend.LocalAddr().(*net.UDPAddr).Port, true, zerolog.Nop(), newUDPSessionBudget(1))
+	handler := newUDPHandler("127.0.0.1", backend.LocalAddr().(*net.UDPAddr).Port, true, config.DefaultMaxUDPFragmentGroupsPerHandler, config.DefaultMaxUDPFragmentBackingBytesPerHandler, zerolog.Nop(), newUDPSessionBudget(1))
 	handler.ctx = context.Background()
 	handler.started = true
 	defer handler.stopAndWait()
@@ -484,7 +486,7 @@ func TestUDPHandlerEpochExhaustionCleansCandidateAndKeepsExistingSession(t *test
 	}
 	t.Cleanup(func() { _ = backend.Close() })
 	budget := newUDPSessionBudget(2)
-	handler := newUDPHandler("127.0.0.1", backend.LocalAddr().(*net.UDPAddr).Port, true, zerolog.Nop(), budget)
+	handler := newUDPHandler("127.0.0.1", backend.LocalAddr().(*net.UDPAddr).Port, true, config.DefaultMaxUDPFragmentGroupsPerHandler, config.DefaultMaxUDPFragmentBackingBytesPerHandler, zerolog.Nop(), budget)
 	handler.ctx = context.Background()
 	handler.started = true
 	handler.epochAllocator.Store(math.MaxUint32 - 1)
@@ -528,7 +530,7 @@ func TestUDPHandlerReceivesLiteralWidenedFragmentsAndRejectsLegacy(t *testing.T)
 	}
 	t.Cleanup(func() { _ = backend.Close() })
 	clientConn, serverConn := newUDPHandlerQUICPair(t)
-	handler := NewUDPHandler("127.0.0.1", backend.LocalAddr().(*net.UDPAddr).Port, true, zerolog.Nop())
+	handler := NewUDPHandler("127.0.0.1", backend.LocalAddr().(*net.UDPAddr).Port, true, config.DefaultMaxUDPFragmentGroupsPerHandler, config.DefaultMaxUDPFragmentBackingBytesPerHandler, zerolog.Nop())
 	handler.Start(context.Background(), clientConn)
 	defer handler.stopAndWait()
 
@@ -591,7 +593,7 @@ func TestUDPHandlerReceivesLiteralWidenedFragmentsAndRejectsLegacy(t *testing.T)
 }
 
 func TestUDPHandlerStopBeforeStart(t *testing.T) {
-	handler := NewUDPHandler("127.0.0.1", 1, true, zerolog.Nop())
+	handler := NewUDPHandler("127.0.0.1", 1, true, config.DefaultMaxUDPFragmentGroupsPerHandler, config.DefaultMaxUDPFragmentBackingBytesPerHandler, zerolog.Nop())
 	handler.Stop()
 	handler.Stop()
 	handler.Start(context.Background(), nil)
@@ -621,6 +623,8 @@ func TestUDPHandlerStopJoinsBlockedReceiveSessionAndAssembler(t *testing.T) {
 		"127.0.0.1",
 		backend.LocalAddr().(*net.UDPAddr).Port,
 		true,
+		config.DefaultMaxUDPFragmentGroupsPerHandler,
+		config.DefaultMaxUDPFragmentBackingBytesPerHandler,
 		zerolog.Nop(),
 		budget,
 	)
@@ -691,7 +695,7 @@ func TestUDPHandlerStopJoinsBlockedReceiveSessionAndAssembler(t *testing.T) {
 
 func TestUDPHandlerReceiveTerminalErrorStopsWithoutWaitingForItself(t *testing.T) {
 	clientConn, serverConn := newUDPHandlerQUICPair(t)
-	handler := NewUDPHandler("127.0.0.1", 1, true, zerolog.Nop())
+	handler := NewUDPHandler("127.0.0.1", 1, true, config.DefaultMaxUDPFragmentGroupsPerHandler, config.DefaultMaxUDPFragmentBackingBytesPerHandler, zerolog.Nop())
 	handler.Start(context.Background(), clientConn)
 	if err := serverConn.CloseWithError(1, "terminal receive error"); err != nil {
 		t.Fatal(err)

@@ -9,11 +9,11 @@ import (
 
 // Buffer size constants for common message types
 const (
-	SmallBufferSize  = 256         // For heartbeats, errors
-	MediumBufferSize = 4096        // For typical messages
-	LargeBufferSize  = 65536       // For large payloads
-	CopyBufferSize   = 512 * 1024  // 512KB for data copy operations
-	MaxPooledBuffer  = 1024 * 1024 // 1MB - don't pool larger buffers
+	SmallBufferSize       = 256   // For heartbeats, errors
+	MediumBufferSize      = 4096  // For typical messages
+	LargeBufferSize       = 65536 // For large payloads
+	DefaultCopyBufferSize = 128 * 1024
+	MaxPooledBuffer       = 1024 * 1024 // 1MB - don't pool larger buffers
 )
 
 // bufferPool is a sync.Pool for reusing byte buffers to reduce allocations
@@ -23,12 +23,9 @@ var bufferPool = sync.Pool{
 	},
 }
 
-// copyBufferPool is a sync.Pool for reusing copy buffers
-var copyBufferPool = sync.Pool{
-	New: func() any {
-		buf := make([]byte, CopyBufferSize)
-		return &buf
-	},
+// CopyBufferPool reuses fixed-size TCP relay buffers.
+type CopyBufferPool struct {
+	pool sync.Pool
 }
 
 // GetBuffer retrieves a buffer from the pool.
@@ -62,25 +59,25 @@ func PutBuffer(buf *bytes.Buffer) {
 	bufferPool.Put(buf)
 }
 
-// GetCopyBuffer retrieves a copy buffer from the pool.
-func GetCopyBuffer() *[]byte {
-	return copyBufferPool.Get().(*[]byte)
-}
-
-// PutCopyBuffer returns a copy buffer to the pool.
-func PutCopyBuffer(buf *[]byte) {
-	if buf == nil {
-		return
+// NewCopyBufferPool creates an immutable fixed-size copy buffer pool.
+func NewCopyBufferPool(size int) *CopyBufferPool {
+	if size == 0 {
+		size = DefaultCopyBufferSize
 	}
-	copyBufferPool.Put(buf)
+	p := &CopyBufferPool{}
+	p.pool.New = func() any {
+		buf := make([]byte, size)
+		return &buf
+	}
+	return p
 }
 
 type readerOnly struct{ io.Reader }
 type writerOnly struct{ io.Writer }
 
-// CopyBuffered uses WriterTo or ReaderFrom when available, unless forcePooledBuffer requires the pooled 512KB buffer.
+// CopyBuffered uses WriterTo or ReaderFrom when available, unless forcePooledBuffer requires the pooled buffer.
 // Returns the number of bytes copied and any error encountered.
-func CopyBuffered(dst io.Writer, src io.Reader, forcePooledBuffer bool) (int64, error) {
+func (p *CopyBufferPool) CopyBuffered(dst io.Writer, src io.Reader, forcePooledBuffer bool) (int64, error) {
 	if !forcePooledBuffer {
 		if wt, ok := src.(io.WriterTo); ok {
 			return wt.WriteTo(dst)
@@ -92,8 +89,8 @@ func CopyBuffered(dst io.Writer, src io.Reader, forcePooledBuffer bool) (int64, 
 		dst = writerOnly{dst}
 		src = readerOnly{src}
 	}
-	bufPtr := GetCopyBuffer()
-	defer PutCopyBuffer(bufPtr)
+	bufPtr := p.pool.Get().(*[]byte)
+	defer p.pool.Put(bufPtr)
 	return io.CopyBuffer(dst, src, *bufPtr)
 }
 
@@ -104,19 +101,19 @@ type RelayLifecycle struct {
 }
 
 // StartRelay copies a to b and b to a, then runs each direction's callback.
-func StartRelay(a, b io.ReadWriter, onAToBComplete, onBToAComplete func(error) error) *RelayLifecycle {
+func (p *CopyBufferPool) StartRelay(a, b io.ReadWriter, onAToBComplete, onBToAComplete func(error) error) *RelayLifecycle {
 	relay := &RelayLifecycle{}
 	relay.wg.Add(2)
 
-	go relay.copy(0, b, a, onAToBComplete)
-	go relay.copy(1, a, b, onBToAComplete)
+	go relay.copy(p, 0, b, a, onAToBComplete)
+	go relay.copy(p, 1, a, b, onBToAComplete)
 
 	return relay
 }
 
-func (r *RelayLifecycle) copy(index int, dst io.Writer, src io.Reader, onComplete func(error) error) {
+func (r *RelayLifecycle) copy(pool *CopyBufferPool, index int, dst io.Writer, src io.Reader, onComplete func(error) error) {
 	defer r.wg.Done()
-	_, copyErr := CopyBuffered(dst, src, true)
+	_, copyErr := pool.CopyBuffered(dst, src, true)
 	var callbackErr error
 	if onComplete != nil {
 		callbackErr = onComplete(copyErr)

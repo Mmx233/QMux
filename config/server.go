@@ -17,10 +17,11 @@ import (
 )
 
 type Server struct {
-	AdminAddress string         `yaml:"admin_address"`
-	Listeners    []QuicListener `yaml:"listeners"`
-	Auth         ServerAuth     `yaml:"auth"`
-	TLS          ServerTLS      `yaml:"tls"`
+	AdminAddress      string         `yaml:"admin_address"`
+	Listeners         []QuicListener `yaml:"listeners"`
+	Auth              ServerAuth     `yaml:"auth"`
+	TLS               ServerTLS      `yaml:"tls"`
+	TCPCopyBufferSize int            `yaml:"tcp_copy_buffer_size"`
 
 	// Load balancer algorithm: "least-connections" (default) or "round-robin"
 	LoadBalancer string `yaml:"load_balancer"`
@@ -41,14 +42,18 @@ type QuicListener struct {
 
 // ListenerCapacity bounds resources owned by one server listener.
 type ListenerCapacity struct {
-	MaxClientGenerations             int `yaml:"max_client_generations"`
-	MaxPendingRegistrations          int `yaml:"max_pending_registrations"`
-	MaxTCPConnections                int `yaml:"max_tcp_connections"`
-	MaxPendingTCPSetups              int `yaml:"max_pending_tcp_setups"`
-	MaxTCPConnectionsPerGeneration   int `yaml:"max_tcp_connections_per_generation"`
-	MaxPendingTCPSetupsPerGeneration int `yaml:"max_pending_tcp_setups_per_generation"`
-	MaxUDPSessions                   int `yaml:"max_udp_sessions"`
-	MaxUDPSessionsPerGeneration      int `yaml:"max_udp_sessions_per_generation"`
+	MaxClientGenerations                        int   `yaml:"max_client_generations"`
+	MaxPendingRegistrations                     int   `yaml:"max_pending_registrations"`
+	MaxTCPConnections                           int   `yaml:"max_tcp_connections"`
+	MaxPendingTCPSetups                         int   `yaml:"max_pending_tcp_setups"`
+	MaxTCPConnectionsPerGeneration              int   `yaml:"max_tcp_connections_per_generation"`
+	MaxPendingTCPSetupsPerGeneration            int   `yaml:"max_pending_tcp_setups_per_generation"`
+	MaxUDPSessions                              int   `yaml:"max_udp_sessions"`
+	MaxUDPSessionsPerGeneration                 int   `yaml:"max_udp_sessions_per_generation"`
+	MaxUDPSenderQueuedFramesPerGeneration       int   `yaml:"max_udp_sender_queued_frames_per_generation"`
+	MaxUDPSenderQueuedBackingBytesPerGeneration int64 `yaml:"max_udp_sender_queued_backing_bytes_per_generation"`
+	MaxUDPFragmentGroups                        int   `yaml:"max_udp_fragment_groups"`
+	MaxUDPFragmentBackingBytes                  int64 `yaml:"max_udp_fragment_backing_bytes"`
 }
 
 // ApplyDefaults fills omitted or explicitly zero capacity limits.
@@ -79,6 +84,18 @@ func (c *ListenerCapacity) ApplyDefaults() {
 	if c.MaxUDPSessionsPerGeneration == 0 {
 		c.MaxUDPSessionsPerGeneration = DefaultMaxUDPSessionsPerGeneration
 	}
+	if c.MaxUDPSenderQueuedFramesPerGeneration == 0 {
+		c.MaxUDPSenderQueuedFramesPerGeneration = DefaultMaxUDPSenderQueuedFramesPerGeneration
+	}
+	if c.MaxUDPSenderQueuedBackingBytesPerGeneration == 0 {
+		c.MaxUDPSenderQueuedBackingBytesPerGeneration = DefaultMaxUDPSenderQueuedBackingBytesPerGeneration
+	}
+	if c.MaxUDPFragmentGroups == 0 {
+		c.MaxUDPFragmentGroups = DefaultMaxUDPFragmentGroups
+	}
+	if c.MaxUDPFragmentBackingBytes == 0 {
+		c.MaxUDPFragmentBackingBytes = DefaultMaxUDPFragmentBackingBytes
+	}
 }
 
 // Validate rejects negative limits. Zero means use the default.
@@ -87,16 +104,20 @@ func (c *ListenerCapacity) ApplyDefaults() {
 func (c ListenerCapacity) Validate(path string) error {
 	limits := []struct {
 		name  string
-		value int
+		value int64
 	}{
-		{"max_client_generations", c.MaxClientGenerations},
-		{"max_pending_registrations", c.MaxPendingRegistrations},
-		{"max_tcp_connections", c.MaxTCPConnections},
-		{"max_pending_tcp_setups", c.MaxPendingTCPSetups},
-		{"max_tcp_connections_per_generation", c.MaxTCPConnectionsPerGeneration},
-		{"max_pending_tcp_setups_per_generation", c.MaxPendingTCPSetupsPerGeneration},
-		{"max_udp_sessions", c.MaxUDPSessions},
-		{"max_udp_sessions_per_generation", c.MaxUDPSessionsPerGeneration},
+		{"max_client_generations", int64(c.MaxClientGenerations)},
+		{"max_pending_registrations", int64(c.MaxPendingRegistrations)},
+		{"max_tcp_connections", int64(c.MaxTCPConnections)},
+		{"max_pending_tcp_setups", int64(c.MaxPendingTCPSetups)},
+		{"max_tcp_connections_per_generation", int64(c.MaxTCPConnectionsPerGeneration)},
+		{"max_pending_tcp_setups_per_generation", int64(c.MaxPendingTCPSetupsPerGeneration)},
+		{"max_udp_sessions", int64(c.MaxUDPSessions)},
+		{"max_udp_sessions_per_generation", int64(c.MaxUDPSessionsPerGeneration)},
+		{"max_udp_sender_queued_frames_per_generation", int64(c.MaxUDPSenderQueuedFramesPerGeneration)},
+		{"max_udp_sender_queued_backing_bytes_per_generation", c.MaxUDPSenderQueuedBackingBytesPerGeneration},
+		{"max_udp_fragment_groups", int64(c.MaxUDPFragmentGroups)},
+		{"max_udp_fragment_backing_bytes", c.MaxUDPFragmentBackingBytes},
 	}
 	for _, limit := range limits {
 		if limit.value < 0 {
@@ -211,6 +232,9 @@ func (t *ServerTLS) LoadCertificates() error {
 // ApplyDefaults applies default values to zero-value fields.
 // It sets HeartbeatInterval and HealthTimeout if not specified.
 func (s *Server) ApplyDefaults() {
+	if s.TCPCopyBufferSize == 0 {
+		s.TCPCopyBufferSize = DefaultTCPCopyBufferSize
+	}
 	for i := range s.Listeners {
 		s.Listeners[i].Capacity.ApplyDefaults()
 	}
@@ -229,6 +253,9 @@ func (s *Server) ApplyDefaults() {
 func (s *Server) Validate() error {
 	if len(s.Listeners) == 0 {
 		return errors.New("listeners must contain at least one listener")
+	}
+	if s.TCPCopyBufferSize < 0 {
+		return errors.New("tcp_copy_buffer_size must not be negative")
 	}
 
 	type socketClaim struct {

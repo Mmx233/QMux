@@ -13,6 +13,7 @@ import (
 
 	"github.com/Mmx233/QMux/config"
 	"github.com/Mmx233/QMux/protocol"
+	"github.com/quic-go/quic-go"
 	"github.com/rs/zerolog"
 )
 
@@ -188,7 +189,7 @@ func pooledDatagramBacking(t testing.TB, datagrams []protocol.DatagramResult) in
 
 func TestClientDsendSnapshotOwnsAndReleasesBatch(t *testing.T) {
 	stats := &clientDsendStats{}
-	handler := newUDPHandler("127.0.0.1", 1, true, zerolog.Nop(), nil, stats)
+	handler := newUDPHandler("127.0.0.1", 1, true, config.DefaultMaxUDPFragmentGroupsPerHandler, config.DefaultMaxUDPFragmentBackingBytesPerHandler, zerolog.Nop(), nil, stats)
 	t.Cleanup(handler.Stop)
 	var counter atomic.Uint32
 	datagrams, err := handler.fragmentDatagrams(1, 1, make([]byte, protocol.MaxUDPPayload+1), &counter)
@@ -268,7 +269,7 @@ func TestClientDsendBackingProjectionForPooledBatches(t *testing.T) {
 			}
 			for _, payloadSize := range []int{1, protocol.DefaultReadBufferSize} {
 				stats := &clientDsendStats{}
-				handler := newUDPHandler("127.0.0.1", 1, true, zerolog.Nop(), nil, stats)
+				handler := newUDPHandler("127.0.0.1", 1, true, config.DefaultMaxUDPFragmentGroupsPerHandler, config.DefaultMaxUDPFragmentBackingBytesPerHandler, zerolog.Nop(), nil, stats)
 				var counter atomic.Uint32
 				datagrams, err := handler.fragmentDatagrams(1, 1, make([]byte, payloadSize), &counter)
 				if err != nil {
@@ -329,7 +330,7 @@ func TestClientUDPSessionSnapshotHighWater(t *testing.T) {
 
 func TestClientSnapshotAggregatesLiveAndRetiredAssemblers(t *testing.T) {
 	client := &Client{liveUDPHandlers: make(map[*UDPHandler]struct{})}
-	first := newUDPHandler("127.0.0.1", 1, true, zerolog.Nop(), nil)
+	first := newUDPHandler("127.0.0.1", 1, true, config.DefaultMaxUDPFragmentGroupsPerHandler, config.DefaultMaxUDPFragmentBackingBytesPerHandler, zerolog.Nop(), nil)
 	for sessionID := uint32(0); ; sessionID++ {
 		_, err := first.fragmentAssembler.AddFragment(sessionID, 1, 0, 2, []byte("x"))
 		if errors.Is(err, protocol.ErrFragmentAssemblerFull) {
@@ -342,7 +343,7 @@ func TestClientSnapshotAggregatesLiveAndRetiredAssemblers(t *testing.T) {
 			t.Fatal("fragment group capacity was not reached")
 		}
 	}
-	second := newUDPHandler("127.0.0.1", 1, true, zerolog.Nop(), nil)
+	second := newUDPHandler("127.0.0.1", 1, true, config.DefaultMaxUDPFragmentGroupsPerHandler, config.DefaultMaxUDPFragmentBackingBytesPerHandler, zerolog.Nop(), nil)
 	if _, err := second.fragmentAssembler.AddFragment(1, 1, 0, 2, []byte("second")); err != nil {
 		t.Fatal(err)
 	}
@@ -380,10 +381,111 @@ func TestClientSnapshotAggregatesLiveAndRetiredAssemblers(t *testing.T) {
 	}
 }
 
+func TestUDPHandlerFragmentLimitsAreIndependent(t *testing.T) {
+	newHandler := func() *UDPHandler {
+		return newUDPHandler(
+			"127.0.0.1",
+			1,
+			true,
+			1,
+			int64(protocol.FragmentBufferSize),
+			zerolog.Nop(),
+			nil,
+		)
+	}
+	first, second := newHandler(), newHandler()
+	t.Cleanup(first.Stop)
+	t.Cleanup(second.Stop)
+	for i, handler := range []*UDPHandler{first, second} {
+		if _, err := handler.fragmentAssembler.AddFragment(1, 1, 0, 2, []byte("accepted")); err != nil {
+			t.Fatalf("handler %d first group: %v", i, err)
+		}
+		if _, err := handler.fragmentAssembler.AddFragment(2, 1, 0, 2, []byte("rejected")); !errors.Is(err, protocol.ErrFragmentAssemblerFull) {
+			t.Fatalf("handler %d second group error = %v, want %v", i, err, protocol.ErrFragmentAssemblerFull)
+		}
+		if got := handler.fragmentAssembler.Snapshot(); got.RetainedGroups != 1 || got.RetainedBackingBytes != int64(protocol.FragmentBufferSize) {
+			t.Fatalf("handler %d retained state = %+v", i, got)
+		}
+	}
+
+	first.Stop()
+	second.Stop()
+	for i, handler := range []*UDPHandler{first, second} {
+		if got := handler.fragmentAssembler.Snapshot(); got.RetainedGroups != 0 || got.RetainedBackingBytes != 0 {
+			t.Fatalf("handler %d retained state after Stop = %+v", i, got)
+		}
+	}
+}
+
+func TestClientFragmentLimitsReachInstalledRuntime(t *testing.T) {
+	peer := newLifecyclePeer(t)
+	serverDone := peer.serveRegistration(func(conn *quic.Conn, stream *quic.Stream, _ protocol.RegisterMsg) error {
+		if err := writeSuccessfulLifecycleAck(stream); err != nil {
+			return err
+		}
+		<-conn.Context().Done()
+		return nil
+	})
+	endpoint := peer.endpoint()
+	conf := &config.Client{
+		ClientID: "fragment-limit-client",
+		Server:   config.ClientServer{Servers: []config.ServerEndpoint{endpoint}},
+		Local:    config.LocalService{Host: "127.0.0.1", Port: 1},
+		TLS:      lifecycleClientTLSFiles(t),
+		Capacity: config.ClientCapacity{
+			MaxUDPFragmentGroupsPerHandler:       1,
+			MaxUDPFragmentBackingBytesPerHandler: int64(protocol.FragmentBufferSize),
+		},
+	}
+	client, err := New(conf)
+	if err != nil {
+		t.Fatalf("New client: %v", err)
+	}
+	client.connMgr.baseTLSConfig = peer.clientTLS.Clone()
+	client.connMgr.quicConfig = conf.Quic.GetConfig()
+	conf.Capacity.MaxUDPFragmentGroupsPerHandler = 99
+	conf.Capacity.MaxUDPFragmentBackingBytesPerHandler = 99 * int64(protocol.FragmentBufferSize)
+
+	sc, err := client.connMgr.connectAndRegister(t.Context(), endpoint)
+	if err != nil {
+		t.Fatalf("connect and register: %v", err)
+	}
+	client.installRuntime(sc)
+	client.runtimesMu.Lock()
+	runtime := client.runtimes[sc]
+	client.runtimesMu.Unlock()
+	if runtime == nil || runtime.udp == nil {
+		t.Fatal("installed runtime has no UDP handler")
+	}
+	t.Cleanup(func() {
+		_ = client.cleanupRuntime(runtime)
+		client.watcherWG.Wait()
+		if err := awaitLifecycle(t, serverDone, "fragment-limit peer shutdown"); err != nil {
+			t.Error(err)
+		}
+	})
+
+	assembler := runtime.udp.fragmentAssembler
+	if _, err := assembler.AddFragment(1, 1, 0, 2, []byte("accepted")); err != nil {
+		t.Fatalf("first configured fragment: %v", err)
+	}
+	if _, err := assembler.AddFragment(1, 1, 1, 2, []byte("byte limit")); !errors.Is(err, protocol.ErrFragmentAssemblerFull) {
+		t.Fatalf("configured byte limit error = %v, want %v", err, protocol.ErrFragmentAssemblerFull)
+	}
+	if _, err := assembler.AddFragment(2, 1, 0, 2, []byte("group limit")); !errors.Is(err, protocol.ErrFragmentAssemblerFull) {
+		t.Fatalf("configured group limit error = %v, want %v", err, protocol.ErrFragmentAssemblerFull)
+	}
+	if client.maxUDPFragmentGroupsPerHandler != 1 ||
+		client.maxUDPFragmentBackingBytesPerHandler != int64(protocol.FragmentBufferSize) {
+		t.Fatalf("client retained mutated fragment limits: %d/%d", client.maxUDPFragmentGroupsPerHandler,
+			client.maxUDPFragmentBackingBytesPerHandler)
+	}
+}
+
 func TestClientDsendSnapshotConcurrentBestEffort(t *testing.T) {
 	const producers = 8
 	stats := &clientDsendStats{}
-	handler := newUDPHandler("127.0.0.1", 1, true, zerolog.Nop(), nil, stats)
+	handler := newUDPHandler("127.0.0.1", 1, true, config.DefaultMaxUDPFragmentGroupsPerHandler, config.DefaultMaxUDPFragmentBackingBytesPerHandler, zerolog.Nop(), nil, stats)
 	t.Cleanup(handler.Stop)
 	start := make(chan struct{})
 	var workers sync.WaitGroup
@@ -436,7 +538,7 @@ func TestClientDsendSnapshotConcurrentBestEffort(t *testing.T) {
 func TestClientDsendHighWaterAggregatePeak(t *testing.T) {
 	const producers = 8
 	stats := &clientDsendStats{}
-	handler := newUDPHandler("127.0.0.1", 1, true, zerolog.Nop(), nil, stats)
+	handler := newUDPHandler("127.0.0.1", 1, true, config.DefaultMaxUDPFragmentGroupsPerHandler, config.DefaultMaxUDPFragmentBackingBytesPerHandler, zerolog.Nop(), nil, stats)
 	t.Cleanup(handler.Stop)
 	acquired := make(chan struct{}, producers)
 	release := make(chan struct{})
@@ -479,7 +581,7 @@ func TestClientDsendHighWaterAggregatePeak(t *testing.T) {
 
 func BenchmarkClientDsendFragmentRelease(b *testing.B) {
 	stats := &clientDsendStats{}
-	handler := newUDPHandler("127.0.0.1", 1, true, zerolog.Nop(), nil, stats)
+	handler := newUDPHandler("127.0.0.1", 1, true, config.DefaultMaxUDPFragmentGroupsPerHandler, config.DefaultMaxUDPFragmentBackingBytesPerHandler, zerolog.Nop(), nil, stats)
 	b.Cleanup(handler.Stop)
 	payload := make([]byte, 1000)
 	send := func([]byte) error { return nil }

@@ -72,7 +72,7 @@ func TestTrafficConnectionFatalRetiresRegistrationForSameID(t *testing.T) {
 		QuicAddr:    registrationTestAddress,
 		TrafficAddr: trafficAddr,
 		Protocol:    "tcp",
-	}}}, map[string]*pool.ConnectionPool{registrationTestAddress: harness.pool}, zerolog.Nop())
+	}}}, map[string]*pool.ConnectionPool{registrationTestAddress: harness.pool}, protocol.NewCopyBufferPool(protocol.DefaultCopyBufferSize), zerolog.Nop())
 	t.Cleanup(manager.Stop)
 	if err := manager.Start(harness.ctx); err != nil {
 		t.Fatalf("start traffic manager: %v", err)

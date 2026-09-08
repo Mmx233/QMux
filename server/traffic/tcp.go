@@ -666,7 +666,7 @@ func (l *Listener) handleTCPConnection(flow *tcpFlow, setupDeadline time.Time, s
 
 	logger.Debug().Uint64("conn_id", connID).Int("attempts", attempts).Msg("forwarding connection")
 
-	relay := protocol.StartRelay(conn, stream,
+	relay := l.copyBufferPool.StartRelay(conn, stream,
 		func(err error) error {
 			if err != nil {
 				flow.abort()

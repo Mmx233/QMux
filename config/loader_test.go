@@ -285,7 +285,8 @@ tls:
 }
 
 func TestLoadConfigCapacity(t *testing.T) {
-	serverPath := writeTestConfig(t, `listeners:
+	serverPath := writeTestConfig(t, `tcp_copy_buffer_size: 10
+listeners:
   - quic_addr: "127.0.0.1:8443"
     traffic_addr: "127.0.0.1:8080"
     protocol: tcp
@@ -298,6 +299,10 @@ func TestLoadConfigCapacity(t *testing.T) {
       max_pending_tcp_setups_per_generation: 6
       max_udp_sessions: 7
       max_udp_sessions_per_generation: 8
+      max_udp_sender_queued_frames_per_generation: 9
+      max_udp_sender_queued_backing_bytes_per_generation: 10
+      max_udp_fragment_groups: 11
+      max_udp_fragment_backing_bytes: 12
 auth:
   method: token
   token: "0123456789abcdef"
@@ -310,26 +315,40 @@ tls:
 		t.Fatalf("LoadServerConfig: %v", err)
 	}
 	wantServer := ListenerCapacity{
-		MaxClientGenerations:             1,
-		MaxPendingRegistrations:          2,
-		MaxTCPConnections:                3,
-		MaxPendingTCPSetups:              4,
-		MaxTCPConnectionsPerGeneration:   5,
-		MaxPendingTCPSetupsPerGeneration: 6,
-		MaxUDPSessions:                   7,
-		MaxUDPSessionsPerGeneration:      8,
+		MaxClientGenerations:                        1,
+		MaxPendingRegistrations:                     2,
+		MaxTCPConnections:                           3,
+		MaxPendingTCPSetups:                         4,
+		MaxTCPConnectionsPerGeneration:              5,
+		MaxPendingTCPSetupsPerGeneration:            6,
+		MaxUDPSessions:                              7,
+		MaxUDPSessionsPerGeneration:                 8,
+		MaxUDPSenderQueuedFramesPerGeneration:       9,
+		MaxUDPSenderQueuedBackingBytesPerGeneration: 10,
+		MaxUDPFragmentGroups:                        11,
+		MaxUDPFragmentBackingBytes:                  12,
 	}
-	if got := serverConfig.Listeners[0].Capacity; got != wantServer {
+	if got := serverConfig.Listeners[0].Capacity; got != wantServer || serverConfig.TCPCopyBufferSize != 10 {
 		t.Fatalf("server capacity = %+v, want %+v", got, wantServer)
 	}
 
-	clientPath := writeTestConfig(t, "capacity:\n  max_local_udp_sessions: 9\n")
+	clientPath := writeTestConfig(t, `tcp_copy_buffer_size: 13
+capacity:
+  max_local_udp_sessions: 14
+  max_udp_fragment_groups_per_handler: 15
+  max_udp_fragment_backing_bytes_per_handler: 16
+`)
 	clientConfig, err := LoadConfig[Client](clientPath)
 	if err != nil {
 		t.Fatalf("LoadConfig[Client]: %v", err)
 	}
-	if got := clientConfig.Capacity.MaxLocalUDPSessions; got != 9 {
-		t.Fatalf("client max local UDP sessions = %d, want 9", got)
+	wantClient := ClientCapacity{
+		MaxLocalUDPSessions:                  14,
+		MaxUDPFragmentGroupsPerHandler:       15,
+		MaxUDPFragmentBackingBytesPerHandler: 16,
+	}
+	if clientConfig.TCPCopyBufferSize != 13 || clientConfig.Capacity != wantClient {
+		t.Fatalf("client copy buffer/capacity = %d/%+v, want 13/%+v", clientConfig.TCPCopyBufferSize, clientConfig.Capacity, wantClient)
 	}
 
 }

@@ -40,7 +40,7 @@ func TestShardedFragmentAssemblerChargesPooledBufferCapacity(t *testing.T) {
 		t.Fatalf("shortened buffer retained bytes = %d, want capacity %d", retainedBytes, bufferCapacity)
 	}
 
-	assembler := NewShardedFragmentAssembler(1)
+	assembler := NewShardedFragmentAssembler(1, 0, 0)
 	assembler.maxBytes = int64(bufferCapacity - 1)
 	defer assembler.Close()
 	if _, err := assembler.AddFragment(1, 1, 0, 2, []byte("x")); !errors.Is(err, ErrFragmentAssemblerFull) {
@@ -52,7 +52,7 @@ func TestShardedFragmentAssemblerChargesPooledBufferCapacity(t *testing.T) {
 }
 
 func TestShardedFragmentAssemblerLargePayload(t *testing.T) {
-	assembler := NewShardedFragmentAssembler(16)
+	assembler := NewShardedFragmentAssembler(16, 0, 0)
 	defer assembler.Close()
 	largePayload := make([]byte, FragmentBufferSize+100)
 	for i := range largePayload {
@@ -74,6 +74,85 @@ func TestShardedFragmentAssemblerLargePayload(t *testing.T) {
 	}
 	if groups, retainedBytes := assembler.retainedGroups.Load(), assembler.retainedBytes.Load(); groups != 0 || retainedBytes != 0 {
 		t.Fatalf("completion retained budget: groups=%d bytes=%d", groups, retainedBytes)
+	}
+}
+
+func TestFragmentAssemblerConstructorsEnforceConfiguredLimits(t *testing.T) {
+	t.Run("regular group limit", func(t *testing.T) {
+		assembler := NewFragmentAssembler(1, 1024)
+		defer assembler.Close()
+		if _, err := assembler.AddFragment(1, 1, 0, 2, []byte("a")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := assembler.AddFragment(2, 1, 0, 2, []byte("b")); !errors.Is(err, ErrFragmentAssemblerFull) {
+			t.Fatalf("second group error = %v, want %v", err, ErrFragmentAssemblerFull)
+		}
+		if len(assembler.fragments) != 1 || assembler.retainedBytes != 1 {
+			t.Fatalf("rejected group changed ownership: groups=%d bytes=%d", len(assembler.fragments), assembler.retainedBytes)
+		}
+	})
+
+	t.Run("regular byte limit", func(t *testing.T) {
+		assembler := NewFragmentAssembler(2, 1)
+		defer assembler.Close()
+		if _, err := assembler.AddFragment(1, 1, 0, 2, []byte("a")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := assembler.AddFragment(1, 1, 1, 2, []byte("b")); !errors.Is(err, ErrFragmentAssemblerFull) {
+			t.Fatalf("second byte error = %v, want %v", err, ErrFragmentAssemblerFull)
+		}
+		if len(assembler.fragments) != 1 || assembler.retainedBytes != 1 {
+			t.Fatalf("rejected byte changed ownership: groups=%d bytes=%d", len(assembler.fragments), assembler.retainedBytes)
+		}
+	})
+
+	t.Run("sharded group limit", func(t *testing.T) {
+		assembler := NewShardedFragmentAssembler(1, 1, 2*int64(FragmentBufferSize))
+		defer assembler.Close()
+		if _, err := assembler.AddFragment(1, 1, 0, 2, []byte("a")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := assembler.AddFragment(2, 1, 0, 2, []byte("b")); !errors.Is(err, ErrFragmentAssemblerFull) {
+			t.Fatalf("second group error = %v, want %v", err, ErrFragmentAssemblerFull)
+		}
+		if got := assembler.Snapshot(); got.RetainedGroups != 1 || got.RetainedBackingBytes != int64(FragmentBufferSize) {
+			t.Fatalf("rejected group changed ownership: %+v", got)
+		}
+	})
+
+	t.Run("sharded byte limit", func(t *testing.T) {
+		assembler := NewShardedFragmentAssembler(1, 2, int64(FragmentBufferSize))
+		defer assembler.Close()
+		if _, err := assembler.AddFragment(1, 1, 0, 2, []byte("a")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := assembler.AddFragment(1, 1, 1, 2, []byte("b")); !errors.Is(err, ErrFragmentAssemblerFull) {
+			t.Fatalf("second buffer error = %v, want %v", err, ErrFragmentAssemblerFull)
+		}
+		if got := assembler.Snapshot(); got.RetainedGroups != 1 || got.RetainedBackingBytes != int64(FragmentBufferSize) {
+			t.Fatalf("rejected buffer changed ownership: %+v", got)
+		}
+	})
+}
+
+func TestFragmentAssemblerConstructorsRespectLimitsAboveOldDefaults(t *testing.T) {
+	groupLimit := maxRetainedFragmentGroups + 1
+	byteLimit := int64(maxRetainedFragmentBytes + 1)
+	regular := NewFragmentAssembler(groupLimit, byteLimit)
+	defer regular.Close()
+	sharded := NewShardedFragmentAssembler(1, groupLimit, byteLimit)
+	defer sharded.Close()
+
+	for name, limits := range map[string]struct {
+		groups int
+		bytes  int64
+	}{
+		"regular": {fragmentGroupLimit(regular.maxGroups), fragmentByteLimit(regular.maxBytes)},
+		"sharded": {fragmentGroupLimit(sharded.maxGroups), fragmentByteLimit(sharded.maxBytes)},
+	} {
+		if limits.groups != groupLimit || limits.bytes != byteLimit {
+			t.Fatalf("%s effective limits = %d/%d, want %d/%d", name, limits.groups, limits.bytes, groupLimit, byteLimit)
+		}
 	}
 }
 
@@ -140,7 +219,7 @@ func makeBenchmarkFragmentSets(tb testing.TB, count int) [][]benchmarkFragment {
 
 func BenchmarkShardedFragmentAssembler_AddFragment(b *testing.B) {
 	fragments := makeBenchmarkFragmentSets(b, 1)[0]
-	assembler := NewShardedFragmentAssembler(DefaultShardCount)
+	assembler := NewShardedFragmentAssembler(DefaultShardCount, 0, 0)
 	defer assembler.Close()
 
 	b.ResetTimer()
@@ -162,7 +241,7 @@ func BenchmarkShardedFragmentAssembler_Concurrent(b *testing.B) {
 		{"64_shards", 64},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
-			assembler := NewShardedFragmentAssembler(tc.shards)
+			assembler := NewShardedFragmentAssembler(tc.shards, 0, 0)
 			defer assembler.Close()
 			var sessionID atomic.Uint32
 

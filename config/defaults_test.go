@@ -10,6 +10,7 @@ func TestApplyDefaults(t *testing.T) {
 	client.ApplyDefaults()
 	if client.ClientID == "" || client.Auth.Method != ClientAuthMethodMTLS ||
 		client.HeartbeatInterval != DefaultHeartbeatInterval || client.HealthTimeout != DefaultHealthTimeout ||
+		client.TCPCopyBufferSize != DefaultTCPCopyBufferSize ||
 		client.Capacity != defaultClientCapacity() {
 		t.Fatalf("client defaults = %+v", client)
 	}
@@ -18,6 +19,7 @@ func TestApplyDefaults(t *testing.T) {
 	server.ApplyDefaults()
 	if server.HeartbeatInterval != DefaultHeartbeatInterval || server.HealthTimeout != DefaultHealthTimeout ||
 		server.LoadBalancer != DefaultLoadBalancer || server.Listeners[0].Capacity != defaultListenerCapacity() ||
+		server.TCPCopyBufferSize != DefaultTCPCopyBufferSize ||
 		server.TLS.SessionTicketEncryptionKeyRotationOverlap != nil {
 		t.Fatalf("server defaults = %+v", server)
 	}
@@ -31,14 +33,21 @@ func TestApplyDefaultsPreservesValues(t *testing.T) {
 	client := Client{
 		ClientID:          "client-id",
 		Auth:              ClientAuth{Method: ClientAuthMethodToken},
-		Capacity:          ClientCapacity{MaxLocalUDPSessions: 7},
+		TCPCopyBufferSize: 11,
+		Capacity: ClientCapacity{
+			MaxLocalUDPSessions:                  7,
+			MaxUDPFragmentGroupsPerHandler:       8,
+			MaxUDPFragmentBackingBytesPerHandler: 9,
+		},
 		HeartbeatInterval: time.Second,
 		HealthTimeout:     2 * time.Second,
 	}
 	client.ApplyDefaults()
 	if client.ClientID != "client-id" || client.Auth.Method != ClientAuthMethodToken ||
 		client.HeartbeatInterval != time.Second || client.HealthTimeout != 2*time.Second ||
-		client.Capacity.MaxLocalUDPSessions != 7 {
+		client.TCPCopyBufferSize != 11 || client.Capacity.MaxLocalUDPSessions != 7 ||
+		client.Capacity.MaxUDPFragmentGroupsPerHandler != 8 ||
+		client.Capacity.MaxUDPFragmentBackingBytesPerHandler != 9 {
 		t.Fatalf("client values changed: %+v", client)
 	}
 
@@ -46,10 +55,12 @@ func TestApplyDefaultsPreservesValues(t *testing.T) {
 		MaxClientGenerations: 1, MaxPendingRegistrations: 2, MaxTCPConnections: 3, MaxPendingTCPSetups: 4,
 		MaxTCPConnectionsPerGeneration: 5, MaxPendingTCPSetupsPerGeneration: 6,
 		MaxUDPSessions: 7, MaxUDPSessionsPerGeneration: 8,
+		MaxUDPSenderQueuedFramesPerGeneration: 9, MaxUDPSenderQueuedBackingBytesPerGeneration: 10,
+		MaxUDPFragmentGroups: 11, MaxUDPFragmentBackingBytes: 12,
 	}
 	overlap := uint8(2)
 	server := Server{
-		Listeners: []QuicListener{{Capacity: wantCapacity}}, LoadBalancer: "round-robin",
+		Listeners: []QuicListener{{Capacity: wantCapacity}}, LoadBalancer: "round-robin", TCPCopyBufferSize: 13,
 		HeartbeatInterval: time.Second, HealthTimeout: 2 * time.Second,
 		TLS: ServerTLS{
 			SessionTicketEncryptionKeyRotationInterval: time.Hour,
@@ -59,6 +70,7 @@ func TestApplyDefaultsPreservesValues(t *testing.T) {
 	server.ApplyDefaults()
 	if server.HeartbeatInterval != time.Second || server.HealthTimeout != 2*time.Second ||
 		server.LoadBalancer != "round-robin" || server.Listeners[0].Capacity != wantCapacity ||
+		server.TCPCopyBufferSize != 13 ||
 		server.TLS.SessionTicketEncryptionKeyRotationOverlap != &overlap {
 		t.Fatalf("server values changed: %+v", server)
 	}
@@ -107,6 +119,10 @@ func TestCapacityValidation(t *testing.T) {
 		{"max_pending_tcp_setups_per_generation", func(c *ListenerCapacity) { c.MaxPendingTCPSetupsPerGeneration = -1 }},
 		{"max_udp_sessions", func(c *ListenerCapacity) { c.MaxUDPSessions = -1 }},
 		{"max_udp_sessions_per_generation", func(c *ListenerCapacity) { c.MaxUDPSessionsPerGeneration = -1 }},
+		{"max_udp_sender_queued_frames_per_generation", func(c *ListenerCapacity) { c.MaxUDPSenderQueuedFramesPerGeneration = -1 }},
+		{"max_udp_sender_queued_backing_bytes_per_generation", func(c *ListenerCapacity) { c.MaxUDPSenderQueuedBackingBytesPerGeneration = -1 }},
+		{"max_udp_fragment_groups", func(c *ListenerCapacity) { c.MaxUDPFragmentGroups = -1 }},
+		{"max_udp_fragment_backing_bytes", func(c *ListenerCapacity) { c.MaxUDPFragmentBackingBytes = -1 }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -125,25 +141,47 @@ func TestCapacityValidation(t *testing.T) {
 	if err := (ClientCapacity{}).Validate("capacity"); err != nil {
 		t.Fatalf("zero client capacity validation: %v", err)
 	}
-	if err := (ClientCapacity{MaxLocalUDPSessions: -1}).Validate("capacity"); err == nil ||
-		err.Error() != "capacity.max_local_udp_sessions must not be negative" {
-		t.Fatalf("client capacity validation error = %v", err)
+	clientTests := []struct {
+		name string
+		set  func(*ClientCapacity)
+	}{
+		{"max_local_udp_sessions", func(c *ClientCapacity) { c.MaxLocalUDPSessions = -1 }},
+		{"max_udp_fragment_groups_per_handler", func(c *ClientCapacity) { c.MaxUDPFragmentGroupsPerHandler = -1 }},
+		{"max_udp_fragment_backing_bytes_per_handler", func(c *ClientCapacity) { c.MaxUDPFragmentBackingBytesPerHandler = -1 }},
+	}
+	for _, test := range clientTests {
+		t.Run("client "+test.name, func(t *testing.T) {
+			var capacity ClientCapacity
+			test.set(&capacity)
+			want := "capacity." + test.name + " must not be negative"
+			if err := capacity.Validate("capacity"); err == nil || err.Error() != want {
+				t.Fatalf("Validate() error = %v, want %q", err, want)
+			}
+		})
 	}
 }
 
 func defaultListenerCapacity() ListenerCapacity {
 	return ListenerCapacity{
-		MaxClientGenerations:             DefaultMaxClientGenerations,
-		MaxPendingRegistrations:          DefaultMaxPendingRegistrations,
-		MaxTCPConnections:                DefaultMaxTCPConnections,
-		MaxPendingTCPSetups:              DefaultMaxPendingTCPSetups,
-		MaxTCPConnectionsPerGeneration:   DefaultMaxTCPConnectionsPerGeneration,
-		MaxPendingTCPSetupsPerGeneration: DefaultMaxPendingTCPSetupsPerGeneration,
-		MaxUDPSessions:                   DefaultMaxUDPSessions,
-		MaxUDPSessionsPerGeneration:      DefaultMaxUDPSessionsPerGeneration,
+		MaxClientGenerations:                        DefaultMaxClientGenerations,
+		MaxPendingRegistrations:                     DefaultMaxPendingRegistrations,
+		MaxTCPConnections:                           DefaultMaxTCPConnections,
+		MaxPendingTCPSetups:                         DefaultMaxPendingTCPSetups,
+		MaxTCPConnectionsPerGeneration:              DefaultMaxTCPConnectionsPerGeneration,
+		MaxPendingTCPSetupsPerGeneration:            DefaultMaxPendingTCPSetupsPerGeneration,
+		MaxUDPSessions:                              DefaultMaxUDPSessions,
+		MaxUDPSessionsPerGeneration:                 DefaultMaxUDPSessionsPerGeneration,
+		MaxUDPSenderQueuedFramesPerGeneration:       DefaultMaxUDPSenderQueuedFramesPerGeneration,
+		MaxUDPSenderQueuedBackingBytesPerGeneration: DefaultMaxUDPSenderQueuedBackingBytesPerGeneration,
+		MaxUDPFragmentGroups:                        DefaultMaxUDPFragmentGroups,
+		MaxUDPFragmentBackingBytes:                  DefaultMaxUDPFragmentBackingBytes,
 	}
 }
 
 func defaultClientCapacity() ClientCapacity {
-	return ClientCapacity{MaxLocalUDPSessions: DefaultMaxLocalUDPSessions}
+	return ClientCapacity{
+		MaxLocalUDPSessions:                  DefaultMaxLocalUDPSessions,
+		MaxUDPFragmentGroupsPerHandler:       DefaultMaxUDPFragmentGroupsPerHandler,
+		MaxUDPFragmentBackingBytesPerHandler: DefaultMaxUDPFragmentBackingBytesPerHandler,
+	}
 }

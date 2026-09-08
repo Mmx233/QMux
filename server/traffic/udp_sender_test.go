@@ -171,9 +171,12 @@ func datagramBackingBytes(datagrams []protocol.DatagramResult) int64 {
 
 func TestUDPSenderWholeBatchAdmissionAndOwnership(t *testing.T) {
 	t.Run("frame limit", func(t *testing.T) {
-		handler := &UDPHandler{logger: zerolog.Nop()}
+		handler := &UDPHandler{
+			maxSenderQueuedFrames:       224,
+			maxSenderQueuedBackingBytes: config.DefaultMaxUDPSenderQueuedBackingBytesPerGeneration,
+			logger:                      zerolog.Nop()}
 		sender := &udpSender{
-			queue: make(chan udpSendBatch, maxUDPSenderQueuedFrames),
+			queue: make(chan udpSendBatch, config.DefaultMaxUDPSenderQueuedFramesPerGeneration),
 		}
 		batches := make([]udpSendBatch, 0, 5)
 		for i := range 5 {
@@ -222,26 +225,29 @@ func TestUDPSenderWholeBatchAdmissionAndOwnership(t *testing.T) {
 			t.Fatalf("initialize large UDP datagram pool: %v", err)
 		}
 
-		handler := &UDPHandler{logger: zerolog.Nop()}
+		handler := &UDPHandler{
+			maxSenderQueuedFrames:       9,
+			maxSenderQueuedBackingBytes: 7 * int64(protocol.DatagramBufferSize),
+			logger:                      zerolog.Nop()}
 		sender := &udpSender{
-			queue: make(chan udpSendBatch, maxUDPSenderQueuedFrames),
+			queue: make(chan udpSendBatch, config.DefaultMaxUDPSenderQueuedFramesPerGeneration),
 		}
-		accepted := make([]udpSendBatch, 0, 8)
-		for i := range 8 {
+		accepted := make([]udpSendBatch, 0, 7)
+		for i := range 7 {
 			batch := fragmentUDPSenderBatch(t, uint32(i+1), []byte("pooled byte cap"))
 			if result := handler.enqueueSender(sender, batch); result != udpEnqueued {
 				t.Fatalf("enqueue pooled batch %d at backing limit = %v, want accepted", i, result)
 			}
 			accepted = append(accepted, batch)
 		}
-		rejected := fragmentUDPSenderBatch(t, 9, []byte("over pooled byte cap"))
+		rejected := fragmentUDPSenderBatch(t, 8, []byte("over pooled byte cap"))
 		if result := handler.enqueueSender(sender, rejected); result != udpQueueFull {
 			t.Fatalf("enqueue batch over backing limit = %v, want queue full", result)
 		}
 		protocol.ReleaseDatagramResults(rejected.datagrams)
-		if sender.ownedFrames != 8 || sender.ownedFrames*int64(protocol.DatagramBufferSize) != maxUDPSenderQueuedBacking {
-			t.Fatalf("ownership after backing rejection = %d frames/%d bytes, want 8/%d",
-				sender.ownedFrames, sender.ownedFrames*int64(protocol.DatagramBufferSize), maxUDPSenderQueuedBacking)
+		if sender.ownedFrames != 7 || sender.ownedFrames*int64(protocol.DatagramBufferSize) != handler.maxSenderQueuedBackingBytes {
+			t.Fatalf("ownership after backing rejection = %d frames/%d bytes, want 7/%d",
+				sender.ownedFrames, sender.ownedFrames*int64(protocol.DatagramBufferSize), handler.maxSenderQueuedBackingBytes)
 		}
 		handler.failSender(sender)
 		if sender.ownedFrames != 0 {
@@ -257,12 +263,48 @@ func TestUDPSenderWholeBatchAdmissionAndOwnership(t *testing.T) {
 	})
 }
 
+func TestUDPSenderLargeFrameLimitUsesSmallBackingCapacity(t *testing.T) {
+	handler := &UDPHandler{
+		maxSenderQueuedFrames:       int64(^uint(0) >> 1),
+		maxSenderQueuedBackingBytes: int64(protocol.DatagramBufferSize),
+		logger:                      zerolog.Nop(),
+	}
+	if got := handler.senderFrameLimit(); got != 1 {
+		t.Fatalf("effective sender frame limit = %d, want 1", got)
+	}
+	sender := &udpSender{queue: make(chan udpSendBatch, int(handler.senderFrameLimit()))}
+	if cap(sender.queue) != 1 {
+		t.Fatalf("sender queue capacity = %d, want 1", cap(sender.queue))
+	}
+
+	accepted := fragmentUDPSenderBatch(t, 1, []byte("accepted"))
+	if got := handler.enqueueSender(sender, accepted); got != udpEnqueued {
+		t.Fatalf("first enqueue = %v, want %v", got, udpEnqueued)
+	}
+	rejected := fragmentUDPSenderBatch(t, 2, []byte("rejected"))
+	if got := handler.enqueueSender(sender, rejected); got != udpQueueFull {
+		t.Fatalf("second enqueue = %v, want %v", got, udpQueueFull)
+	}
+	if sender.ownedFrames != 1 {
+		t.Fatalf("rejection changed owned frames to %d, want 1", sender.ownedFrames)
+	}
+	protocol.ReleaseDatagramResults(rejected.datagrams)
+	handler.failSender(sender)
+	if sender.ownedFrames != 0 || accepted.datagrams[0].Buffer != nil || rejected.datagrams[0].Buffer != nil {
+		t.Fatalf("drain/rejection retained ownership: frames=%d accepted=%p rejected=%p",
+			sender.ownedFrames, accepted.datagrams[0].Buffer, rejected.datagrams[0].Buffer)
+	}
+}
+
 func TestUDPSenderFragmentsBeforeAdmissionLock(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	pair := newUDPSenderQUICPair(t, ctx)
 	handlerCtx, cancelHandler := context.WithCancel(ctx)
 	handler := &UDPHandler{
+		maxSenderQueuedFrames:       int64(config.DefaultMaxUDPSenderQueuedFramesPerGeneration),
+		maxSenderQueuedBackingBytes: config.DefaultMaxUDPSenderQueuedBackingBytesPerGeneration,
+
 		ctx:                 handlerCtx,
 		logger:              zerolog.Nop(),
 		enableFragmentation: true,
@@ -317,9 +359,13 @@ func TestUDPSenderWorkerSendsWithoutAdmissionLock(t *testing.T) {
 	pair := newUDPSenderQUICPair(t, ctx)
 	handlerCtx, cancelHandler := context.WithCancel(ctx)
 	handler := &UDPHandler{
-		ctx:     handlerCtx,
-		logger:  zerolog.Nop(),
-		senders: make(map[*pool.ClientConn]*udpSender),
+		maxSenderQueuedFrames:       3,
+		maxSenderQueuedBackingBytes: 2 * int64(protocol.DatagramBufferSize),
+
+		ctx:                 handlerCtx,
+		logger:              zerolog.Nop(),
+		enableFragmentation: true,
+		senders:             make(map[*pool.ClientConn]*udpSender),
 	}
 	defer func() {
 		cancelHandler()
@@ -350,8 +396,29 @@ func TestUDPSenderWorkerSendsWithoutAdmissionLock(t *testing.T) {
 	if sender.ownedFrames != int64(len(batch.datagrams)) {
 		t.Fatalf("selected ownership while release awaits lock = %d frames, want %d", sender.ownedFrames, len(batch.datagrams))
 	}
+	rejected := fragmentUDPSenderBatch(t, 62, make([]byte, protocol.MaxUDPPayload+1))
+	if got, want := len(rejected.datagrams), 2; got != want {
+		t.Fatalf("rejected whole batch frames = %d, want %d", got, want)
+	}
+	if result := handler.enqueueSenderLocked(sender, rejected); result != udpQueueFull {
+		t.Fatalf("enqueue whole batch while worker holds ownership = %v, want %v", result, udpQueueFull)
+	}
+	if sender.ownedFrames != int64(len(batch.datagrams)) {
+		t.Fatalf("whole-batch rejection changed worker-held ownership to %d, want %d", sender.ownedFrames, len(batch.datagrams))
+	}
+	protocol.ReleaseDatagramResults(rejected.datagrams)
+	for i := range rejected.datagrams {
+		if rejected.datagrams[i].Buffer != nil {
+			t.Fatalf("rejected datagram %d retained pooled ownership", i)
+		}
+	}
 	sender.mu.Unlock()
 	locked = false
+	session := &UDPSession{id: 63, client: client, sender: sender}
+	handler.sendDatagrams(session, make([]byte, 2*protocol.MaxFragPayload+1))
+	if got := handler.senderStats.queueFullDrops.Load(); got != 1 {
+		t.Fatalf("queue-full drops after over-cap whole batch = %d, want 1", got)
+	}
 	awaitUDPCondition(t, time.Second, "selected batch release", func() bool {
 		sender.mu.Lock()
 		defer sender.mu.Unlock()
@@ -371,6 +438,9 @@ func TestUDPSenderRejectsOversizedPacketBeforeSessionLookup(t *testing.T) {
 
 	t.Run("without session", func(t *testing.T) {
 		handler := &UDPHandler{
+			maxSenderQueuedFrames:       int64(config.DefaultMaxUDPSenderQueuedFramesPerGeneration),
+			maxSenderQueuedBackingBytes: config.DefaultMaxUDPSenderQueuedBackingBytesPerGeneration,
+
 			ctx:     context.Background(),
 			logger:  zerolog.Nop(),
 			senders: make(map[*pool.ClientConn]*udpSender),
@@ -395,6 +465,9 @@ func TestUDPSenderRejectsOversizedPacketBeforeSessionLookup(t *testing.T) {
 		clientAddr := netip.MustParseAddrPort("127.0.0.1:12346")
 		session := &UDPSession{id: 7, clientAddr: clientAddr, client: client}
 		handler := &UDPHandler{
+			maxSenderQueuedFrames:       int64(config.DefaultMaxUDPSenderQueuedFramesPerGeneration),
+			maxSenderQueuedBackingBytes: config.DefaultMaxUDPSenderQueuedBackingBytesPerGeneration,
+
 			ctx:     context.Background(),
 			logger:  zerolog.Nop(),
 			senders: make(map[*pool.ClientConn]*udpSender),
@@ -429,6 +502,9 @@ func TestUDPSenderFragmentFailureClosesPublishedSession(t *testing.T) {
 	clientAddr := netip.MustParseAddrPort("127.0.0.1:12347")
 	session := &UDPSession{id: 8, clientAddr: clientAddr, client: client}
 	handler := &UDPHandler{
+		maxSenderQueuedFrames:       int64(config.DefaultMaxUDPSenderQueuedFramesPerGeneration),
+		maxSenderQueuedBackingBytes: config.DefaultMaxUDPSenderQueuedBackingBytesPerGeneration,
+
 		ctx:     context.Background(),
 		logger:  zerolog.Nop(),
 		senders: make(map[*pool.ClientConn]*udpSender),
@@ -521,7 +597,7 @@ func TestUDPSenderBlackholeIsolationAndManagerRetirement(t *testing.T) {
 		QuicAddr:    "udp-sender-test",
 		TrafficAddr: "127.0.0.1:0",
 		Protocol:    "udp",
-	}}}, map[string]*pool.ConnectionPool{"udp-sender-test": connectionPool}, zerolog.Nop())
+	}}}, map[string]*pool.ConnectionPool{"udp-sender-test": connectionPool}, newTestCopyBufferPool(), zerolog.Nop())
 	if err := manager.Start(ctx); err != nil {
 		t.Fatalf("start UDP sender manager: %v", err)
 	}
@@ -578,7 +654,7 @@ func TestUDPSenderBlackholeIsolationAndManagerRetirement(t *testing.T) {
 			handler.lifecycleMu.Unlock()
 			if hotSender != nil {
 				hotSender.mu.Lock()
-				full := hotSender.ownedFrames == maxUDPSenderQueuedFrames
+				full := hotSender.ownedFrames == config.DefaultMaxUDPSenderQueuedFramesPerGeneration
 				hotSender.mu.Unlock()
 				if full {
 					break
@@ -607,7 +683,7 @@ func TestUDPSenderBlackholeIsolationAndManagerRetirement(t *testing.T) {
 		frames := hotSender.ownedFrames
 		hotSender.mu.Unlock()
 		backing := frames * int64(protocol.DatagramBufferSize)
-		if frames > maxUDPSenderQueuedFrames || backing > maxUDPSenderQueuedBacking {
+		if frames > config.DefaultMaxUDPSenderQueuedFramesPerGeneration || backing > config.DefaultMaxUDPSenderQueuedBackingBytesPerGeneration {
 			t.Fatalf("hot sender exceeded budget under pressure: %d frames, %d bytes", frames, backing)
 		}
 	}
@@ -618,8 +694,8 @@ func TestUDPSenderBlackholeIsolationAndManagerRetirement(t *testing.T) {
 		t.Fatalf("hot generation retired while only outbound packets were blackholed: %v", context.Cause(hotClient.Conn.Context()))
 	}
 	// The cold sender doesn't exist yet, so these listener aggregates equal the hot generation.
-	if snapshot := handler.snapshot(); snapshot.DSendItemsHighWater > maxUDPSenderQueuedFrames ||
-		snapshot.DSendBackingBytesHighWater > maxUDPSenderQueuedBacking ||
+	if snapshot := handler.snapshot(); snapshot.DSendItemsHighWater > config.DefaultMaxUDPSenderQueuedFramesPerGeneration ||
+		snapshot.DSendBackingBytesHighWater > config.DefaultMaxUDPSenderQueuedBackingBytesPerGeneration ||
 		snapshot.DSendBackingBytesHighWater != snapshot.DSendItemsHighWater*int64(protocol.DatagramBufferSize) {
 		t.Fatalf("hot sender observed high-water exceeded its budget or projection: %+v", snapshot)
 	}
@@ -708,11 +784,14 @@ func TestUDPSenderRegistryUsesExactGeneration(t *testing.T) {
 	}
 	handlerCtx, cancelHandler := context.WithCancel(ctx)
 	handler := &UDPHandler{
+		maxSenderQueuedFrames:       int64(config.DefaultMaxUDPSenderQueuedFramesPerGeneration),
+		maxSenderQueuedBackingBytes: config.DefaultMaxUDPSenderQueuedBackingBytesPerGeneration,
+
 		packetConn:        packetConn,
 		logger:            zerolog.Nop(),
 		ctx:               handlerCtx,
 		cancel:            cancelHandler,
-		fragmentAssembler: protocol.NewShardedFragmentAssembler(protocol.DefaultShardCount),
+		fragmentAssembler: protocol.NewShardedFragmentAssembler(protocol.DefaultShardCount, 0, 0),
 		receivers:         make(map[*quic.Conn]struct{}),
 		senders:           make(map[*pool.ClientConn]*udpSender),
 	}
@@ -777,11 +856,14 @@ func TestUDPReceiverUsesExactGenerationBeforeFragmentRetention(t *testing.T) {
 	}
 	handlerCtx, cancelHandler := context.WithCancel(ctx)
 	handler := &UDPHandler{
+		maxSenderQueuedFrames:       int64(config.DefaultMaxUDPSenderQueuedFramesPerGeneration),
+		maxSenderQueuedBackingBytes: config.DefaultMaxUDPSenderQueuedBackingBytesPerGeneration,
+
 		packetConn:        packetConn,
 		logger:            zerolog.Nop(),
 		ctx:               handlerCtx,
 		cancel:            cancelHandler,
-		fragmentAssembler: protocol.NewShardedFragmentAssembler(protocol.DefaultShardCount),
+		fragmentAssembler: protocol.NewShardedFragmentAssembler(protocol.DefaultShardCount, 0, 0),
 		receivers:         make(map[*quic.Conn]struct{}),
 		senders:           make(map[*pool.ClientConn]*udpSender),
 	}
@@ -901,11 +983,14 @@ func TestUDPReceiverAcceptsLiteralWidenedFragmentsAndRejectsLegacy(t *testing.T)
 	}
 	handlerCtx, cancelHandler := context.WithCancel(ctx)
 	handler := &UDPHandler{
+		maxSenderQueuedFrames:       int64(config.DefaultMaxUDPSenderQueuedFramesPerGeneration),
+		maxSenderQueuedBackingBytes: config.DefaultMaxUDPSenderQueuedBackingBytesPerGeneration,
+
 		packetConn:        packetConn,
 		logger:            zerolog.Nop(),
 		ctx:               handlerCtx,
 		cancel:            cancelHandler,
-		fragmentAssembler: protocol.NewShardedFragmentAssembler(protocol.DefaultShardCount),
+		fragmentAssembler: protocol.NewShardedFragmentAssembler(protocol.DefaultShardCount, 0, 0),
 		receivers:         make(map[*quic.Conn]struct{}),
 		senders:           make(map[*pool.ClientConn]*udpSender),
 	}
@@ -1025,7 +1110,10 @@ func TestUDPServerSessionCachesExactSender(t *testing.T) {
 		defer cancel()
 		pair := newUDPSenderQUICPair(t, ctx)
 		handlerCtx, cancelHandler := context.WithCancel(ctx)
-		handler := &UDPHandler{ctx: handlerCtx, logger: zerolog.Nop(), enableFragmentation: true, senders: make(map[*pool.ClientConn]*udpSender)}
+		handler := &UDPHandler{
+			maxSenderQueuedFrames:       int64(config.DefaultMaxUDPSenderQueuedFramesPerGeneration),
+			maxSenderQueuedBackingBytes: config.DefaultMaxUDPSenderQueuedBackingBytesPerGeneration,
+			ctx:                         handlerCtx, logger: zerolog.Nop(), enableFragmentation: true, senders: make(map[*pool.ClientConn]*udpSender)}
 		defer func() {
 			cancelHandler()
 			handler.wait()
@@ -1063,7 +1151,10 @@ func TestUDPServerSessionCachesExactSender(t *testing.T) {
 		stalePair := newUDPSenderQUICPair(t, ctx)
 		freshPair := newUDPSenderQUICPair(t, ctx)
 		handlerCtx, cancelHandler := context.WithCancel(ctx)
-		handler := &UDPHandler{ctx: handlerCtx, logger: zerolog.Nop(), enableFragmentation: true, senders: make(map[*pool.ClientConn]*udpSender)}
+		handler := &UDPHandler{
+			maxSenderQueuedFrames:       int64(config.DefaultMaxUDPSenderQueuedFramesPerGeneration),
+			maxSenderQueuedBackingBytes: config.DefaultMaxUDPSenderQueuedBackingBytesPerGeneration,
+			ctx:                         handlerCtx, logger: zerolog.Nop(), enableFragmentation: true, senders: make(map[*pool.ClientConn]*udpSender)}
 		defer func() {
 			cancelHandler()
 			handler.wait()
@@ -1121,7 +1212,10 @@ func TestUDPServerSenderCancellationRaceDrainsExactly(t *testing.T) {
 	defer cancel()
 	pair := newUDPSenderQUICPair(t, ctx)
 	handlerCtx, cancelHandler := context.WithCancel(ctx)
-	handler := &UDPHandler{ctx: handlerCtx, logger: zerolog.Nop(), enableFragmentation: true, senders: make(map[*pool.ClientConn]*udpSender)}
+	handler := &UDPHandler{
+		maxSenderQueuedFrames:       int64(config.DefaultMaxUDPSenderQueuedFramesPerGeneration),
+		maxSenderQueuedBackingBytes: config.DefaultMaxUDPSenderQueuedBackingBytesPerGeneration,
+		ctx:                         handlerCtx, logger: zerolog.Nop(), enableFragmentation: true, senders: make(map[*pool.ClientConn]*udpSender)}
 	defer func() {
 		cancelHandler()
 		handler.wait()
@@ -1167,7 +1261,7 @@ func TestUDPServerSenderCancellationRaceDrainsExactly(t *testing.T) {
 		frames := sender.ownedFrames
 		sender.mu.Unlock()
 		backing := frames * int64(protocol.DatagramBufferSize)
-		if frames < 0 || frames > maxUDPSenderQueuedFrames || backing > maxUDPSenderQueuedBacking {
+		if frames < 0 || frames > config.DefaultMaxUDPSenderQueuedFramesPerGeneration || backing > config.DefaultMaxUDPSenderQueuedBackingBytesPerGeneration {
 			t.Fatalf("racing sender exceeded cap: owned=%d/%d", frames, backing)
 		}
 		if sender.stopped.Load() {
@@ -1244,6 +1338,9 @@ func BenchmarkUDPSenderResolution(b *testing.B) {
 	pair := newUDPSenderQUICPair(b, ctx)
 	handlerCtx, cancelHandler := context.WithCancel(ctx)
 	handler := &UDPHandler{
+		maxSenderQueuedFrames:       int64(config.DefaultMaxUDPSenderQueuedFramesPerGeneration),
+		maxSenderQueuedBackingBytes: config.DefaultMaxUDPSenderQueuedBackingBytesPerGeneration,
+
 		ctx:     handlerCtx,
 		senders: make(map[*pool.ClientConn]*udpSender),
 	}
@@ -1283,7 +1380,10 @@ func BenchmarkUDPSenderResolution(b *testing.B) {
 }
 
 func BenchmarkUDPServerDsendAccounting(b *testing.B) {
-	handler := &UDPHandler{}
+	handler := &UDPHandler{
+		maxSenderQueuedFrames:       int64(config.DefaultMaxUDPSenderQueuedFramesPerGeneration),
+		maxSenderQueuedBackingBytes: config.DefaultMaxUDPSenderQueuedBackingBytesPerGeneration,
+	}
 	sender := &udpSender{
 		queue: make(chan udpSendBatch, 1),
 	}

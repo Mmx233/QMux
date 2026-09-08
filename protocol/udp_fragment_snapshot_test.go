@@ -9,7 +9,7 @@ import (
 )
 
 func TestShardedFragmentAssemblerSnapshotCapacityReasons(t *testing.T) {
-	assembler := NewShardedFragmentAssembler(2)
+	assembler := NewShardedFragmentAssembler(2, 0, 0)
 	defer assembler.Close()
 	assembler.maxGroups = 1
 	assembler.maxBytes = int64(FragmentBufferSize)
@@ -45,7 +45,7 @@ func TestShardedFragmentAssemblerSnapshotCapacityReasons(t *testing.T) {
 
 func TestShardedFragmentAssemblerSnapshotExpiration(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		assembler := NewShardedFragmentAssembler(1)
+		assembler := NewShardedFragmentAssembler(1, 0, 0)
 		defer assembler.Close()
 		if _, err := assembler.AddFragment(1, 1, 0, 2, []byte("fragment")); err != nil {
 			t.Fatal(err)
@@ -71,7 +71,7 @@ func TestShardedFragmentAssemblerSnapshotExpiration(t *testing.T) {
 }
 
 func TestFragmentSnapshotDoesNotWaitForShardLocks(t *testing.T) {
-	assembler := NewShardedFragmentAssembler(1)
+	assembler := NewShardedFragmentAssembler(1, 0, 0)
 	defer assembler.Close()
 	if _, err := assembler.AddFragment(1, 1, 0, 2, []byte("fragment")); err != nil {
 		t.Fatal(err)

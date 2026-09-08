@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"errors"
+	"io"
 	"io/fs"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,15 @@ import (
 )
 
 const clientLifecycleTimeout = 3 * time.Second
+
+type clientCopyBufferObserver struct {
+	size int
+}
+
+func (r *clientCopyBufferObserver) Read(p []byte) (int, error) {
+	r.size = len(p)
+	return 0, io.EOF
+}
 
 func callClientLifecycle(fn func() error) <-chan error {
 	done := make(chan error, 1)
@@ -51,6 +61,28 @@ func newClientLifecycleClient(t *testing.T, clientID string, endpoints ...config
 	}
 	c.connMgr.attemptTimeout = 20 * time.Second
 	return c
+}
+
+func TestNewUsesConfiguredCopyBufferPool(t *testing.T) {
+	const copyBufferSize = 32 << 10
+	c, err := New(&config.Client{
+		ClientID:          "copy-buffer-config",
+		Server:            config.ClientServer{Servers: []config.ServerEndpoint{{Address: "server.example.com:8443"}}},
+		Local:             config.LocalService{Host: "127.0.0.1", Port: 8080},
+		TLS:               lifecycleClientTLSFiles(t),
+		TCPCopyBufferSize: copyBufferSize,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	observer := &clientCopyBufferObserver{}
+	if _, err := c.copyBufferPool.CopyBuffered(io.Discard, observer, true); err != nil {
+		t.Fatalf("CopyBuffered: %v", err)
+	}
+	if observer.size != copyBufferSize {
+		t.Fatalf("copy buffer size = %d, want %d", observer.size, copyBufferSize)
+	}
 }
 
 func TestNewRejectsNilAndSemanticErrorsBeforeCredentials(t *testing.T) {

@@ -22,6 +22,10 @@ import (
 
 const trafficResolverChild = "QMUX_TRAFFIC_RESOLVER_CHILD"
 
+func newTestCopyBufferPool() *protocol.CopyBufferPool {
+	return protocol.NewCopyBufferPool(protocol.DefaultCopyBufferSize)
+}
+
 func testPool(t *testing.T, quicAddr string) *pool.ConnectionPool {
 	t.Helper()
 	p := pool.New(quicAddr, pool.NewRoundRobinBalancer(), zerolog.Nop())
@@ -113,8 +117,40 @@ func closeTestTCPAndUDP(t *testing.T, tcpListener net.Listener, udpListener *net
 	}
 }
 
+func TestManagerSharesRootCopyBufferPoolWithEveryListener(t *testing.T) {
+	const copyBufferSize = 48 << 10
+	conf := &config.Server{
+		TCPCopyBufferSize: copyBufferSize,
+		Listeners: []config.QuicListener{
+			{QuicAddr: "copy-buffer-first", TrafficAddr: "127.0.0.1:0", Protocol: "tcp"},
+			{QuicAddr: "copy-buffer-second", TrafficAddr: "127.0.0.1:0", Protocol: "tcp"},
+		},
+	}
+	copyBufferPool := protocol.NewCopyBufferPool(conf.TCPCopyBufferSize)
+	manager := NewManager(conf, map[string]*pool.ConnectionPool{
+		"copy-buffer-first":  testPool(t, "copy-buffer-first"),
+		"copy-buffer-second": testPool(t, "copy-buffer-second"),
+	}, copyBufferPool, zerolog.Nop())
+	if manager.copyBufferPool != copyBufferPool {
+		t.Fatal("manager did not retain the root copy buffer pool")
+	}
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer manager.Stop()
+
+	if len(manager.listeners) != len(conf.Listeners) {
+		t.Fatalf("committed listeners = %d, want %d", len(manager.listeners), len(conf.Listeners))
+	}
+	for i, listener := range manager.listeners {
+		if listener.copyBufferPool != copyBufferPool {
+			t.Fatalf("listener %d did not receive the root copy buffer pool", i)
+		}
+	}
+}
+
 func TestManagerEmptyLifecycleAndStableStartErrors(t *testing.T) {
-	manager := NewManager(nil, nil, zerolog.Nop())
+	manager := NewManager(nil, nil, newTestCopyBufferPool(), zerolog.Nop())
 	if manager.Running() {
 		t.Fatal("new manager reported running")
 	}
@@ -150,7 +186,7 @@ func TestNewManagerSnapshotsListeners(t *testing.T) {
 			EnableFragmentation: &fragmentation,
 		},
 	}}}
-	manager := NewManager(conf, nil, zerolog.Nop())
+	manager := NewManager(conf, nil, newTestCopyBufferPool(), zerolog.Nop())
 	conf.Listeners[0].QuicAddr = "quic-mutated"
 	fragmentation = false
 	if manager.configs[0].QuicAddr != "quic-original" ||
@@ -168,7 +204,7 @@ func TestNewManagerSnapshotsListeners(t *testing.T) {
 }
 
 func TestManagerCloseBeforeStartIsTerminal(t *testing.T) {
-	manager := NewManager(nil, nil, zerolog.Nop())
+	manager := NewManager(nil, nil, newTestCopyBufferPool(), zerolog.Nop())
 	manager.Close()
 	waitManager(t, manager)
 	if err := manager.Start(context.Background()); !errors.Is(err, ErrManagerStopped) {
@@ -186,7 +222,7 @@ func TestManagerContextCancellationInitiatesShutdown(t *testing.T) {
 	}}}
 	manager := NewManager(conf, map[string]*pool.ConnectionPool{
 		quicAddr: testPool(t, quicAddr),
-	}, zerolog.Nop())
+	}, newTestCopyBufferPool(), zerolog.Nop())
 	ctx, cancel := context.WithCancel(context.Background())
 	if err := manager.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -223,7 +259,7 @@ func TestManagerBothContextCancellationAllowsRepeatedExactRebind(t *testing.T) {
 				QuicAddr:    quicAddr,
 				TrafficAddr: trafficAddr,
 				Protocol:    "both",
-			}}}, map[string]*pool.ConnectionPool{quicAddr: connectionPool}, zerolog.Nop())
+			}}}, map[string]*pool.ConnectionPool{quicAddr: connectionPool}, newTestCopyBufferPool(), zerolog.Nop())
 
 			ctx, cancel := context.WithCancel(context.Background())
 			if err := manager.Start(ctx); err != nil {
@@ -255,7 +291,7 @@ func TestManagerCancelWhileStartingRollsBackStagedSockets(t *testing.T) {
 		Protocol:    "both",
 	}}}, map[string]*pool.ConnectionPool{
 		quicAddr: testPool(t, quicAddr),
-	}, zerolog.Nop())
+	}, newTestCopyBufferPool(), zerolog.Nop())
 	staged := make(chan struct{})
 	releaseCommit := make(chan struct{})
 	var releaseOnce sync.Once
@@ -393,7 +429,7 @@ func runTrafficResolverChild(t *testing.T) {
 	}}, map[string]*pool.ConnectionPool{
 		"staged":  firstPool,
 		"blocked": blockedPool,
-	}, zerolog.Nop())
+	}, newTestCopyBufferPool(), zerolog.Nop())
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		_, _ = io.Copy(io.Discard, os.Stdin)
@@ -421,7 +457,7 @@ func TestManagerWaitJoinsCommittedListenerHandlers(t *testing.T) {
 		Protocol:    "tcp",
 	}}}, map[string]*pool.ConnectionPool{
 		quicAddr: testPool(t, quicAddr),
-	}, zerolog.Nop())
+	}, newTestCopyBufferPool(), zerolog.Nop())
 	if err := manager.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -488,7 +524,7 @@ func TestManagerMissingPoolFailsBeforeBinding(t *testing.T) {
 	}}
 	manager := NewManager(conf, map[string]*pool.ConnectionPool{
 		"present": testPool(t, "present"),
-	}, zerolog.Nop())
+	}, newTestCopyBufferPool(), zerolog.Nop())
 
 	err := manager.Start(context.Background())
 	if !errors.Is(err, ErrMissingPool) {
@@ -531,7 +567,7 @@ func TestManagerRollsBackTCPWhenUDPBindFails(t *testing.T) {
 	}}}
 	manager := NewManager(conf, map[string]*pool.ConnectionPool{
 		quicAddr: testPool(t, quicAddr),
-	}, zerolog.Nop())
+	}, newTestCopyBufferPool(), zerolog.Nop())
 	startErr := manager.Start(context.Background())
 	if startErr == nil {
 		t.Fatal("Start succeeded with occupied UDP address")
@@ -569,7 +605,7 @@ func TestManagerRollsBackPriorListener(t *testing.T) {
 	manager := NewManager(conf, map[string]*pool.ConnectionPool{
 		"first":  testPool(t, "first"),
 		"second": testPool(t, "second"),
-	}, zerolog.Nop())
+	}, newTestCopyBufferPool(), zerolog.Nop())
 	if err := manager.Start(context.Background()); err == nil {
 		t.Fatal("Start succeeded with occupied later TCP address")
 	}
@@ -592,7 +628,7 @@ func TestManagerRejectsAmbiguousDatagramRoutes(t *testing.T) {
 	}}
 	manager := NewManager(conf, map[string]*pool.ConnectionPool{
 		quicAddr: testPool(t, quicAddr),
-	}, zerolog.Nop())
+	}, newTestCopyBufferPool(), zerolog.Nop())
 	if err := manager.Start(context.Background()); !errors.Is(err, ErrDuplicateDatagramRoute) {
 		t.Fatalf("Start error = %v, want ErrDuplicateDatagramRoute", err)
 	}
@@ -608,7 +644,7 @@ func TestManagerUDPShutdownClosesHandlerAndAssembler(t *testing.T) {
 	}}}
 	manager := NewManager(conf, map[string]*pool.ConnectionPool{
 		quicAddr: testPool(t, quicAddr),
-	}, zerolog.Nop())
+	}, newTestCopyBufferPool(), zerolog.Nop())
 	if err := manager.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -630,7 +666,7 @@ func TestManagerUDPShutdownClosesHandlerAndAssembler(t *testing.T) {
 }
 
 func TestManagerConcurrentCloseWaitStop(t *testing.T) {
-	manager := NewManager(nil, nil, zerolog.Nop())
+	manager := NewManager(nil, nil, newTestCopyBufferPool(), zerolog.Nop())
 	if err := manager.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}

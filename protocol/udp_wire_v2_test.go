@@ -219,7 +219,7 @@ func TestLegacyFragmentRejectedBeforeAssembly(t *testing.T) {
 		t.Fatalf("legacy fragment reached assembler %d times", calls)
 	}
 
-	retaining := NewShardedFragmentAssembler(1)
+	retaining := NewShardedFragmentAssembler(1, 0, 0)
 	defer retaining.Close()
 	if _, _, _, err := DecodeAndAssembleUDPDatagram(wire, retaining); !errors.Is(err, ErrUnknownDatagramType) {
 		t.Fatalf("legacy fragment retaining assembler error = %v", err)
@@ -369,7 +369,7 @@ func TestDecodeAndAssembleUDPDatagram(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		assembler := NewFragmentAssembler()
+		assembler := NewFragmentAssembler(0, 0)
 		for i, datagram := range datagrams {
 			sessionID, payload, complete, err := DecodeAndAssembleUDPDatagram(datagram, assembler)
 			if err != nil {
@@ -418,8 +418,8 @@ func TestDecodeAndAssembleUDPDatagramSameFragmentIDDifferentSessions(t *testing.
 		Close()
 	}
 	assemblers := map[string]func() closeAssembler{
-		"regular": func() closeAssembler { return NewFragmentAssembler() },
-		"sharded": func() closeAssembler { return NewShardedFragmentAssembler(16) },
+		"regular": func() closeAssembler { return NewFragmentAssembler(0, 0) },
+		"sharded": func() closeAssembler { return NewShardedFragmentAssembler(16, 0, 0) },
 	}
 	firstPayload := bytes.Repeat([]byte("first"), 500)
 	secondPayload := bytes.Repeat([]byte("second"), 500)

@@ -35,6 +35,7 @@ const (
 type Server struct {
 	config               *config.Server
 	pools                map[string]*pool.ConnectionPool // quicAddr -> pool
+	copyBufferPool       *protocol.CopyBufferPool
 	trafficManager       *traffic.Manager
 	authenticator        auth.Auth
 	registrationTimeout  time.Duration
@@ -166,12 +167,13 @@ func New(conf *config.Server) (*Server, error) {
 	srv := &Server{
 		config:               &ownedConfig,
 		pools:                pools,
+		copyBufferPool:       protocol.NewCopyBufferPool(ownedConfig.TCPCopyBufferSize),
 		authenticator:        authenticator,
 		registrationTimeout:  registrationTimeout,
 		writeRegistrationAck: protocol.WriteRegisterAckWithAuth,
 		logger:               logger,
 	}
-	srv.trafficManager = traffic.NewManager(srv.config, srv.pools, srv.logger)
+	srv.trafficManager = traffic.NewManager(srv.config, srv.pools, srv.copyBufferPool, srv.logger)
 	return srv, nil
 }
 

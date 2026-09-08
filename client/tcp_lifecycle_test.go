@@ -116,7 +116,8 @@ func TestClientTCPRelayDeliversResponseAfterRequestFIN(t *testing.T) {
 			Host: "127.0.0.1",
 			Port: listener.Addr().(*net.TCPAddr).Port,
 		}},
-		logger: zerolog.Nop(),
+		copyBufferPool: protocol.NewCopyBufferPool(protocol.DefaultCopyBufferSize),
+		logger:         zerolog.Nop(),
 	}
 	handlerDone := make(chan struct{})
 	go func() {
@@ -172,8 +173,9 @@ func TestClientTCPSetupFailureResetsBothStreamDirections(t *testing.T) {
 	}
 
 	c := &Client{
-		config: &config.Client{Local: config.LocalService{Host: "127.0.0.1", Port: backendPort}},
-		logger: zerolog.Nop(),
+		config:         &config.Client{Local: config.LocalService{Host: "127.0.0.1", Port: backendPort}},
+		copyBufferPool: protocol.NewCopyBufferPool(protocol.DefaultCopyBufferSize),
+		logger:         zerolog.Nop(),
 	}
 	handlerDone := make(chan struct{})
 	if err := backend.Close(); err != nil {
@@ -286,7 +288,8 @@ func newBlockedClientRelay(
 			Host: "127.0.0.1",
 			Port: listener.Addr().(*net.TCPAddr).Port,
 		}},
-		logger: zerolog.Nop(),
+		copyBufferPool: protocol.NewCopyBufferPool(protocol.DefaultCopyBufferSize),
+		logger:         zerolog.Nop(),
 	}
 	handlerDone := make(chan struct{})
 	go func() {

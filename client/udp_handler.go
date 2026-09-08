@@ -210,14 +210,23 @@ type UDPHandler struct {
 }
 
 // NewUDPHandler creates a new UDP handler
-func NewUDPHandler(localHost string, localPort int, enableFragmentation bool, logger zerolog.Logger) *UDPHandler {
-	return newUDPHandler(localHost, localPort, enableFragmentation, logger, newUDPSessionBudget(0))
+func NewUDPHandler(
+	localHost string,
+	localPort int,
+	enableFragmentation bool,
+	maxFragmentGroups int,
+	maxFragmentBackingBytes int64,
+	logger zerolog.Logger,
+) *UDPHandler {
+	return newUDPHandler(localHost, localPort, enableFragmentation, maxFragmentGroups, maxFragmentBackingBytes, logger, newUDPSessionBudget(0))
 }
 
 func newUDPHandler(
 	localHost string,
 	localPort int,
 	enableFragmentation bool,
+	maxFragmentGroups int,
+	maxFragmentBackingBytes int64,
 	logger zerolog.Logger,
 	budget *udpSessionBudget,
 	dsendStats ...*clientDsendStats,
@@ -234,7 +243,7 @@ func newUDPHandler(
 		localPort:           localPort,
 		enableFragmentation: enableFragmentation,
 		logger:              logger.With().Str("component", "udp_handler").Logger(),
-		fragmentAssembler:   protocol.NewShardedFragmentAssembler(protocol.DefaultShardCount),
+		fragmentAssembler:   protocol.NewShardedFragmentAssembler(protocol.DefaultShardCount, maxFragmentGroups, maxFragmentBackingBytes),
 		sessionBudget:       budget,
 		dsendStats:          stats,
 		done:                make(chan struct{}),

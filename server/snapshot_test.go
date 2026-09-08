@@ -1,7 +1,12 @@
 package server
 
 import (
+	"crypto/x509"
+	"encoding/pem"
+	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -9,10 +14,67 @@ import (
 	"time"
 
 	"github.com/Mmx233/QMux/config"
+	"github.com/Mmx233/QMux/protocol"
 	"github.com/Mmx233/QMux/server/pool"
 	"github.com/Mmx233/QMux/server/traffic"
 	"github.com/rs/zerolog"
 )
+
+type serverCopyBufferObserver struct {
+	size int
+}
+
+func (r *serverCopyBufferObserver) Read(p []byte) (int, error) {
+	r.size = len(p)
+	return 0, io.EOF
+}
+
+func snapshotServerTLSFiles(t *testing.T) config.ServerTLS {
+	t.Helper()
+	certificate, _ := registrationTestCertificate(t)
+	privateKey, err := x509.MarshalPKCS8PrivateKey(certificate.PrivateKey)
+	if err != nil {
+		t.Fatalf("marshal server private key: %v", err)
+	}
+	directory := t.TempDir()
+	certificateFile := filepath.Join(directory, "server.crt")
+	privateKeyFile := filepath.Join(directory, "server.key")
+	if err := os.WriteFile(certificateFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Certificate[0]}), 0o600); err != nil {
+		t.Fatalf("write server certificate: %v", err)
+	}
+	if err := os.WriteFile(privateKeyFile, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privateKey}), 0o600); err != nil {
+		t.Fatalf("write server private key: %v", err)
+	}
+	return config.ServerTLS{ServerCertFile: certificateFile, ServerKeyFile: privateKeyFile}
+}
+
+func TestNewUsesConfiguredCopyBufferPool(t *testing.T) {
+	const copyBufferSize = 48 << 10
+	srv, err := New(&config.Server{
+		Listeners: []config.QuicListener{{
+			QuicAddr:    "127.0.0.1:8443",
+			TrafficAddr: "127.0.0.1:8080",
+			Protocol:    "tcp",
+		}},
+		Auth:              config.ServerAuth{Method: "token", Token: "0123456789abcdef"},
+		TLS:               snapshotServerTLSFiles(t),
+		TCPCopyBufferSize: copyBufferSize,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	for _, connectionPool := range srv.pools {
+		t.Cleanup(connectionPool.Stop)
+	}
+
+	observer := &serverCopyBufferObserver{}
+	if _, err := srv.copyBufferPool.CopyBuffered(io.Discard, observer, true); err != nil {
+		t.Fatalf("CopyBuffered: %v", err)
+	}
+	if observer.size != copyBufferSize {
+		t.Fatalf("copy buffer size = %d, want %d", observer.size, copyBufferSize)
+	}
+}
 
 func TestRouteSnapshotIncludesPoolCapacity(t *testing.T) {
 	const addr = "route"
@@ -343,7 +405,7 @@ func newSnapshotTestServer(t *testing.T, listeners []config.QuicListener) *Serve
 	return &Server{
 		config:         serverConfig,
 		pools:          pools,
-		trafficManager: traffic.NewManager(serverConfig, pools, zerolog.Nop()),
+		trafficManager: traffic.NewManager(serverConfig, pools, protocol.NewCopyBufferPool(protocol.DefaultCopyBufferSize), zerolog.Nop()),
 	}
 }
 

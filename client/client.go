@@ -31,17 +31,20 @@ const tcpSetupTimeout = 5 * time.Second
 
 // Client represents the QMux client
 type Client struct {
-	config      *config.Client
-	connMgr     *ConnectionManager
-	udpHandlers sync.Map // serverAddr -> *UDPHandler
-	localConns  sync.Map // connID -> net.Conn
-	udpBudget   *udpSessionBudget
-	dsendStats  *clientDsendStats
-	tcpSetups   stats.Operation
-	tcpDials    stats.Operation
-	tcpPending  atomic.Int64
-	tcpActive   atomic.Int64
-	logger      zerolog.Logger
+	config                               *config.Client
+	connMgr                              *ConnectionManager
+	copyBufferPool                       *protocol.CopyBufferPool
+	maxUDPFragmentGroupsPerHandler       int
+	maxUDPFragmentBackingBytesPerHandler int64
+	udpHandlers                          sync.Map // serverAddr -> *UDPHandler
+	localConns                           sync.Map // connID -> net.Conn
+	udpBudget                            *udpSessionBudget
+	dsendStats                           *clientDsendStats
+	tcpSetups                            stats.Operation
+	tcpDials                             stats.Operation
+	tcpPending                           atomic.Int64
+	tcpActive                            atomic.Int64
+	logger                               zerolog.Logger
 
 	udpMu            sync.Mutex
 	liveUDPHandlers  map[*UDPHandler]struct{}
@@ -189,16 +192,19 @@ func New(conf *config.Client) (*Client, error) {
 
 	forceCtx, forceCancel := context.WithCancel(context.Background())
 	return &Client{
-		config:          conf,
-		connMgr:         connMgr,
-		udpBudget:       newUDPSessionBudget(conf.Capacity.MaxLocalUDPSessions),
-		dsendStats:      &clientDsendStats{},
-		liveUDPHandlers: make(map[*UDPHandler]struct{}),
-		runtimes:        make(map[*ServerConnection]*connectionRuntime),
-		logger:          logger,
-		terminalDone:    make(chan struct{}),
-		forceCtx:        forceCtx,
-		forceCancel:     forceCancel,
+		config:                               conf,
+		connMgr:                              connMgr,
+		copyBufferPool:                       protocol.NewCopyBufferPool(conf.TCPCopyBufferSize),
+		maxUDPFragmentGroupsPerHandler:       conf.Capacity.MaxUDPFragmentGroupsPerHandler,
+		maxUDPFragmentBackingBytesPerHandler: conf.Capacity.MaxUDPFragmentBackingBytesPerHandler,
+		udpBudget:                            newUDPSessionBudget(conf.Capacity.MaxLocalUDPSessions),
+		dsendStats:                           &clientDsendStats{},
+		liveUDPHandlers:                      make(map[*UDPHandler]struct{}),
+		runtimes:                             make(map[*ServerConnection]*connectionRuntime),
+		logger:                               logger,
+		terminalDone:                         make(chan struct{}),
+		forceCtx:                             forceCtx,
+		forceCancel:                          forceCancel,
 	}, nil
 }
 
@@ -297,7 +303,8 @@ func (c *Client) installRuntime(sc *ServerConnection) {
 		dsendStats := c.dsendStats
 		c.udpMu.Unlock()
 		runtime.udp = newUDPHandler(c.config.Local.Host, c.config.Local.Port,
-			c.config.UDP.IsFragmentationEnabled(), c.logger, c.udpBudget, dsendStats)
+			c.config.UDP.IsFragmentationEnabled(), c.maxUDPFragmentGroupsPerHandler,
+			c.maxUDPFragmentBackingBytesPerHandler, c.logger, c.udpBudget, dsendStats)
 	}
 	if conn == nil {
 		close(runtime.acceptDone)
@@ -546,7 +553,7 @@ func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *Serv
 	}
 
 	relayOwnsStream = true
-	relay := protocol.StartRelay(localConn, stream, localToQUICComplete, quicToLocalComplete)
+	relay := c.copyBufferPool.StartRelay(localConn, stream, localToQUICComplete, quicToLocalComplete)
 	stopAbort := context.AfterFunc(ctx, abort)
 	err = relay.Wait()
 	if !stopAbort() {

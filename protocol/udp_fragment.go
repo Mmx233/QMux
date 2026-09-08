@@ -221,14 +221,14 @@ func validateFragmentInput(index, total uint8) error {
 }
 
 func fragmentGroupLimit(limit int) int {
-	if limit > 0 && limit < maxRetainedFragmentGroups {
+	if limit > 0 {
 		return limit
 	}
 	return maxRetainedFragmentGroups
 }
 
 func fragmentByteLimit(limit int64) int64 {
-	if limit > 0 && limit < maxRetainedFragmentBytes {
+	if limit > 0 {
 		return limit
 	}
 	return maxRetainedFragmentBytes
@@ -298,9 +298,11 @@ func releaseAllFragmentGroups(groups map[fragmentKey]*fragmentGroup) (int64, int
 }
 
 // NewFragmentAssembler creates a new fragment assembler
-func NewFragmentAssembler() *FragmentAssembler {
+func NewFragmentAssembler(maxGroups int, maxBackingBytes int64) *FragmentAssembler {
 	fa := &FragmentAssembler{
 		fragments: make(map[fragmentKey]*fragmentGroup),
+		maxGroups: maxGroups,
+		maxBytes:  maxBackingBytes,
 		stopCh:    make(chan struct{}),
 		doneCh:    make(chan struct{}),
 	}
@@ -431,16 +433,18 @@ type ShardedFragmentAssembler struct {
 }
 
 // NewShardedFragmentAssembler creates a new sharded fragment assembler
-func NewShardedFragmentAssembler(shardCount int) *ShardedFragmentAssembler {
+func NewShardedFragmentAssembler(shardCount, maxGroups int, maxBackingBytes int64) *ShardedFragmentAssembler {
 	if shardCount <= 0 {
 		shardCount = DefaultShardCount
 	}
 
 	sfa := &ShardedFragmentAssembler{
-		shards: make([]fragmentShard, shardCount),
-		seed:   maphash.MakeSeed(),
-		stopCh: make(chan struct{}),
-		doneCh: make(chan struct{}),
+		shards:    make([]fragmentShard, shardCount),
+		seed:      maphash.MakeSeed(),
+		maxGroups: maxGroups,
+		maxBytes:  maxBackingBytes,
+		stopCh:    make(chan struct{}),
+		doneCh:    make(chan struct{}),
 	}
 
 	for i := range sfa.shards {

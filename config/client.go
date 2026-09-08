@@ -24,13 +24,16 @@ type Client struct {
 	Auth              ClientAuth     `yaml:"auth"`
 	UDP               UDPConfig      `yaml:"udp"`
 	Capacity          ClientCapacity `yaml:"capacity"`
+	TCPCopyBufferSize int            `yaml:"tcp_copy_buffer_size"`
 	HeartbeatInterval time.Duration  `yaml:"heartbeat_interval"` // Heartbeat interval, default 30s
 	HealthTimeout     time.Duration  `yaml:"health_timeout"`     // Health timeout for received heartbeats, default 90s
 }
 
-// ClientCapacity bounds resources shared by the client process.
+// ClientCapacity bounds process-wide sessions and per-handler fragment state.
 type ClientCapacity struct {
-	MaxLocalUDPSessions int `yaml:"max_local_udp_sessions"`
+	MaxLocalUDPSessions                  int   `yaml:"max_local_udp_sessions"`
+	MaxUDPFragmentGroupsPerHandler       int   `yaml:"max_udp_fragment_groups_per_handler"`
+	MaxUDPFragmentBackingBytesPerHandler int64 `yaml:"max_udp_fragment_backing_bytes_per_handler"`
 }
 
 // ApplyDefaults fills omitted or explicitly zero capacity limits.
@@ -40,14 +43,30 @@ func (c *ClientCapacity) ApplyDefaults() {
 	if c.MaxLocalUDPSessions == 0 {
 		c.MaxLocalUDPSessions = DefaultMaxLocalUDPSessions
 	}
+	if c.MaxUDPFragmentGroupsPerHandler == 0 {
+		c.MaxUDPFragmentGroupsPerHandler = DefaultMaxUDPFragmentGroupsPerHandler
+	}
+	if c.MaxUDPFragmentBackingBytesPerHandler == 0 {
+		c.MaxUDPFragmentBackingBytesPerHandler = DefaultMaxUDPFragmentBackingBytesPerHandler
+	}
 }
 
 // Validate rejects negative limits. Zero means use the default.
 //
 //goland:noinspection GoMixedReceiverTypes
 func (c ClientCapacity) Validate(path string) error {
-	if c.MaxLocalUDPSessions < 0 {
-		return fmt.Errorf("%s.max_local_udp_sessions must not be negative", path)
+	limits := []struct {
+		name  string
+		value int64
+	}{
+		{"max_local_udp_sessions", int64(c.MaxLocalUDPSessions)},
+		{"max_udp_fragment_groups_per_handler", int64(c.MaxUDPFragmentGroupsPerHandler)},
+		{"max_udp_fragment_backing_bytes_per_handler", c.MaxUDPFragmentBackingBytesPerHandler},
+	}
+	for _, limit := range limits {
+		if limit.value < 0 {
+			return fmt.Errorf("%s.%s must not be negative", path, limit.name)
+		}
 	}
 	return nil
 }
@@ -66,6 +85,9 @@ func (c *Client) ApplyDefaults() {
 	c.EnsureClientID()
 	c.Auth.ApplyDefaults()
 	c.Capacity.ApplyDefaults()
+	if c.TCPCopyBufferSize == 0 {
+		c.TCPCopyBufferSize = DefaultTCPCopyBufferSize
+	}
 	if c.HeartbeatInterval == 0 {
 		c.HeartbeatInterval = DefaultHeartbeatInterval
 	}
@@ -83,6 +105,9 @@ func (c *Client) Validate() error {
 	}
 	if err := c.Capacity.Validate("capacity"); err != nil {
 		return err
+	}
+	if c.TCPCopyBufferSize < 0 {
+		return errors.New("tcp_copy_buffer_size must not be negative")
 	}
 	if err := c.Server.Validate(); err != nil {
 		return err

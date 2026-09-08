@@ -14,7 +14,7 @@ import (
 )
 
 func TestUDPAdmissionSnapshotOwnedSendState(t *testing.T) {
-	assembler := protocol.NewShardedFragmentAssembler(1)
+	assembler := protocol.NewShardedFragmentAssembler(1, 0, 0)
 	defer assembler.Close()
 	if _, err := assembler.AddFragment(1, 1, 0, 2, []byte("a")); err != nil {
 		t.Fatal(err)
@@ -23,6 +23,9 @@ func TestUDPAdmissionSnapshotOwnedSendState(t *testing.T) {
 	queued := &udpSender{ownedFrames: 2}
 	selected := &udpSender{ownedFrames: 3}
 	handler := &UDPHandler{
+		maxSenderQueuedFrames:       int64(config.DefaultMaxUDPSenderQueuedFramesPerGeneration),
+		maxSenderQueuedBackingBytes: config.DefaultMaxUDPSenderQueuedBackingBytesPerGeneration,
+
 		senders: map[*pool.ClientConn]*udpSender{
 			{}: queued,
 			{}: selected,
@@ -63,7 +66,10 @@ func TestUDPAdmissionSnapshotDsendHighWaterSurvivesRelease(t *testing.T) {
 		queue:  make(chan udpSendBatch, 1),
 		done:   make(chan struct{}),
 	}
-	handler := &UDPHandler{senders: map[*pool.ClientConn]*udpSender{client: sender}}
+	handler := &UDPHandler{
+		maxSenderQueuedFrames:       int64(config.DefaultMaxUDPSenderQueuedFramesPerGeneration),
+		maxSenderQueuedBackingBytes: config.DefaultMaxUDPSenderQueuedBackingBytesPerGeneration,
+		senders:                     map[*pool.ClientConn]*udpSender{client: sender}}
 	batch := fragmentUDPSenderBatch(t, 1, make([]byte, protocol.MaxUDPPayload+1))
 	wantItems := int64(len(batch.datagrams))
 	wantBacking := wantItems * int64(protocol.DatagramBufferSize)
@@ -96,7 +102,10 @@ func TestUDPAdmissionSnapshotDsendHighWaterCoversSample(t *testing.T) {
 		queue:  make(chan udpSendBatch, 1),
 		done:   make(chan struct{}),
 	}
-	handler := &UDPHandler{senders: map[*pool.ClientConn]*udpSender{client: sender}}
+	handler := &UDPHandler{
+		maxSenderQueuedFrames:       int64(config.DefaultMaxUDPSenderQueuedFramesPerGeneration),
+		maxSenderQueuedBackingBytes: config.DefaultMaxUDPSenderQueuedBackingBytesPerGeneration,
+		senders:                     map[*pool.ClientConn]*udpSender{client: sender}}
 
 	sender.mu.Lock()
 	snapshotDone := make(chan UDPAdmissionSnapshot, 1)
@@ -124,6 +133,9 @@ func TestUDPAdmissionSnapshotReleasesRegistryBeforeSenderSampling(t *testing.T) 
 	blockedSender := &udpSender{}
 	reachedSenderSampling := make(chan struct{})
 	handler := &UDPHandler{
+		maxSenderQueuedFrames:       int64(config.DefaultMaxUDPSenderQueuedFramesPerGeneration),
+		maxSenderQueuedBackingBytes: config.DefaultMaxUDPSenderQueuedBackingBytesPerGeneration,
+
 		senders:            map[*pool.ClientConn]*udpSender{blockedClient: blockedSender},
 		beforeSenderSample: func() { close(reachedSenderSampling) },
 	}
@@ -163,6 +175,9 @@ func TestUDPAdmissionSnapshotSenderRegistryAfterDeletion(t *testing.T) {
 	deleted := make(chan struct{})
 	release := make(chan struct{})
 	handler := &UDPHandler{
+		maxSenderQueuedFrames:       int64(config.DefaultMaxUDPSenderQueuedFramesPerGeneration),
+		maxSenderQueuedBackingBytes: config.DefaultMaxUDPSenderQueuedBackingBytesPerGeneration,
+
 		senders: map[*pool.ClientConn]*udpSender{client: sender},
 		afterSenderDelete: func() {
 			close(deleted)
@@ -199,7 +214,10 @@ func TestUDPAdmissionSnapshotSenderRegistryAfterDeletion(t *testing.T) {
 }
 
 func TestUDPAdmissionResourceErrorsAreNotDecodeDrops(t *testing.T) {
-	handler := &UDPHandler{}
+	handler := &UDPHandler{
+		maxSenderQueuedFrames:       int64(config.DefaultMaxUDPSenderQueuedFramesPerGeneration),
+		maxSenderQueuedBackingBytes: config.DefaultMaxUDPSenderQueuedBackingBytesPerGeneration,
+	}
 	for _, err := range []error{protocol.ErrFragmentAssemblerFull, protocol.ErrFragmentAssemblerClosed} {
 		handler.recordDecodeError(err)
 		handler.recordDecodeError(errors.Join(errors.New("wrapped"), err))
@@ -259,9 +277,15 @@ func TestManagerUDPAdmissionSnapshotsConfiguredOrder(t *testing.T) {
 		{Protocol: "tcp"},
 		{Protocol: "udp"},
 		{Protocol: "both"},
-	}}, nil, zerolog.Nop())
-	udp := &UDPHandler{senders: make(map[*pool.ClientConn]*udpSender)}
-	both := &UDPHandler{senders: make(map[*pool.ClientConn]*udpSender)}
+	}}, nil, newTestCopyBufferPool(), zerolog.Nop())
+	udp := &UDPHandler{
+		maxSenderQueuedFrames:       int64(config.DefaultMaxUDPSenderQueuedFramesPerGeneration),
+		maxSenderQueuedBackingBytes: config.DefaultMaxUDPSenderQueuedBackingBytesPerGeneration,
+		senders:                     make(map[*pool.ClientConn]*udpSender)}
+	both := &UDPHandler{
+		maxSenderQueuedFrames:       int64(config.DefaultMaxUDPSenderQueuedFramesPerGeneration),
+		maxSenderQueuedBackingBytes: config.DefaultMaxUDPSenderQueuedBackingBytesPerGeneration,
+		senders:                     make(map[*pool.ClientConn]*udpSender)}
 	udp.sessionStats.mu.Lock()
 	udp.sessionStats.current = 11
 	udp.sessionStats.mu.Unlock()

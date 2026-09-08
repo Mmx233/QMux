@@ -37,15 +37,20 @@ func TestServerConfigTemplateFields(t *testing.T) {
 	assert.NotEmpty(t, cfg.Listeners[0].TrafficAddr, "traffic_addr should not be empty")
 	assert.NotEmpty(t, cfg.Listeners[0].Protocol, "protocol should not be empty")
 	assert.Equal(t, config.ListenerCapacity{
-		MaxClientGenerations:             config.DefaultMaxClientGenerations,
-		MaxPendingRegistrations:          config.DefaultMaxPendingRegistrations,
-		MaxTCPConnections:                config.DefaultMaxTCPConnections,
-		MaxPendingTCPSetups:              config.DefaultMaxPendingTCPSetups,
-		MaxTCPConnectionsPerGeneration:   config.DefaultMaxTCPConnectionsPerGeneration,
-		MaxPendingTCPSetupsPerGeneration: config.DefaultMaxPendingTCPSetupsPerGeneration,
-		MaxUDPSessions:                   config.DefaultMaxUDPSessions,
-		MaxUDPSessionsPerGeneration:      config.DefaultMaxUDPSessionsPerGeneration,
+		MaxClientGenerations:                        config.DefaultMaxClientGenerations,
+		MaxPendingRegistrations:                     config.DefaultMaxPendingRegistrations,
+		MaxTCPConnections:                           config.DefaultMaxTCPConnections,
+		MaxPendingTCPSetups:                         config.DefaultMaxPendingTCPSetups,
+		MaxTCPConnectionsPerGeneration:              config.DefaultMaxTCPConnectionsPerGeneration,
+		MaxPendingTCPSetupsPerGeneration:            config.DefaultMaxPendingTCPSetupsPerGeneration,
+		MaxUDPSessions:                              config.DefaultMaxUDPSessions,
+		MaxUDPSessionsPerGeneration:                 config.DefaultMaxUDPSessionsPerGeneration,
+		MaxUDPSenderQueuedFramesPerGeneration:       config.DefaultMaxUDPSenderQueuedFramesPerGeneration,
+		MaxUDPSenderQueuedBackingBytesPerGeneration: config.DefaultMaxUDPSenderQueuedBackingBytesPerGeneration,
+		MaxUDPFragmentGroups:                        config.DefaultMaxUDPFragmentGroups,
+		MaxUDPFragmentBackingBytes:                  config.DefaultMaxUDPFragmentBackingBytes,
 	}, cfg.Listeners[0].Capacity)
+	assert.Equal(t, config.DefaultTCPCopyBufferSize, cfg.TCPCopyBufferSize)
 
 	// Verify auth
 	assert.NotEmpty(t, cfg.Auth.Method, "auth method should not be empty")
@@ -97,7 +102,12 @@ func TestClientConfigTemplateFields(t *testing.T) {
 	// Verify local service
 	assert.NotEmpty(t, cfg.Local.Host, "local host should not be empty")
 	assert.Greater(t, cfg.Local.Port, 0, "local port should be greater than 0")
-	assert.Equal(t, config.ClientCapacity{MaxLocalUDPSessions: config.DefaultMaxLocalUDPSessions}, cfg.Capacity)
+	assert.Equal(t, config.ClientCapacity{
+		MaxLocalUDPSessions:                  config.DefaultMaxLocalUDPSessions,
+		MaxUDPFragmentGroupsPerHandler:       config.DefaultMaxUDPFragmentGroupsPerHandler,
+		MaxUDPFragmentBackingBytesPerHandler: config.DefaultMaxUDPFragmentBackingBytesPerHandler,
+	}, cfg.Capacity)
+	assert.Equal(t, config.DefaultTCPCopyBufferSize, cfg.TCPCopyBufferSize)
 
 	// Verify TLS
 	assert.NotEmpty(t, cfg.TLS.CACertFile, "TLS CA cert file should not be empty")

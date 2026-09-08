@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/Mmx233/QMux/config"
+	"github.com/Mmx233/QMux/protocol"
 	"github.com/Mmx233/QMux/server/pool"
 	"github.com/rs/zerolog"
 )
@@ -39,9 +40,10 @@ const (
 
 // Manager manages traffic listeners.
 type Manager struct {
-	configs []config.QuicListener
-	pools   map[string]*pool.ConnectionPool // quicAddr -> pool
-	logger  zerolog.Logger
+	configs        []config.QuicListener
+	pools          map[string]*pool.ConnectionPool // quicAddr -> pool
+	copyBufferPool *protocol.CopyBufferPool
+	logger         zerolog.Logger
 
 	mu        sync.Mutex
 	state     managerState
@@ -64,6 +66,7 @@ type Listener struct {
 	TCPListener         net.Listener
 	UDPConn             net.PacketConn
 	Pool                *pool.ConnectionPool
+	copyBufferPool      *protocol.CopyBufferPool
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -73,19 +76,23 @@ type Listener struct {
 	fixedWG   sync.WaitGroup
 	handlerWG sync.WaitGroup
 
-	flowsMu         sync.Mutex
-	flowsClosing    bool
-	flows           map[*tcpFlow]struct{}
-	tcpFlowLimit    int
-	tcpSetupLimit   int
-	tcpSetupSlots   chan struct{}
-	tcpAdmission    tcpAdmissionStats
-	udpSessionLimit int
-	udpHandler      *UDPHandler
+	flowsMu                                  sync.Mutex
+	flowsClosing                             bool
+	flows                                    map[*tcpFlow]struct{}
+	tcpFlowLimit                             int
+	tcpSetupLimit                            int
+	tcpSetupSlots                            chan struct{}
+	tcpAdmission                             tcpAdmissionStats
+	udpSessionLimit                          int
+	udpSenderQueuedFramesPerGeneration       int
+	udpSenderQueuedBackingBytesPerGeneration int64
+	udpFragmentGroups                        int
+	udpFragmentBackingBytes                  int64
+	udpHandler                               *UDPHandler
 }
 
 // NewManager creates a new traffic manager.
-func NewManager(conf *config.Server, pools map[string]*pool.ConnectionPool, logger zerolog.Logger) *Manager {
+func NewManager(conf *config.Server, pools map[string]*pool.ConnectionPool, copyBufferPool *protocol.CopyBufferPool, logger zerolog.Logger) *Manager {
 	var configs []config.QuicListener
 	if conf != nil {
 		configs = slices.Clone(conf.Listeners)
@@ -98,12 +105,13 @@ func NewManager(conf *config.Server, pools map[string]*pool.ConnectionPool, logg
 		}
 	}
 	return &Manager{
-		configs:   configs,
-		pools:     pools,
-		listeners: make([]*Listener, 0),
-		logger:    logger.With().Str("com", "traffic").Logger(),
-		state:     managerNew,
-		done:      make(chan struct{}),
+		configs:        configs,
+		pools:          pools,
+		copyBufferPool: copyBufferPool,
+		listeners:      make([]*Listener, 0),
+		logger:         logger.With().Str("com", "traffic").Logger(),
+		state:          managerNew,
+		done:           make(chan struct{}),
 	}
 }
 
@@ -272,17 +280,22 @@ func (m *Manager) validate(configs []config.QuicListener) error {
 func (m *Manager) newListener(ctx context.Context, listenerConf config.QuicListener, poolInst *pool.ConnectionPool) *Listener {
 	listenerCtx, listenerCancel := context.WithCancel(ctx)
 	return &Listener{
-		Addr:                listenerConf.TrafficAddr,
-		Protocol:            listenerConf.Protocol,
-		EnableFragmentation: listenerConf.UDP.IsFragmentationEnabled(),
-		Pool:                poolInst,
-		ctx:                 listenerCtx,
-		cancel:              listenerCancel,
-		flows:               make(map[*tcpFlow]struct{}),
-		tcpFlowLimit:        listenerConf.Capacity.MaxTCPConnections,
-		tcpSetupLimit:       listenerConf.Capacity.MaxPendingTCPSetups,
-		tcpSetupSlots:       make(chan struct{}, listenerConf.Capacity.MaxPendingTCPSetups),
-		udpSessionLimit:     listenerConf.Capacity.MaxUDPSessions,
+		Addr:                                     listenerConf.TrafficAddr,
+		Protocol:                                 listenerConf.Protocol,
+		EnableFragmentation:                      listenerConf.UDP.IsFragmentationEnabled(),
+		Pool:                                     poolInst,
+		copyBufferPool:                           m.copyBufferPool,
+		ctx:                                      listenerCtx,
+		cancel:                                   listenerCancel,
+		flows:                                    make(map[*tcpFlow]struct{}),
+		tcpFlowLimit:                             listenerConf.Capacity.MaxTCPConnections,
+		tcpSetupLimit:                            listenerConf.Capacity.MaxPendingTCPSetups,
+		tcpSetupSlots:                            make(chan struct{}, listenerConf.Capacity.MaxPendingTCPSetups),
+		udpSessionLimit:                          listenerConf.Capacity.MaxUDPSessions,
+		udpSenderQueuedFramesPerGeneration:       listenerConf.Capacity.MaxUDPSenderQueuedFramesPerGeneration,
+		udpSenderQueuedBackingBytesPerGeneration: listenerConf.Capacity.MaxUDPSenderQueuedBackingBytesPerGeneration,
+		udpFragmentGroups:                        listenerConf.Capacity.MaxUDPFragmentGroups,
+		udpFragmentBackingBytes:                  listenerConf.Capacity.MaxUDPFragmentBackingBytes,
 		logger: m.logger.With().
 			Str("traffic_addr", listenerConf.TrafficAddr).
 			Str("quic_addr", listenerConf.QuicAddr).

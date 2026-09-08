@@ -61,6 +61,7 @@ func TestClientValidatePathsAndOrder(t *testing.T) {
 		path string
 	}{
 		{"admin address", func(c *Client) { c.AdminAddress = "bad" }, "admin_address"},
+		{"TCP copy buffer", func(c *Client) { c.TCPCopyBufferSize = -1 }, "tcp_copy_buffer_size"},
 		{"capacity", func(c *Client) { c.Capacity.MaxLocalUDPSessions = -1 }, "capacity.max_local_udp_sessions"},
 		{"empty servers", func(c *Client) { c.Server.Servers = nil }, "server.servers:"},
 		{"empty local host", func(c *Client) { c.Local.Host = " \t" }, "local.host"},
@@ -163,6 +164,7 @@ func TestServerValidateRemainingPaths(t *testing.T) {
 		path string
 	}{
 		{"admin address", func(s *Server) { s.AdminAddress = "bad" }, "admin_address"},
+		{"TCP copy buffer", func(s *Server) { s.TCPCopyBufferSize = -1 }, "tcp_copy_buffer_size"},
 		{"admin listener conflict", func(s *Server) { s.AdminAddress = "127.0.0.1:8080" }, "admin_address"},
 		{"load balancer", func(s *Server) { s.LoadBalancer = "random" }, "load_balancer"},
 		{"heartbeat interval", func(s *Server) { s.HeartbeatInterval = 0 }, "heartbeat_interval"},

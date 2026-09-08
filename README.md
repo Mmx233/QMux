@@ -73,6 +73,8 @@ Edit `server.yaml`:
 ```yaml
 admin_address: "127.0.0.1:9090" # Optional; omit to disable admin endpoints
 
+tcp_copy_buffer_size: 131072 # Bytes; shared by this server root's TCP relays
+
 listeners:
   - quic_addr: "0.0.0.0:8443"    # QUIC control port
     traffic_addr: "0.0.0.0:8080" # Traffic forwarding port
@@ -86,6 +88,10 @@ listeners:
       max_pending_tcp_setups_per_generation: 16
       max_udp_sessions: 1024
       max_udp_sessions_per_generation: 256
+      max_udp_sender_queued_frames_per_generation: 256
+      max_udp_sender_queued_backing_bytes_per_generation: 524288
+      max_udp_fragment_groups: 4096
+      max_udp_fragment_backing_bytes: 67108864
 
 auth:
   method: "mtls"
@@ -103,8 +109,12 @@ Edit `client.yaml`:
 ```yaml
 admin_address: "127.0.0.1:9090" # Optional; omit to disable admin endpoints
 
+tcp_copy_buffer_size: 131072 # Bytes; shared by this client root's TCP relays
+
 capacity:
   max_local_udp_sessions: 256
+  max_udp_fragment_groups_per_handler: 4096
+  max_udp_fragment_backing_bytes_per_handler: 67108864
 
 server:
   servers:
@@ -124,23 +134,30 @@ tls:
   client_key_file: "./certs/client.key"
 ```
 
-| Key                                     | Scope                                                                  | Default | When full                                                                 |
-|-----------------------------------------|------------------------------------------------------------------------|--------:|---------------------------------------------------------------------------|
-| `max_client_generations`                | Server listener: client generations                                    |      16 | Reject the new client registration.                                       |
-| `max_pending_registrations`             | Server listener: registrations not yet committed                       |     128 | Close the new registration connection.                                    |
-| `max_tcp_connections`                   | Server listener: pending and active TCP flows                          |     128 | Close the new TCP connection.                                             |
-| `max_pending_tcp_setups`                | Server listener: TCP flows still setting up                            |     128 | Close the new TCP connection.                                             |
-| `max_tcp_connections_per_generation`    | Server listener: pending and active TCP flows on one client generation |     100 | Try another eligible generation; otherwise close the new TCP connection.  |
-| `max_pending_tcp_setups_per_generation` | Server listener: pending TCP setups on one client generation           |      16 | Try another eligible generation; otherwise close the new TCP connection.  |
-| `max_udp_sessions`                      | Server listener: server-side UDP sessions                              |    1024 | Drop the datagram that would create a new session.                        |
-| `max_udp_sessions_per_generation`       | Server listener: server-side UDP sessions on one client generation     |     256 | Try another eligible generation; otherwise drop the new-session datagram. |
-| `max_local_udp_sessions`                | Client process: local UDP sessions shared by all UDP handlers          |     256 | Drop the datagram that would create a new local session.                  |
+| Key                                                  | Scope                                                                                                  |  Default | When full                                                                 |
+|------------------------------------------------------|--------------------------------------------------------------------------------------------------------|---------:|---------------------------------------------------------------------------|
+| `tcp_copy_buffer_size`                               | Client root: all TCP relays; server traffic-manager root: all listeners and TCP relays (bytes)         |   131072 | N/A                                                                       |
+| `max_client_generations`                             | Server listener: client generations                                                                    |       16 | Reject the new client registration.                                       |
+| `max_pending_registrations`                          | Server listener: registrations not yet committed                                                       |      128 | Close the new registration connection.                                    |
+| `max_tcp_connections`                                | Server listener: pending and active TCP flows                                                          |      128 | Close the new TCP connection.                                             |
+| `max_pending_tcp_setups`                             | Server listener: TCP flows still setting up                                                            |      128 | Close the new TCP connection.                                             |
+| `max_tcp_connections_per_generation`                 | Server listener: pending and active TCP flows on one client generation                                 |      100 | Try another eligible generation; otherwise close the new TCP connection.  |
+| `max_pending_tcp_setups_per_generation`              | Server listener: pending TCP setups on one client generation                                           |       16 | Try another eligible generation; otherwise close the new TCP connection.  |
+| `max_udp_sessions`                                   | Server listener: server-side UDP sessions                                                              |     1024 | Drop the datagram that would create a new session.                        |
+| `max_udp_sessions_per_generation`                    | Server listener: server-side UDP sessions on one client generation                                     |      256 | Try another eligible generation; otherwise drop the new-session datagram. |
+| `max_udp_sender_queued_frames_per_generation`        | Server listener: queued and worker-held frames for one client generation                               |      256 | Drop the new datagram batch.                                              |
+| `max_udp_sender_queued_backing_bytes_per_generation` | Server listener: queued and worker-held full pooled datagram backing for one client generation (bytes) |   524288 | Drop the new datagram batch.                                              |
+| `max_udp_fragment_groups`                            | Server listener: incomplete UDP fragment groups                                                        |     4096 | Drop the fragment that would create a new group.                          |
+| `max_udp_fragment_backing_bytes`                     | Server listener: retained UDP fragment backing (bytes)                                                 | 67108864 | Drop the fragment that would exceed the limit.                            |
+| `max_local_udp_sessions`                             | Client process: local UDP sessions shared by all UDP handlers                                          |      256 | Drop the datagram that would create a new local session.                  |
+| `max_udp_fragment_groups_per_handler`                | Client UDP handler (connection generation): incomplete fragment groups                                 |     4096 | Drop the fragment that would create a new group.                          |
+| `max_udp_fragment_backing_bytes_per_handler`         | Client UDP handler (connection generation): retained fragment backing (bytes)                          | 67108864 | Drop the fragment that would exceed the limit.                            |
 
-All eight server settings are enforced independently for each `listeners` entry. `max_local_udp_sessions` is one process-wide client budget. Omitting a setting or using `0` selects its default; negative values are rejected, and there is no unlimited setting. When a gate is full, QMux rejects or drops only new work; it does not evict registered generations, established TCP connections, or existing UDP sessions.
+All sizes are integer bytes. Omitting any listed setting or using `0` selects its default; negative values are rejected, and there is no unlimited setting. The TCP copy pools are immutable per root; a standard CLI invocation creates one root for its selected client or server role. `max_local_udp_sessions` is one process-wide client budget, while each client handler has independent fragment limits. Server capacity settings are independent per `listeners` entry, and sender limits include queued and worker-held frames for each client generation. When a gate is full, QMux rejects or drops only new work; it does not evict registered generations, established TCP connections, or existing UDP sessions.
 
 The per-generation TCP gates are independent: `max_tcp_connections_per_generation` (100 by default) counts pending and active connections, while `max_pending_tcp_setups_per_generation` (16 by default) counts only connections still being established. A pending TCP setup remains counted through backend dial and the NewConn ACK round trip, so size this limit for peak concurrent setup latency; success activates it and failure or the setup deadline releases it.
 
-For multi-listener deployments, calculate the aggregate budget from the actual listener count and workload, then validate the limits under that topology.
+For multi-listener or multi-generation deployments, aggregate memory bounds multiply by the number of active client handlers, listeners, and client generations. Calculate the aggregate budget from the actual topology and workload, then validate the limits under that topology.
 
 ### 5. Run
 
