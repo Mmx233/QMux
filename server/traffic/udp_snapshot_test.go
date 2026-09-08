@@ -119,6 +119,44 @@ func TestUDPAdmissionSnapshotDsendHighWaterCoversSample(t *testing.T) {
 	handler.releaseSenderBatch(sender, <-sender.queue)
 }
 
+func TestUDPAdmissionSnapshotReleasesRegistryBeforeSenderSampling(t *testing.T) {
+	blockedClient := &pool.ClientConn{}
+	blockedSender := &udpSender{}
+	reachedSenderSampling := make(chan struct{})
+	handler := &UDPHandler{
+		senders:            map[*pool.ClientConn]*udpSender{blockedClient: blockedSender},
+		beforeSenderSample: func() { close(reachedSenderSampling) },
+	}
+
+	blockedSender.mu.Lock()
+	snapshotDone := make(chan struct{})
+	defer func() {
+		blockedSender.mu.Unlock()
+		select {
+		case <-snapshotDone:
+		case <-time.After(time.Second):
+			t.Error("snapshot did not finish after sender sampling was released")
+		}
+	}()
+	go func() {
+		handler.snapshot()
+		close(snapshotDone)
+	}()
+	select {
+	case <-reachedSenderSampling:
+	case <-time.After(time.Second):
+		t.Fatal("snapshot did not reach sender sampling")
+	}
+
+	otherClient := &pool.ClientConn{}
+	if !handler.lifecycleMu.TryLock() {
+		t.Fatal("snapshot held the sender registry lock while sampling a sender")
+	}
+	handler.senders[otherClient] = &udpSender{}
+	delete(handler.senders, otherClient)
+	handler.lifecycleMu.Unlock()
+}
+
 func TestUDPAdmissionSnapshotSenderRegistryAfterDeletion(t *testing.T) {
 	client := &pool.ClientConn{}
 	sender := &udpSender{client: client, done: make(chan struct{})}

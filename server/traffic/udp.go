@@ -179,6 +179,7 @@ type UDPHandler struct {
 	closeOnce           sync.Once
 	afterSessionPublish func()
 	afterSenderDelete   func()
+	beforeSenderSample  func()
 
 	// lifecycleMu is the worker registry gate. Once closed is set, no new
 	// session, receiver, or sender can be registered, making the wait groups safe to join.
@@ -590,6 +591,9 @@ func (h *UDPHandler) snapshot() UDPAdmissionSnapshot {
 	snapshot.DSendWorkers = int64(len(h.senders))
 	h.lifecycleMu.Unlock()
 	for _, sender := range senders {
+		if h.beforeSenderSample != nil {
+			h.beforeSenderSample()
+		}
 		sender.mu.Lock()
 		snapshot.DSendItems += sender.ownedFrames
 		sender.mu.Unlock()
