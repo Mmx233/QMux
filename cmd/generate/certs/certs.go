@@ -44,6 +44,10 @@ func init() {
 }
 
 func runGenerate(_ *cobra.Command, _ []string) (err error) {
+	if validYears <= 0 {
+		return fmt.Errorf("--years must be positive, got %d", validYears)
+	}
+
 	logger := log.With().Str("com", "generate").Logger()
 	finalDir := filepath.Clean(outputDir)
 
