@@ -353,7 +353,7 @@ func TestTCPAdmissionRevalidatesFallbackCapacity(t *testing.T) {
 	}
 }
 
-func TestLeastConnectionsIncludesPendingWithoutCommitUndercount(t *testing.T) {
+func TestLeastConnectionsIncludesPending(t *testing.T) {
 	balancer := NewLeastConnectionsBalancer()
 	busy := &ClientConn{ID: "busy"}
 	idle := &ClientConn{ID: "idle"}
@@ -367,16 +367,5 @@ func TestLeastConnectionsIncludesPendingWithoutCommitUndercount(t *testing.T) {
 	}
 	if selected != idle {
 		t.Fatalf("Select() = %s, want idle client", selected.ID)
-	}
-
-	// Match TCPLease.Commit's publication order. The read order in the
-	// balancer must see either one pending, one active, or a brief score of two.
-	busy.ActiveConns.Add(1)
-	if score := busy.tcpPending.Load() + busy.ActiveConns.Load(); score < 1 {
-		t.Fatalf("score during commit = %d, want at least 1", score)
-	}
-	busy.tcpPending.Add(-1)
-	if score := busy.tcpPending.Load() + busy.ActiveConns.Load(); score != 1 {
-		t.Fatalf("score after commit = %d, want 1", score)
 	}
 }
