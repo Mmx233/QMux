@@ -920,7 +920,6 @@ type ServerConnectionInfo struct {
 	Healthy                bool
 	LastHeartbeat          time.Time
 	LastReceivedFromServer time.Time
-	ConnectedAt            time.Time
 }
 
 // Info returns current connection status information.
