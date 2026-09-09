@@ -272,10 +272,26 @@ func TestUDPSenderLargeFrameLimitUsesSmallBackingCapacity(t *testing.T) {
 	if got := handler.senderFrameLimit(); got != 1 {
 		t.Fatalf("effective sender frame limit = %d, want 1", got)
 	}
-	sender := &udpSender{queue: make(chan udpSendBatch, int(handler.senderFrameLimit()))}
-	if cap(sender.queue) != 1 {
-		t.Fatalf("sender queue capacity = %d, want 1", cap(sender.queue))
-	}
+	t.Run("production queue capacity", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		pair := newUDPSenderQUICPair(t, ctx)
+		handler.ctx = ctx
+		handler.senders = make(map[*pool.ClientConn]*udpSender)
+		defer func() {
+			cancel()
+			handler.wait()
+		}()
+		sender := handler.senderFor(&pool.ClientConn{ID: "small-backing-capacity", Conn: pair.server})
+		if sender == nil {
+			t.Fatal("create UDP sender")
+		}
+		if cap(sender.queue) != 1 {
+			t.Fatalf("sender queue capacity = %d, want 1", cap(sender.queue))
+		}
+	})
+
+	// Keep admission deterministic by using a queue without a consuming worker.
+	sender := &udpSender{queue: make(chan udpSendBatch, 1)}
 
 	accepted := fragmentUDPSenderBatch(t, 1, []byte("accepted"))
 	if got := handler.enqueueSender(sender, accepted); got != udpEnqueued {

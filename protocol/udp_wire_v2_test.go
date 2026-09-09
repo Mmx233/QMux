@@ -370,6 +370,7 @@ func TestDecodeAndAssembleUDPDatagram(t *testing.T) {
 			t.Fatal(err)
 		}
 		assembler := NewFragmentAssembler(0, 0)
+		defer assembler.Close()
 		for i, datagram := range datagrams {
 			sessionID, payload, complete, err := DecodeAndAssembleUDPDatagram(datagram, assembler)
 			if err != nil {

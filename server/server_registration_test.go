@@ -231,7 +231,7 @@ func TestTokenRegistrationAuthFailuresSendNoAck(t *testing.T) {
 		auth *protocol.RegisterAuth
 	}{
 		{name: "missing proof"},
-		{name: "wrong scheme", auth: &protocol.RegisterAuth{Scheme: "mtls", Proof: make([]byte, sharedtoken.ProofSize)}},
+		{name: "wrong scheme", auth: &protocol.RegisterAuth{Scheme: "mtls"}},
 		{name: "wrong proof", auth: &protocol.RegisterAuth{Scheme: sharedtoken.Scheme, Proof: make([]byte, sharedtoken.ProofSize)}},
 	}
 	for _, test := range tests {
@@ -242,6 +242,15 @@ func TestTokenRegistrationAuthFailuresSendNoAck(t *testing.T) {
 			}
 			harness := newRegistrationHarness(t, authenticator, time.Second)
 			stream := harness.openStream(t)
+			if test.auth != nil && test.auth.Scheme != sharedtoken.Scheme {
+				test.auth.Proof, err = sharedtoken.Compute(secret, sharedtoken.Transcript{
+					ClientID: "client-1", Version: protocol.ProtocolVersion,
+					Capabilities: []string{protocol.CapabilityUDPWireV2},
+				}, harness.client.ConnectionState().TLS)
+				if err != nil {
+					t.Fatalf("Compute() error = %v", err)
+				}
+			}
 			if err := protocol.WriteRegisterWithAuth(
 				stream,
 				"client-1",
@@ -284,6 +293,9 @@ func TestRegistrationRejectsMalformedAndOversizedMessages(t *testing.T) {
 			harness.waitForHandler(t)
 			if got := harness.pool.Count(); got != 0 {
 				t.Fatalf("pool Count() after invalid registration = %d, want 0", got)
+			}
+			if results := harness.pool.Snapshot().Registrations.Results; len(results) != 1 || results["protocol_error"] != 1 {
+				t.Fatalf("registration results = %v, want one protocol_error without timeout", results)
 			}
 		})
 	}

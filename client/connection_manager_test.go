@@ -143,8 +143,8 @@ func TestNewConnectionManagerValidatesConfig(t *testing.T) {
 	}
 
 	cfg := &config.Client{ClientID: "test-client"}
-	if _, err := NewConnectionManager(cfg, logger); err == nil {
-		t.Fatal("NewConnectionManager accepted an empty server list")
+	if _, err := NewConnectionManager(cfg, logger); err == nil || !strings.Contains(err.Error(), "server.servers") {
+		t.Fatalf("NewConnectionManager error = %v, want server.servers", err)
 	}
 }
 

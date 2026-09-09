@@ -819,7 +819,6 @@ func TestRegistrationLifecycleSuccessfulAckClearsAttemptDeadline(t *testing.T) {
 	cm := newLifecycleManager(t, peer)
 	cm.attemptTimeout = 300 * time.Millisecond
 	const heartbeatCount = 4
-	heartbeats := make(chan protocol.HeartbeatMsg, heartbeatCount)
 	serverDone := peer.serveRegistration(func(_ *quic.Conn, stream *quic.Stream, _ protocol.RegisterMsg) error {
 		if err := writeSuccessfulLifecycleAck(stream); err != nil {
 			return err
@@ -829,7 +828,9 @@ func TestRegistrationLifecycleSuccessfulAckClearsAttemptDeadline(t *testing.T) {
 			if err := protocol.ReadTypedMessage(stream, protocol.MsgTypeHeartbeat, &heartbeat); err != nil {
 				return fmt.Errorf("read post-registration heartbeat: %w", err)
 			}
-			heartbeats <- heartbeat
+			if err := protocol.WriteHeartbeat(stream, heartbeat.Timestamp); err != nil {
+				return fmt.Errorf("reply to post-registration heartbeat: %w", err)
+			}
 		}
 		return nil
 	})
@@ -845,13 +846,22 @@ func TestRegistrationLifecycleSuccessfulAckClearsAttemptDeadline(t *testing.T) {
 	if waitPastDeadline > 0 {
 		<-time.After(waitPastDeadline)
 	}
+	stream := sc.controlStream.Load()
+	if stream == nil {
+		t.Fatal("registration did not publish the control stream")
+	}
+	// Direct I/O must retain the cleared deadline; SendHeartbeat sets a new write deadline.
 	for i := range heartbeatCount {
-		if err := sc.SendHeartbeat(); err != nil {
+		if err := protocol.WriteHeartbeat(stream, int64(i+1)); err != nil {
 			t.Fatalf("heartbeat %d after attempt deadline: %v", i+1, err)
 		}
-	}
-	for i := range heartbeatCount {
-		awaitLifecycle(t, heartbeats, fmt.Sprintf("heartbeat %d after attempt deadline", i+1))
+		var reply protocol.HeartbeatMsg
+		if err := protocol.ReadTypedMessage(stream, protocol.MsgTypeHeartbeat, &reply); err != nil {
+			t.Fatalf("heartbeat reply %d after attempt deadline: %v", i+1, err)
+		}
+		if reply.Timestamp != int64(i+1) {
+			t.Fatalf("heartbeat reply timestamp = %d, want %d", reply.Timestamp, i+1)
+		}
 	}
 	if err := awaitLifecycle(t, serverDone, "post-deadline heartbeats"); err != nil {
 		t.Fatal(err)

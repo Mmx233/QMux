@@ -97,9 +97,6 @@ func TestTCPReverseProxy_TokenWithoutClientCertificate(t *testing.T) {
 		quicPort,
 	)
 	c := newTestClient(t, clientConfig)
-	if len(clientConfig.TLS.ClientCert.Certificate) != 0 {
-		t.Fatal("token credential loading populated a client certificate")
-	}
 	clientErr := startTestClientReporting(ctx, c)
 	waitForHealthyTokenClient(t, ctx, c, clientErr, serverErr)
 

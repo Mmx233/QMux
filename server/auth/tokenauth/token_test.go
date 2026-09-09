@@ -17,19 +17,6 @@ import (
 	"github.com/Mmx233/QMux/server/auth"
 )
 
-func TestVerifyRequiresConfiguredScheme(t *testing.T) {
-	authenticator, err := New([]byte("0123456789abcdef"))
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	for _, scheme := range []string{"", "mtls", sharedtoken.Scheme + "-other"} {
-		err := authenticator.Verify(tls.ConnectionState{}, auth.Registration{Scheme: scheme, Proof: make([]byte, sharedtoken.ProofSize)})
-		if err == nil {
-			t.Fatalf("Verify() accepted scheme %q", scheme)
-		}
-	}
-}
-
 func TestVerifyExporterBoundProof(t *testing.T) {
 	clientState, serverState := connectedTLSStates(t)
 	secret := []byte("0123456789abcdef0123456789abcdef")
@@ -55,6 +42,15 @@ func TestVerifyExporterBoundProof(t *testing.T) {
 	}
 	if err := authenticator.Verify(serverState, registration); err != nil {
 		t.Fatalf("Verify() error = %v", err)
+	}
+	for _, scheme := range []string{"", "mtls", sharedtoken.Scheme + "-other"} {
+		t.Run("reject scheme "+scheme, func(t *testing.T) {
+			wrongScheme := registration
+			wrongScheme.Scheme = scheme
+			if err := authenticator.Verify(serverState, wrongScheme); err == nil {
+				t.Fatalf("Verify() accepted scheme %q with a valid proof", scheme)
+			}
+		})
 	}
 	registration.Proof = append([]byte(nil), proof...)
 	registration.Proof[0] ^= 0xff

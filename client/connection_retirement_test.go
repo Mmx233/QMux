@@ -70,7 +70,7 @@ func (ctx *firstErrGateContext) Err() error {
 	return err
 }
 
-func TestConnectionPublicationRetiresExactPreviousAndRejectsStaleCallback(t *testing.T) {
+func TestConnectionPublicationRetiresExactPrevious(t *testing.T) {
 	const address = "127.0.0.1:8443"
 	cm := newRetirementManager(t, address)
 	old := newDisconnectedRetirementConnection(address)

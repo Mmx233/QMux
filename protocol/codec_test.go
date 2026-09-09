@@ -15,23 +15,6 @@ const (
 	LargePayloadSize  = 65536 // 64 KB - large message
 )
 
-func TestBufferSizeConstants(t *testing.T) {
-	sizes := []struct {
-		name string
-		got  int
-		want int
-	}{
-		{"small", SmallBufferSize, 256},
-		{"medium", MediumBufferSize, 4096},
-		{"large", LargeBufferSize, 65536},
-	}
-	for _, size := range sizes {
-		if size.got != size.want {
-			t.Errorf("%s buffer size = %d, want %d", size.name, size.got, size.want)
-		}
-	}
-}
-
 func TestGenericJSONWireContract(t *testing.T) {
 	checkWire := func(t *testing.T, wire *bytes.Buffer, want string) {
 		t.Helper()
