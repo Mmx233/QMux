@@ -119,6 +119,9 @@ func TestHeartbeatWriteDeadlineBoundsFlowControlStall(t *testing.T) {
 			_ = sender.CloseWithError(0, "unblock stalled heartbeat loop")
 			t.Fatal("heartbeat loop did not exit its stalled write")
 		}
+		if err := sc.controlResult(); !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("heartbeat loop error = %T %v, want os.ErrDeadlineExceeded", err, err)
+		}
 		if sc.IsHealthy() || reconnects.Load() != 1 {
 			t.Fatalf("stalled heartbeat loop left healthy=%t reconnects=%d, want false/1", sc.IsHealthy(), reconnects.Load())
 		}
@@ -127,7 +130,7 @@ func TestHeartbeatWriteDeadlineBoundsFlowControlStall(t *testing.T) {
 		}
 		select {
 		case err := <-peerDone:
-			if err != nil {
+			if err != nil && !errors.Is(err, &quic.StreamError{StreamID: stream.StreamID(), ErrorCode: 0, Remote: true}) {
 				t.Fatalf("heartbeat-only peer: %v", err)
 			}
 		case <-time.After(2 * time.Second):
