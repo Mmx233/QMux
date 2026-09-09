@@ -8,8 +8,6 @@ import (
 )
 
 // MTLSAuth accepts client certificates already verified by the TLS handshake.
-//
-//goland:noinspection GoNameStartsWithPackageName
 type MTLSAuth struct{}
 
 // New creates a new mTLS authenticator. The caller must install client trust in

@@ -91,7 +91,7 @@ func relayLifecycleTLSConfigs(t testing.TB) (*tls.Config, *tls.Config) {
 		NextProtos:   []string{relayLifecycleTestALPN},
 	}, &tls.Config{
 		// This certificate is generated solely for the in-process test listener.
-		InsecureSkipVerify: true, //nolint:gosec
+		InsecureSkipVerify: true,
 		NextProtos:         []string{relayLifecycleTestALPN},
 	}
 }

@@ -223,7 +223,6 @@ func finishClientSignalResult(
 
 func signalStartError(err error) error {
 	// Only the bare Stop sentinel is expected after a signal; joined startup errors survive.
-	//goland:noinspection GoDirectComparisonOfErrors
 	if err == client.ErrClientStopped {
 		return nil
 	}

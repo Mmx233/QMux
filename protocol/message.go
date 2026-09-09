@@ -87,8 +87,6 @@ type Message struct {
 }
 
 // ProtocolVersion is retained as the exported wire-version API.
-//
-//goland:noinspection GoNameStartsWithPackageName
 const ProtocolVersion = "2.0"
 
 const (

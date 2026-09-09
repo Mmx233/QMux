@@ -37,8 +37,6 @@ type ClientCapacity struct {
 }
 
 // ApplyDefaults fills omitted or explicitly zero capacity limits.
-//
-//goland:noinspection GoMixedReceiverTypes
 func (c *ClientCapacity) ApplyDefaults() {
 	if c.MaxLocalUDPSessions == 0 {
 		c.MaxLocalUDPSessions = DefaultMaxLocalUDPSessions
@@ -52,8 +50,6 @@ func (c *ClientCapacity) ApplyDefaults() {
 }
 
 // Validate rejects negative limits. Zero means use the default.
-//
-//goland:noinspection GoMixedReceiverTypes
 func (c ClientCapacity) Validate(path string) error {
 	limits := []struct {
 		name  string

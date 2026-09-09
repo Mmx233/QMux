@@ -372,7 +372,7 @@ func TestUDPAdmissionEpochExhaustionCleansCandidateAndKeepsExistingSession(t *te
 	}
 	parsed, err := protocol.DecodeUDPDatagram(wire)
 	if err != nil || parsed.SessionID != existing.id || !bytes.Equal(parsed.Payload, want) {
-		t.Fatalf("existing session datagram = session %d payload %q error %v", parsed.SessionID, parsed.Payload, err)
+		t.Fatalf("existing session datagram = parsed %+v error %v", parsed, err)
 	}
 }
 

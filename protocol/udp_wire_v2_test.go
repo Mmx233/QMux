@@ -304,7 +304,7 @@ func TestFragmentIdentitySurvives65537EncoderAllocations(t *testing.T) {
 		parsed, decodeErr := DecodeUDPDatagram(fragments[0].Data)
 		if decodeErr != nil || parsed.FragmentID != fragmentIdentity(epoch, id) {
 			ReleaseDatagramResults(fragments)
-			t.Fatalf("identity %d decoded as %#x, error %v", id, parsed.FragmentID, decodeErr)
+			t.Fatalf("identity %d decoded as %#v, error %v", id, parsed, decodeErr)
 		}
 		if id == lastID {
 			var got []byte
