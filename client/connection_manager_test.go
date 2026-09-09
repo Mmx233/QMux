@@ -148,22 +148,33 @@ func TestNewConnectionManagerValidatesConfig(t *testing.T) {
 	}
 }
 
-func TestConnectionManagerStartValidatesSemanticsBeforeCredentials(t *testing.T) {
+func TestNewConnectionManagerValidatesSemanticsBeforeCredentials(t *testing.T) {
 	cfg := &config.Client{
 		Server:            config.ClientServer{Servers: []config.ServerEndpoint{{Address: "server.example.com:8443"}}},
 		HeartbeatInterval: time.Second,
 		HealthTimeout:     2 * time.Second,
 	}
-	cm, err := NewConnectionManager(cfg, zerolog.Nop())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = cm.Stop() })
-
-	err = cm.Start(context.Background())
+	_, err := NewConnectionManager(cfg, zerolog.Nop())
 	if err == nil || !strings.Contains(err.Error(), "local.host") || strings.Contains(err.Error(), "credentials") {
-		t.Fatalf("Start error = %v, want local.host before credentials", err)
+		t.Fatalf("NewConnectionManager error = %v, want local.host before credentials", err)
 	}
+}
+
+func completeConnectionManagerTestConfig(t *testing.T, cfg *config.Client) *config.Client {
+	t.Helper()
+	if cfg.Local.Host == "" {
+		cfg.Local = config.LocalService{Host: "127.0.0.1", Port: 1}
+	}
+	if cfg.HeartbeatInterval == 0 {
+		cfg.HeartbeatInterval = time.Hour
+	}
+	if cfg.HealthTimeout == 0 {
+		cfg.HealthTimeout = 2 * time.Hour
+	}
+	if cfg.TLS.CACertFile == "" {
+		cfg.TLS = lifecycleClientTLSFiles(t)
+	}
+	return cfg
 }
 
 func TestNewConnectionManagerDeduplicatesServers(t *testing.T) {
@@ -175,6 +186,7 @@ func TestNewConnectionManagerDeduplicatesServers(t *testing.T) {
 			{Address: "server2.example.com:8443", ServerName: "server2"},
 		}},
 	}
+	completeConnectionManagerTestConfig(t, cfg)
 
 	cm, err := NewConnectionManager(cfg, zerolog.Nop())
 	if err != nil {
@@ -195,6 +207,7 @@ func TestConnectionManagerStopJoinsBlockedPublication(t *testing.T) {
 			ServerName: "localhost",
 		}}},
 	}
+	completeConnectionManagerTestConfig(t, cfg)
 	cm, err := NewConnectionManager(cfg, zerolog.Nop())
 	if err != nil {
 		t.Fatal(err)
@@ -204,7 +217,7 @@ func TestConnectionManagerStopJoinsBlockedPublication(t *testing.T) {
 	sc := NewServerConnection(
 		cfg.Server.Servers[0].Address,
 		cfg.Server.Servers[0].ServerName,
-		cm.sessionCaches.GetOrCreate(cfg.Server.Servers[0].Address),
+		cm.SessionCacheManager().GetOrCreate(cfg.Server.Servers[0].Address),
 		zerolog.Nop(),
 	)
 	published := make(chan bool, 1)
@@ -259,6 +272,7 @@ func TestStartReconnectionRejectsCanceledRunContext(t *testing.T) {
 			ServerName: "localhost",
 		}}},
 	}
+	completeConnectionManagerTestConfig(t, cfg)
 	cm, err := NewConnectionManager(cfg, zerolog.Nop())
 	if err != nil {
 		t.Fatal(err)

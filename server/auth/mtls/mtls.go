@@ -2,7 +2,6 @@ package mtls
 
 import (
 	"crypto/tls"
-	"crypto/x509"
 	"errors"
 
 	"github.com/Mmx233/QMux/server/auth"
@@ -13,10 +12,9 @@ import (
 //goland:noinspection GoNameStartsWithPackageName
 type MTLSAuth struct{}
 
-// New creates a new mTLS authenticator. The caller must install caCertPool in
-// tls.Config.ClientCAs; the completed TLS handshake is the sole verification
-// authority.
-func New(_ *x509.CertPool) auth.Auth {
+// New creates a new mTLS authenticator. The caller must install client trust in
+// tls.Config.ClientCAs; the completed TLS handshake is the sole verification authority.
+func New() auth.Auth {
 	return &MTLSAuth{}
 }
 

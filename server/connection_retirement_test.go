@@ -24,7 +24,7 @@ func TestTrafficConnectionFatalRetiresRegistrationForSameID(t *testing.T) {
 		[]x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	)
 	serverTLS, clientTLS := registrationMTLSTLSConfigs(t, clientRoots, clientCertificate)
-	harness := newRegistrationHarnessWithTLS(t, mtls.New(clientRoots), time.Second, serverTLS, clientTLS)
+	harness := newRegistrationHarnessWithTLS(t, mtls.New(), time.Second, serverTLS, clientTLS)
 	const clientID = "retired-client-id"
 	registerTCPClient := func() {
 		controlStream := harness.openStream(t)
@@ -149,7 +149,7 @@ func TestControlStreamTerminalRetiresRegisteredConnection(t *testing.T) {
 				[]x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 			)
 			serverTLS, clientTLS := registrationMTLSTLSConfigs(t, clientRoots, clientCertificate)
-			harness := newRegistrationHarnessWithTLS(t, mtls.New(clientRoots), time.Second, serverTLS, clientTLS)
+			harness := newRegistrationHarnessWithTLS(t, mtls.New(), time.Second, serverTLS, clientTLS)
 			controlStream := registerMTLSClient(t, harness, "control-terminal-client")
 			registered, ok := harness.pool.Get("control-terminal-client")
 			if !ok {
@@ -185,7 +185,7 @@ func TestStaleControlHeartbeatRetiresOnlyItsGeneration(t *testing.T) {
 		[]x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	)
 	serverTLS, clientTLS := registrationMTLSTLSConfigs(t, clientRoots, clientCertificate)
-	harness := newRegistrationHarnessWithTLS(t, mtls.New(clientRoots), time.Second, serverTLS, clientTLS)
+	harness := newRegistrationHarnessWithTLS(t, mtls.New(), time.Second, serverTLS, clientTLS)
 	const clientID = "stale-control-client"
 	controlStream := registerMTLSClient(t, harness, clientID)
 	stale, ok := harness.pool.Get(clientID)
@@ -237,7 +237,7 @@ func TestDrainRequestRetiresGenerationAndKeepsRetiredHeartbeatAlive(t *testing.T
 	clientCertificate, clientRoots := registrationTestClientCertificate(
 		t, "drain-retirement", false, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
 	serverTLS, clientTLS := registrationMTLSTLSConfigs(t, clientRoots, clientCertificate)
-	harness := newRegistrationHarnessWithTLS(t, mtls.New(clientRoots), time.Second, serverTLS, clientTLS)
+	harness := newRegistrationHarnessWithTLS(t, mtls.New(), time.Second, serverTLS, clientTLS)
 	const clientID = "draining-client"
 	controlStream := registerDrainClient(t, harness, clientID)
 	old, _ := harness.pool.Get(clientID)
@@ -297,7 +297,7 @@ func TestDrainCompleteWriteFailureClosesOnlyRetiredGeneration(t *testing.T) {
 	clientCertificate, clientRoots := registrationTestClientCertificate(
 		t, "drain-write-failure", false, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth})
 	serverTLS, clientTLS := registrationMTLSTLSConfigs(t, clientRoots, clientCertificate)
-	harness := newRegistrationHarnessWithTLS(t, mtls.New(clientRoots), time.Second, serverTLS, clientTLS)
+	harness := newRegistrationHarnessWithTLS(t, mtls.New(), time.Second, serverTLS, clientTLS)
 	const clientID = "drain-write-failure-client"
 	controlStream := registerDrainClient(t, harness, clientID)
 	old, _ := harness.pool.Get(clientID)

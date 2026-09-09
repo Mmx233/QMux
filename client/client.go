@@ -12,6 +12,7 @@ import (
 
 	"github.com/Mmx233/QMux/config"
 	"github.com/Mmx233/QMux/internal/stats"
+	"github.com/Mmx233/QMux/internal/tlsreload"
 	"github.com/Mmx233/QMux/protocol"
 	"github.com/quic-go/quic-go"
 	"github.com/rs/zerolog"
@@ -179,11 +180,6 @@ func New(conf *config.Client) (*Client, error) {
 		return nil, fmt.Errorf("invalid client config: %w", err)
 	}
 
-	// Load the credentials required by the selected authentication mode.
-	if err := conf.LoadCredentials(); err != nil {
-		return nil, fmt.Errorf("load credentials: %w", err)
-	}
-
 	// Create connection manager
 	connMgr, err := NewConnectionManager(conf, logger)
 	if err != nil {
@@ -223,6 +219,13 @@ func (c *Client) Start(ctx context.Context) error {
 	c.started = true
 	c.runCancel = cancel
 	c.startupWG.Add(1)
+	if c.connMgr.tlsAutoReload {
+		c.watcherWG.Go(func() {
+			if err := c.connMgr.tlsReloader.Wait(); err != nil {
+				c.selectTerminal(fmt.Errorf("TLS watcher: %w", err), true)
+			}
+		})
+	}
 	c.producerWG.Go(c.handleNewConnections)
 	c.lifecycleMu.Unlock()
 	callerWatchDone := make(chan struct{})
@@ -250,8 +253,11 @@ func (c *Client) Start(ctx context.Context) error {
 
 	var startupErr error
 	if err := c.connMgr.Start(runCtx); err != nil {
+		c.lifecycleMu.Lock()
+		ownedReloaderStop := c.stopping && errors.Is(err, tlsreload.ErrStopped)
+		c.lifecycleMu.Unlock()
 		coordinatorCancellation := runCtx.Err() != nil && errors.Is(err, runCtx.Err())
-		if !coordinatorCancellation {
+		if !ownedReloaderStop && !coordinatorCancellation {
 			startupErr = fmt.Errorf("start connection manager: %w", err)
 			c.selectTerminal(startupErr, true)
 		}
@@ -273,7 +279,7 @@ func (c *Client) Start(ctx context.Context) error {
 	c.lifecycleMu.Lock()
 	teardown := c.terminalTeardown
 	c.lifecycleMu.Unlock()
-	return errors.Join(startupErr, teardown)
+	return errors.Join(startupErr, teardown, c.connMgr.tlsReloader.Wait())
 }
 
 // handleNewConnections listens on the connection manager's NewConns channel

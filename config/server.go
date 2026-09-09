@@ -1,6 +1,7 @@
 package config
 
 import (
+	"cmp"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -57,50 +58,22 @@ type ListenerCapacity struct {
 }
 
 // ApplyDefaults fills omitted or explicitly zero capacity limits.
-//
-//goland:noinspection GoMixedReceiverTypes
 func (c *ListenerCapacity) ApplyDefaults() {
-	if c.MaxClientGenerations == 0 {
-		c.MaxClientGenerations = DefaultMaxClientGenerations
-	}
-	if c.MaxPendingRegistrations == 0 {
-		c.MaxPendingRegistrations = DefaultMaxPendingRegistrations
-	}
-	if c.MaxTCPConnections == 0 {
-		c.MaxTCPConnections = DefaultMaxTCPConnections
-	}
-	if c.MaxPendingTCPSetups == 0 {
-		c.MaxPendingTCPSetups = DefaultMaxPendingTCPSetups
-	}
-	if c.MaxTCPConnectionsPerGeneration == 0 {
-		c.MaxTCPConnectionsPerGeneration = DefaultMaxTCPConnectionsPerGeneration
-	}
-	if c.MaxPendingTCPSetupsPerGeneration == 0 {
-		c.MaxPendingTCPSetupsPerGeneration = DefaultMaxPendingTCPSetupsPerGeneration
-	}
-	if c.MaxUDPSessions == 0 {
-		c.MaxUDPSessions = DefaultMaxUDPSessions
-	}
-	if c.MaxUDPSessionsPerGeneration == 0 {
-		c.MaxUDPSessionsPerGeneration = DefaultMaxUDPSessionsPerGeneration
-	}
-	if c.MaxUDPSenderQueuedFramesPerGeneration == 0 {
-		c.MaxUDPSenderQueuedFramesPerGeneration = DefaultMaxUDPSenderQueuedFramesPerGeneration
-	}
-	if c.MaxUDPSenderQueuedBackingBytesPerGeneration == 0 {
-		c.MaxUDPSenderQueuedBackingBytesPerGeneration = DefaultMaxUDPSenderQueuedBackingBytesPerGeneration
-	}
-	if c.MaxUDPFragmentGroups == 0 {
-		c.MaxUDPFragmentGroups = DefaultMaxUDPFragmentGroups
-	}
-	if c.MaxUDPFragmentBackingBytes == 0 {
-		c.MaxUDPFragmentBackingBytes = DefaultMaxUDPFragmentBackingBytes
-	}
+	c.MaxClientGenerations = cmp.Or(c.MaxClientGenerations, DefaultMaxClientGenerations)
+	c.MaxPendingRegistrations = cmp.Or(c.MaxPendingRegistrations, DefaultMaxPendingRegistrations)
+	c.MaxTCPConnections = cmp.Or(c.MaxTCPConnections, DefaultMaxTCPConnections)
+	c.MaxPendingTCPSetups = cmp.Or(c.MaxPendingTCPSetups, DefaultMaxPendingTCPSetups)
+	c.MaxTCPConnectionsPerGeneration = cmp.Or(c.MaxTCPConnectionsPerGeneration, DefaultMaxTCPConnectionsPerGeneration)
+	c.MaxPendingTCPSetupsPerGeneration = cmp.Or(c.MaxPendingTCPSetupsPerGeneration, DefaultMaxPendingTCPSetupsPerGeneration)
+	c.MaxUDPSessions = cmp.Or(c.MaxUDPSessions, DefaultMaxUDPSessions)
+	c.MaxUDPSessionsPerGeneration = cmp.Or(c.MaxUDPSessionsPerGeneration, DefaultMaxUDPSessionsPerGeneration)
+	c.MaxUDPSenderQueuedFramesPerGeneration = cmp.Or(c.MaxUDPSenderQueuedFramesPerGeneration, DefaultMaxUDPSenderQueuedFramesPerGeneration)
+	c.MaxUDPSenderQueuedBackingBytesPerGeneration = cmp.Or(c.MaxUDPSenderQueuedBackingBytesPerGeneration, DefaultMaxUDPSenderQueuedBackingBytesPerGeneration)
+	c.MaxUDPFragmentGroups = cmp.Or(c.MaxUDPFragmentGroups, DefaultMaxUDPFragmentGroups)
+	c.MaxUDPFragmentBackingBytes = cmp.Or(c.MaxUDPFragmentBackingBytes, DefaultMaxUDPFragmentBackingBytes)
 }
 
 // Validate rejects negative limits. Zero means use the default.
-//
-//goland:noinspection GoMixedReceiverTypes
 func (c ListenerCapacity) Validate(path string) error {
 	limits := []struct {
 		name  string
@@ -176,16 +149,14 @@ func (a *ServerAuth) Validate() error {
 }
 
 // CreateAuthenticator creates and returns the appropriate authenticator based on the configured method.
-// For mTLS (or empty method): loads the CA certificate and creates an mTLS authenticator.
+// For mTLS (or empty method): creates an authenticator; the caller installs CA
+// trust in tls.Config.ClientCAs.
 // For token method: creates an exporter-bound registration authenticator.
 // Returns an error if authenticator creation fails.
 func (a *ServerAuth) CreateAuthenticator() (auth.Auth, error) {
 	switch a.Method {
 	case "", "mtls":
-		if err := a.LoadCACertificate(); err != nil {
-			return nil, fmt.Errorf("load CA certificate: %w", err)
-		}
-		return mtls.New(a.CACertPool), nil
+		return mtls.New(), nil
 	case "token":
 		return tokenauth.New([]byte(a.Token))
 	default:
@@ -196,6 +167,7 @@ func (a *ServerAuth) CreateAuthenticator() (auth.Auth, error) {
 type ServerTLS struct {
 	ServerCertFile string `yaml:"server_cert_file"`
 	ServerKeyFile  string `yaml:"server_key_file"`
+	AutoReload     bool   `yaml:"auto_reload"`
 
 	// Rotation interval for custom session ticket encryption keys.
 	// Zero delegates key rotation to Go's automatic TLS policy.

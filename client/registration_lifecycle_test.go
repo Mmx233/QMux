@@ -210,18 +210,18 @@ func newLifecycleManager(t *testing.T, peer *lifecyclePeer) *ConnectionManager {
 	t.Helper()
 
 	endpoint := peer.endpoint()
-	cm, err := NewConnectionManager(&config.Client{
+	cm, err := NewConnectionManager(completeConnectionManagerTestConfig(t, &config.Client{
 		ClientID: "lifecycle-client",
 		Server: config.ClientServer{
 			Servers: []config.ServerEndpoint{endpoint},
 		},
 		HeartbeatInterval: 20 * time.Millisecond,
 		HealthTimeout:     2 * time.Second,
-	}, zerolog.Nop())
+	}), zerolog.Nop())
 	if err != nil {
 		t.Fatalf("create connection manager: %v", err)
 	}
-	cm.baseTLSConfig = peer.clientTLS.Clone()
+	cm.tlsState.Store(&clientTLSState{baseTLSConfig: peer.clientTLS.Clone(), sessionCaches: NewSessionCacheManager()})
 	cm.quicConfig = &quic.Config{
 		HandshakeIdleTimeout: 10 * time.Second,
 		MaxIdleTimeout:       30 * time.Second,

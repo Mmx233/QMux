@@ -10,7 +10,7 @@ import (
 
 func TestVerifyRequiresCompletedVerifiedTLSHandshake(t *testing.T) {
 	certificate := &x509.Certificate{}
-	authenticator := New(x509.NewCertPool())
+	authenticator := New()
 	registration := auth.Registration{
 		Scheme: "untrusted-registration-field",
 		Proof:  []byte("must not switch the server policy"),

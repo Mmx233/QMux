@@ -27,7 +27,7 @@ func TestHeartbeatWriteStallRetiresExactServerGeneration(t *testing.T) {
 	serverTLS, clientTLS := registrationMTLSTLSConfigs(t, clientRoots, clientCertificate)
 	harness := newRegistrationHarnessWithTLSAndQUIC(
 		t,
-		mtls.New(clientRoots),
+		mtls.New(),
 		time.Second,
 		serverTLS,
 		clientTLS,

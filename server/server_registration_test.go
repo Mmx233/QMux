@@ -491,7 +491,7 @@ func TestMTLSRegistrationAcceptsTLSVerifiedChains(t *testing.T) {
 				t, test.name, test.withIntermediate, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 			)
 			serverTLS, clientTLS := registrationMTLSTLSConfigs(t, clientRoots, clientCertificate)
-			harness := newRegistrationHarnessWithTLS(t, mtls.New(clientRoots), time.Second, serverTLS, clientTLS)
+			harness := newRegistrationHarnessWithTLS(t, mtls.New(), time.Second, serverTLS, clientTLS)
 
 			registerMTLSClient(t, harness, "mtls-"+test.name)
 			serverState := harness.serverConn.ConnectionState().TLS
@@ -524,7 +524,7 @@ func TestMTLSRegistrationAcceptsResumedTLS13Session(t *testing.T) {
 	cache := newRegistrationSessionCache()
 	clientTLS.ClientSessionCache = cache
 
-	first := newRegistrationHarnessWithTLS(t, mtls.New(clientRoots), time.Second, serverTLS, clientTLS)
+	first := newRegistrationHarnessWithTLS(t, mtls.New(), time.Second, serverTLS, clientTLS)
 	registerMTLSClient(t, first, "mtls-first")
 	if first.client.ConnectionState().TLS.DidResume || first.serverConn.ConnectionState().TLS.DidResume {
 		t.Fatal("first mTLS connection unexpectedly resumed a TLS session")
@@ -539,7 +539,7 @@ func TestMTLSRegistrationAcceptsResumedTLS13Session(t *testing.T) {
 	}
 	first.waitForHandler(t)
 
-	second := newRegistrationHarnessWithTLS(t, mtls.New(clientRoots), time.Second, serverTLS, clientTLS)
+	second := newRegistrationHarnessWithTLS(t, mtls.New(), time.Second, serverTLS, clientTLS)
 	if !second.client.ConnectionState().TLS.DidResume || !second.serverConn.ConnectionState().TLS.DidResume {
 		t.Fatal("second mTLS connection did not resume the TLS session on both peers")
 	}

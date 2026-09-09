@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -10,10 +11,12 @@ import (
 	"net/netip"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Mmx233/QMux/config"
 	"github.com/Mmx233/QMux/internal/stats"
+	"github.com/Mmx233/QMux/internal/tlsreload"
 	"github.com/Mmx233/QMux/protocol"
 	"github.com/Mmx233/QMux/server/auth"
 	"github.com/Mmx233/QMux/server/pool"
@@ -41,6 +44,13 @@ type Server struct {
 	registrationTimeout  time.Duration
 	writeRegistrationAck registrationAckWriter
 	logger               zerolog.Logger
+	tlsState             atomic.Pointer[serverTLSState]
+	tlsReloader          *tlsreload.Reloader
+}
+
+type serverTLSState struct {
+	certificate tls.Certificate
+	clientCAs   *x509.CertPool
 }
 
 // Snapshot is a point-in-time, value-only view of server readiness.
@@ -126,15 +136,34 @@ func New(conf *config.Server) (*Server, error) {
 	ownedConfig := cloneServerConfig(conf)
 
 	logger := log.With().Str("com", "server").Logger()
-
-	// Load TLS certificates
-	if err := ownedConfig.TLS.LoadCertificates(); err != nil {
-		return nil, fmt.Errorf("load certificates: %w", err)
+	srv := &Server{config: &ownedConfig, logger: logger}
+	paths := tlsreload.Paths{
+		CertFile: ownedConfig.TLS.ServerCertFile,
+		KeyFile:  ownedConfig.TLS.ServerKeyFile,
+	}
+	if ownedConfig.Auth.Method == "" || ownedConfig.Auth.Method == "mtls" {
+		paths.CAFile = ownedConfig.Auth.CACertFile
+	}
+	reloader, err := tlsreload.New("server", paths, logger, func(bundle *tlsreload.Bundle) error {
+		srv.tlsState.Store(&serverTLSState{
+			certificate: *bundle.Certificate,
+			clientCAs:   bundle.CAPool,
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("initialize TLS reloader: %w", err)
+	}
+	srv.tlsReloader = reloader
+	if err := reloader.LoadInitial(); err != nil {
+		reloader.Stop()
+		return nil, fmt.Errorf("load initial TLS material: %w", err)
 	}
 
 	// Create authenticator using factory
 	authenticator, err := ownedConfig.Auth.CreateAuthenticator()
 	if err != nil {
+		reloader.Stop()
 		return nil, fmt.Errorf("create authenticator: %w", err)
 	}
 
@@ -164,15 +193,11 @@ func New(conf *config.Server) (*Server, error) {
 			Msg("created connection pool")
 	}
 
-	srv := &Server{
-		config:               &ownedConfig,
-		pools:                pools,
-		copyBufferPool:       protocol.NewCopyBufferPool(ownedConfig.TCPCopyBufferSize),
-		authenticator:        authenticator,
-		registrationTimeout:  registrationTimeout,
-		writeRegistrationAck: protocol.WriteRegisterAckWithAuth,
-		logger:               logger,
-	}
+	srv.pools = pools
+	srv.copyBufferPool = protocol.NewCopyBufferPool(ownedConfig.TCPCopyBufferSize)
+	srv.authenticator = authenticator
+	srv.registrationTimeout = registrationTimeout
+	srv.writeRegistrationAck = protocol.WriteRegisterAckWithAuth
 	srv.trafficManager = traffic.NewManager(srv.config, srv.pools, srv.copyBufferPool, srv.logger)
 	return srv, nil
 }
@@ -210,13 +235,14 @@ func cloneServerConfig(conf *config.Server) config.Server {
 
 // Start runs the server until cancellation or a component failure.
 func (s *Server) Start(ctx context.Context) error {
+	defer s.tlsReloader.Stop()
 	defer func() {
 		for _, connectionPool := range s.pools {
 			connectionPool.Stop()
 		}
 	}()
 
-	return superviseServer(ctx, s.trafficManager, s.config.Listeners, s.startListener)
+	return superviseServer(ctx, s.trafficManager, s.config.Listeners, s.startListener, s.tlsReloader, s.config.TLS.AutoReload)
 }
 
 // Snapshot returns the current route and aggregate readiness state. It is
@@ -302,35 +328,91 @@ func superviseServer(
 	trafficManager trafficLifecycle,
 	listenerConfs []config.QuicListener,
 	startListener listenerStartFunc,
+	tlsReloader *tlsreload.Reloader,
+	watchTLS bool,
 ) error {
 	if cause := context.Cause(ctx); cause != nil {
 		return cause
 	}
+	componentCtx, cancelComponents := context.WithCancelCause(context.WithoutCancel(ctx))
+	errorState := newListenerErrorState()
+	var startupMu sync.Mutex
+	startupPending := true
+	cancelDuringStartup := func(cause error) {
+		startupMu.Lock()
+		defer startupMu.Unlock()
+		if startupPending {
+			cancelComponents(cause)
+		}
+	}
+	watcherDone := make(chan struct{})
+	if watchTLS {
+		if tlsReloader == nil {
+			cancelComponents(context.Canceled)
+			return errors.New("TLS reloader is unavailable")
+		}
+		if err := tlsReloader.PrepareStart(componentCtx, true); err != nil {
+			cancelComponents(err)
+			tlsReloader.Stop()
+			return fmt.Errorf("start TLS watcher: %w", err)
+		}
+		go func() {
+			defer close(watcherDone)
+			if err := tlsReloader.Wait(); err != nil {
+				err = fmt.Errorf("TLS watcher: %w", err)
+				errorState.report(err)
+				cancelDuringStartup(err)
+			}
+		}()
+	}
+	stopComponents := func(cause error) {
+		cancelComponents(cause)
+		if watchTLS {
+			tlsReloader.Stop()
+			<-watcherDone
+		}
+	}
 
 	// Traffic Start is a startup transaction. Runtime ownership begins only
 	// after it has successfully bound and launched all configured listeners.
-	if err := trafficManager.Start(ctx); err != nil {
+	stopStartupCancellation := context.AfterFunc(ctx, func() {
+		cancelDuringStartup(context.Cause(ctx))
+	})
+	trafficStartErr := trafficManager.Start(componentCtx)
+	startupMu.Lock()
+	startupPending = false
+	startupMu.Unlock()
+	if trafficStartErr != nil {
+		stopStartupCancellation()
 		trafficManager.Close()
 		trafficManager.Wait()
+		firstErr := errorState.beginShutdown()
+		shutdownCause := firstErr
+		if shutdownCause == nil {
+			shutdownCause = context.Cause(ctx)
+		}
+		if shutdownCause == nil {
+			shutdownCause = trafficStartErr
+		}
+		stopComponents(shutdownCause)
+		if firstErr != nil && (errors.Is(trafficStartErr, componentCtx.Err()) || errors.Is(trafficStartErr, context.Cause(componentCtx))) {
+			return firstErr
+		}
 		if cause := context.Cause(ctx); cause != nil &&
-			(errors.Is(err, cause) || errors.Is(err, ctx.Err())) {
+			(errors.Is(trafficStartErr, cause) || errors.Is(trafficStartErr, ctx.Err()) || errors.Is(trafficStartErr, componentCtx.Err())) {
 			return cause
 		}
-		return fmt.Errorf("start traffic manager: %w", err)
+		return fmt.Errorf("start traffic manager: %w", trafficStartErr)
 	}
+	stopStartupCancellation()
 
-	// QUIC listener cancellation is deliberately detached from caller
-	// cancellation. This lets the supervisor initiate traffic shutdown before
-	// closing QUIC transports and the established tunnels they own.
-	listenerCtx, cancelListeners := context.WithCancelCause(context.WithoutCancel(ctx))
 	var listenerWG sync.WaitGroup
-	errorState := newListenerErrorState()
 	for _, listenerConf := range listenerConfs {
 		listenerWG.Add(1)
 		go func(lc config.QuicListener) {
 			defer listenerWG.Done()
-			err := startListener(listenerCtx, lc)
-			if err == nil && listenerCtx.Err() == nil {
+			err := startListener(componentCtx, lc)
+			if err == nil && componentCtx.Err() == nil {
 				err = errors.New("listener stopped unexpectedly")
 			}
 			if err != nil {
@@ -357,8 +439,14 @@ func superviseServer(
 	// QUIC transports and join their connection handlers before waiting for
 	// traffic tunnels to finish unwinding.
 	trafficManager.Close()
-	cancelListeners(shutdownCause)
+	cancelComponents(shutdownCause)
+	if watchTLS {
+		tlsReloader.Stop()
+	}
 	listenerWG.Wait()
+	if watchTLS {
+		<-watcherDone
+	}
 	trafficManager.Wait()
 
 	if firstErr != nil {
@@ -381,11 +469,6 @@ func configureSessionTicketKeyRotation(
 		return nil, err
 	}
 	tlsConf.SetSessionTicketKeys(*manager.Keys.Load())
-	tlsConf.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
-		cfg := tlsConf.Clone()
-		cfg.SetSessionTicketKeys(*manager.Keys.Load())
-		return cfg, nil
-	}
 	return manager, nil
 }
 
@@ -425,20 +508,8 @@ func (s *Server) startListener(ctx context.Context, listenerConf config.QuicList
 	}
 	defer func() { _ = udpConn.Close() }()
 
-	// Configure TLS based on auth method
-	tlsConf := &tls.Config{
-		Certificates: []tls.Certificate{s.config.TLS.ServerCert},
-	}
-
-	// For mTLS, require and verify client certificates
-	// For token auth, no client cert verification is needed
-	if s.config.Auth.Method == "" || s.config.Auth.Method == "mtls" {
-		tlsConf.ClientAuth = tls.RequireAndVerifyClientCert
-		tlsConf.ClientCAs = s.config.Auth.CACertPool
-	} else {
-		// Token-based auth doesn't require client certificates
-		tlsConf.ClientAuth = tls.NoClientCert
-	}
+	// Each ClientHello receives one immutable TLS material snapshot.
+	tlsConf := &tls.Config{}
 
 	oldKeyLimit := s.config.TLS.RotationOldKeyLimit()
 	stekManager, err := configureSessionTicketKeyRotation(
@@ -448,6 +519,26 @@ func (s *Server) startListener(ctx context.Context, listenerConf config.QuicList
 	)
 	if err != nil {
 		return fmt.Errorf("initialize session ticket key rotation: %w", err)
+	}
+	tlsConf.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
+		state := s.tlsState.Load()
+		if state == nil {
+			return nil, errors.New("TLS state is unavailable")
+		}
+		cfg := tlsConf.Clone()
+		cfg.GetConfigForClient = nil
+		cfg.Certificates = []tls.Certificate{state.certificate}
+		if s.config.Auth.Method == "" || s.config.Auth.Method == "mtls" {
+			cfg.ClientAuth = tls.RequireAndVerifyClientCert
+			cfg.ClientCAs = state.clientCAs
+		} else {
+			cfg.ClientAuth = tls.NoClientCert
+			cfg.ClientCAs = nil
+		}
+		if stekManager != nil {
+			cfg.SetSessionTicketKeys(*stekManager.Keys.Load())
+		}
+		return cfg, nil
 	}
 	if stekManager == nil {
 		logger.Info().Msg("using Go automatic session ticket key rotation")

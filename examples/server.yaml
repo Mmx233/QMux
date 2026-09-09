@@ -90,6 +90,9 @@ tls:
   # Path to server private key file
   server_key_file: "./certs/server.key"
 
+  # Reload TLS files for new handshakes when they change (default: false)
+  auto_reload: false
+
   # Custom session ticket encryption key rotation interval.
   # 0 (default) uses Go's automatic rotation. Go 1.27 rotates keys every 24h
   # and expires them after 7d. Set a positive duration for QMux custom rotation.

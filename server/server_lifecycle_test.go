@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"testing"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/Mmx233/QMux/config"
 	"github.com/Mmx233/QMux/internal/testutil"
+	"github.com/Mmx233/QMux/internal/tlsreload"
 	"github.com/rs/zerolog"
 )
 
@@ -23,11 +25,15 @@ type lifecycleTraffic struct {
 	mu       sync.Mutex
 	events   []string
 	startErr error
+	start    func(context.Context) error
 	onClose  func()
 }
 
-func (m *lifecycleTraffic) Start(context.Context) error {
+func (m *lifecycleTraffic) Start(ctx context.Context) error {
 	m.record("traffic-start")
+	if m.start != nil {
+		return m.start(ctx)
+	}
 	return m.startErr
 }
 
@@ -72,7 +78,7 @@ func TestSuperviseServerCancellationJoinsQUICBeforeTrafficWait(t *testing.T) {
 
 	result := make(chan error, 1)
 	go func() {
-		result <- superviseServer(ctx, manager, listeners, startListener)
+		result <- superviseServer(ctx, manager, listeners, startListener, nil, false)
 	}()
 	waitForLifecycleSignals(t, ready, len(listeners))
 
@@ -114,7 +120,7 @@ func TestSuperviseServerPreservesListenerErrorAndFiltersCloseNoise(t *testing.T)
 
 	result := make(chan error, 1)
 	go func() {
-		result <- superviseServer(ctx, manager, listeners, startListener)
+		result <- superviseServer(ctx, manager, listeners, startListener, nil, false)
 	}()
 	waitForLifecycleSignals(t, ready, len(listeners))
 	close(releaseFailure)
@@ -140,6 +146,8 @@ func TestSuperviseServerTrafficStartupFailureIsJoined(t *testing.T) {
 			listenerCalled = true
 			return nil
 		},
+		nil,
+		false,
 	)
 	if !errors.Is(err, startupFailure) {
 		t.Fatalf("superviseServer() error = %v, want startup failure %v", err, startupFailure)
@@ -150,6 +158,110 @@ func TestSuperviseServerTrafficStartupFailureIsJoined(t *testing.T) {
 	if events := manager.snapshot(); !slices.Equal(events, []string{"traffic-start", "traffic-close", "traffic-wait"}) {
 		t.Fatalf("lifecycle events = %v, want traffic startup rollback and join", events)
 	}
+}
+
+func TestSuperviseServerStopsWatcherAfterTrafficStartupFailure(t *testing.T) {
+	reloader, _ := newServerLifecycleReloader(t)
+	startupFailure := errors.New("traffic bind failed")
+	manager := &lifecycleTraffic{startErr: startupFailure}
+	err := superviseServer(
+		context.Background(), manager, nil,
+		func(context.Context, config.QuicListener) error { return nil },
+		reloader, true,
+	)
+	if !errors.Is(err, startupFailure) {
+		t.Fatalf("superviseServer() error = %v, want startup failure %v", err, startupFailure)
+	}
+	if waitErr := reloader.Wait(); waitErr != nil {
+		t.Fatalf("watcher completion error = %v, want owned cancellation", waitErr)
+	}
+	if events := manager.snapshot(); !slices.Equal(events, []string{"traffic-start", "traffic-close", "traffic-wait"}) {
+		t.Fatalf("lifecycle events = %v, want traffic startup rollback and join", events)
+	}
+}
+
+func TestSuperviseServerWatcherFailureCancelsPendingTrafficStartup(t *testing.T) {
+	reloader, parent := newServerLifecycleReloader(t)
+	started := make(chan struct{})
+	manager := &lifecycleTraffic{start: func(ctx context.Context) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	result := make(chan error, 1)
+	go func() {
+		result <- superviseServer(
+			context.Background(), manager, nil,
+			func(context.Context, config.QuicListener) error { return nil },
+			reloader, true,
+		)
+	}()
+	<-started
+	assertServerLifecycleWatcherFailure(t, reloader, parent, result)
+	if events := manager.snapshot(); !slices.Equal(events, []string{"traffic-start", "traffic-close", "traffic-wait"}) {
+		t.Fatalf("lifecycle events = %v, want blocked startup rollback and join", events)
+	}
+}
+
+func TestSuperviseServerWatcherFailurePreservesRuntimeShutdownOrder(t *testing.T) {
+	reloader, parent := newServerLifecycleReloader(t)
+	manager := &lifecycleTraffic{}
+	listenerReady := make(chan struct{}, 1)
+	result := make(chan error, 1)
+	go func() {
+		result <- superviseServer(
+			context.Background(), manager, []config.QuicListener{{QuicAddr: "listener"}},
+			func(ctx context.Context, _ config.QuicListener) error {
+				listenerReady <- struct{}{}
+				<-ctx.Done()
+				manager.record("listener-exit")
+				return ctx.Err()
+			},
+			reloader, true,
+		)
+	}()
+	waitForLifecycleSignals(t, listenerReady, 1)
+	assertServerLifecycleWatcherFailure(t, reloader, parent, result)
+	events := manager.snapshot()
+	assertLifecycleEventBefore(t, events, "traffic-close", "listener-exit")
+	assertLifecycleEventBefore(t, events, "listener-exit", "traffic-wait")
+}
+
+func assertServerLifecycleWatcherFailure(
+	t *testing.T,
+	reloader *tlsreload.Reloader,
+	parent string,
+	result <-chan error,
+) {
+	t.Helper()
+	removed := parent + "-removed"
+	if err := os.Rename(parent, removed); err != nil {
+		t.Fatalf("rename watched parent: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(removed) })
+
+	err := waitForLifecycleResult(t, result)
+	watcherErr := reloader.Wait()
+	if watcherErr == nil || !errors.Is(err, watcherErr) {
+		t.Fatalf("superviseServer() error = %v, want watcher cause %v", err, watcherErr)
+	}
+}
+
+func newServerLifecycleReloader(t *testing.T) (*tlsreload.Reloader, string) {
+	t.Helper()
+	tlsFiles := snapshotServerTLSFiles(t)
+	reloader, err := tlsreload.New("server", tlsreload.Paths{
+		CertFile: tlsFiles.ServerCertFile,
+		KeyFile:  tlsFiles.ServerKeyFile,
+	}, zerolog.Nop(), func(*tlsreload.Bundle) error { return nil })
+	if err != nil {
+		t.Fatalf("create TLS reloader: %v", err)
+	}
+	if err := reloader.LoadInitial(); err != nil {
+		t.Fatalf("load initial TLS material: %v", err)
+	}
+	t.Cleanup(reloader.Stop)
+	return reloader, filepath.Dir(tlsFiles.ServerCertFile)
 }
 
 func TestSuperviseServerCancelsRealListenerHostnameResolve(t *testing.T) {
@@ -220,7 +332,7 @@ func runServerResolverChild(t *testing.T) {
 		err := srv.startListener(ctx, listener)
 		manager.record("listener-exit")
 		return err
-	})
+	}, nil, false)
 	if !errors.Is(err, want) {
 		t.Fatalf("superviseServer error = %v, want caller cause %v", err, want)
 	}

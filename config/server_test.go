@@ -128,35 +128,15 @@ func TestServerAuthValidate(t *testing.T) {
 }
 
 func TestServerAuthCreateAuthenticator(t *testing.T) {
-	validCert, _ := testCertificate(t)
-	validCertPath := filepath.Join(t.TempDir(), "ca.crt")
-	if err := os.WriteFile(validCertPath, validCert, 0o644); err != nil {
-		t.Fatalf("write valid CA: %v", err)
-	}
-	invalidCertPath := filepath.Join(t.TempDir(), "invalid.crt")
-	if err := os.WriteFile(invalidCertPath, []byte("invalid"), 0o644); err != nil {
-		t.Fatalf("write invalid CA: %v", err)
-	}
-
 	tests := []struct {
 		name      string
 		auth      ServerAuth
 		wantType  string
 		wantError string
 	}{
-		{name: "mtls", auth: ServerAuth{Method: "mtls", CACertFile: validCertPath}, wantType: "mtls"},
-		{name: "default mtls", auth: ServerAuth{CACertFile: validCertPath}, wantType: "mtls"},
+		{name: "mtls", auth: ServerAuth{Method: "mtls", CACertFile: "not-read.pem"}, wantType: "mtls"},
+		{name: "default mtls", auth: ServerAuth{CACertFile: "not-read.pem"}, wantType: "mtls"},
 		{name: "token", auth: ServerAuth{Method: "token", Token: "this-is-a-valid-token"}, wantType: "token"},
-		{
-			name:      "missing CA file",
-			auth:      ServerAuth{Method: "mtls", CACertFile: filepath.Join(t.TempDir(), "missing.crt")},
-			wantError: "load CA certificate",
-		},
-		{
-			name:      "invalid CA file",
-			auth:      ServerAuth{Method: "mtls", CACertFile: invalidCertPath},
-			wantError: "load CA certificate",
-		},
 		{name: "unknown method", auth: ServerAuth{Method: "unknown"}, wantError: "unknown auth method"},
 	}
 
@@ -180,8 +160,8 @@ func TestServerAuthCreateAuthenticator(t *testing.T) {
 				if _, ok := authenticator.(*mtls.MTLSAuth); !ok {
 					t.Fatalf("authenticator type = %T, want *mtls.MTLSAuth", authenticator)
 				}
-				if test.auth.CACertPool == nil {
-					t.Fatal("CreateAuthenticator did not load the CA pool")
+				if test.auth.CACertPool != nil {
+					t.Fatal("CreateAuthenticator mutated the CA pool")
 				}
 			case "token":
 				if _, ok := authenticator.(*tokenauth.TokenAuth); !ok {

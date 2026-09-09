@@ -1,6 +1,8 @@
 package server
 
 import (
+	"bytes"
+	"context"
 	"crypto/x509"
 	"encoding/pem"
 	"io"
@@ -18,6 +20,7 @@ import (
 	"github.com/Mmx233/QMux/server/pool"
 	"github.com/Mmx233/QMux/server/traffic"
 	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 )
 
 type serverCopyBufferObserver struct {
@@ -73,6 +76,116 @@ func TestNewUsesConfiguredCopyBufferPool(t *testing.T) {
 	}
 	if observer.size != copyBufferSize {
 		t.Fatalf("copy buffer size = %d, want %d", observer.size, copyBufferSize)
+	}
+}
+
+func TestNewLoadsAndLogsInitialTLSState(t *testing.T) {
+	var output bytes.Buffer
+	previousLogger := log.Logger
+	log.Logger = zerolog.New(&output)
+	t.Cleanup(func() { log.Logger = previousLogger })
+	tlsFiles := snapshotServerTLSFiles(t)
+	srv, err := New(&config.Server{
+		Listeners: []config.QuicListener{{
+			QuicAddr: "127.0.0.1:8443", TrafficAddr: "127.0.0.1:8080", Protocol: "tcp",
+		}},
+		Auth: config.ServerAuth{Method: "token", Token: "0123456789abcdef"},
+		TLS:  tlsFiles,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		srv.tlsReloader.Stop()
+		for _, connectionPool := range srv.pools {
+			connectionPool.Stop()
+		}
+	})
+	if state := srv.tlsState.Load(); state == nil || len(state.certificate.Certificate) == 0 || state.clientCAs != nil {
+		t.Fatalf("initial TLS state = %+v, want token server certificate only", state)
+	}
+	logs := output.String()
+	if strings.Count(logs, `"phase":"initial"`) != 1 || !strings.Contains(logs, `"level":"info"`) ||
+		!strings.Contains(logs, `"changed":true`) {
+		t.Fatalf("initial TLS result log = %s", logs)
+	}
+}
+
+func TestNewRejectsRequiredCAFromLoggedInitialLoad(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		prepare func(*testing.T) string
+	}{
+		{name: "missing", prepare: func(t *testing.T) string { return filepath.Join(t.TempDir(), "missing-ca.pem") }},
+		{name: "invalid", prepare: func(t *testing.T) string {
+			path := filepath.Join(t.TempDir(), "invalid-ca.pem")
+			if err := os.WriteFile(path, []byte("invalid CA"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return path
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var output bytes.Buffer
+			previousLogger := log.Logger
+			log.Logger = zerolog.New(&output)
+			t.Cleanup(func() { log.Logger = previousLogger })
+			tlsFiles := snapshotServerTLSFiles(t)
+			srv, err := New(&config.Server{
+				Listeners: []config.QuicListener{{
+					QuicAddr: "127.0.0.1:8443", TrafficAddr: "127.0.0.1:8080", Protocol: "tcp",
+				}},
+				Auth: config.ServerAuth{Method: "mtls", CACertFile: test.prepare(t)},
+				TLS:  tlsFiles,
+			})
+			if err == nil || srv != nil || !strings.Contains(err.Error(), "load initial TLS material") {
+				t.Fatalf("New() = (%v, %v), want logged initial CA failure", srv, err)
+			}
+			logs := output.String()
+			if strings.Count(logs, `"phase":"initial"`) != 1 || !strings.Contains(logs, `"level":"error"`) {
+				t.Fatalf("initial failure log = %s", logs)
+			}
+		})
+	}
+}
+
+func TestServerTLSUnchangedStartupKeepsPublishedState(t *testing.T) {
+	var output bytes.Buffer
+	previousLogger := log.Logger
+	log.Logger = zerolog.New(&output)
+	t.Cleanup(func() { log.Logger = previousLogger })
+	tlsFiles := snapshotServerTLSFiles(t)
+	tlsFiles.AutoReload = true
+	srv, err := New(&config.Server{
+		Listeners: []config.QuicListener{{
+			QuicAddr: "127.0.0.1:8443", TrafficAddr: "127.0.0.1:8080", Protocol: "tcp",
+		}},
+		Auth: config.ServerAuth{Method: "token", Token: "0123456789abcdef"},
+		TLS:  tlsFiles,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	for _, connectionPool := range srv.pools {
+		t.Cleanup(connectionPool.Stop)
+	}
+	before := srv.tlsState.Load()
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := srv.tlsReloader.PrepareStart(ctx, true); err != nil {
+		cancel()
+		t.Fatalf("PrepareStart: %v", err)
+	}
+	if after := srv.tlsState.Load(); after != before {
+		t.Fatal("unchanged startup reread replaced the published TLS state")
+	}
+	cancel()
+	srv.tlsReloader.Stop()
+	if err := srv.tlsReloader.Wait(); err != nil {
+		t.Fatalf("owned watcher cancellation: %v", err)
+	}
+	logs := output.String()
+	if strings.Count(logs, `"phase":"startup"`) != 1 || !strings.Contains(logs, `"changed":false`) {
+		t.Fatalf("unchanged startup result log = %s", logs)
 	}
 }
 

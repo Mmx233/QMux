@@ -12,6 +12,7 @@ import (
 
 	"github.com/Mmx233/QMux/config"
 	"github.com/Mmx233/QMux/internal/stats"
+	"github.com/Mmx233/QMux/internal/tlsreload"
 	"github.com/quic-go/quic-go"
 	"github.com/rs/zerolog"
 )
@@ -25,13 +26,16 @@ const (
 // ConnectionManager manages connections to multiple servers.
 // It orchestrates ServerConnection instances and handles lifecycle management.
 type ConnectionManager struct {
-	config        *config.Client
-	connections   sync.Map // map[string]*ServerConnection (key: server address)
-	sessionCaches *SessionCacheManager
-	logger        zerolog.Logger
+	config      *config.Client
+	auth        config.ClientAuth
+	connections sync.Map // map[string]*ServerConnection (key: server address)
+	logger      zerolog.Logger
 
 	// TLS and QUIC configuration
-	baseTLSConfig *tls.Config
+	tlsState      atomic.Pointer[clientTLSState]
+	tlsReloader   *tlsreload.Reloader
+	tlsAutoReload bool
+	tlsConfig     config.ClientTLS
 	quicConfig    *quic.Config
 
 	// Lifecycle management
@@ -56,6 +60,11 @@ type ConnectionManager struct {
 	// NewConns delivers newly established ServerConnections (initial + reconnected)
 	// to the Client layer for stream acceptance and UDP handler setup.
 	NewConns chan *ServerConnection
+}
+
+type clientTLSState struct {
+	baseTLSConfig *tls.Config
+	sessionCaches *SessionCacheManager
 }
 
 type clientGenerationPhase uint8
@@ -88,6 +97,9 @@ func NewConnectionManager(cfg *config.Client, logger zerolog.Logger) (*Connectio
 	if cfg == nil {
 		return nil, errors.New("client config is nil")
 	}
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid client configuration: %w", err)
+	}
 
 	// Validate and deduplicate servers
 	hasDuplicates, err := cfg.Server.ValidateAndDeduplicate()
@@ -102,13 +114,42 @@ func NewConnectionManager(cfg *config.Client, logger zerolog.Logger) (*Connectio
 
 	cm := &ConnectionManager{
 		config:         cfg,
-		sessionCaches:  NewSessionCacheManager(),
+		auth:           cfg.Auth,
 		logger:         logger.With().Str("component", "connection_manager").Logger(),
+		tlsAutoReload:  cfg.TLS.AutoReload,
+		tlsConfig:      cfg.TLS,
+		quicConfig:     cfg.Quic.GetConfig(),
 		ctx:            ctx,
 		cancel:         cancel,
 		attemptTimeout: defaultConnectionAttemptTimeout,
 		reconnecting:   make(map[string]bool),
 		NewConns:       make(chan *ServerConnection, max(16, len(cfg.Server.GetServers()))),
+	}
+	paths := tlsreload.Paths{CAFile: cfg.TLS.CACertFile}
+	if cfg.Auth.Method != config.ClientAuthMethodToken {
+		paths.CertFile = cfg.TLS.ClientCertFile
+		paths.KeyFile = cfg.TLS.ClientKeyFile
+	}
+	reloader, err := tlsreload.New("client", paths, cm.logger, func(bundle *tlsreload.Bundle) error {
+		baseTLSConfig := &tls.Config{RootCAs: bundle.CAPool}
+		if bundle.Certificate != nil {
+			baseTLSConfig.Certificates = []tls.Certificate{*bundle.Certificate}
+		}
+		cm.tlsState.Store(&clientTLSState{
+			baseTLSConfig: baseTLSConfig,
+			sessionCaches: NewSessionCacheManager(),
+		})
+		return nil
+	})
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("initialize TLS reloader: %w", err)
+	}
+	cm.tlsReloader = reloader
+	if err := reloader.LoadInitial(); err != nil {
+		reloader.Stop()
+		cancel()
+		return nil, fmt.Errorf("load initial TLS material: %w", err)
 	}
 	for _, endpoint := range cfg.Server.GetServers() {
 		cm.endpoints = append(cm.endpoints, clientEndpointPhases{endpoint: endpoint.Address})
@@ -121,25 +162,16 @@ func NewConnectionManager(cfg *config.Client, logger zerolog.Logger) (*Connectio
 // It uses goroutines for each server and waits for all connection attempts.
 // Partial failures are handled - the manager continues with successful connections.
 func (cm *ConnectionManager) Start(ctx context.Context) error {
-	if err := cm.config.Validate(); err != nil {
+	validationConfig := *cm.config
+	validationConfig.Auth = cm.auth
+	validationConfig.TLS = cm.tlsConfig
+	if err := validationConfig.Validate(); err != nil {
 		return fmt.Errorf("invalid client configuration: %w", err)
 	}
-
-	// Load the credentials required by the selected authentication mode.
-	if err := cm.config.LoadCredentials(); err != nil {
-		return fmt.Errorf("load credentials: %w", err)
-	}
-
-	// Create base TLS config
-	cm.baseTLSConfig = &tls.Config{
-		RootCAs: cm.config.TLS.CACertPool,
-	}
-	if cm.config.Auth.Method != config.ClientAuthMethodToken {
-		cm.baseTLSConfig.Certificates = []tls.Certificate{cm.config.TLS.ClientCert}
-	}
-
-	// Get QUIC config
 	cm.quicConfig = cm.config.Quic.GetConfig()
+	if err := cm.tlsReloader.PrepareStart(ctx, cm.tlsAutoReload); err != nil {
+		return fmt.Errorf("prepare TLS material: %w", err)
+	}
 
 	servers := cm.config.Server.GetServers()
 	cm.logger.Info().Int("server_count", len(servers)).Msg("starting connections to servers")
@@ -207,11 +239,15 @@ func (cm *ConnectionManager) Start(ctx context.Context) error {
 func (cm *ConnectionManager) connectAndRegister(ctx context.Context, endpoint config.ServerEndpoint) (*ServerConnection, error) {
 	attemptCtx, cancel := cm.newAttemptContext(ctx)
 	defer cancel()
+	state := cm.tlsState.Load()
+	if state == nil {
+		return nil, errors.New("TLS state is unavailable")
+	}
 
 	sc := NewServerConnection(
 		endpoint.Address,
 		endpoint.ServerName,
-		cm.sessionCaches.GetOrCreate(endpoint.Address),
+		state.sessionCaches.GetOrCreate(endpoint.Address),
 		cm.logger,
 	)
 	cm.publishMu.Lock()
@@ -219,7 +255,7 @@ func (cm *ConnectionManager) connectAndRegister(ctx context.Context, endpoint co
 	cm.publishMu.Unlock()
 	observed := &cm.endpoints[sc.capacityEndpoint]
 	started := observed.connect.Start()
-	err := sc.Connect(attemptCtx, cm.baseTLSConfig, cm.quicConfig)
+	err := sc.Connect(attemptCtx, state.baseTLSConfig, cm.quicConfig)
 	observed.connect.Finish(started, stats.Result(err, "dial_error"))
 	if err != nil {
 		_ = sc.Close()
@@ -229,7 +265,7 @@ func (cm *ConnectionManager) connectAndRegister(ctx context.Context, endpoint co
 	cm.moveGenerationLocked(sc, clientGenerationHandshaking, clientGenerationPending)
 	cm.publishMu.Unlock()
 	started = observed.registration.Start()
-	err = sc.RegisterWithAuth(attemptCtx, cm.config.ClientID, cm.config.Auth)
+	err = sc.RegisterWithAuth(attemptCtx, cm.config.ClientID, cm.auth)
 	observed.registration.Finish(started, stats.Result(err, "protocol_error"))
 	if err != nil {
 		_ = sc.Close()
@@ -500,6 +536,7 @@ func (cm *ConnectionManager) Stop() error {
 }
 
 func (cm *ConnectionManager) stopPublishing() {
+	cm.tlsReloader.Stop()
 	cm.publishMu.Lock()
 	cm.closed = true
 	cm.cancel()
@@ -689,5 +726,9 @@ func (cm *ConnectionManager) TotalCount() int {
 // SessionCacheManager returns the session cache manager.
 // This is useful for testing session cache persistence.
 func (cm *ConnectionManager) SessionCacheManager() *SessionCacheManager {
-	return cm.sessionCaches
+	state := cm.tlsState.Load()
+	if state == nil {
+		return nil
+	}
+	return state.sessionCaches
 }

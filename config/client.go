@@ -211,6 +211,7 @@ type ClientTLS struct {
 	CACertFile     string `yaml:"ca_cert_file"`
 	ClientCertFile string `yaml:"client_cert_file"`
 	ClientKeyFile  string `yaml:"client_key_file"`
+	AutoReload     bool   `yaml:"auto_reload"`
 
 	// Loaded certificates (not from YAML)
 	CACertPool *x509.CertPool  `yaml:"-"`

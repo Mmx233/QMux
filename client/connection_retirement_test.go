@@ -17,7 +17,7 @@ import (
 
 func newRetirementManager(t *testing.T, address string) *ConnectionManager {
 	t.Helper()
-	cm, err := NewConnectionManager(&config.Client{
+	cm, err := NewConnectionManager(completeConnectionManagerTestConfig(t, &config.Client{
 		ClientID:          "retirement-client",
 		HeartbeatInterval: time.Hour,
 		HealthTimeout:     2 * time.Hour,
@@ -25,7 +25,7 @@ func newRetirementManager(t *testing.T, address string) *ConnectionManager {
 			Address:    address,
 			ServerName: "lifecycle.test",
 		}}},
-	}, zerolog.Nop())
+	}), zerolog.Nop())
 	if err != nil {
 		t.Fatalf("create retirement manager: %v", err)
 	}

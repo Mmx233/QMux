@@ -89,6 +89,9 @@ tls:
   client_cert_file: "./certs/client.crt"
   client_key_file: "./certs/client.key"
 
+  # Reload TLS files for new handshakes when they change (default: false)
+  auto_reload: false
+
 # Heartbeat configuration
 # How often to send heartbeat messages to the server
 heartbeat_interval: 10s

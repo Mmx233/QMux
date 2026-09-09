@@ -23,11 +23,11 @@ func newCapacitySnapshotManager(t *testing.T, endpoints ...string) *ConnectionMa
 	for i, endpoint := range endpoints {
 		servers[i] = config.ServerEndpoint{Address: endpoint, ServerName: "snapshot.test"}
 	}
-	manager, err := NewConnectionManager(&config.Client{
+	manager, err := NewConnectionManager(completeConnectionManagerTestConfig(t, &config.Client{
 		Server:            config.ClientServer{Servers: servers},
 		HeartbeatInterval: time.Hour,
 		HealthTimeout:     2 * time.Hour,
-	}, zerolog.Nop())
+	}), zerolog.Nop())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -441,7 +441,7 @@ func TestClientFragmentLimitsReachInstalledRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New client: %v", err)
 	}
-	client.connMgr.baseTLSConfig = peer.clientTLS.Clone()
+	client.connMgr.tlsState.Store(&clientTLSState{baseTLSConfig: peer.clientTLS.Clone(), sessionCaches: NewSessionCacheManager()})
 	client.connMgr.quicConfig = conf.Quic.GetConfig()
 	conf.Capacity.MaxUDPFragmentGroupsPerHandler = 99
 	conf.Capacity.MaxUDPFragmentBackingBytesPerHandler = 99 * int64(protocol.FragmentBufferSize)

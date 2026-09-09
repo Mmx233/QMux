@@ -1,24 +1,44 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Mmx233/QMux/config"
 	"github.com/Mmx233/QMux/protocol"
 	"github.com/quic-go/quic-go"
+	"github.com/rs/zerolog"
 )
 
 const clientLifecycleTimeout = 3 * time.Second
 
 type clientCopyBufferObserver struct {
 	size int
+}
+
+type clientLifecycleLogGate struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (g *clientLifecycleLogGate) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte(`"message":"starting client"`)) {
+		g.once.Do(func() {
+			close(g.entered)
+			<-g.release
+		})
+	}
+	return len(p), nil
 }
 
 func (r *clientCopyBufferObserver) Read(p []byte) (int, error) {
@@ -156,6 +176,43 @@ func stallClientLifecycleRegistration(peer *lifecyclePeer) (<-chan struct{}, <-c
 func TestClientLifecycle(t *testing.T) {
 	offlineEndpoint := config.ServerEndpoint{Address: "127.0.0.1:1", ServerName: "lifecycle.test"}
 
+	t.Run("owned termination before TLS preparation is not a startup failure", func(t *testing.T) {
+		for _, test := range []struct {
+			name      string
+			terminate func(*Client) error
+		}{
+			{name: "Stop", terminate: (*Client).Stop},
+			{name: "Shutdown", terminate: func(c *Client) error { return c.Shutdown(context.Background()) }},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				c := newClientLifecycleClient(t, "client-stop-before-tls-prepare", offlineEndpoint)
+				gate := &clientLifecycleLogGate{entered: make(chan struct{}), release: make(chan struct{})}
+				c.logger = zerolog.New(gate)
+				release := sync.OnceFunc(func() { close(gate.release) })
+				defer release()
+
+				startDone := callClientLifecycle(func() error { return c.Start(context.Background()) })
+				awaitClientLifecycle(t, gate.entered, "Client.Start TLS preparation barrier")
+				terminationDone := callClientLifecycle(func() error { return test.terminate(c) })
+				if err := awaitClientLifecycle(
+					t,
+					callClientLifecycle(c.connMgr.tlsReloader.Wait),
+					"owned TLS reloader stop",
+				); err != nil {
+					t.Fatalf("owned TLS reloader stop returned error: %v", err)
+				}
+				release()
+
+				if err := awaitClientLifecycle(t, terminationDone, "Client."+test.name); err != nil {
+					t.Errorf("%s returned error: %v", test.name, err)
+				}
+				if err := awaitClientLifecycle(t, startDone, "concurrent Client.Start"); err != nil {
+					t.Errorf("%s made Client.Start fail: %v", test.name, err)
+				}
+			})
+		}
+	})
+
 	t.Run("Stop interrupts stalled registration and duplicate Start is rejected", func(t *testing.T) {
 		peer := newLifecycleStartPeer(t)
 		c := newClientLifecycleClient(t, "client-stop-stalled-registration", peer.endpoint())
@@ -208,7 +265,9 @@ func TestClientLifecycle(t *testing.T) {
 
 	t.Run("startup failure preserves cause and tears down once", func(t *testing.T) {
 		c := newClientLifecycleClient(t, "client-startup-failure", offlineEndpoint)
-		c.config.TLS.CACertFile = filepath.Join(t.TempDir(), "missing-ca.crt")
+		if err := os.Remove(c.connMgr.tlsConfig.CACertFile); err != nil {
+			t.Fatalf("remove frozen CA file: %v", err)
+		}
 
 		err := awaitClientLifecycle(
 			t,
@@ -218,7 +277,7 @@ func TestClientLifecycle(t *testing.T) {
 		if !errors.Is(err, fs.ErrNotExist) {
 			t.Fatalf("Start error = %v, want fs.ErrNotExist in chain", err)
 		}
-		if prefix := "start connection manager: load credentials: read CA cert:"; !strings.HasPrefix(err.Error(), prefix) {
+		if prefix := "start connection manager: prepare TLS material: read TLS ca file:"; !strings.HasPrefix(err.Error(), prefix) {
 			t.Fatalf("Start error = %q, want prefix %q", err, prefix)
 		}
 		if err := c.Shutdown(context.Background()); !errors.Is(err, fs.ErrNotExist) {
@@ -275,4 +334,55 @@ func TestClientLifecycle(t *testing.T) {
 		}
 		assertLifecycleUnpublished(t, c.connMgr)
 	})
+}
+
+func TestClientStartReturnsFatalTLSWatcherCause(t *testing.T) {
+	peer := newLifecycleStartPeer(t)
+	serverDone := peer.serveRegistration(func(conn *quic.Conn, stream *quic.Stream, _ protocol.RegisterMsg) error {
+		if err := writeSuccessfulLifecycleAck(stream); err != nil {
+			return err
+		}
+		<-conn.Context().Done()
+		return nil
+	})
+	tlsFiles := lifecycleClientTLSFiles(t)
+	tlsFiles.AutoReload = true
+	c, err := New(&config.Client{
+		ClientID:          "fatal-tls-watcher",
+		Server:            config.ClientServer{Servers: []config.ServerEndpoint{peer.endpoint()}},
+		Local:             config.LocalService{Host: "127.0.0.1", Port: 1},
+		TLS:               tlsFiles,
+		HeartbeatInterval: time.Hour,
+		HealthTimeout:     2 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	startDone := callClientLifecycle(func() error { return c.Start(context.Background()) })
+	deadline := time.NewTimer(clientLifecycleTimeout)
+	defer deadline.Stop()
+	for c.HealthyConnectionCount() != 1 {
+		select {
+		case err := <-startDone:
+			t.Fatalf("Client.Start returned before watcher failure: %v", err)
+		case <-deadline.C:
+			t.Fatal("client did not become healthy")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	parent := filepath.Dir(tlsFiles.CACertFile)
+	removed := parent + "-removed"
+	if err := os.Rename(parent, removed); err != nil {
+		t.Fatalf("rename watched TLS parent: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(removed) })
+
+	err = awaitClientLifecycle(t, startDone, "fatal TLS watcher teardown")
+	watcherErr := c.connMgr.tlsReloader.Wait()
+	if watcherErr == nil || !errors.Is(err, watcherErr) {
+		t.Fatalf("Client.Start error = %v, want watcher cause %v", err, watcherErr)
+	}
+	if err := awaitLifecycle(t, serverDone, "fatal watcher connection close"); err != nil {
+		t.Fatal(err)
+	}
 }

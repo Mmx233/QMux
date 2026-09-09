@@ -100,6 +100,7 @@ auth:
 tls:
   server_cert_file: "./certs/server.crt"
   server_key_file: "./certs/server.key"
+  auto_reload: false
 ```
 
 ### 4. Configure Example Client
@@ -132,6 +133,7 @@ tls:
   ca_cert_file: "./certs/ca.crt"
   client_cert_file: "./certs/client.crt"
   client_key_file: "./certs/client.key"
+  auto_reload: false
 ```
 
 | Key                                                  | Scope                                                                                                  |  Default | When full                                                                 |
