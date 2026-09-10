@@ -88,7 +88,7 @@ jobs:
           set -euo pipefail
           mkdir .cr-release-packages
           helm package "$CHART_PATH" --destination .cr-release-packages
-          release_tag="qmux-$CHART_VERSION"
+          release_tag="helm-chart-$CHART_VERSION"
           if gh release view "$release_tag" --json isDraft,assets > "$RUNNER_TEMP/release.json" 2>/dev/null; then
             jq -e --arg package "$PACKAGE" \
               '.isDraft == false and [.assets[].name] == [$package]' \
@@ -138,6 +138,7 @@ jobs:
         uses: helm/chart-releaser-action@3e001cb8c68933439c7e721650f20a07a1a5c61e
         with:
           version: v1.7.0
+          config: .github/cr.yaml
           skip_packaging: "true"
           skip_existing: "true"
           mark_as_latest: "false"
