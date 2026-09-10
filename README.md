@@ -29,6 +29,29 @@ go install github.com/Mmx233/QMux@latest
 docker pull mmx233/qmux
 ```
 
+### Helm
+
+#### Get Repo Info
+
+```bash
+helm repo add qmux https://mmx233.github.io/QMux
+helm repo update
+```
+
+#### Install Chart
+
+Set the role and its QMux configuration directly through chart values. See
+[`charts/qmux/values.yaml`](charts/qmux/values.yaml) for the complete options.
+
+```bash
+helm install qmux-client qmux/qmux \
+  --namespace qmux \
+  --create-namespace \
+  --set mode=client \
+  --set 'config.client.server.servers[0].address=qmux.example.com:8443' \
+  ...
+```
+
 ## Quick Start
 
 ### 1. Generate Certificates
