@@ -1,0 +1,14 @@
+apiVersion: v1
+entries:
+  qmux:
+  - apiVersion: v2
+    appVersion: v2.1.1
+    created: "2026-09-10T10:10:54.336531086Z"
+    description: QMux server or client
+    digest: 138267370a7f24c1b822bd9cdebaf59e4a096c57f3f1639965d70ab2f38032e0
+    name: qmux
+    type: application
+    urls:
+    - https://github.com/Mmx233/QMux/releases/download/helm-chart-0.1.1/qmux-0.1.1.tgz
+    version: 0.1.1
+generated: "2026-09-10T10:10:54.336545634Z"
