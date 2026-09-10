@@ -254,5 +254,4 @@ ConfigMap
 {{- if not .Values.admin.enabled -}}
   {{- if or .Values.probes.liveness.enabled .Values.probes.readiness.enabled (and .Values.monitoring.enabled (or .Values.monitoring.prometheusAnnotations.enabled .Values.monitoring.podMonitor.enabled)) -}}{{- fail "admin.enabled=false requires probes and metrics collection to be disabled" -}}{{- end -}}
 {{- end -}}
-{{- if and .Values.monitoring.enabled .Values.monitoring.podMonitor.enabled (not (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1/PodMonitor")) -}}{{- fail "monitoring.podMonitor.enabled=true requires monitoring.coreos.com/v1/PodMonitor" -}}{{- end -}}
 {{- end -}}

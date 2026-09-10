@@ -102,7 +102,6 @@ jobs:
           helm template monitoring-defaults "$CHART_PATH" \
             --values "$CHART_PATH/ci/cert-manager-client-values.yaml" \
             --set monitoring.enabled=true \
-            --api-versions monitoring.coreos.com/v1/PodMonitor \
             --api-versions cert-manager.io/v1/Certificate > "$render_dir/monitoring-defaults.yaml"
           grep -F 'kind: PodMonitor' "$render_dir/monitoring-defaults.yaml" >/dev/null
           if grep -E 'prometheus.io/scrape:|qmux-client.json:' "$render_dir/monitoring-defaults.yaml" >/dev/null; then
