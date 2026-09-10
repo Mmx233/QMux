@@ -1,0 +1,199 @@
+rule_files:
+  - client-rules.yaml
+  - server-rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  - name: client endpoint degraded
+    interval: 1m
+    input_series:
+      - series: 'qmux_client_connection_healthy{namespace="default",app_kubernetes_io_instance="client",app_kubernetes_io_component="client",pod="client-0",endpoint="server:8443"}'
+        values: '1+0x20'
+      - series: 'qmux_client_connection_healthy{namespace="default",app_kubernetes_io_instance="client",app_kubernetes_io_component="client",pod="client-1",endpoint="server:8443"}'
+        values: '0+0x20'
+      - series: 'qmux_client_connection_healthy{namespace="default",app_kubernetes_io_instance="other",app_kubernetes_io_component="client",pod="other-0",endpoint="server:8443"}'
+        values: '0+0x20'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: QMuxClientEndpointDegraded
+        exp_alerts:
+          - exp_labels:
+              namespace: default
+              app_kubernetes_io_instance: client
+              app_kubernetes_io_component: client
+              endpoint: server:8443
+              severity: warning
+            exp_annotations:
+              summary: QMux client endpoint is degraded
+              description: Observed client replicas disagree on endpoint health.
+      - eval_time: 16m
+        alertname: QMuxClientEndpointUnavailable
+        exp_alerts: []
+
+  - name: server route unavailable
+    interval: 1m
+    input_series:
+      - series: 'qmux_server_route_ready{namespace="default",app_kubernetes_io_instance="server",app_kubernetes_io_component="server",pod="server-0",listener="0.0.0.0:8443"}'
+        values: '0+0x10'
+      - series: 'qmux_server_route_ready{namespace="default",app_kubernetes_io_instance="server",app_kubernetes_io_component="server",pod="server-1",listener="0.0.0.0:8443"}'
+        values: '0+0x10'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: QMuxServerRouteUnavailable
+        exp_alerts:
+          - exp_labels:
+              namespace: default
+              app_kubernetes_io_instance: server
+              app_kubernetes_io_component: server
+              listener: 0.0.0.0:8443
+              severity: critical
+            exp_annotations:
+              summary: QMux server route is unavailable
+              description: All observed server replicas report the listener route unavailable.
+      - eval_time: 16m
+        alertname: QMuxServerRouteDegraded
+        exp_alerts: []
+
+  - name: another release does not degrade the client
+    interval: 1m
+    input_series:
+      - series: 'qmux_client_connection_healthy{namespace="default",app_kubernetes_io_instance="client",app_kubernetes_io_component="client",pod="client-0",endpoint="server:8443"}'
+        values: '1+0x20'
+      - series: 'qmux_client_connection_healthy{namespace="default",app_kubernetes_io_instance="client",app_kubernetes_io_component="client",pod="client-1",endpoint="server:8443"}'
+        values: '1+0x20'
+      - series: 'qmux_client_connection_healthy{namespace="default",app_kubernetes_io_instance="other",app_kubernetes_io_component="client",pod="other-0",endpoint="server:8443"}'
+        values: '0+0x20'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: QMuxClientEndpointDegraded
+        exp_alerts: []
+
+  - name: zero capacity limit is ignored
+    interval: 1m
+    input_series:
+      - series: 'qmux_client_udp_session_permits{namespace="default",app_kubernetes_io_instance="client",app_kubernetes_io_component="client",pod="client-0"}'
+        values: '10+0x15'
+      - series: 'qmux_client_udp_sessions_limit{namespace="default",app_kubernetes_io_instance="client",app_kubernetes_io_component="client",pod="client-0"}'
+        values: '0+0x15'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: QMuxCapacityNearLimit
+        exp_alerts: []
+
+  - name: server capacity preserves resource labels
+    interval: 1m
+    input_series:
+      - series: 'qmux_server_capacity_usage{namespace="default",app_kubernetes_io_instance="server",app_kubernetes_io_component="server",pod="server-0",listener="0.0.0.0:8443",resource="pending_registrations"}'
+        values: '10+0x15'
+      - series: 'qmux_server_capacity_limit{namespace="default",app_kubernetes_io_instance="server",app_kubernetes_io_component="server",pod="server-0",listener="0.0.0.0:8443",resource="pending_registrations"}'
+        values: '10+0x15'
+    alert_rule_test:
+      - eval_time: 11m
+        alertname: QMuxCapacityNearLimit
+        exp_alerts:
+          - exp_labels:
+              namespace: default
+              app_kubernetes_io_instance: server
+              app_kubernetes_io_component: server
+              pod: server-0
+              listener: 0.0.0.0:8443
+              resource: pending_registrations
+              severity: warning
+            exp_annotations:
+              summary: QMux server generation capacity is near its limit
+              description: A server capacity resource has remained above 90 percent; per-generation resources describe the busiest generation.
+
+  - name: canceled server admissions do not dilute failures
+    interval: 1m
+    input_series:
+      - series: 'qmux_server_tcp_admissions_total{namespace="default",app_kubernetes_io_instance="server",app_kubernetes_io_component="server",pod="server-0",listener="0.0.0.0:8443",result="committed"}'
+        values: '0+1x20'
+      - series: 'qmux_server_tcp_admissions_total{namespace="default",app_kubernetes_io_instance="server",app_kubernetes_io_component="server",pod="server-0",listener="0.0.0.0:8443",result="setup_failure"}'
+        values: '0+1x20'
+      - series: 'qmux_server_tcp_admissions_total{namespace="default",app_kubernetes_io_instance="server",app_kubernetes_io_component="server",pod="server-0",listener="0.0.0.0:8443",result="canceled"}'
+        values: '0+100x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: QMuxTCPFailureRateHigh
+        exp_alerts:
+          - exp_labels:
+              namespace: default
+              app_kubernetes_io_instance: server
+              app_kubernetes_io_component: server
+              pod: server-0
+              listener: 0.0.0.0:8443
+              severity: warning
+            exp_annotations:
+              summary: QMux server TCP admission failure rate is high
+              description: More than 10 percent of at least 10 terminal TCP admissions failed in ten minutes.
+
+  - name: low-volume client failures do not alert
+    interval: 5m
+    input_series:
+      - series: 'qmux_client_tcp_dial_results_total{namespace="default",app_kubernetes_io_instance="client",app_kubernetes_io_component="client",pod="client-0",result="success"}'
+        values: '0+1x8'
+      - series: 'qmux_client_tcp_dial_results_total{namespace="default",app_kubernetes_io_instance="client",app_kubernetes_io_component="client",pod="client-0",result="dial_error"}'
+        values: '0+1x8'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: QMuxTCPFailureRateHigh
+        exp_alerts: []
+
+  - name: identity certificate warning
+    start_timestamp: 1000000
+    interval: 1m
+    input_series:
+      - series: 'qmux_client_tls_certificate_not_after_timestamp_seconds{namespace="default",app_kubernetes_io_instance="client",app_kubernetes_io_component="client",pod="client-0",kind="identity"}'
+        values: '2200000+0x20'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: QMuxTLSIdentityCertificateExpiring
+        exp_alerts:
+          - exp_labels:
+              namespace: default
+              app_kubernetes_io_instance: client
+              app_kubernetes_io_component: client
+              kind: identity
+              severity: warning
+            exp_annotations:
+              summary: QMux identity certificate expires soon
+              description: The earliest expiry in the loaded identity chain is less than 14 days away.
+
+  - name: identity certificate critical
+    start_timestamp: 1000000
+    interval: 1m
+    input_series:
+      - series: 'qmux_server_tls_certificate_not_after_timestamp_seconds{namespace="default",app_kubernetes_io_instance="server",app_kubernetes_io_component="server",pod="server-0",kind="identity"}'
+        values: '1200000+0x20'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: QMuxTLSIdentityCertificateExpiring
+        exp_alerts:
+          - exp_labels:
+              namespace: default
+              app_kubernetes_io_instance: server
+              app_kubernetes_io_component: server
+              kind: identity
+              severity: critical
+            exp_annotations:
+              summary: QMux identity certificate expiry is imminent
+              description: The earliest expiry in the loaded identity chain is less than three days away or has passed.
+
+  - name: absent metrics keeps release labels
+    interval: 1m
+    input_series:
+      - series: 'qmux_server_ready{namespace="default",app_kubernetes_io_instance="server",app_kubernetes_io_component="server",pod="server-0"}'
+        values: '1+0x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: QMuxMetricsAbsent
+        exp_alerts:
+          - exp_labels:
+              namespace: default
+              app_kubernetes_io_instance: client
+              app_kubernetes_io_component: client
+              severity: warning
+            exp_annotations:
+              summary: QMux metrics are absent
+              description: No ready metric is available for this QMux release and role.

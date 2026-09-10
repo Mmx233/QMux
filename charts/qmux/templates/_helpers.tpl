@@ -187,6 +187,14 @@ ConfigMap
 {{- if eq .Values.tls.mode "certManager" -}}{{- .Values.tls.certManager.trustSecretName -}}{{- else -}}{{- .Values.tls.existingSecret.name -}}{{- end -}}
 {{- end -}}
 
+{{- define "qmux.alertLabels" -}}
+{{- $labels := deepCopy .root.Values.monitoring.prometheusRule.additionalLabels -}}
+{{- $_ := set $labels "severity" .severity -}}
+{{- if .subsystem -}}{{- $_ := set $labels "subsystem" .subsystem -}}{{- end -}}
+{{- if .resource -}}{{- $_ := set $labels "resource" .resource -}}{{- end -}}
+{{- toYaml $labels -}}
+{{- end -}}
+
 {{- define "qmux.validate" -}}
 {{- $source := include "qmux.configSource" . -}}
 {{- if eq $source "direct" -}}
@@ -252,6 +260,6 @@ ConfigMap
 {{- if and (ne .Values.pdb.minAvailable nil) (ne .Values.pdb.maxUnavailable nil) -}}{{- fail "pdb.minAvailable and pdb.maxUnavailable are mutually exclusive" -}}{{- end -}}
 {{- if and .Values.pdb.enabled (eq .Values.pdb.minAvailable nil) (eq .Values.pdb.maxUnavailable nil) -}}{{- fail "pdb.enabled=true requires pdb.minAvailable or pdb.maxUnavailable" -}}{{- end -}}
 {{- if not .Values.admin.enabled -}}
-  {{- if or .Values.probes.liveness.enabled .Values.probes.readiness.enabled (and .Values.monitoring.enabled (or .Values.monitoring.prometheusAnnotations.enabled .Values.monitoring.podMonitor.enabled)) -}}{{- fail "admin.enabled=false requires probes and metrics collection to be disabled" -}}{{- end -}}
+  {{- if or .Values.probes.liveness.enabled .Values.probes.readiness.enabled (and .Values.monitoring.enabled (or .Values.monitoring.prometheusAnnotations.enabled .Values.monitoring.podMonitor.enabled .Values.monitoring.prometheusRule.enabled)) -}}{{- fail "admin.enabled=false requires probes and metrics collection to be disabled" -}}{{- end -}}
 {{- end -}}
 {{- end -}}

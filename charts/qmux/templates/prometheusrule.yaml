@@ -1,0 +1,251 @@
+{{- $excluded := .Values.monitoring.prometheusRule.excludeRules -}}
+{{- $ruleNames := list "QMuxMetricsAbsent" "QMuxInternalFault" "QMuxCapacityNearLimit" "QMuxTCPFailureRateHigh" "QMuxTLSIdentityCertificateExpiring" "QMuxTLSCACertificateExpiring" -}}
+{{- if eq .Values.mode "client" -}}
+  {{- $ruleNames = concat $ruleNames (list "QMuxClientEndpointUnavailable" "QMuxClientEndpointDegraded") -}}
+{{- else -}}
+  {{- $ruleNames = concat $ruleNames (list "QMuxServerRouteUnavailable" "QMuxServerRouteDegraded") -}}
+{{- end -}}
+{{- $hasRules := false -}}
+{{- range $ruleNames -}}
+  {{- if not (has . $excluded) -}}{{- $hasRules = true -}}{{- end -}}
+{{- end -}}
+{{- $hasReplicas := or (eq (include "qmux.workloadKind" .) "DaemonSet") (gt (int (include "qmux.replicaCount" .)) 0) -}}
+{{- if and .Values.monitoring.enabled .Values.monitoring.prometheusRule.enabled .Values.admin.enabled $hasReplicas $hasRules }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "qmux.fullname" . }}
+  labels:
+    {{- include "qmux.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.monitoring.prometheusRule.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  groups:
+    - name: qmux.{{ .Values.mode }}
+      rules:
+        {{- if not (has "QMuxMetricsAbsent" $excluded) }}
+        - alert: QMuxMetricsAbsent
+          expr: absent(qmux_{{ .Values.mode }}_ready{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component={{ .Values.mode | quote }}})
+          for: 5m
+          labels:
+            {{- include "qmux.alertLabels" (dict "root" $ "severity" "warning") | nindent 12 }}
+          annotations:
+            summary: QMux metrics are absent
+            description: No ready metric is available for this QMux release and role.
+        {{- end }}
+        {{- if eq .Values.mode "client" }}
+          {{- if not (has "QMuxClientEndpointUnavailable" $excluded) }}
+        - alert: QMuxClientEndpointUnavailable
+          expr: max by (namespace, app_kubernetes_io_instance, app_kubernetes_io_component, endpoint) (qmux_client_connection_healthy{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="client"}) == 0
+          for: 2m
+          labels:
+            {{- include "qmux.alertLabels" (dict "root" $ "severity" "critical") | nindent 12 }}
+          annotations:
+            summary: QMux client endpoint is unavailable
+            description: All observed client replicas report the endpoint unhealthy.
+          {{- end }}
+          {{- if not (has "QMuxClientEndpointDegraded" $excluded) }}
+        - alert: QMuxClientEndpointDegraded
+          expr: |-
+            min by (namespace, app_kubernetes_io_instance, app_kubernetes_io_component, endpoint) (qmux_client_connection_healthy{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="client"}) == 0
+            and
+            max by (namespace, app_kubernetes_io_instance, app_kubernetes_io_component, endpoint) (qmux_client_connection_healthy{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="client"}) == 1
+          for: 15m
+          labels:
+            {{- include "qmux.alertLabels" (dict "root" $ "severity" "warning") | nindent 12 }}
+          annotations:
+            summary: QMux client endpoint is degraded
+            description: Observed client replicas disagree on endpoint health.
+          {{- end }}
+        {{- else }}
+          {{- if not (has "QMuxServerRouteUnavailable" $excluded) }}
+        - alert: QMuxServerRouteUnavailable
+          expr: max by (namespace, app_kubernetes_io_instance, app_kubernetes_io_component, listener) (qmux_server_route_ready{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="server"}) == 0
+          for: 2m
+          labels:
+            {{- include "qmux.alertLabels" (dict "root" $ "severity" "critical") | nindent 12 }}
+          annotations:
+            summary: QMux server route is unavailable
+            description: All observed server replicas report the listener route unavailable.
+          {{- end }}
+          {{- if not (has "QMuxServerRouteDegraded" $excluded) }}
+        - alert: QMuxServerRouteDegraded
+          expr: |-
+            min by (namespace, app_kubernetes_io_instance, app_kubernetes_io_component, listener) (qmux_server_route_ready{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="server"}) == 0
+            and
+            max by (namespace, app_kubernetes_io_instance, app_kubernetes_io_component, listener) (qmux_server_route_ready{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="server"}) == 1
+          for: 15m
+          labels:
+            {{- include "qmux.alertLabels" (dict "root" $ "severity" "warning") | nindent 12 }}
+          annotations:
+            summary: QMux server route is degraded
+            description: Observed server replicas disagree on listener route readiness.
+          {{- end }}
+        {{- end }}
+        {{- if not (has "QMuxInternalFault" $excluded) }}
+          {{- if eq .Values.mode "client" }}
+        - alert: QMuxInternalFault
+          expr: increase(qmux_client_connection_accounting_faults_total{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="client"}[5m]) > 0
+          labels:
+            {{- include "qmux.alertLabels" (dict "root" $ "severity" "warning" "subsystem" "connection") | nindent 12 }}
+          annotations:
+            summary: QMux client connection accounting fault
+            description: The client connection accounting invariant failed in the last five minutes.
+        - alert: QMuxInternalFault
+          expr: increase(qmux_client_udp_accounting_faults_total{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="client"}[5m]) > 0
+          labels:
+            {{- include "qmux.alertLabels" (dict "root" $ "severity" "warning" "subsystem" "udp") | nindent 12 }}
+          annotations:
+            summary: QMux client UDP accounting fault
+            description: The client UDP accounting invariant failed in the last five minutes.
+          {{- else }}
+        - alert: QMuxInternalFault
+          expr: increase(qmux_server_pool_accounting_faults_total{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="server"}[5m]) > 0
+          labels:
+            {{- include "qmux.alertLabels" (dict "root" $ "severity" "warning" "subsystem" "pool") | nindent 12 }}
+          annotations:
+            summary: QMux server pool accounting fault
+            description: The server pool accounting invariant failed in the last five minutes.
+        - alert: QMuxInternalFault
+          expr: increase(qmux_server_udp_accounting_faults_total{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="server"}[5m]) > 0
+          labels:
+            {{- include "qmux.alertLabels" (dict "root" $ "severity" "warning" "subsystem" "udp") | nindent 12 }}
+          annotations:
+            summary: QMux server UDP accounting fault
+            description: The server UDP accounting invariant failed in the last five minutes.
+          {{- end }}
+        {{- end }}
+        {{- if not (has "QMuxCapacityNearLimit" $excluded) }}
+          {{- if eq .Values.mode "server" }}
+        - alert: QMuxCapacityNearLimit
+          expr: |-
+            (qmux_server_capacity_usage{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="server"} / qmux_server_capacity_limit{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="server"} > 0.9)
+            and
+            qmux_server_capacity_limit{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="server"} > 0
+          for: 10m
+          labels:
+            {{- include "qmux.alertLabels" (dict "root" $ "severity" "warning") | nindent 12 }}
+          annotations:
+            summary: QMux server generation capacity is near its limit
+            description: A server capacity resource has remained above 90 percent; per-generation resources describe the busiest generation.
+        - alert: QMuxCapacityNearLimit
+          expr: |-
+            (qmux_server_tcp_flow_connections{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="server"} / qmux_server_tcp_flow_connections_limit{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="server"} > 0.9)
+            and
+            qmux_server_tcp_flow_connections_limit{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="server"} > 0
+          for: 10m
+          labels:
+            {{- include "qmux.alertLabels" (dict "root" $ "severity" "warning" "resource" "tcp_flows") | nindent 12 }}
+          annotations:
+            summary: QMux server TCP flow capacity is near its limit
+            description: Server TCP flow capacity has remained above 90 percent.
+        - alert: QMuxCapacityNearLimit
+          expr: |-
+            (qmux_server_tcp_setup_connections{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="server"} / qmux_server_tcp_setup_connections_limit{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="server"} > 0.9)
+            and
+            qmux_server_tcp_setup_connections_limit{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="server"} > 0
+          for: 10m
+          labels:
+            {{- include "qmux.alertLabels" (dict "root" $ "severity" "warning" "resource" "tcp_setups") | nindent 12 }}
+          annotations:
+            summary: QMux server TCP setup capacity is near its limit
+            description: Server TCP setup capacity has remained above 90 percent.
+        - alert: QMuxCapacityNearLimit
+          expr: |-
+            (qmux_server_udp_session_permits{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="server"} / qmux_server_udp_sessions_limit{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="server"} > 0.9)
+            and
+            qmux_server_udp_sessions_limit{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="server"} > 0
+          for: 10m
+          labels:
+            {{- include "qmux.alertLabels" (dict "root" $ "severity" "warning" "resource" "udp_sessions") | nindent 12 }}
+          annotations:
+            summary: QMux server UDP session capacity is near its limit
+            description: Server UDP session permits have remained above 90 percent of the configured limit.
+          {{- else }}
+        - alert: QMuxCapacityNearLimit
+          expr: |-
+            (qmux_client_udp_session_permits{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="client"} / qmux_client_udp_sessions_limit{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="client"} > 0.9)
+            and
+            qmux_client_udp_sessions_limit{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="client"} > 0
+          for: 10m
+          labels:
+            {{- include "qmux.alertLabels" (dict "root" $ "severity" "warning" "resource" "udp_sessions") | nindent 12 }}
+          annotations:
+            summary: QMux client UDP session capacity is near its limit
+            description: Client UDP session permits have remained above 90 percent of the configured limit.
+          {{- end }}
+        {{- end }}
+        {{- if not (has "QMuxTCPFailureRateHigh" $excluded) }}
+          {{- if eq .Values.mode "server" }}
+        - alert: QMuxTCPFailureRateHigh
+          expr: |-
+            (
+              sum by (namespace, app_kubernetes_io_instance, app_kubernetes_io_component, pod, listener) (rate(qmux_server_tcp_admissions_total{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="server",result!~"committed|canceled"}[10m]))
+              /
+              sum by (namespace, app_kubernetes_io_instance, app_kubernetes_io_component, pod, listener) (rate(qmux_server_tcp_admissions_total{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="server",result!="canceled"}[10m]))
+              > 0.10
+            )
+            and
+            sum by (namespace, app_kubernetes_io_instance, app_kubernetes_io_component, pod, listener) (increase(qmux_server_tcp_admissions_total{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="server",result!="canceled"}[10m])) >= 10
+          for: 5m
+          labels:
+            {{- include "qmux.alertLabels" (dict "root" $ "severity" "warning") | nindent 12 }}
+          annotations:
+            summary: QMux server TCP admission failure rate is high
+            description: More than 10 percent of at least 10 terminal TCP admissions failed in ten minutes.
+          {{- else }}
+        - alert: QMuxTCPFailureRateHigh
+          expr: |-
+            (
+              sum by (namespace, app_kubernetes_io_instance, app_kubernetes_io_component, pod) (rate(qmux_client_tcp_dial_results_total{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="client",result=~"dial_error|timeout"}[10m]))
+              /
+              sum by (namespace, app_kubernetes_io_instance, app_kubernetes_io_component, pod) (rate(qmux_client_tcp_dial_results_total{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="client",result=~"success|dial_error|timeout"}[10m]))
+              > 0.10
+            )
+            and
+            sum by (namespace, app_kubernetes_io_instance, app_kubernetes_io_component, pod) (increase(qmux_client_tcp_dial_results_total{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component="client",result=~"success|dial_error|timeout"}[10m])) >= 10
+          for: 5m
+          labels:
+            {{- include "qmux.alertLabels" (dict "root" $ "severity" "warning") | nindent 12 }}
+          annotations:
+            summary: QMux client TCP backend failure rate is high
+            description: More than 10 percent of at least 10 terminal backend dials failed in ten minutes.
+          {{- end }}
+        {{- end }}
+        {{- if not (has "QMuxTLSIdentityCertificateExpiring" $excluded) }}
+        - alert: QMuxTLSIdentityCertificateExpiring
+          expr: |-
+            min by (namespace, app_kubernetes_io_instance, app_kubernetes_io_component, kind) (qmux_{{ .Values.mode }}_tls_certificate_not_after_timestamp_seconds{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component={{ .Values.mode | quote }},kind="identity"}) - time() < 1209600
+            and
+            min by (namespace, app_kubernetes_io_instance, app_kubernetes_io_component, kind) (qmux_{{ .Values.mode }}_tls_certificate_not_after_timestamp_seconds{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component={{ .Values.mode | quote }},kind="identity"}) - time() >= 259200
+          for: 15m
+          labels:
+            {{- include "qmux.alertLabels" (dict "root" $ "severity" "warning") | nindent 12 }}
+          annotations:
+            summary: QMux identity certificate expires soon
+            description: The earliest expiry in the loaded identity chain is less than 14 days away.
+        - alert: QMuxTLSIdentityCertificateExpiring
+          expr: min by (namespace, app_kubernetes_io_instance, app_kubernetes_io_component, kind) (qmux_{{ .Values.mode }}_tls_certificate_not_after_timestamp_seconds{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component={{ .Values.mode | quote }},kind="identity"}) - time() < 259200
+          for: 15m
+          labels:
+            {{- include "qmux.alertLabels" (dict "root" $ "severity" "critical") | nindent 12 }}
+          annotations:
+            summary: QMux identity certificate expiry is imminent
+            description: The earliest expiry in the loaded identity chain is less than three days away or has passed.
+        {{- end }}
+        {{- if not (has "QMuxTLSCACertificateExpiring" $excluded) }}
+        - alert: QMuxTLSCACertificateExpiring
+          expr: min by (namespace, app_kubernetes_io_instance, app_kubernetes_io_component, kind) (qmux_{{ .Values.mode }}_tls_certificate_not_after_timestamp_seconds{namespace={{ .Release.Namespace | quote }},app_kubernetes_io_instance={{ .Release.Name | quote }},app_kubernetes_io_component={{ .Values.mode | quote }},kind="ca"}) - time() < 1209600
+          for: 15m
+          labels:
+            {{- include "qmux.alertLabels" (dict "root" $ "severity" "warning") | nindent 12 }}
+          annotations:
+            summary: A loaded QMux CA certificate expires soon
+            description: At least one certificate in the loaded CA bundle expires in less than 14 days; another trusted CA may remain valid.
+        {{- end }}
+{{- end }}

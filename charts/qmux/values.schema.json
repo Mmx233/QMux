@@ -102,7 +102,7 @@
     "monitoring": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["enabled", "prometheusAnnotations", "podMonitor", "dashboard"],
+      "required": ["enabled", "prometheusAnnotations", "podMonitor", "prometheusRule", "dashboard"],
       "properties": {
         "enabled": {"type": "boolean"},
         "prometheusAnnotations": {
@@ -120,6 +120,36 @@
             "interval": {"type": "string", "minLength": 1},
             "scrapeTimeout": {"type": "string", "minLength": 1},
             "labels": {"type": "object", "additionalProperties": {"type": "string"}}
+          }
+        },
+        "prometheusRule": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "labels", "annotations", "additionalLabels", "excludeRules"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "labels": {"type": "object", "additionalProperties": {"type": "string"}},
+            "annotations": {"type": "object", "additionalProperties": {"type": "string"}},
+            "additionalLabels": {"type": "object", "additionalProperties": {"type": "string"}},
+            "excludeRules": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "enum": [
+                  "QMuxMetricsAbsent",
+                  "QMuxClientEndpointUnavailable",
+                  "QMuxClientEndpointDegraded",
+                  "QMuxServerRouteUnavailable",
+                  "QMuxServerRouteDegraded",
+                  "QMuxInternalFault",
+                  "QMuxCapacityNearLimit",
+                  "QMuxTCPFailureRateHigh",
+                  "QMuxTLSIdentityCertificateExpiring",
+                  "QMuxTLSCACertificateExpiring"
+                ]
+              }
+            }
           }
         },
         "dashboard": {
