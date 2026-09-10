@@ -1,0 +1,6 @@
+apiVersion: v2
+name: qmux
+description: QMux server or client
+type: application
+version: 0.1.0
+appVersion: v2.1.1

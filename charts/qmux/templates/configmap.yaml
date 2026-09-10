@@ -1,0 +1,11 @@
+{{- if and (ne (include "qmux.configSource" .) "existing") (eq (include "qmux.configResourceKind" .) "ConfigMap") }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "qmux.configResourceName" . | quote }}
+  labels:
+    {{- include "qmux.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    {{- include "qmux.generatedConfig" . | nindent 4 }}
+{{- end }}

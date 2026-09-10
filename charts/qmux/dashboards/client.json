@@ -1,0 +1,450 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "id": 1,
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "title": "Client readiness",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [{"options": {"0": {"color": "red", "text": "Not ready"}, "1": {"color": "green", "text": "Ready"}}, "type": "value"}],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}
+        },
+        "overrides": []
+      },
+      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "value", "wideLayout": true},
+      "targets": [{"expr": "qmux_client_ready{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}", "instant": true, "legendFormat": "{{pod}}"}]
+    },
+    {
+      "id": 3,
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "title": "Active TCP relays",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "short"}, "overrides": []},
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"expr": "sum(qmux_client_tcp_active_connections{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"})", "legendFormat": "Active"}]
+    },
+    {
+      "id": 4,
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "title": "TCP setup rate",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "decimals": 2, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "ops"}, "overrides": []},
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"expr": "sum(rate(qmux_client_tcp_setup_results_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\",result=\"success\"}[$__rate_interval]))", "legendFormat": "Setups/s"}]
+    },
+    {
+      "id": 5,
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "title": "Backend error rate",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 16, "y": 0},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "decimals": 2, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 0.001}]}, "unit": "ops"}, "overrides": []},
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"expr": "sum(rate(qmux_client_tcp_dial_results_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\",result!=\"success\"}[$__rate_interval]))", "legendFormat": "Errors/s"}]
+    },
+    {
+      "id": 6,
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "title": "QUIC traffic",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 20, "y": 0},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "decimals": 1, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}, "unit": "Bps"}, "overrides": []},
+      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"expr": "sum(rate(qmux_client_quic_sent_bytes_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}[$__rate_interval]) + rate(qmux_client_quic_received_bytes_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}[$__rate_interval]))", "legendFormat": "Total"}]
+    },
+    {
+      "id": 7,
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "title": "QUIC throughput",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "drawStyle": "line", "fillOpacity": 10, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "showPoints": "never", "spanNulls": false, "stacking": {"group": "A", "mode": "none"}}, "unit": "Bps"}, "overrides": []},
+      "options": {"legend": {"calcs": ["lastNotNull", "mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "sum by (endpoint) (rate(qmux_client_quic_sent_bytes_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}[$__rate_interval]))", "legendFormat": "{{endpoint}} sent"},
+        {"expr": "sum by (endpoint) (rate(qmux_client_quic_received_bytes_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}[$__rate_interval]))", "legendFormat": "{{endpoint}} received"}
+      ]
+    },
+    {
+      "id": 8,
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "title": "TCP relay activity",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "fieldConfig": {
+        "defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "Connections", "axisPlacement": "left", "drawStyle": "line", "fillOpacity": 10, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "showPoints": "never", "spanNulls": false, "stacking": {"group": "A", "mode": "none"}}, "unit": "short"},
+        "overrides": [{"matcher": {"id": "byRegexp", "options": "/\\/s$/"}, "properties": [{"id": "unit", "value": "ops"}, {"id": "custom.axisLabel", "value": "Operations/s"}, {"id": "custom.axisPlacement", "value": "right"}]}]
+      },
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "sum(qmux_client_tcp_active_connections{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"})", "legendFormat": "Active relays"},
+        {"expr": "sum(rate(qmux_client_tcp_setup_results_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\",result=\"success\"}[$__rate_interval]))", "legendFormat": "Setup success/s"},
+        {"expr": "sum(rate(qmux_client_tcp_setup_results_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\",result!=\"success\"}[$__rate_interval]))", "legendFormat": "Setup errors/s"},
+        {"expr": "sum(rate(qmux_client_tcp_dial_results_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\",result!=\"success\"}[$__rate_interval]))", "legendFormat": "Backend errors/s"}
+      ]
+    },
+    {
+      "id": 9,
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "title": "Heartbeat age",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 20},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "Age", "axisPlacement": "auto", "drawStyle": "line", "fillOpacity": 10, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "showPoints": "never", "spanNulls": false, "stacking": {"group": "A", "mode": "none"}}, "unit": "s"}, "overrides": []},
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "max by (endpoint) (time() - (qmux_client_heartbeat_received_timestamp_seconds{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"} > 0))", "legendFormat": "{{endpoint}}"}]
+    },
+    {
+      "id": 10,
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "title": "Connection events",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 20},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "Events/s", "axisPlacement": "auto", "drawStyle": "line", "fillOpacity": 10, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "showPoints": "never", "spanNulls": false, "stacking": {"group": "A", "mode": "none"}}, "unit": "ops"}, "overrides": []},
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "sum by (endpoint) (rate(qmux_client_connection_results_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\",result=\"success\"}[$__rate_interval]))", "legendFormat": "{{endpoint}} connected"},
+        {"expr": "sum by (endpoint) (rate(qmux_client_connection_results_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\",result!=\"success\"}[$__rate_interval]))", "legendFormat": "{{endpoint}} connection errors"},
+        {"expr": "sum by (endpoint) (rate(qmux_client_registration_results_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\",result!=\"success\"}[$__rate_interval]))", "legendFormat": "{{endpoint}} registration errors"},
+        {"expr": "sum by (endpoint) (rate(qmux_client_reconnect_attempts_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}[$__rate_interval]))", "legendFormat": "{{endpoint}} reconnects"}
+      ]
+    },
+    {
+      "id": 11,
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "title": "QUIC latency and loss",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 20},
+      "fieldConfig": {
+        "defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "Latency", "axisPlacement": "left", "drawStyle": "line", "fillOpacity": 10, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "showPoints": "never", "spanNulls": false, "stacking": {"group": "A", "mode": "none"}}, "unit": "s"},
+        "overrides": [{"matcher": {"id": "byRegexp", "options": "/lost packets\\/s$/"}, "properties": [{"id": "unit", "value": "pps"}, {"id": "custom.axisLabel", "value": "Lost packets/s"}, {"id": "custom.axisPlacement", "value": "right"}]}]
+      },
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "avg by (endpoint) (qmux_client_quic_smoothed_rtt_seconds{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"})", "legendFormat": "{{endpoint}} mean RTT"},
+        {"expr": "max by (endpoint) (qmux_client_quic_smoothed_rtt_max_seconds{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"})", "legendFormat": "{{endpoint}} max RTT"},
+        {"expr": "max by (endpoint) (qmux_client_quic_rtt_deviation_max_seconds{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"})", "legendFormat": "{{endpoint}} RTT deviation"},
+        {"expr": "sum by (endpoint) (clamp_min(deriv(qmux_client_quic_lost_packets{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}[$__rate_interval]), 0))", "legendFormat": "{{endpoint}} lost packets/s"}
+      ]
+    },
+    {
+      "id": 12,
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "title": "UDP activity",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 28},
+      "fieldConfig": {
+        "defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "Sessions", "axisPlacement": "left", "drawStyle": "line", "fillOpacity": 10, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "showPoints": "never", "spanNulls": false, "stacking": {"group": "A", "mode": "none"}}, "unit": "short"},
+        "overrides": [{"matcher": {"id": "byRegexp", "options": "/\\/s$/"}, "properties": [{"id": "unit", "value": "ops"}, {"id": "custom.axisLabel", "value": "Events/s"}, {"id": "custom.axisPlacement", "value": "right"}]}]
+      },
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "sum(qmux_client_udp_sessions{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"})", "legendFormat": "Sessions"},
+        {"expr": "sum(rate(qmux_client_udp_drops_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}[$__rate_interval]))", "legendFormat": "Drops/s"},
+        {"expr": "sum(rate(qmux_client_udp_local_errors_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}[$__rate_interval]))", "legendFormat": "Local errors/s"},
+        {"expr": "sum(rate(qmux_client_udp_send_errors_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}[$__rate_interval]))", "legendFormat": "Send errors/s"}
+      ]
+    },
+    {
+      "id": 20,
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "title": "UDP capacity",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 28},
+      "fieldConfig": {"defaults": {"min": 0, "max": 1, "unit": "percentunit"}, "overrides": []},
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "max by (pod) (qmux_client_udp_session_permits{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}) / clamp_min(max by (pod) (qmux_client_udp_sessions_limit{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}), 1)", "legendFormat": "{{pod}} current"},
+        {"expr": "max by (pod) (qmux_client_udp_sessions_high_water{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}) / clamp_min(max by (pod) (qmux_client_udp_sessions_limit{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}), 1)", "legendFormat": "{{pod}} high water"}
+      ]
+    },
+    {
+      "id": 21,
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "title": "TCP path latency",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 28},
+      "fieldConfig": {"defaults": {"min": 0, "unit": "s"}, "overrides": []},
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "histogram_quantile(0.95, sum by (le, pod) (rate(qmux_client_tcp_setup_duration_seconds_bucket{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}[$__rate_interval])))", "legendFormat": "{{pod}} setup p95"},
+        {"expr": "histogram_quantile(0.95, sum by (le, pod) (rate(qmux_client_tcp_dial_duration_seconds_bucket{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}[$__rate_interval])))", "legendFormat": "{{pod}} backend dial p95"}
+      ]
+    },
+    {
+      "id": 22,
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "title": "Internal faults",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"expr": "sum(qmux_client_connection_accounting_faults_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}) + sum(qmux_client_udp_accounting_faults_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"})", "instant": true, "legendFormat": "Faults"}]
+    },
+    {
+      "id": 17,
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "title": "Process CPU",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "fieldConfig": {"defaults": {"min": 0, "unit": "percentunit"}, "overrides": []},
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "max by (pod) (rate(process_cpu_seconds_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}[$__rate_interval]))", "legendFormat": "{{pod}}"}]
+    },
+    {
+      "id": 18,
+      "datasource": {"type": "prometheus", "uid": "$datasource"},
+      "title": "Process RSS",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "fieldConfig": {"defaults": {"min": 0, "unit": "bytes"}, "overrides": []},
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "max by (pod) (process_resident_memory_bytes{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"})", "legendFormat": "{{pod}}"}]
+    },
+    {
+      "id": 13,
+      "title": "Go runtime",
+      "type": "row",
+      "collapsed": true,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 36},
+      "panels": [
+        {
+          "id": 14,
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "title": "Goroutines",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 37},
+          "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+          "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [{"expr": "max by (pod) (go_goroutines{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"})", "legendFormat": "{{pod}}"}]
+        },
+        {
+          "id": 15,
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "title": "Heap in use",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 37},
+          "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []},
+          "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [{"expr": "max by (pod) (go_memstats_heap_inuse_bytes{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"})", "legendFormat": "{{pod}}"}]
+        },
+        {
+          "id": 16,
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "title": "GC max pause",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 45},
+          "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+          "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [{"expr": "max by (pod) (go_gc_duration_seconds{quantile=~\"1([.]0)?\",namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"})", "legendFormat": "{{pod}}"}]
+        },
+        {
+          "id": 19,
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "title": "File descriptors",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 45},
+          "fieldConfig": {
+            "defaults": {"min": 0, "unit": "short"},
+            "overrides": [{"matcher": {"id": "byRegexp", "options": "/utilization$/"}, "properties": [{"id": "unit", "value": "percentunit"}, {"id": "custom.axisLabel", "value": "Utilization"}, {"id": "custom.axisPlacement", "value": "right"}]}]
+          },
+          "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"expr": "max by (pod) (process_open_fds{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"})", "legendFormat": "{{pod}} open"},
+            {"expr": "max by (pod) (process_open_fds{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}) / clamp_min(max by (pod) (process_max_fds{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}), 1)", "legendFormat": "{{pod}} utilization"}
+          ]
+        },
+        {
+          "id": 23,
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "title": "Allocation rate",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 53},
+          "fieldConfig": {"defaults": {"min": 0, "unit": "Bps"}, "overrides": []},
+          "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [{"expr": "sum by (pod) (rate(go_memstats_alloc_bytes_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}[$__rate_interval]))", "legendFormat": "{{pod}}"}]
+        },
+        {
+          "id": 24,
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "title": "GC activity",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 53},
+          "fieldConfig": {
+            "defaults": {"min": 0, "unit": "ops"},
+            "overrides": [{"matcher": {"id": "byRegexp", "options": "/pause time\\/s$/"}, "properties": [{"id": "unit", "value": "percentunit"}, {"id": "custom.axisLabel", "value": "Pause time/s"}, {"id": "custom.axisPlacement", "value": "right"}]}]
+          },
+          "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"expr": "sum by (pod) (rate(go_gc_duration_seconds_count{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}[$__rate_interval]))", "legendFormat": "{{pod}} collections/s"},
+            {"expr": "sum by (pod) (rate(go_gc_duration_seconds_sum{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}[$__rate_interval]))", "legendFormat": "{{pod}} pause time/s"}
+          ]
+        }
+      ]
+    },
+    {
+      "id": 25,
+      "title": "Connection diagnostics",
+      "type": "row",
+      "collapsed": true,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 61},
+      "panels": [
+        {
+          "id": 26,
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "title": "Connection generations",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 62},
+          "fieldConfig": {"defaults": {"min": 0, "unit": "short"}, "overrides": []},
+          "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [{"expr": "sum by (pod, endpoint, state) (qmux_client_connection_generations{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"})", "legendFormat": "{{pod}} {{endpoint}} {{state}}"}]
+        },
+        {
+          "id": 27,
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "title": "Reconnect and QUIC state",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 62},
+          "fieldConfig": {"defaults": {"min": 0, "unit": "short"}, "overrides": []},
+          "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"expr": "max by (pod, endpoint) (qmux_client_reconnecting{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"})", "legendFormat": "{{pod}} {{endpoint}} reconnecting"},
+            {"expr": "max by (pod, endpoint) (qmux_client_quic_connections{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"})", "legendFormat": "{{pod}} {{endpoint}} QUIC connections"}
+          ]
+        },
+        {
+          "id": 28,
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "title": "Connection and registration latency",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 70},
+          "fieldConfig": {"defaults": {"min": 0, "unit": "s"}, "overrides": []},
+          "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"expr": "histogram_quantile(0.95, sum by (le, pod, endpoint) (qmux_client_connection_duration_seconds_bucket{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}))", "legendFormat": "{{pod}} {{endpoint}} connect p95"},
+            {"expr": "histogram_quantile(0.95, sum by (le, pod, endpoint) (qmux_client_registration_duration_seconds_bucket{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}))", "legendFormat": "{{pod}} {{endpoint}} register p95"}
+          ]
+        },
+        {
+          "id": 29,
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "title": "Failure reasons",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 70},
+          "fieldConfig": {"defaults": {"min": 0, "unit": "ops"}, "overrides": []},
+          "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"expr": "sum by (pod, endpoint, result) (rate(qmux_client_connection_results_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\",result!=\"success\"}[$__rate_interval])) > 0", "legendFormat": "{{pod}} connection {{result}}"},
+            {"expr": "sum by (pod, endpoint, result) (rate(qmux_client_registration_results_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\",result!=\"success\"}[$__rate_interval])) > 0", "legendFormat": "{{pod}} registration {{result}}"},
+            {"expr": "sum by (pod, result) (rate(qmux_client_tcp_setup_results_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\",result!=\"success\"}[$__rate_interval])) > 0", "legendFormat": "{{pod}} TCP setup {{result}}"},
+            {"expr": "sum by (pod, result) (rate(qmux_client_tcp_dial_results_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\",result!=\"success\"}[$__rate_interval])) > 0", "legendFormat": "{{pod}} TCP dial {{result}}"},
+            {"expr": "sum by (pod, endpoint) (rate(qmux_client_connection_accounting_faults_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}[$__rate_interval])) > 0", "legendFormat": "{{pod}} connection accounting fault"}
+          ]
+        }
+      ]
+    },
+    {
+      "id": 30,
+      "title": "UDP diagnostics",
+      "type": "row",
+      "collapsed": true,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 78},
+      "panels": [
+        {
+          "id": 31,
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "title": "UDP sessions and capacity",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 79},
+          "fieldConfig": {"defaults": {"min": 0, "unit": "short"}, "overrides": []},
+          "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"expr": "max by (pod) (qmux_client_udp_sessions{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"})", "legendFormat": "{{pod}} sessions"},
+            {"expr": "max by (pod) (qmux_client_udp_session_permits{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"})", "legendFormat": "{{pod}} permits"},
+            {"expr": "max by (pod) (qmux_client_udp_sessions_limit{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"})", "legendFormat": "{{pod}} limit"},
+            {"expr": "max by (pod) (qmux_client_udp_sessions_high_water{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"})", "legendFormat": "{{pod}} high water"}
+          ]
+        },
+        {
+          "id": 32,
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "title": "UDP sender ownership",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 79},
+          "fieldConfig": {
+            "defaults": {"min": 0, "unit": "short"},
+            "overrides": [{"matcher": {"id": "byRegexp", "options": "/backing/"}, "properties": [{"id": "unit", "value": "bytes"}, {"id": "custom.axisLabel", "value": "Backing memory"}, {"id": "custom.axisPlacement", "value": "right"}]}]
+          },
+          "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"expr": "max by (pod) (qmux_client_udp_send_items{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"})", "legendFormat": "{{pod}} items"},
+            {"expr": "max by (pod) (qmux_client_udp_send_workers{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"})", "legendFormat": "{{pod}} workers"},
+            {"expr": "max by (pod) (qmux_client_udp_send_backing_bytes{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"})", "legendFormat": "{{pod}} backing"},
+            {"expr": "max by (pod) (qmux_client_udp_send_backing_high_water_bytes{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"})", "legendFormat": "{{pod}} backing high water"}
+          ]
+        },
+        {
+          "id": 33,
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "title": "UDP fragmentation",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 87},
+          "fieldConfig": {
+            "defaults": {"min": 0, "unit": "short"},
+            "overrides": [{"matcher": {"id": "byRegexp", "options": "/backing$/"}, "properties": [{"id": "unit", "value": "bytes"}, {"id": "custom.axisLabel", "value": "Backing memory"}, {"id": "custom.axisPlacement", "value": "right"}]}]
+          },
+          "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"expr": "max by (pod) (qmux_client_udp_fragment_assemblers{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"})", "legendFormat": "{{pod}} assemblers"},
+            {"expr": "max by (pod) (qmux_client_udp_fragment_groups{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"})", "legendFormat": "{{pod}} groups"},
+            {"expr": "max by (pod) (qmux_client_udp_fragment_backing_bytes{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"})", "legendFormat": "{{pod}} backing"}
+          ]
+        },
+        {
+          "id": 34,
+          "datasource": {"type": "prometheus", "uid": "$datasource"},
+          "title": "UDP errors by reason",
+          "type": "timeseries",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 87},
+          "fieldConfig": {"defaults": {"min": 0, "unit": "ops"}, "overrides": []},
+          "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"expr": "sum by (pod, reason) (rate(qmux_client_udp_drops_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}[$__rate_interval])) > 0", "legendFormat": "{{pod}} drop {{reason}}"},
+            {"expr": "sum by (pod, reason) (rate(qmux_client_udp_fragment_drops_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}[$__rate_interval])) > 0", "legendFormat": "{{pod}} fragment {{reason}}"},
+            {"expr": "sum by (pod, operation) (rate(qmux_client_udp_local_errors_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}[$__rate_interval])) > 0", "legendFormat": "{{pod}} local {{operation}}"},
+            {"expr": "sum by (pod) (rate(qmux_client_udp_send_errors_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}[$__rate_interval])) > 0", "legendFormat": "{{pod}} send"},
+            {"expr": "sum by (pod) (rate(qmux_client_udp_accounting_faults_total{namespace=~\"$namespace\",app_kubernetes_io_instance=~\"$instance\",app_kubernetes_io_component=\"client\"}[$__rate_interval])) > 0", "legendFormat": "{{pod}} accounting fault"}
+          ]
+        }
+      ]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 41,
+  "tags": ["qmux", "role:client"],
+  "templating": {
+    "list": [
+      {"name": "datasource", "label": "Prometheus", "type": "datasource", "query": "prometheus"},
+      {"name": "namespace", "label": "Namespace", "type": "query", "datasource": {"type": "prometheus", "uid": "$datasource"}, "query": "label_values(qmux_client_ready{namespace=~\".+\",app_kubernetes_io_instance=~\".+\",app_kubernetes_io_component=\"client\"}, namespace)", "refresh": 1},
+      {"name": "instance", "label": "Release", "type": "query", "datasource": {"type": "prometheus", "uid": "$datasource"}, "query": "label_values(qmux_client_ready{namespace=~\"$namespace\",app_kubernetes_io_instance=~\".+\",app_kubernetes_io_component=\"client\"}, app_kubernetes_io_instance)", "refresh": 1}
+    ]
+  },
+  "time": {"from": "now-1h", "to": "now"},
+  "timezone": "browser",
+  "title": "QMux Client",
+  "uid": "qmux-client",
+  "version": 1
+}

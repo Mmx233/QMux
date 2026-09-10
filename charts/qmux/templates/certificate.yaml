@@ -1,0 +1,32 @@
+{{- if eq .Values.tls.mode "certManager" }}
+{{- $dnsNames := deepCopy .Values.tls.certManager.dnsNames -}}
+{{- if and (eq .Values.mode "server") (eq (include "qmux.workloadKind" .) "StatefulSet") .Values.tls.certManager.includeHeadlessServiceDNS -}}
+  {{- $service := include "qmux.headlessServiceName" . -}}
+  {{- $dnsNames = append $dnsNames $service -}}
+  {{- $dnsNames = append $dnsNames (printf "%s.%s" $service .Release.Namespace) -}}
+  {{- $dnsNames = append $dnsNames (printf "%s.%s.svc" $service .Release.Namespace) -}}
+{{- end -}}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "qmux.fullname" . }}
+  labels:
+    {{- include "qmux.labels" . | nindent 4 }}
+spec:
+  secretName: {{ .Values.tls.certManager.identitySecretName | quote }}
+  {{- if eq .Values.mode "client" }}
+  commonName: {{ include "qmux.fullname" . }}
+  {{- end }}
+  issuerRef:
+    name: {{ .Values.tls.certManager.issuerRef.name | quote }}
+    kind: {{ .Values.tls.certManager.issuerRef.kind | quote }}
+    group: {{ .Values.tls.certManager.issuerRef.group | quote }}
+  usages:
+    - digital signature
+    - key encipherment
+    - {{ if eq .Values.mode "server" }}server auth{{ else }}client auth{{ end }}
+  {{- with ($dnsNames | uniq) }}
+  dnsNames:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

@@ -1,0 +1,25 @@
+mode: server
+
+workload:
+  kind: DaemonSet
+
+config:
+  inlineYaml: |
+    ---
+    listeners:
+      - quic_addr: 0.0.0.0:8443
+        traffic_addr: 0.0.0.0:8080
+        protocol: both
+    auth:
+      method: token
+      token: |+
+        replace-with-at-least-256-random-bits
+
+    ...
+
+tls:
+  existingSecret:
+    name: qmux-server-tls
+
+dashboard:
+  enabled: true

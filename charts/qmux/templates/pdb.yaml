@@ -1,0 +1,17 @@
+{{- if and .Values.pdb.enabled (ne (include "qmux.workloadKind" .) "DaemonSet") }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "qmux.fullname" . }}
+  labels:
+    {{- include "qmux.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "qmux.selectorLabels" . | nindent 6 }}
+  {{- if ne .Values.pdb.minAvailable nil }}
+  minAvailable: {{ .Values.pdb.minAvailable | toJson }}
+  {{- else }}
+  maxUnavailable: {{ .Values.pdb.maxUnavailable | toJson }}
+  {{- end }}
+{{- end }}

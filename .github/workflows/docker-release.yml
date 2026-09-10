@@ -1,7 +1,3 @@
-# Docker Release Workflow
-# Builds and publishes cross-platform Docker images to Docker Hub using ko
-# Triggers on release publish or manual dispatch
-
 name: Docker Release
 
 on:
@@ -15,8 +11,28 @@ on:
         type: string
 
 jobs:
-  build-and-push:
+  validate-manual-tag:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    steps:
+      - name: Validate application tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          case "$TAG" in
+            v*) ;;
+            *) echo "Docker release tags must start with v" >&2; exit 1 ;;
+          esac
+
+  build-and-push:
+    needs: validate-manual-tag
+    if: >-
+      always() &&
+      ((github.event_name == 'workflow_dispatch' && needs.validate-manual-tag.result == 'success') ||
+       (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v')))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout
@@ -43,3 +59,16 @@ jobs:
           KO_DOCKER_REPO: ${{ vars.DOCKERHUB_REPO }}
           VERSION: ${{ inputs.tag || github.event.release.tag_name }}
         run: ko build --sbom none --bare --tags "latest,$VERSION" .
+
+  publish-chart:
+    needs: build-and-push
+    if: ${{ !cancelled() && needs.build-and-push.result == 'success' }}
+    permissions:
+      actions: read
+      contents: write
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/helm-release.yml
+    with:
+      chart_ref: ${{ github.event.repository.default_branch }}
+    secrets: inherit

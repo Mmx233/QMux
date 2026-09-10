@@ -1,0 +1,221 @@
+name: Helm Release
+
+on:
+  workflow_call:
+    inputs:
+      chart_ref:
+        description: Git ref containing the chart to publish
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      chart_ref:
+        description: Git ref containing the chart to publish
+        required: true
+        type: string
+
+concurrency:
+  group: qmux-chart-publish
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  CHART_PATH: charts/qmux
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: read
+    outputs:
+      pages_sha: ${{ steps.pages.outputs.sha }}
+      chart_version: ${{ steps.metadata.outputs.chart_version }}
+      app_version: ${{ steps.metadata.outputs.app_version }}
+    steps:
+      - name: Checkout chart source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.chart_ref }}
+          fetch-depth: 0
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v4.2.4
+
+      - name: Resolve chart metadata
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          chart_version=$(helm show chart "$CHART_PATH" | awk '$1 == "version:" {print $2}')
+          app_version=$(helm show chart "$CHART_PATH" | awk '$1 == "appVersion:" {print $2}')
+          test -n "$chart_version" && test -n "$app_version"
+          case "$app_version" in
+            v*) ;;
+            *) echo "Chart appVersion must be an application v* tag" >&2; exit 1 ;;
+          esac
+          {
+            echo "chart_version=$chart_version"
+            echo "app_version=$app_version"
+            echo "package=qmux-$chart_version.tgz"
+          } >> "$GITHUB_OUTPUT"
+          printf 'Publishing chart source %s at %s\n' \
+            "${{ inputs.chart_ref }}" "$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check release prerequisites
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_VERSION: ${{ steps.metadata.outputs.app_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GITHUB_REPOSITORY/pages" --jq '.build_type')" = workflow || {
+            echo "GitHub Pages must already use GitHub Actions as its source" >&2
+            exit 1
+          }
+          docker manifest inspect "docker.io/mmx233/qmux:$APP_VERSION" >/dev/null
+
+      - name: Package chart and reject version conflicts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHART_VERSION: ${{ steps.metadata.outputs.chart_version }}
+          PACKAGE: ${{ steps.metadata.outputs.package }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir .cr-release-packages
+          helm package "$CHART_PATH" --destination .cr-release-packages
+          release_tag="qmux-$CHART_VERSION"
+          if gh release view "$release_tag" --json isDraft,assets > "$RUNNER_TEMP/release.json" 2>/dev/null; then
+            jq -e --arg package "$PACKAGE" \
+              '.isDraft == false and [.assets[].name] == [$package]' \
+              "$RUNNER_TEMP/release.json" >/dev/null
+            mkdir "$RUNNER_TEMP/download" "$RUNNER_TEMP/existing" "$RUNNER_TEMP/current"
+            gh release download "$release_tag" --pattern "$PACKAGE" --dir "$RUNNER_TEMP/download"
+            tar -xzf ".cr-release-packages/$PACKAGE" -C "$RUNNER_TEMP/current" --strip-components=1
+            tar -xzf "$RUNNER_TEMP/download/$PACKAGE" -C "$RUNNER_TEMP/existing" --strip-components=1
+            diff -qr "$RUNNER_TEMP/current" "$RUNNER_TEMP/existing"
+          elif git ls-remote --exit-code --tags origin "refs/tags/$release_tag" >/dev/null 2>&1; then
+            echo "$release_tag exists without a published chart release" >&2
+            exit 1
+          fi
+
+      - name: Configure Git
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+
+      - name: Ensure gh-pages exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git fetch origin gh-pages
+            unexpected=$(git ls-tree -r --name-only FETCH_HEAD | grep -Ev '^(\.nojekyll|index\.yaml)$' || true)
+            test -z "$unexpected" || {
+              echo "gh-pages contains unexpected files:" >&2
+              printf '%s\n' "$unexpected" >&2
+              exit 1
+            }
+          else
+            pages_dir="$RUNNER_TEMP/gh-pages"
+            git worktree add --detach "$pages_dir"
+            git -C "$pages_dir" switch --orphan gh-pages
+            git -C "$pages_dir" rm -rf --ignore-unmatch .
+            touch "$pages_dir/.nojekyll"
+            git -C "$pages_dir" add .nojekyll
+            git -C "$pages_dir" commit -m 'chore: bootstrap Helm repository'
+            git -C "$pages_dir" push origin HEAD:gh-pages
+            git worktree remove "$pages_dir"
+            git branch -D gh-pages
+          fi
+
+      - name: Publish chart
+        # Includes the skip_packaging fix from helm/chart-releaser-action#202.
+        uses: helm/chart-releaser-action@3e001cb8c68933439c7e721650f20a07a1a5c61e
+        with:
+          version: v1.7.0
+          skip_packaging: "true"
+          skip_existing: "true"
+          mark_as_latest: "false"
+          packages_with_index: "false"
+        env:
+          CR_TOKEN: ${{ github.token }}
+
+      - name: Resolve Pages commit
+        id: pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin gh-pages
+          git ls-tree -r --name-only FETCH_HEAD | grep -Fx index.yaml >/dev/null
+          unexpected=$(git ls-tree -r --name-only FETCH_HEAD | grep -Ev '^(\.nojekyll|index\.yaml)$' || true)
+          test -z "$unexpected"
+          echo "sha=$(git rev-parse FETCH_HEAD)" >> "$GITHUB_OUTPUT"
+
+  deploy-pages:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout Pages content
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release.outputs.pages_sha }}
+          path: gh-pages
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: false
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: gh-pages
+
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v4.2.4
+
+      - name: Verify published chart
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHART_VERSION: ${{ needs.release.outputs.chart_version }}
+          APP_VERSION: ${{ needs.release.outputs.app_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            rm -rf "$RUNNER_TEMP/public"
+            mkdir "$RUNNER_TEMP/public"
+            helm repo remove qmux-pages >/dev/null 2>&1 || true
+            if helm repo add qmux-pages https://mmx233.github.io/QMux >/dev/null 2>&1 &&
+              helm repo update qmux-pages >/dev/null 2>&1 &&
+              helm pull qmux-pages/qmux --version "$CHART_VERSION" --destination "$RUNNER_TEMP/public" >/dev/null 2>&1; then
+              package="$RUNNER_TEMP/public/qmux-$CHART_VERSION.tgz"
+              version=$(helm show chart "$package" | awk '$1 == "version:" {print $2}')
+              app_version=$(helm show chart "$package" | awk '$1 == "appVersion:" {print $2}')
+              latest=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name')
+              if [ "$version" = "$CHART_VERSION" ] && [ "$app_version" = "$APP_VERSION" ]; then
+                case "$latest" in v*) exit 0 ;; esac
+              fi
+            fi
+            [ "$attempt" -eq 30 ] || sleep 10
+          done
+          echo "GitHub Pages did not serve the expected chart within five minutes" >&2
+          exit 1

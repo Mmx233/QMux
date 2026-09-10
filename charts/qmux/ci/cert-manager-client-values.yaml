@@ -1,0 +1,24 @@
+mode: client
+
+config:
+  client:
+    server:
+      servers:
+        - address: qmux.example.com:8443
+          server_name: qmux.example.com
+    local:
+      host: echo-backend
+      port: 8080
+    auth:
+      method: mtls
+
+tls:
+  mode: certManager
+  certManager:
+    issuerRef:
+      name: qmux-ca
+      kind: ClusterIssuer
+      group: cert-manager.io
+    identitySecretName: qmux-client-identity
+    trustSecretName: qmux-client-trust
+    includeHeadlessServiceDNS: false

@@ -1,0 +1,202 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "mode": {"type": "string", "enum": ["client", "server"], "description": "QMux role."},
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "tag", "pullPolicy", "pullSecrets"],
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "tag": {"type": "string"},
+        "pullPolicy": {"type": "string", "enum": ["Always", "IfNotPresent", "Never"]},
+        "pullSecrets": {"type": "array", "items": {"type": "object"}}
+      }
+    },
+    "workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "revisionHistoryLimit", "terminationGracePeriodSeconds"],
+      "properties": {
+        "kind": {"type": "string", "enum": ["", "Deployment", "DaemonSet", "StatefulSet"]},
+        "replicaCount": {"type": ["integer", "null"], "minimum": 0},
+        "revisionHistoryLimit": {"type": "integer", "minimum": 0},
+        "terminationGracePeriodSeconds": {"type": "integer", "minimum": 0}
+      }
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["client", "server", "inlineYaml", "existing"],
+      "properties": {
+        "client": {"type": "object"},
+        "server": {"type": "object"},
+        "inlineYaml": {"type": "string"},
+        "existing": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name", "key"],
+          "properties": {
+            "kind": {"type": "string", "enum": ["ConfigMap", "Secret"]},
+            "name": {"type": "string"},
+            "key": {"type": "string", "minLength": 1}
+          }
+        }
+      }
+    },
+    "tls": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "existingSecret", "certManager"],
+      "properties": {
+        "mode": {"type": "string", "enum": ["existingSecret", "certManager"]},
+        "existingSecret": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name"],
+          "properties": {"name": {"type": "string"}}
+        },
+        "certManager": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["issuerRef", "identitySecretName", "trustSecretName", "dnsNames", "includeHeadlessServiceDNS"],
+          "properties": {
+            "issuerRef": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["name", "kind", "group"],
+              "properties": {
+                "name": {"type": "string"},
+                "kind": {"type": "string", "minLength": 1},
+                "group": {"type": "string", "minLength": 1}
+              }
+            },
+            "identitySecretName": {"type": "string"},
+            "trustSecretName": {"type": "string"},
+            "dnsNames": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+            "includeHeadlessServiceDNS": {"type": "boolean"}
+          }
+        }
+      }
+    },
+    "admin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "port": {"type": ["integer", "null"], "minimum": 1, "maximum": 65535}
+      }
+    },
+    "probes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["liveness", "readiness"],
+      "properties": {
+        "liveness": {"$ref": "#/definitions/probe"},
+        "readiness": {"$ref": "#/definitions/probe"}
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["annotations"],
+      "properties": {
+        "annotations": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled"],
+          "properties": {"enabled": {"type": "boolean"}}
+        }
+      }
+    },
+    "podMonitor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "interval", "scrapeTimeout", "labels"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "interval": {"type": "string", "minLength": 1},
+        "scrapeTimeout": {"type": "string", "minLength": 1},
+        "labels": {"type": "object", "additionalProperties": {"type": "string"}}
+      }
+    },
+    "dashboard": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "labels", "annotations"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "labels": {"type": "object", "additionalProperties": {"type": "string"}},
+        "annotations": {"type": "object", "additionalProperties": {"type": "string"}}
+      }
+    },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["create", "name", "annotations"],
+      "properties": {
+        "create": {"type": "boolean"},
+        "name": {"type": "string"},
+        "annotations": {"type": "object", "additionalProperties": {"type": "string"}}
+      }
+    },
+    "podSecurityContext": {"type": "object"},
+    "securityContext": {"type": "object"},
+    "affinity": {"type": "object"},
+    "resources": {"type": "object"},
+    "nodeSelector": {"type": "object", "additionalProperties": {"type": "string"}},
+    "tolerations": {"type": "array", "items": {"type": "object"}},
+    "topologySpreadConstraints": {"type": "array", "items": {"type": "object"}},
+    "podAnnotations": {"type": "object", "additionalProperties": {"type": "string"}},
+    "podLabels": {"type": "object", "additionalProperties": {"type": "string"}},
+    "priorityClassName": {"type": "string"},
+    "updateStrategy": {"type": "object"},
+    "pdb": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "minAvailable": {"$ref": "#/definitions/intOrPercentOrNull"},
+        "maxUnavailable": {"$ref": "#/definitions/intOrPercentOrNull"}
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "ingress", "egress"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "ingress": {"type": "array", "items": {"type": "object"}},
+        "egress": {"type": "array", "items": {"type": "object"}}
+      }
+    },
+    "hostNetwork": {"type": "boolean"},
+    "dnsPolicy": {"type": "string"}
+  },
+  "required": ["mode", "image", "workload", "config", "tls", "admin", "probes", "metrics", "podMonitor", "dashboard", "serviceAccount", "podSecurityContext", "securityContext", "affinity", "resources", "nodeSelector", "tolerations", "topologySpreadConstraints", "podAnnotations", "podLabels", "priorityClassName", "updateStrategy", "pdb", "networkPolicy", "hostNetwork", "dnsPolicy"],
+  "definitions": {
+    "probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "initialDelaySeconds", "periodSeconds", "timeoutSeconds", "failureThreshold"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "initialDelaySeconds": {"type": "integer", "minimum": 0},
+        "periodSeconds": {"type": "integer", "minimum": 1},
+        "timeoutSeconds": {"type": "integer", "minimum": 1},
+        "failureThreshold": {"type": "integer", "minimum": 1}
+      }
+    },
+    "intOrPercentOrNull": {
+      "anyOf": [
+        {"type": "integer", "minimum": 0},
+        {"type": "string", "pattern": "^[0-9]+%$"},
+        {"type": "null"}
+      ]
+    }
+  }
+}

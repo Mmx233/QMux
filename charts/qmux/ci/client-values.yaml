@@ -1,0 +1,24 @@
+mode: client
+
+config:
+  client:
+    server:
+      servers:
+        - address: qmux-server-headless:8443
+          server_name: qmux-server-headless
+    local:
+      host: echo-backend
+      port: 8080
+    auth:
+      method: mtls
+
+tls:
+  existingSecret:
+    name: qmux-client-tls
+
+metrics:
+  annotations:
+    enabled: true
+
+dashboard:
+  enabled: true

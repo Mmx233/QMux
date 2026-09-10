@@ -1,0 +1,432 @@
+name: Helm Checks
+
+on:
+  push:
+    paths:
+      - charts/qmux/**
+      - .github/workflows/helm-test.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - charts/qmux/**
+      - .github/workflows/helm-test.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CHART_PATH: charts/qmux
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v4.2.4
+
+      - name: Lint chart and dashboards
+        shell: bash
+        run: |
+          set -euo pipefail
+          for values in "$CHART_PATH"/ci/*-values.yaml; do
+            helm lint "$CHART_PATH" --strict --values "$values"
+          done
+          jq empty "$CHART_PATH"/dashboards/*.json
+
+      - name: Render supported modes
+        shell: bash
+        run: |
+          set -euo pipefail
+          render_dir="$RUNNER_TEMP/rendered"
+          mkdir "$render_dir"
+          for values in "$CHART_PATH"/ci/*-values.yaml; do
+            name=$(basename "$values" -values.yaml)
+            helm template "$name" "$CHART_PATH" --values "$values" \
+              --api-versions monitoring.coreos.com/v1/PodMonitor \
+              --api-versions cert-manager.io/v1/Certificate > "$render_dir/$name.yaml"
+          done
+
+          grep -F 'kind: Deployment' "$render_dir/client.yaml" >/dev/null
+          grep -F '  replicas: 2' "$render_dir/client.yaml" >/dev/null
+          grep -F '  name: "client-qmux-config"' "$render_dir/client.yaml" >/dev/null
+          grep -F '        checksum/config:' "$render_dir/client.yaml" >/dev/null
+          grep -F '    admin_address: 0.0.0.0:9091' "$render_dir/client.yaml" >/dev/null
+          grep -F '      ca_cert_file: /etc/qmux/tls/ca.crt' "$render_dir/client.yaml" >/dev/null
+          grep -F '      client_cert_file: /etc/qmux/tls/tls.crt' "$render_dir/client.yaml" >/dev/null
+          grep -F '      client_key_file: /etc/qmux/tls/tls.key' "$render_dir/client.yaml" >/dev/null
+
+          grep -F 'kind: DaemonSet' "$render_dir/server.yaml" >/dev/null
+          grep -F '  name: "server-qmux-config"' "$render_dir/server.yaml" >/dev/null
+          grep -F '      token: |+' "$render_dir/server.yaml" >/dev/null
+          grep -F '      server_cert_file: /etc/qmux/tls/tls.crt' "$render_dir/server.yaml" >/dev/null
+          grep -F '      server_key_file: /etc/qmux/tls/tls.key' "$render_dir/server.yaml" >/dev/null
+          if grep -F 'ca_cert_file:' "$render_dir/server.yaml" >/dev/null; then
+            echo 'Token inline config unexpectedly received an mTLS CA path' >&2
+            exit 1
+          fi
+          awk '
+            $0 == "      token: |+" {
+              getline
+              if ($0 != "        replace-with-at-least-256-random-bits") exit 1
+              getline
+              if ($0 != "    ") exit 1
+              found = 1
+            }
+            END { if (!found) exit 1 }
+          ' "$render_dir/server.yaml"
+
+          grep -F 'kind: Certificate' "$render_dir/cert-manager-client.yaml" >/dev/null
+          grep -F '  commonName: cert-manager-client-qmux' "$render_dir/cert-manager-client.yaml" >/dev/null
+          grep -F 'kind: StatefulSet' "$render_dir/cert-manager-server.yaml" >/dev/null
+          grep -F '  replicas: 1' "$render_dir/cert-manager-server.yaml" >/dev/null
+          grep -F 'kind: Certificate' "$render_dir/cert-manager-server.yaml" >/dev/null
+          grep -F 'kind: PodMonitor' "$render_dir/cert-manager-server.yaml" >/dev/null
+          grep -F '            name: "qmux-server-config"' "$render_dir/cert-manager-server.yaml" >/dev/null
+          if grep -F 'checksum/config:' "$render_dir/cert-manager-server.yaml" >/dev/null; then
+            echo 'Existing config unexpectedly received a checksum' >&2
+            exit 1
+          fi
+
+          long_release=$(printf 'a%.0s' {1..53})
+          helm template "$long_release" "$CHART_PATH" \
+            --values "$CHART_PATH/ci/cert-manager-server-values.yaml" \
+            --api-versions monitoring.coreos.com/v1/PodMonitor \
+            --api-versions cert-manager.io/v1/Certificate \
+            --show-only templates/headless-service.yaml > "$render_dir/headless.yaml"
+          name=$(awk '$1 == "name:" {print $2; exit}' "$render_dir/headless.yaml")
+          test "${#name}" -le 63
+
+          helm template pdb "$CHART_PATH" --values "$CHART_PATH/ci/client-values.yaml" \
+            --set pdb.enabled=true --show-only templates/pdb.yaml > "$render_dir/pdb.yaml"
+          grep -Fx '  maxUnavailable: 1' "$render_dir/pdb.yaml" >/dev/null
+          helm template pdb "$CHART_PATH" --values "$CHART_PATH/ci/client-values.yaml" \
+            --set pdb.enabled=true --set pdb.minAvailable=1 --set pdb.maxUnavailable=null \
+            --show-only templates/pdb.yaml > "$render_dir/pdb-min.yaml"
+          grep -Fx '  minAvailable: 1' "$render_dir/pdb-min.yaml" >/dev/null
+
+      - name: Verify config precedence and generated resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          render_dir="$RUNNER_TEMP/config-rendered"
+          mkdir "$render_dir"
+
+          cat > "$RUNNER_TEMP/existing-precedence.yaml" <<'VALUES'
+          mode: client
+          config:
+            client:
+              auth:
+                method: invalid
+            inlineYaml: "["
+            existing:
+              kind: Secret
+              name: external-config
+              key: custom.yaml
+          tls:
+            existingSecret:
+              name: qmux-client-tls
+          VALUES
+          helm template existing-precedence "$CHART_PATH" \
+            --values "$RUNNER_TEMP/existing-precedence.yaml" > "$render_dir/existing.yaml"
+          test "$(grep -c '^kind:' "$render_dir/existing.yaml")" -eq 1
+          grep -F '          secret:' "$render_dir/existing.yaml" >/dev/null
+          grep -F '            secretName: "external-config"' "$render_dir/existing.yaml" >/dev/null
+          grep -F '              - key: "custom.yaml"' "$render_dir/existing.yaml" >/dev/null
+          if grep -F 'checksum/config:' "$render_dir/existing.yaml" >/dev/null; then
+            echo 'Existing precedence render unexpectedly has a config checksum' >&2
+            exit 1
+          fi
+          if grep -F 'existing-precedence-qmux-config' "$render_dir/existing.yaml" >/dev/null; then
+            echo 'Existing precedence render unexpectedly generated a config resource' >&2
+            exit 1
+          fi
+
+          cat > "$RUNNER_TEMP/inline-precedence.yaml" <<'VALUES'
+          mode: client
+          config:
+            client:
+              auth:
+                method: invalid
+            server:
+              listeners: invalid
+            inlineYaml: |
+              # leading comment
+              --- # document start
+              admin_address: 127.0.0.1:19091
+              auth:
+                method: mtls
+              tls:
+                ca_cert_file: /custom/ca.crt
+                client_cert_file: /custom/client.crt
+                client_key_file: /custom/client.key
+              ... # document end
+              # trailing comment
+          tls:
+            existingSecret:
+              name: qmux-client-tls
+          VALUES
+          helm template inline-precedence "$CHART_PATH" \
+            --values "$RUNNER_TEMP/inline-precedence.yaml" > "$render_dir/inline.yaml"
+          grep -F 'kind: ConfigMap' "$render_dir/inline.yaml" >/dev/null
+          grep -F '  name: "inline-precedence-qmux-config"' "$render_dir/inline.yaml" >/dev/null
+          grep -F '        checksum/config:' "$render_dir/inline.yaml" >/dev/null
+          grep -F '    admin_address: 127.0.0.1:19091' "$render_dir/inline.yaml" >/dev/null
+          grep -F '      ca_cert_file: /custom/ca.crt' "$render_dir/inline.yaml" >/dev/null
+          grep -F '      client_cert_file: /custom/client.crt' "$render_dir/inline.yaml" >/dev/null
+          grep -F '      client_key_file: /custom/client.key' "$render_dir/inline.yaml" >/dev/null
+
+          missing_method=$(jq -Rn --arg inline 'value: test' '$inline')
+          helm template inline-missing-method "$CHART_PATH" \
+            --values "$CHART_PATH/ci/client-values.yaml" \
+            --set-json "config.inlineYaml=$missing_method" \
+            --show-only templates/configmap.yaml > "$render_dir/inline-missing-method.yaml"
+          empty_method=$(jq -Rn --arg inline $'auth:\n  method: ""' '$inline')
+          helm template inline-empty-method "$CHART_PATH" \
+            --values "$CHART_PATH/ci/client-values.yaml" \
+            --set-json "config.inlineYaml=$empty_method" \
+            --show-only templates/configmap.yaml > "$render_dir/inline-empty-method.yaml"
+          for rendered in "$render_dir"/inline-{missing,empty}-method.yaml; do
+            grep -F '      ca_cert_file: /etc/qmux/tls/ca.crt' "$rendered" >/dev/null
+            grep -F '      client_cert_file: /etc/qmux/tls/tls.crt' "$rendered" >/dev/null
+            grep -F '      client_key_file: /etc/qmux/tls/tls.key' "$rendered" >/dev/null
+          done
+
+          cat > "$RUNNER_TEMP/inactive-client.yaml" <<'VALUES'
+          mode: server
+          config:
+            client:
+              auth:
+                method: invalid
+            server:
+              listeners:
+                - quic_addr: 0.0.0.0:8443
+                  traffic_addr: 0.0.0.0:8080
+                  protocol: both
+          tls:
+            existingSecret:
+              name: qmux-server-tls
+          VALUES
+          helm template inactive-client "$CHART_PATH" \
+            --values "$RUNNER_TEMP/inactive-client.yaml" > "$render_dir/direct-server.yaml"
+          grep -F 'kind: ConfigMap' "$render_dir/direct-server.yaml" >/dev/null
+          grep -F '      ca_cert_file: /etc/qmux/tls/ca.crt' "$render_dir/direct-server.yaml" >/dev/null
+          grep -F '      server_cert_file: /etc/qmux/tls/tls.crt' "$render_dir/direct-server.yaml" >/dev/null
+          grep -F '      server_key_file: /etc/qmux/tls/tls.key' "$render_dir/direct-server.yaml" >/dev/null
+          helm template inactive-server "$CHART_PATH" \
+            --values "$CHART_PATH/ci/client-values.yaml" \
+            --set-json 'config.server={"listeners":[],"auth":{"method":"invalid"}}' >/dev/null
+
+          helm template direct-token "$CHART_PATH" \
+            --values "$CHART_PATH/ci/client-values.yaml" \
+            --set config.client.auth.method=token \
+            --set-string config.client.auth.token=replace-with-at-least-256-random-bits \
+            --show-only templates/secret.yaml > "$render_dir/direct-token.yaml"
+          grep -F 'kind: Secret' "$render_dir/direct-token.yaml" >/dev/null
+          grep -F '      token: replace-with-at-least-256-random-bits' "$render_dir/direct-token.yaml" >/dev/null
+          grep -F '      ca_cert_file: /etc/qmux/tls/ca.crt' "$render_dir/direct-token.yaml" >/dev/null
+          if grep -F 'client_cert_file:' "$render_dir/direct-token.yaml" >/dev/null; then
+            echo 'Token direct config unexpectedly received client identity paths' >&2
+            exit 1
+          fi
+
+          helm template direct-custom "$CHART_PATH" \
+            --values "$CHART_PATH/ci/client-values.yaml" \
+            --set-string config.client.admin_address=127.0.0.1:19091 \
+            --set-string config.client.tls.ca_cert_file=/custom/ca.crt \
+            --set-string config.client.tls.client_cert_file=/custom/client.crt \
+            --set-string config.client.tls.client_key_file=/custom/client.key \
+            --show-only templates/configmap.yaml > "$render_dir/direct-custom.yaml"
+          grep -F '    admin_address: 127.0.0.1:19091' "$render_dir/direct-custom.yaml" >/dev/null
+          grep -F '      ca_cert_file: /custom/ca.crt' "$render_dir/direct-custom.yaml" >/dev/null
+          grep -F '      client_cert_file: /custom/client.crt' "$render_dir/direct-custom.yaml" >/dev/null
+          grep -F '      client_key_file: /custom/client.key' "$render_dir/direct-custom.yaml" >/dev/null
+
+          helm template direct-base "$CHART_PATH" \
+            --values "$CHART_PATH/ci/client-values.yaml" > "$render_dir/direct-base.yaml"
+          helm template direct-changed "$CHART_PATH" \
+            --values "$CHART_PATH/ci/client-values.yaml" \
+            --set-string config.client.heartbeat_interval=11s > "$render_dir/direct-changed.yaml"
+          base_checksum=$(awk '$1 == "checksum/config:" {print $2; exit}' "$render_dir/direct-base.yaml")
+          changed_checksum=$(awk '$1 == "checksum/config:" {print $2; exit}' "$render_dir/direct-changed.yaml")
+          test -n "$base_checksum"
+          test -n "$changed_checksum"
+          test "$base_checksum" != "$changed_checksum"
+
+      - name: Preserve Kubernetes string scalars
+        shell: bash
+        run: |
+          set -euo pipefail
+          render_dir="$RUNNER_TEMP/string-scalars"
+          mkdir "$render_dir"
+          assert_line() {
+            grep -Fx "$1" "$2" >/dev/null
+          }
+
+          helm template true "$CHART_PATH" \
+            --values "$CHART_PATH/ci/client-values.yaml" \
+            --set config.existing.kind=ConfigMap \
+            --set-string config.existing.name=true \
+            --set-string config.existing.key=null \
+            --set-string tls.existingSecret.name=123 \
+            --set serviceAccount.create=true \
+            --set-string serviceAccount.name=true \
+            --set-string priorityClassName=null \
+            --set-string dnsPolicy=123 \
+            --set podMonitor.enabled=true \
+            --set-string podMonitor.interval=true \
+            --set-string podMonitor.scrapeTimeout=null \
+            --api-versions monitoring.coreos.com/v1/PodMonitor > "$render_dir/configmap.yaml"
+          assert_line '    app.kubernetes.io/instance: "true"' "$render_dir/configmap.yaml"
+          assert_line '                    app.kubernetes.io/instance: "true"' "$render_dir/configmap.yaml"
+          assert_line '  name: "true"' "$render_dir/configmap.yaml"
+          assert_line '      serviceAccountName: "true"' "$render_dir/configmap.yaml"
+          assert_line '      dnsPolicy: "123"' "$render_dir/configmap.yaml"
+          assert_line '      priorityClassName: "null"' "$render_dir/configmap.yaml"
+          assert_line '            name: "true"' "$render_dir/configmap.yaml"
+          assert_line '              - key: "null"' "$render_dir/configmap.yaml"
+          assert_line '            secretName: "123"' "$render_dir/configmap.yaml"
+          assert_line '      interval: "true"' "$render_dir/configmap.yaml"
+          assert_line '      scrapeTimeout: "null"' "$render_dir/configmap.yaml"
+
+          helm template normal-name "$CHART_PATH" \
+            --values "$CHART_PATH/ci/client-values.yaml" \
+            --set config.existing.kind=Secret \
+            --set-string config.existing.name=123 \
+            --set-string config.existing.key=true \
+            --set-string tls.existingSecret.name=normal-tls \
+            --set-string serviceAccount.name=normal-sa \
+            --set-string priorityClassName=normal-priority \
+            --set-string dnsPolicy=ClusterFirst > "$render_dir/secret.yaml"
+          assert_line '    app.kubernetes.io/instance: "normal-name"' "$render_dir/secret.yaml"
+          assert_line '      serviceAccountName: "normal-sa"' "$render_dir/secret.yaml"
+          assert_line '      dnsPolicy: "ClusterFirst"' "$render_dir/secret.yaml"
+          assert_line '      priorityClassName: "normal-priority"' "$render_dir/secret.yaml"
+          assert_line '            secretName: "123"' "$render_dir/secret.yaml"
+          assert_line '              - key: "true"' "$render_dir/secret.yaml"
+          assert_line '            secretName: "normal-tls"' "$render_dir/secret.yaml"
+
+          helm template cert-strings "$CHART_PATH" \
+            --values "$CHART_PATH/ci/cert-manager-client-values.yaml" \
+            --set-string tls.certManager.identitySecretName=true \
+            --set-string tls.certManager.trustSecretName=null \
+            --set-string tls.certManager.issuerRef.name=123 \
+            --set-string tls.certManager.issuerRef.kind=true \
+            --set-string tls.certManager.issuerRef.group=null \
+            --api-versions cert-manager.io/v1/Certificate > "$render_dir/cert-manager.yaml"
+          assert_line '  secretName: "true"' "$render_dir/cert-manager.yaml"
+          assert_line '    name: "123"' "$render_dir/cert-manager.yaml"
+          assert_line '    kind: "true"' "$render_dir/cert-manager.yaml"
+          assert_line '    group: "null"' "$render_dir/cert-manager.yaml"
+          assert_line '                  name: "true"' "$render_dir/cert-manager.yaml"
+          assert_line '                  name: "null"' "$render_dir/cert-manager.yaml"
+
+      - name: Reject invalid config inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          expect_failure() {
+            local label=$1
+            local expected=$2
+            shift 2
+            local error="$RUNNER_TEMP/$label-error.txt"
+            if "$@" >/dev/null 2>"$error"; then
+              echo "$label unexpectedly rendered" >&2
+              exit 1
+            fi
+            grep -F "$expected" "$error" >/dev/null
+          }
+
+          expect_failure default 'config.client.server.servers' \
+            helm template qmux "$CHART_PATH" --set tls.existingSecret.name=test
+          grep -F 'config.client.local.host' "$RUNNER_TEMP/default-error.txt" >/dev/null
+          grep -F 'config.client.local.port' "$RUNNER_TEMP/default-error.txt" >/dev/null
+          expect_failure server 'config.server.listeners' \
+            helm template qmux "$CHART_PATH" --set mode=server --set tls.existingSecret.name=test
+          expect_failure server-listener 'config.server.listeners[0].quic_addr' \
+            helm template qmux "$CHART_PATH" --set mode=server \
+              --set tls.existingSecret.name=test --set-json 'config.server={"listeners":[{}]}'
+          expect_failure client-auth 'config.client.auth.method' \
+            helm template qmux "$CHART_PATH" --values "$CHART_PATH/ci/client-values.yaml" \
+              --set config.client.auth.method=invalid
+          expect_failure client-token 'config.client.auth.token' \
+            helm template qmux "$CHART_PATH" --values "$CHART_PATH/ci/client-values.yaml" \
+              --set config.client.auth.method=token
+
+          invalid_values=(
+            '['
+            'plain scalar'
+            '- item'
+            '[item]'
+            'null'
+            '~'
+            $'first: document\n---\nsecond: document'
+            $'first: document\n--- {second: document}'
+          )
+          case_number=0
+          for inline in "${invalid_values[@]}"; do
+            case_number=$((case_number + 1))
+            inline_json=$(jq -Rn --arg inline "$inline" '$inline')
+            expect_failure "inline-$case_number" 'config.inlineYaml must be a parseable YAML object' \
+              helm template qmux "$CHART_PATH" --values "$CHART_PATH/ci/server-values.yaml" \
+                --set-json "config.inlineYaml=$inline_json"
+          done
+
+          blank_json=$(jq -Rn --arg inline $' \n\t ' '$inline')
+          expect_failure blank-inline 'config.server.listeners' \
+            helm template qmux "$CHART_PATH" --values "$CHART_PATH/ci/server-values.yaml" \
+              --set-json "config.inlineYaml=$blank_json"
+
+          expect_failure old-source source \
+            helm template qmux "$CHART_PATH" --values "$CHART_PATH/ci/client-values.yaml" \
+              --set config.source=direct
+          expect_failure old-structured structured \
+            helm template qmux "$CHART_PATH" --values "$CHART_PATH/ci/client-values.yaml" \
+              --set-json 'config.structured={}'
+          expect_failure old-raw raw \
+            helm template qmux "$CHART_PATH" --values "$CHART_PATH/ci/client-values.yaml" \
+              --set-string config.raw='legacy'
+
+          helm template qmux "$CHART_PATH" --values "$CHART_PATH/ci/cert-manager-server-values.yaml" \
+            --set workload.kind=Deployment --set tls.certManager.includeHeadlessServiceDNS=false \
+            --set-json tls.certManager.dnsNames='["qmux.example.com"]' \
+            --api-versions cert-manager.io/v1/Certificate \
+            --api-versions monitoring.coreos.com/v1/PodMonitor >/dev/null
+          expect_failure server-dns \
+            'tls.certManager.dnsNames is required when server headless Service DNS is disabled' \
+            helm template qmux "$CHART_PATH" \
+              --values "$CHART_PATH/ci/cert-manager-server-values.yaml" \
+              --set workload.kind=Deployment \
+              --set tls.certManager.includeHeadlessServiceDNS=false \
+              --set-json tls.certManager.dnsNames='[]' \
+              --api-versions cert-manager.io/v1/Certificate \
+              --api-versions monitoring.coreos.com/v1/PodMonitor
+
+      - name: Package chart
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_dir="$RUNNER_TEMP/package"
+          mkdir "$package_dir"
+          helm package "$CHART_PATH" --destination "$package_dir"
+          shopt -s nullglob
+          packages=("$package_dir"/qmux-*.tgz)
+          if [ "${#packages[@]}" -ne 1 ]; then
+            echo "Expected one QMux chart package, found ${#packages[@]}" >&2
+            exit 1
+          fi
+          tar -tzf "${packages[0]}" > "$package_dir/files.txt"
+          if grep -E '^qmux/(ci/|examples?/)' "$package_dir/files.txt" >/dev/null; then
+            echo 'Chart package contains CI fixtures or examples' >&2
+            exit 1
+          fi
+          test ! -e "$CHART_PATH/examples"
+          if grep -Eiq 'checksum|rollout|handshake|Each release runs exactly one' \
+            "$CHART_PATH/values.yaml"; then
+            echo 'values.yaml contains implementation-mechanism commentary' >&2
+            exit 1
+          fi

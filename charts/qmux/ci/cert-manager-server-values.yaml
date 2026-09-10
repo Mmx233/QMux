@@ -1,0 +1,25 @@
+mode: server
+
+config:
+  existing:
+    kind: ConfigMap
+    name: qmux-server-config
+    key: config.yaml
+
+tls:
+  mode: certManager
+  certManager:
+    issuerRef:
+      name: qmux-ca
+      kind: ClusterIssuer
+      group: cert-manager.io
+    identitySecretName: qmux-server-identity
+    trustSecretName: qmux-server-trust
+    dnsNames:
+      - qmux.example.com
+
+podMonitor:
+  enabled: true
+
+dashboard:
+  enabled: true

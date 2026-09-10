@@ -1,0 +1,186 @@
+{{- $kind := include "qmux.workloadKind" . -}}
+{{- $configSource := include "qmux.configSource" . -}}
+{{- $podAnnotations := deepCopy .Values.podAnnotations -}}
+{{- if .Values.metrics.annotations.enabled -}}
+  {{- $_ := set $podAnnotations "prometheus.io/scrape" "true" -}}
+  {{- $_ := set $podAnnotations "prometheus.io/path" "/metrics" -}}
+  {{- $_ := set $podAnnotations "prometheus.io/port" (include "qmux.adminPort" .) -}}
+{{- end -}}
+{{- $podLabels := deepCopy .Values.podLabels -}}
+{{- $_ := set $podLabels "app.kubernetes.io/name" (include "qmux.name" .) -}}
+{{- $_ := set $podLabels "app.kubernetes.io/instance" .Release.Name -}}
+{{- $_ := set $podLabels "app.kubernetes.io/component" .Values.mode -}}
+apiVersion: apps/v1
+kind: {{ $kind }}
+metadata:
+  name: {{ include "qmux.fullname" . }}
+  labels:
+    {{- include "qmux.labels" . | nindent 4 }}
+spec:
+  {{- if ne $kind "DaemonSet" }}
+  replicas: {{ include "qmux.replicaCount" . }}
+  {{- end }}
+  revisionHistoryLimit: {{ .Values.workload.revisionHistoryLimit }}
+  selector:
+    matchLabels:
+      {{- include "qmux.selectorLabels" . | nindent 6 }}
+  {{- if eq $kind "StatefulSet" }}
+  serviceName: {{ include "qmux.headlessServiceName" . }}
+  podManagementPolicy: Parallel
+  {{- end }}
+  {{- with .Values.updateStrategy }}
+  {{- if eq $kind "Deployment" }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- else }}
+  updateStrategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- toYaml $podLabels | nindent 8 }}
+      {{- if or $podAnnotations (ne $configSource "existing") }}
+      annotations:
+        {{- with $podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if ne $configSource "existing" }}
+        checksum/config: {{ include "qmux.generatedConfig" . | sha256sum | quote }}
+        {{- end }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "qmux.serviceAccountName" . | quote }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.workload.terminationGracePeriodSeconds }}
+      hostNetwork: {{ .Values.hostNetwork }}
+      {{- if .Values.dnsPolicy }}
+      dnsPolicy: {{ .Values.dnsPolicy | quote }}
+      {{- else if .Values.hostNetwork }}
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if .Values.priorityClassName }}
+      priorityClassName: {{ .Values.priorityClassName | quote }}
+      {{- end }}
+      {{- if .Values.affinity }}
+      affinity:
+        {{- toYaml .Values.affinity | nindent 8 }}
+      {{- else }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: qmux
+          image: "{{ .Values.image.repository }}:{{ default .Chart.AppVersion .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - run
+            - {{ .Values.mode }}
+            - --config
+            - /etc/qmux/config.yaml
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- if .Values.admin.enabled }}
+          ports:
+            - name: admin
+              containerPort: {{ include "qmux.adminPort" . }}
+              protocol: TCP
+          {{- end }}
+          {{- if .Values.probes.liveness.enabled }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          {{- end }}
+          {{- if .Values.probes.readiness.enabled }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/qmux/config.yaml
+              subPath: config.yaml
+              readOnly: true
+            - name: tls
+              mountPath: /etc/qmux/tls
+              readOnly: true
+      volumes:
+        - name: config
+          {{- if eq (include "qmux.configResourceKind" .) "Secret" }}
+          secret:
+            secretName: {{ include "qmux.configResourceName" . | quote }}
+            items:
+              - key: {{ if eq $configSource "existing" }}{{ .Values.config.existing.key | quote }}{{ else }}{{ "config.yaml" | quote }}{{ end }}
+                path: config.yaml
+          {{- else }}
+          configMap:
+            name: {{ include "qmux.configResourceName" . | quote }}
+            items:
+              - key: {{ if eq $configSource "existing" }}{{ .Values.config.existing.key | quote }}{{ else }}{{ "config.yaml" | quote }}{{ end }}
+                path: config.yaml
+          {{- end }}
+        - name: tls
+          {{- if eq .Values.tls.mode "existingSecret" }}
+          secret:
+            secretName: {{ .Values.tls.existingSecret.name | quote }}
+            items:
+              - key: ca.crt
+                path: ca.crt
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+          {{- else }}
+          projected:
+            sources:
+              - secret:
+                  name: {{ .Values.tls.certManager.identitySecretName | quote }}
+                  items:
+                    - key: tls.crt
+                      path: tls.crt
+                    - key: tls.key
+                      path: tls.key
+              - secret:
+                  name: {{ .Values.tls.certManager.trustSecretName | quote }}
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+          {{- end }}

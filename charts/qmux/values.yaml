@@ -1,0 +1,128 @@
+mode: client
+
+image:
+  repository: mmx233/qmux
+  # Empty uses Chart.appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+config:
+  client: {}
+  server: {}
+  # A non-empty value takes precedence over client and server.
+  inlineYaml: ""
+  existing:
+    # A non-empty name takes precedence over all other config values.
+    kind: ConfigMap
+    name: ""
+    key: config.yaml
+
+tls:
+  # existingSecret or certManager.
+  mode: existingSecret
+  existingSecret:
+    # The Secret must contain ca.crt, tls.crt, and tls.key.
+    name: ""
+  certManager:
+    issuerRef:
+      name: ""
+      kind: Issuer
+      group: cert-manager.io
+    identitySecretName: ""
+    # Existing Secret containing ca.crt.
+    trustSecretName: ""
+    dnsNames: []
+    # Applies only to a server StatefulSet.
+    includeHeadlessServiceDNS: true
+
+admin:
+  enabled: true
+  # Empty uses 9090 for server and 9091 for client.
+  port: null
+
+workload:
+  # Empty uses Deployment for client and StatefulSet for server.
+  kind: ""
+  # Empty uses 2 for client and 1 for server. DaemonSet ignores this value.
+  replicaCount: null
+  revisionHistoryLimit: 10
+  terminationGracePeriodSeconds: 35
+
+probes:
+  liveness:
+    enabled: true
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    enabled: true
+    initialDelaySeconds: 1
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 6
+
+serviceAccount:
+  create: false
+  # Empty with create=false uses the namespace's default ServiceAccount.
+  name: ""
+  annotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+resources: {}
+
+# Empty renders a preferred same-release pod anti-affinity. A non-empty object
+# replaces that default in full.
+affinity: {}
+nodeSelector: {}
+tolerations: []
+topologySpreadConstraints: []
+podAnnotations: {}
+podLabels: {}
+priorityClassName: ""
+updateStrategy: {}
+hostNetwork: false
+# Empty uses Kubernetes' normal default, or ClusterFirstWithHostNet when
+# hostNetwork=true.
+dnsPolicy: ""
+
+pdb:
+  enabled: false
+  minAvailable: null
+  maxUnavailable: 1
+
+metrics:
+  annotations:
+    enabled: false
+
+podMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}
+
+dashboard:
+  enabled: false
+  labels:
+    grafana_dashboard: "1"
+  annotations: {}
+
+networkPolicy:
+  enabled: false
+  ingress: []
+  egress: []

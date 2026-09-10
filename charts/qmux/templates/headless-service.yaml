@@ -1,0 +1,13 @@
+{{- if eq (include "qmux.workloadKind" .) "StatefulSet" }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "qmux.headlessServiceName" . }}
+  labels:
+    {{- include "qmux.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "qmux.selectorLabels" . | nindent 4 }}
+{{- end }}
