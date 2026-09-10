@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -20,6 +21,8 @@ func TestSnapshotMetrics(t *testing.T) {
 	for _, role := range []string{"server", "client"} {
 		t.Run(role, func(t *testing.T) {
 			var reads atomic.Int64
+			identityNotAfter := time.Date(2500, time.January, 1, 0, 0, 0, 0, time.UTC)
+			caNotAfter := time.Date(2501, time.January, 1, 0, 0, 0, 0, time.UTC)
 			traffic := stats.TransportSnapshot{
 				SentBytes: 42, ReceivedBytes: 84,
 				SentPackets: 7, ReceivedPackets: 14,
@@ -33,13 +36,13 @@ func TestSnapshotMetrics(t *testing.T) {
 			if role == "server" {
 				collector = newServerCollector(func() server.Snapshot {
 					reads.Add(1)
-					return server.Snapshot{Routes: []server.RouteSnapshot{{QuicAddr: ":8443", TrafficAddr: ":8080", Protocol: "both", PoolCapacity: pool.CapacitySnapshot{QUIC: traffic}}}}
+					return server.Snapshot{TLSCertificateNotAfter: identityNotAfter, TLSCANotAfter: caNotAfter, Routes: []server.RouteSnapshot{{QuicAddr: ":8443", TrafficAddr: ":8080", Protocol: "both", PoolCapacity: pool.CapacitySnapshot{QUIC: traffic}}}}
 				})
 				labels = `{listener=":8443"}`
 			} else {
 				collector = newClientCollector(func() client.Snapshot {
 					reads.Add(1)
-					return client.Snapshot{Endpoints: []client.EndpointSnapshot{{Endpoint: "server:8443", QUIC: traffic}}}
+					return client.Snapshot{TLSCertificateNotAfter: identityNotAfter, TLSCANotAfter: caNotAfter, Endpoints: []client.EndpointSnapshot{{Endpoint: "server:8443", QUIC: traffic}}}
 				})
 				labels = `{endpoint="server:8443"}`
 			}
@@ -84,9 +87,55 @@ func TestSnapshotMetrics(t *testing.T) {
 						t.Errorf("missing %q", part)
 					}
 				}
+				for kind, notAfter := range map[string]time.Time{"identity": identityNotAfter, "ca": caNotAfter} {
+					value := strconv.FormatFloat(float64(notAfter.Unix()), 'g', -1, 64)
+					want := fmt.Sprintf("\nqmux_%s_tls_certificate_not_after_timestamp_seconds{kind=%q} %s\n", role, kind, value)
+					if !strings.Contains(response.Body.String(), want) {
+						t.Errorf("missing sample %q", want)
+					}
+				}
 			}
 			if reads.Load() != 2 {
 				t.Fatalf("snapshot reads=%d, want one per scrape", reads.Load())
+			}
+		})
+	}
+}
+
+func TestTLSCertificateMetricsOmitMissingKinds(t *testing.T) {
+	notAfter := time.Unix(42, 0)
+	tests := []struct {
+		name      string
+		role      string
+		collector prometheus.Collector
+		present   string
+		absent    string
+	}{
+		{
+			name: "server identity only", role: "server",
+			collector: newServerCollector(func() server.Snapshot {
+				return server.Snapshot{TLSCertificateNotAfter: notAfter}
+			}),
+			present: "identity", absent: "ca",
+		},
+		{
+			name: "client CA only", role: "client",
+			collector: newClientCollector(func() client.Snapshot {
+				return client.Snapshot{TLSCANotAfter: notAfter}
+			}),
+			present: "ca", absent: "identity",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			newAdminHandler(func() bool { return true }, test.collector).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+			metric := "qmux_" + test.role + "_tls_certificate_not_after_timestamp_seconds"
+			if sample := metric + `{kind="` + test.present + `"} 42`; !strings.Contains(response.Body.String(), sample) {
+				t.Errorf("missing sample %q", sample)
+			}
+			if sample := metric + `{kind="` + test.absent + `"}`; strings.Contains(response.Body.String(), sample) {
+				t.Errorf("unexpected sample %q", sample)
 			}
 		})
 	}

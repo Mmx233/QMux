@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"os"
@@ -47,9 +48,11 @@ type Paths struct {
 
 // Bundle is one validated TLS material snapshot.
 type Bundle struct {
-	Certificate *tls.Certificate
-	CAPool      *x509.CertPool
-	digest      [sha256.Size]byte
+	Certificate         *tls.Certificate
+	CAPool              *x509.CertPool
+	CertificateNotAfter time.Time
+	CANotAfter          time.Time
+	digest              [sha256.Size]byte
 }
 
 // Reloader loads and optionally watches one TLS material bundle.
@@ -503,6 +506,7 @@ func loadBundle(paths Paths) (*Bundle, error) {
 				return nil, errors.New("parse TLS CA file: no certificate found")
 			}
 			bundle.CAPool = pool
+			bundle.CANotAfter = earliestPEMCertificateExpiry(file.data)
 		case "cert":
 			// Parsed together after all files have been collected.
 		case "key":
@@ -512,6 +516,7 @@ func loadBundle(paths Paths) (*Bundle, error) {
 				return nil, errors.New("parse TLS certificate/key pair: invalid certificate or key")
 			}
 			bundle.Certificate = &certificate
+			bundle.CertificateNotAfter = earliestCertificateExpiry(certificate.Certificate)
 		}
 	}
 
@@ -526,6 +531,32 @@ func loadBundle(paths Paths) (*Bundle, error) {
 	}
 	copy(bundle.digest[:], hash.Sum(nil))
 	return bundle, nil
+}
+
+func earliestPEMCertificateExpiry(data []byte) time.Time {
+	var certificates [][]byte
+	for {
+		block, rest := pem.Decode(data)
+		if block == nil {
+			break
+		}
+		data = rest
+		if block.Type == "CERTIFICATE" && len(block.Headers) == 0 {
+			certificates = append(certificates, block.Bytes)
+		}
+	}
+	return earliestCertificateExpiry(certificates)
+}
+
+func earliestCertificateExpiry(certificates [][]byte) time.Time {
+	var earliest time.Time
+	for _, der := range certificates {
+		certificate, err := x509.ParseCertificate(der)
+		if err == nil && (earliest.IsZero() || certificate.NotAfter.Before(earliest)) {
+			earliest = certificate.NotAfter
+		}
+	}
+	return earliest
 }
 
 func findMaterial(files []materialFile, label string) []byte {

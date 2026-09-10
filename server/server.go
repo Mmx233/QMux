@@ -49,14 +49,18 @@ type Server struct {
 }
 
 type serverTLSState struct {
-	certificate tls.Certificate
-	clientCAs   *x509.CertPool
+	certificate         tls.Certificate
+	clientCAs           *x509.CertPool
+	certificateNotAfter time.Time
+	caNotAfter          time.Time
 }
 
-// Snapshot is a point-in-time, value-only view of server readiness.
+// Snapshot is a point-in-time, value-only view of server state.
 type Snapshot struct {
-	Routes []RouteSnapshot
-	Ready  bool
+	Routes                 []RouteSnapshot
+	Ready                  bool
+	TLSCertificateNotAfter time.Time
+	TLSCANotAfter          time.Time
 }
 
 // RouteSnapshot describes one configured traffic route.
@@ -146,8 +150,10 @@ func New(conf *config.Server) (*Server, error) {
 	}
 	reloader, err := tlsreload.New("server", paths, logger, func(bundle *tlsreload.Bundle) error {
 		srv.tlsState.Store(&serverTLSState{
-			certificate: *bundle.Certificate,
-			clientCAs:   bundle.CAPool,
+			certificate:         *bundle.Certificate,
+			clientCAs:           bundle.CAPool,
+			certificateNotAfter: bundle.CertificateNotAfter,
+			caNotAfter:          bundle.CANotAfter,
 		})
 		return nil
 	})
@@ -258,6 +264,10 @@ func (s *Server) Snapshot() Snapshot {
 	snapshot := Snapshot{
 		Routes: make([]RouteSnapshot, 0, len(s.config.Listeners)),
 		Ready:  len(s.config.Listeners) > 0,
+	}
+	if state := s.tlsState.Load(); state != nil {
+		snapshot.TLSCertificateNotAfter = state.certificateNotAfter
+		snapshot.TLSCANotAfter = state.caNotAfter
 	}
 	for i, listener := range s.config.Listeners {
 		route := RouteSnapshot{

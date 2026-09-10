@@ -31,8 +31,8 @@ type testMaterial struct {
 
 func TestLoadPublishesChangesAndRetainsLastKnownGood(t *testing.T) {
 	dir := t.TempDir()
-	first := newTestMaterial(t, 1)
-	second := newTestMaterial(t, 2)
+	first := newTestMaterialWithExpiry(t, 1, time.Now().Add(time.Hour))
+	second := newTestMaterialWithExpiry(t, 2, time.Now().Add(2*time.Hour))
 	writeMaterial(t, dir, first)
 
 	logs := newTestLogs()
@@ -110,6 +110,9 @@ func TestLoadPublishesChangesAndRetainsLastKnownGood(t *testing.T) {
 	if len(published) != 2 || bundleSerial(t, published[1]) != second.serial {
 		t.Fatalf("changed load did not publish the second complete bundle")
 	}
+	if !published[1].CertificateNotAfter.After(published[0].CertificateNotAfter) || !published[1].CANotAfter.After(published[0].CANotAfter) {
+		t.Fatalf("reloaded expiry metadata did not replace the initial values")
+	}
 
 	trailing := append(append([]byte(nil), second.ca...), []byte("-----BEGIN MALFORMED-----\n!\n-----END MALFORMED-----\n")...)
 	if err := os.WriteFile(filepath.Join(dir, "ca.crt"), trailing, 0600); err != nil {
@@ -157,6 +160,32 @@ func TestDigestCommitsOnlyAfterPublication(t *testing.T) {
 	}
 	if calls != 2 {
 		t.Fatalf("publisher called %d times, want 2", calls)
+	}
+}
+
+func TestLoadBundleReportsEarliestCertificateExpiry(t *testing.T) {
+	dir := t.TempDir()
+	ignored := newTestMaterialWithExpiry(t, 10, time.Now().Add(-time.Hour))
+	early := newTestMaterialWithExpiry(t, 11, time.Now().Add(time.Hour))
+	late := newTestMaterialWithExpiry(t, 12, time.Now().Add(2*time.Hour))
+	ignoredBlock, _ := pem.Decode(ignored.ca)
+	ignoredBlock.Headers = map[string]string{"X-Ignored": "true"}
+	late.ca = append(late.ca, pem.EncodeToMemory(ignoredBlock)...)
+	late.ca = append(late.ca, early.ca...)
+	late.cert = append(late.cert, early.cert...)
+	writeMaterial(t, dir, late)
+
+	bundle, err := loadBundle(materialPaths(dir))
+	if err != nil {
+		t.Fatalf("loadBundle: %v", err)
+	}
+	block, _ := pem.Decode(early.cert)
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("parse expected certificate: %v", err)
+	}
+	if !bundle.CertificateNotAfter.Equal(certificate.NotAfter) || !bundle.CANotAfter.Equal(certificate.NotAfter) {
+		t.Fatalf("expiry metadata = identity %v, CA %v; want %v", bundle.CertificateNotAfter, bundle.CANotAfter, certificate.NotAfter)
 	}
 }
 
@@ -622,6 +651,10 @@ func startPublishingTestReloader(t *testing.T, dir string, logs *testLogs, publi
 }
 
 func newTestMaterial(t *testing.T, serial int64) testMaterial {
+	return newTestMaterialWithExpiry(t, serial, time.Now().Add(time.Hour))
+}
+
+func newTestMaterialWithExpiry(t *testing.T, serial int64, notAfter time.Time) testMaterial {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -631,7 +664,7 @@ func newTestMaterial(t *testing.T, serial int64) testMaterial {
 		SerialNumber:          big.NewInt(serial),
 		Subject:               pkix.Name{CommonName: fmt.Sprintf("test-%d", serial)},
 		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(time.Hour),
+		NotAfter:              notAfter,
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,

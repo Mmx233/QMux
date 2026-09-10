@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"io"
 	"os"
@@ -29,6 +30,9 @@ func TestConnectionManagerTLSReloadReplacesConfigAndCacheTogether(t *testing.T) 
 	t.Cleanup(func() { _ = cm.Stop() })
 
 	initial := cm.tlsState.Load()
+	if initial.certificateNotAfter.IsZero() || initial.caNotAfter.IsZero() {
+		t.Fatalf("initial TLS expiry metadata = identity %v, CA %v", initial.certificateNotAfter, initial.caNotAfter)
+	}
 	initial.sessionCaches.GetOrCreate(cfg.Server.Servers[0].Address)
 	if err := cm.tlsReloader.LoadInitial(); err != nil {
 		t.Fatalf("unchanged load: %v", err)
@@ -48,6 +52,11 @@ func TestConnectionManagerTLSReloadReplacesConfigAndCacheTogether(t *testing.T) 
 	}
 	if changed.sessionCaches.Count() != 0 || initial.sessionCaches.Count() != 1 {
 		t.Fatal("cache-manager replacement changed old cache ownership")
+	}
+	wantCertificateNotAfter := parsePEMCertificate(t, certPEM).NotAfter
+	wantCANotAfter := parsePEMCertificate(t, caPEM).NotAfter
+	if !changed.certificateNotAfter.Equal(wantCertificateNotAfter) || !changed.caNotAfter.Equal(wantCANotAfter) {
+		t.Fatalf("reloaded TLS expiry metadata = identity %v, CA %v; want identity %v, CA %v", changed.certificateNotAfter, changed.caNotAfter, wantCertificateNotAfter, wantCANotAfter)
 	}
 
 	const privateMarker = "distinctive-private-key-material"
@@ -249,8 +258,12 @@ func TestConnectionManagerTokenModeOmitsConfiguredClientIdentity(t *testing.T) {
 		t.Fatalf("NewConnectionManager: %v", err)
 	}
 	t.Cleanup(func() { _ = cm.Stop() })
-	if got := len(cm.tlsState.Load().baseTLSConfig.Certificates); got != 0 {
+	state := cm.tlsState.Load()
+	if got := len(state.baseTLSConfig.Certificates); got != 0 {
 		t.Fatalf("token-mode TLS state contains %d client certificates, want 0", got)
+	}
+	if !state.certificateNotAfter.IsZero() || state.caNotAfter.IsZero() {
+		t.Fatalf("token-mode TLS expiry metadata = identity %v, CA %v", state.certificateNotAfter, state.caNotAfter)
 	}
 
 	serverDone := peer.serveRegistration(func(conn *quic.Conn, stream *quic.Stream, registration protocol.RegisterMsg) error {
@@ -316,6 +329,19 @@ func writeTLSMaterial(t *testing.T, paths config.ClientTLS, caPEM, certPEM, keyP
 			t.Fatalf("write TLS material: %v", err)
 		}
 	}
+}
+
+func parsePEMCertificate(t *testing.T, data []byte) *x509.Certificate {
+	t.Helper()
+	block, _ := pem.Decode(data)
+	if block == nil {
+		t.Fatal("decode certificate PEM")
+	}
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("parse certificate: %v", err)
+	}
+	return certificate
 }
 
 func replaceTLSReloadFile(t *testing.T, path string, contents []byte) {

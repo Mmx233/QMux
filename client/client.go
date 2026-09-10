@@ -98,13 +98,15 @@ type targetResult struct {
 
 // Snapshot is a value-only view of client capacity ownership.
 type Snapshot struct {
-	Ready          bool
-	TCP            TCPActivitySnapshot
-	Endpoints      []EndpointSnapshot
-	UDPSessions    UDPSessionSnapshot
-	DSend          DSendSnapshot
-	Fragments      protocol.FragmentSnapshot
-	LiveAssemblers int
+	Ready                  bool
+	TCP                    TCPActivitySnapshot
+	Endpoints              []EndpointSnapshot
+	UDPSessions            UDPSessionSnapshot
+	DSend                  DSendSnapshot
+	Fragments              protocol.FragmentSnapshot
+	LiveAssemblers         int
+	TLSCertificateNotAfter time.Time
+	TLSCANotAfter          time.Time
 }
 
 // EndpointSnapshot is one configured endpoint's generation phases.
@@ -877,6 +879,10 @@ func (c *Client) Snapshot() Snapshot {
 			snapshot.Ready = c.Ready()
 		}
 		snapshot.Endpoints = c.connMgr.endpointSnapshot()
+		if state := c.connMgr.tlsState.Load(); state != nil {
+			snapshot.TLSCertificateNotAfter = state.certificateNotAfter
+			snapshot.TLSCANotAfter = state.caNotAfter
+		}
 	}
 	snapshot.TCP = TCPActivitySnapshot{Pending: c.tcpPending.Load(), Active: c.tcpActive.Load(), Setups: c.tcpSetups.Snapshot(), Dials: c.tcpDials.Snapshot()}
 	snapshot.UDPSessions = c.udpBudget.snapshot()

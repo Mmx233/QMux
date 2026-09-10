@@ -63,8 +63,10 @@ type ConnectionManager struct {
 }
 
 type clientTLSState struct {
-	baseTLSConfig *tls.Config
-	sessionCaches *SessionCacheManager
+	baseTLSConfig       *tls.Config
+	sessionCaches       *SessionCacheManager
+	certificateNotAfter time.Time
+	caNotAfter          time.Time
 }
 
 type clientGenerationPhase uint8
@@ -136,8 +138,10 @@ func NewConnectionManager(cfg *config.Client, logger zerolog.Logger) (*Connectio
 			baseTLSConfig.Certificates = []tls.Certificate{*bundle.Certificate}
 		}
 		cm.tlsState.Store(&clientTLSState{
-			baseTLSConfig: baseTLSConfig,
-			sessionCaches: NewSessionCacheManager(),
+			baseTLSConfig:       baseTLSConfig,
+			sessionCaches:       NewSessionCacheManager(),
+			certificateNotAfter: bundle.CertificateNotAfter,
+			caNotAfter:          bundle.CANotAfter,
 		})
 		return nil
 	})

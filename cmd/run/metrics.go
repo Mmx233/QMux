@@ -56,7 +56,16 @@ func timestamp(value time.Time) float64 {
 func newSnapshotCollector(role string) *snapshotCollector {
 	c := &snapshotCollector{role: role, descs: make(map[string]*prometheus.Desc)}
 	c.define("ready", "Whether the running instance is ready (1) or not ready (0).")
+	c.define("tls_certificate_not_after_timestamp_seconds", "Earliest NotAfter Unix timestamp among the currently loaded TLS certificates, by kind.", "kind")
 	return c
+}
+
+func (c *snapshotCollector) tlsCertificates(ch chan<- prometheus.Metric, identity, ca time.Time) {
+	for kind, notAfter := range map[string]time.Time{"identity": identity, "ca": ca} {
+		if !notAfter.IsZero() {
+			c.gauge(ch, "tls_certificate_not_after_timestamp_seconds", float64(notAfter.Unix()), kind)
+		}
+	}
 }
 
 func (c *snapshotCollector) defineTransport(scope string) {
@@ -188,6 +197,7 @@ func newServerCollector(snapshot func() server.Snapshot) prometheus.Collector {
 	c.collect = func(ch chan<- prometheus.Metric) {
 		s := snapshot()
 		c.gauge(ch, "ready", number(s.Ready))
+		c.tlsCertificates(ch, s.TLSCertificateNotAfter, s.TLSCANotAfter)
 		for _, r := range s.Routes {
 			l := r.QuicAddr
 			c.gauge(ch, "route_info", 1, l, r.TrafficAddr, r.Protocol)
@@ -290,6 +300,7 @@ func newClientCollector(snapshot func() client.Snapshot) prometheus.Collector {
 	c.collect = func(ch chan<- prometheus.Metric) {
 		s := snapshot()
 		c.gauge(ch, "ready", number(s.Ready))
+		c.tlsCertificates(ch, s.TLSCertificateNotAfter, s.TLSCANotAfter)
 		for _, e := range s.Endpoints {
 			c.transport(ch, e.QUIC, e.Endpoint)
 			c.operation(ch, "connection", e.Connect, e.Endpoint)

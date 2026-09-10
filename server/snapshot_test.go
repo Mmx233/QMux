@@ -101,8 +101,13 @@ func TestNewLoadsAndLogsInitialTLSState(t *testing.T) {
 			connectionPool.Stop()
 		}
 	})
-	if state := srv.tlsState.Load(); state == nil || len(state.certificate.Certificate) == 0 || state.clientCAs != nil {
+	state := srv.tlsState.Load()
+	if state == nil || len(state.certificate.Certificate) == 0 || state.clientCAs != nil {
 		t.Fatalf("initial TLS state = %+v, want token server certificate only", state)
+	}
+	snapshot := srv.Snapshot()
+	if snapshot.TLSCertificateNotAfter.IsZero() || !snapshot.TLSCertificateNotAfter.Equal(state.certificateNotAfter) || !snapshot.TLSCANotAfter.IsZero() {
+		t.Fatalf("TLS expiry snapshot = identity %v, CA %v", snapshot.TLSCertificateNotAfter, snapshot.TLSCANotAfter)
 	}
 	logs := output.String()
 	if strings.Count(logs, `"phase":"initial"`) != 1 || !strings.Contains(logs, `"level":"info"`) ||
