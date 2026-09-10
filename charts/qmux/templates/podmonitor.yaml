@@ -1,11 +1,11 @@
-{{- if .Values.podMonitor.enabled }}
+{{- if and .Values.monitoring.enabled .Values.monitoring.podMonitor.enabled }}
 apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
 metadata:
   name: {{ include "qmux.fullname" . }}
   labels:
     {{- include "qmux.labels" . | nindent 4 }}
-    {{- with .Values.podMonitor.labels }}
+    {{- with .Values.monitoring.podMonitor.labels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:
@@ -18,7 +18,7 @@ spec:
   podMetricsEndpoints:
     - port: admin
       path: /metrics
-      interval: {{ .Values.podMonitor.interval | quote }}
-      scrapeTimeout: {{ .Values.podMonitor.scrapeTimeout | quote }}
+      interval: {{ .Values.monitoring.podMonitor.interval | quote }}
+      scrapeTimeout: {{ .Values.monitoring.podMonitor.scrapeTimeout | quote }}
       honorLabels: true
 {{- end }}

@@ -18,8 +18,7 @@ tls:
     dnsNames:
       - qmux.example.com
 
-podMonitor:
+monitoring:
   enabled: true
-
-dashboard:
-  enabled: true
+  dashboard:
+    enabled: true

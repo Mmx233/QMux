@@ -106,21 +106,20 @@ pdb:
   minAvailable: null
   maxUnavailable: 1
 
-metrics:
-  annotations:
+monitoring:
+  enabled: false
+  prometheusAnnotations:
     enabled: false
-
-podMonitor:
-  enabled: false
-  interval: 30s
-  scrapeTimeout: 10s
-  labels: {}
-
-dashboard:
-  enabled: false
-  labels:
-    grafana_dashboard: "1"
-  annotations: {}
+  podMonitor:
+    enabled: true
+    interval: 30s
+    scrapeTimeout: 10s
+    labels: {}
+  dashboard:
+    enabled: false
+    labels:
+      grafana_dashboard: "1"
+    annotations: {}
 
 networkPolicy:
   enabled: false

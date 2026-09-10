@@ -1,14 +1,14 @@
-{{- if .Values.dashboard.enabled }}
+{{- if and .Values.monitoring.enabled .Values.monitoring.dashboard.enabled }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: {{ printf "%s-dashboard" (include "qmux.fullname" .) }}
   labels:
     {{- include "qmux.labels" . | nindent 4 }}
-    {{- with .Values.dashboard.labels }}
+    {{- with .Values.monitoring.dashboard.labels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
-  {{- with .Values.dashboard.annotations }}
+  {{- with .Values.monitoring.dashboard.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}

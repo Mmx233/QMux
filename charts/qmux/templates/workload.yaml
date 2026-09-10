@@ -1,7 +1,7 @@
 {{- $kind := include "qmux.workloadKind" . -}}
 {{- $configSource := include "qmux.configSource" . -}}
 {{- $podAnnotations := deepCopy .Values.podAnnotations -}}
-{{- if .Values.metrics.annotations.enabled -}}
+{{- if and .Values.monitoring.enabled .Values.monitoring.prometheusAnnotations.enabled -}}
   {{- $_ := set $podAnnotations "prometheus.io/scrape" "true" -}}
   {{- $_ := set $podAnnotations "prometheus.io/path" "/metrics" -}}
   {{- $_ := set $podAnnotations "prometheus.io/port" (include "qmux.adminPort" .) -}}

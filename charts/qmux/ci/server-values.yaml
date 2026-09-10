@@ -21,5 +21,7 @@ tls:
   existingSecret:
     name: qmux-server-tls
 
-dashboard:
+monitoring:
   enabled: true
+  dashboard:
+    enabled: true

@@ -252,7 +252,7 @@ ConfigMap
 {{- if and (ne .Values.pdb.minAvailable nil) (ne .Values.pdb.maxUnavailable nil) -}}{{- fail "pdb.minAvailable and pdb.maxUnavailable are mutually exclusive" -}}{{- end -}}
 {{- if and .Values.pdb.enabled (eq .Values.pdb.minAvailable nil) (eq .Values.pdb.maxUnavailable nil) -}}{{- fail "pdb.enabled=true requires pdb.minAvailable or pdb.maxUnavailable" -}}{{- end -}}
 {{- if not .Values.admin.enabled -}}
-  {{- if or .Values.probes.liveness.enabled .Values.probes.readiness.enabled .Values.metrics.annotations.enabled .Values.podMonitor.enabled -}}{{- fail "admin.enabled=false requires probes, metrics annotations, and PodMonitor to be disabled" -}}{{- end -}}
+  {{- if or .Values.probes.liveness.enabled .Values.probes.readiness.enabled (and .Values.monitoring.enabled (or .Values.monitoring.prometheusAnnotations.enabled .Values.monitoring.podMonitor.enabled)) -}}{{- fail "admin.enabled=false requires probes and metrics collection to be disabled" -}}{{- end -}}
 {{- end -}}
-{{- if and .Values.podMonitor.enabled (not (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1/PodMonitor")) -}}{{- fail "podMonitor.enabled=true requires monitoring.coreos.com/v1/PodMonitor" -}}{{- end -}}
+{{- if and .Values.monitoring.enabled .Values.monitoring.podMonitor.enabled (not (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1/PodMonitor")) -}}{{- fail "monitoring.podMonitor.enabled=true requires monitoring.coreos.com/v1/PodMonitor" -}}{{- end -}}
 {{- end -}}

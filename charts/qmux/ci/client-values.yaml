@@ -16,9 +16,9 @@ tls:
   existingSecret:
     name: qmux-client-tls
 
-metrics:
-  annotations:
-    enabled: true
-
-dashboard:
+monitoring:
   enabled: true
+  prometheusAnnotations:
+    enabled: true
+  dashboard:
+    enabled: true
