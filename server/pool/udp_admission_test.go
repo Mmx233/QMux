@@ -2,11 +2,12 @@ package pool
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 )
 
-func addUDPAdmissionClient(t *testing.T, p *ConnectionPool, id string) *ClientConn {
+func addUDPAdmissionClient(t testing.TB, p *ConnectionPool, id string) *ClientConn {
 	t.Helper()
 	client := &ClientConn{ID: id, Metadata: ClientMetadata{Capabilities: []string{"udp"}}}
 	if err := p.Add(client); err != nil {
@@ -196,5 +197,57 @@ func TestUDPAdmissionRejectsBalancerResultOutsideCandidates(t *testing.T) {
 	}
 	if client.udpSessions != 0 {
 		t.Fatal("invalid balancer result consumed UDP capacity")
+	}
+}
+
+func BenchmarkUDPAdmissionLifecycle(b *testing.B) {
+	balancers := []struct {
+		name string
+		new  func() LoadBalancer
+	}{
+		{name: "round_robin", new: func() LoadBalancer { return NewRoundRobinBalancer() }},
+		{name: "least_connections", new: func() LoadBalancer { return NewLeastConnectionsBalancer() }},
+	}
+	scenarios := []struct {
+		name      string
+		clients   int
+		unhealthy int
+	}{
+		{name: "1_healthy", clients: 1},
+		{name: "16_healthy", clients: 16},
+		{name: "16_mixed_8_healthy", clients: 16, unhealthy: 8},
+	}
+
+	for _, balancer := range balancers {
+		for _, scenario := range scenarios {
+			b.Run(balancer.name+"/"+scenario.name, func(b *testing.B) {
+				p := New("benchmark", balancer.new(), newTestLogger())
+				defer p.Stop()
+				for i := range scenario.clients {
+					client := addUDPAdmissionClient(b, p, fmt.Sprintf("client-%d", i))
+					if i < scenario.unhealthy && !p.MarkUnhealthy(client) {
+						b.Fatalf("MarkUnhealthy(client-%d) = false", i)
+					}
+				}
+
+				b.ReportAllocs()
+				b.ResetTimer()
+				for range b.N {
+					selected, err := p.ReserveUDP()
+					if err != nil || selected == nil {
+						b.Fatalf("ReserveUDP() = (%v, %v), want client", selected, err)
+					}
+					if !p.ReleaseUDP(selected) {
+						b.Fatal("ReleaseUDP() = false")
+					}
+				}
+				b.StopTimer()
+
+				snapshot := p.Snapshot()
+				if snapshot.UDPSessions != 0 || snapshot.UDPSessionsPerGeneration.Current != 0 || snapshot.AccountingFaults != 0 {
+					b.Fatalf("UDP accounting after benchmark = %+v", snapshot)
+				}
+			})
+		}
 	}
 }

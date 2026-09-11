@@ -315,7 +315,7 @@ flowchart TD
         User2[Users :443]
     end
 
-    subgraph LBLayer["Load Balancers"]
+    subgraph LBLayer["External LB / DNS"]
         direction LR
         LB1[LB :80]
         LB2[LB :443]
@@ -370,27 +370,42 @@ sequenceDiagram
 
     User->>LB: TCP Connection
     LB->>Server: Forward to healthy server
-    Server->>Pool: Select() - Round Robin / Least Connection
-    Pool-->>Server: ClientConn
-    
-    Server->>Client: OpenStream() via existing QUIC conn
-    Server->>Client: NewConnMsg{ConnID, Protocol, SourceAddr}
-    
-    Client->>SVC: Dial internal service
-    SVC-->>Client: Connected
-    Client->>Server: NewConnAckMsg{ConnID}
-    
-    Note over User,SVC: Bidirectional Tunnel Established
-    
-    par Data Flow
-        User->>LB: Request Data
-        LB->>Server: Forward
-        Server->>Client: Stream Data
-        Client->>SVC: Forward
-    and
-        SVC->>Client: Response
-        Client->>Server: Stream Data
-        Server->>LB: Forward
-        LB->>User: Response
+    Server->>Pool: BeginTCPAdmission()
+    Pool-->>Server: TCPAdmission
+
+    loop Retryable candidate attempts within setup budget
+        Server->>Pool: Next() - Round Robin / Least Connection
+        Pool-->>Server: TCPLease + ClientConn
+        Server->>Client: OpenStream() via existing QUIC conn
+        Server->>Client: NewConnMsg{ConnID, Protocol, SourceAddr}
+
+        Client->>SVC: Dial internal service
+        alt Setup succeeds
+            SVC-->>Client: Connected
+            Client->>Server: NewConnAckMsg{ConnID}
+            Server->>Pool: TCPLease.Commit()
+
+            Note over User,SVC: Bidirectional Tunnel Established
+
+            par Data Flow
+                User->>LB: Request Data
+                LB->>Server: Forward
+                Server->>Client: Stream Data
+                Client->>SVC: Forward
+            and
+                SVC->>Client: Response
+                Client->>Server: Stream Data
+                Server->>LB: Forward
+                LB->>User: Response
+            end
+            Server->>Pool: TCPLease.Release()
+        else Candidate setup fails
+            Server->>Pool: TCPLease.Release()
+            alt Retryable, budget remains, and another candidate is available
+                Note over Server,Pool: Continue with Next()
+            else Deadline, shutdown, or candidates exhausted
+                Server-->>LB: Close current public TCP request
+            end
+        end
     end
 ```

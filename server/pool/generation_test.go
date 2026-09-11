@@ -262,14 +262,7 @@ func TestGenerationFailedDuplicateAddDoesNotConsumePointer(t *testing.T) {
 	}
 }
 
-func TestGenerationInterleavingsAcrossBalancers(t *testing.T) {
-	balancers := []struct {
-		name string
-		new  func() LoadBalancer
-	}{
-		{name: "round-robin", new: func() LoadBalancer { return NewRoundRobinBalancer() }},
-		{name: "least-connections", new: func() LoadBalancer { return NewLeastConnectionsBalancer() }},
-	}
+func TestGenerationInterleavings(t *testing.T) {
 	tests := []struct {
 		name      string
 		beforeAdd func(t *testing.T, pool *ConnectionPool, stale *ClientConn)
@@ -306,132 +299,114 @@ func TestGenerationInterleavingsAcrossBalancers(t *testing.T) {
 		},
 	}
 
-	for _, balancer := range balancers {
-		for _, test := range tests {
-			t.Run(balancer.name+"/"+test.name, func(t *testing.T) {
-				pool := New("test", balancer.new(), newTestLogger())
-				defer pool.Stop()
-
-				stale := &ClientConn{ID: "client"}
-				if err := pool.Add(stale); err != nil {
-					t.Fatalf("Add(stale) error = %v", err)
-				}
-				if test.beforeAdd != nil {
-					test.beforeAdd(t, pool, stale)
-				}
-				if !pool.Remove(stale) {
-					t.Fatal("Remove(stale) = false while current")
-				}
-
-				current := &ClientConn{ID: stale.ID}
-				if err := pool.Add(current); err != nil {
-					t.Fatalf("Add(current) error = %v", err)
-				}
-				if test.afterAdd != nil {
-					test.afterAdd(t, pool, stale)
-				}
-
-				selected, err := pool.Select()
-				if err != nil {
-					t.Fatalf("Select() error = %v", err)
-				}
-				if selected != current {
-					t.Fatalf("Select() = %p, want current generation %p", selected, current)
-				}
-				if !current.healthy.Load() {
-					t.Fatal("stale interleaving changed current health")
-				}
-			})
-		}
-	}
-}
-
-func TestGenerationConcurrentStaleCompletionsAreBounded(t *testing.T) {
-	balancers := []struct {
-		name string
-		new  func() LoadBalancer
-	}{
-		{name: "round-robin", new: func() LoadBalancer { return NewRoundRobinBalancer() }},
-		{name: "least-connections", new: func() LoadBalancer { return NewLeastConnectionsBalancer() }},
-	}
-
-	for _, balancer := range balancers {
-		t.Run(balancer.name, func(t *testing.T) {
-			pool := New("test", balancer.new(), newTestLogger())
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			pool := New("test", NewRoundRobinBalancer(), newTestLogger())
 			defer pool.Stop()
 
 			stale := &ClientConn{ID: "client"}
 			if err := pool.Add(stale); err != nil {
 				t.Fatalf("Add(stale) error = %v", err)
 			}
+			if test.beforeAdd != nil {
+				test.beforeAdd(t, pool, stale)
+			}
 			if !pool.Remove(stale) {
 				t.Fatal("Remove(stale) = false while current")
 			}
+
 			current := &ClientConn{ID: stale.ID}
 			if err := pool.Add(current); err != nil {
 				t.Fatalf("Add(current) error = %v", err)
 			}
-			cached := warmGenerationCache(t, pool, current)
-
-			const workers = 128
-			start := make(chan struct{})
-			var wg sync.WaitGroup
-			var unexpectedSuccesses atomic.Int64
-			for i := range workers {
-				wg.Go(func() {
-					<-start
-					var succeeded bool
-					switch i % 3 {
-					case 0:
-						succeeded = pool.Remove(stale)
-					case 1:
-						succeeded = pool.MarkUnhealthy(stale)
-					case 2:
-						succeeded = pool.MarkHealthy(stale)
-					}
-					if succeeded {
-						unexpectedSuccesses.Add(1)
-					}
-				})
-			}
-			close(start)
-			done := make(chan struct{})
-			go func() {
-				wg.Wait()
-				close(done)
-			}()
-			select {
-			case <-done:
-			case <-time.After(2 * time.Second):
-				t.Fatal("stale completions did not finish within 2s")
+			if test.afterAdd != nil {
+				test.afterAdd(t, pool, stale)
 			}
 
-			if got := unexpectedSuccesses.Load(); got != 0 {
-				t.Fatalf("successful stale completions = %d, want 0", got)
-			}
-			if got, ok := pool.Get(current.ID); !ok || got != current {
-				t.Fatalf("Get() = (%p, %v), want (%p, true)", got, ok, current)
+			selected, ok := pool.Get(current.ID)
+			if !ok || selected != current {
+				t.Fatalf("Get() = (%p, %v), want current generation (%p, true)", selected, ok, current)
 			}
 			if !current.healthy.Load() {
-				t.Fatal("concurrent stale completions changed current health")
+				t.Fatal("stale interleaving changed current health")
 			}
-			assertGenerationCacheUnchanged(t, pool, cached)
 		})
 	}
 }
 
+func TestGenerationConcurrentStaleCompletionsAreBounded(t *testing.T) {
+	pool := New("test", NewRoundRobinBalancer(), newTestLogger())
+	defer pool.Stop()
+
+	stale := &ClientConn{ID: "client"}
+	if err := pool.Add(stale); err != nil {
+		t.Fatalf("Add(stale) error = %v", err)
+	}
+	if !pool.Remove(stale) {
+		t.Fatal("Remove(stale) = false while current")
+	}
+	current := &ClientConn{ID: stale.ID}
+	if err := pool.Add(current); err != nil {
+		t.Fatalf("Add(current) error = %v", err)
+	}
+	cached := warmGenerationCache(t, pool, current)
+
+	const workers = 128
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var unexpectedSuccesses atomic.Int64
+	for i := range workers {
+		wg.Go(func() {
+			<-start
+			var succeeded bool
+			switch i % 3 {
+			case 0:
+				succeeded = pool.Remove(stale)
+			case 1:
+				succeeded = pool.MarkUnhealthy(stale)
+			case 2:
+				succeeded = pool.MarkHealthy(stale)
+			}
+			if succeeded {
+				unexpectedSuccesses.Add(1)
+			}
+		})
+	}
+	close(start)
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stale completions did not finish within 2s")
+	}
+
+	if got := unexpectedSuccesses.Load(); got != 0 {
+		t.Fatalf("successful stale completions = %d, want 0", got)
+	}
+	if got, ok := pool.Get(current.ID); !ok || got != current {
+		t.Fatalf("Get() = (%p, %v), want (%p, true)", got, ok, current)
+	}
+	if !current.healthy.Load() {
+		t.Fatal("concurrent stale completions changed current health")
+	}
+	assertGenerationCacheUnchanged(t, pool, cached)
+}
+
 func warmGenerationCache(t *testing.T, pool *ConnectionPool, expected *ClientConn) *[]*ClientConn {
 	t.Helper()
-	selected, err := pool.Select()
-	if err != nil && expected.healthy.Load() {
-		t.Fatalf("Select() while warming cache error = %v", err)
-	}
-	if expected.healthy.Load() && selected != expected {
-		t.Fatalf("Select() while warming cache = %p, want %p", selected, expected)
+	pool.mu.Lock()
+	clients := pool.clientSliceLocked()
+	pool.mu.Unlock()
+	if len(clients) != 1 || clients[0] != expected {
+		t.Fatalf("clientSliceLocked() = %v, want only %p", clients, expected)
 	}
 	cached := pool.cachedClients.Load()
 	if cached == nil {
-		t.Fatal("Select() did not warm the cache")
+		t.Fatal("clientSliceLocked() did not warm the cache")
 	}
 	if len(*cached) != 1 || (*cached)[0] != expected {
 		t.Fatalf("cached clients = %v, want only %p", *cached, expected)

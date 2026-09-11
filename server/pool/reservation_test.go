@@ -1,7 +1,6 @@
 package pool
 
 import (
-	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -21,9 +20,6 @@ func TestReservationIsNotPublishedUntilCommit(t *testing.T) {
 	}
 	if _, ok := pool.Get(client.ID); ok {
 		t.Fatal("Get() published a pending reservation")
-	}
-	if _, err := pool.Select(); !errors.Is(err, ErrNoClientsAvailable) {
-		t.Fatalf("Select() while pending error = %v, want %v", err, ErrNoClientsAvailable)
 	}
 	if client.added.Load() {
 		t.Fatal("Reserve() consumed the generation token")

@@ -57,34 +57,6 @@ func TestConnectionPool_AddRemove(t *testing.T) {
 	}
 }
 
-// TestConnectionPool_Select tests client selection
-func TestConnectionPool_Select(t *testing.T) {
-	pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
-	defer pool.Stop()
-
-	// Try to select when no clients exist
-	_, err := pool.Select()
-	if !errors.Is(err, ErrNoClientsAvailable) {
-		t.Errorf("expected ErrNoClientsAvailable, got %v", err)
-	}
-
-	// Add healthy client
-	client1 := &ClientConn{
-		ID: "client1",
-	}
-	client1.healthy.Store(true)
-	_ = pool.Add(client1)
-
-	// Should select the only healthy client
-	selected, err := pool.Select()
-	if err != nil {
-		t.Fatalf("failed to select client: %v", err)
-	}
-	if selected.ID != "client1" {
-		t.Errorf("expected client1, got %s", selected.ID)
-	}
-}
-
 func TestConnectionPoolHealthTransitions(t *testing.T) {
 	for name, newBalancer := range map[string]func() LoadBalancer{
 		"round robin":       func() LoadBalancer { return NewRoundRobinBalancer() },
@@ -94,7 +66,11 @@ func TestConnectionPoolHealthTransitions(t *testing.T) {
 			pool := New("test", newBalancer(), newTestLogger())
 			defer pool.Stop()
 
-			clients := []*ClientConn{{ID: "client1"}, {ID: "client2"}, {ID: "client3"}}
+			clients := []*ClientConn{
+				{ID: "client1", Metadata: ClientMetadata{Capabilities: []string{"tcp"}}},
+				{ID: "client2", Metadata: ClientMetadata{Capabilities: []string{"tcp"}}},
+				{ID: "client3", Metadata: ClientMetadata{Capabilities: []string{"tcp"}}},
+			}
 			for _, client := range clients {
 				if err := pool.Add(client); err != nil {
 					t.Fatal(err)
@@ -103,22 +79,36 @@ func TestConnectionPoolHealthTransitions(t *testing.T) {
 
 			pool.MarkUnhealthy(clients[0])
 			for range 6 {
-				selected, err := pool.Select()
-				if err != nil || selected == clients[0] {
-					t.Fatalf("selection with one unhealthy client = %v, %v", selected, err)
+				admission, err := pool.BeginTCPAdmission()
+				if err != nil {
+					t.Fatalf("BeginTCPAdmission() with one unhealthy client error = %v", err)
+				}
+				lease, err := admission.Next()
+				if err != nil || lease == nil || lease.Client() == clients[0] {
+					t.Fatalf("Next() with one unhealthy client = (%v, %v)", lease, err)
+				}
+				if !lease.Release() {
+					t.Fatal("Release() with one unhealthy client = false")
 				}
 			}
 
 			pool.MarkUnhealthy(clients[1])
 			pool.MarkUnhealthy(clients[2])
-			if _, err := pool.Select(); !errors.Is(err, ErrNoHealthyClients) {
+			if _, err := pool.BeginTCPAdmission(); !errors.Is(err, ErrNoEligibleClients) {
 				t.Fatalf("all-unhealthy error = %v", err)
 			}
 
 			pool.MarkHealthy(clients[2])
-			selected, err := pool.Select()
-			if err != nil || selected != clients[2] {
-				t.Fatalf("selection after recovery = %v, %v", selected, err)
+			admission, err := pool.BeginTCPAdmission()
+			if err != nil {
+				t.Fatalf("BeginTCPAdmission() after recovery error = %v", err)
+			}
+			lease, err := admission.Next()
+			if err != nil || lease == nil || lease.Client() != clients[2] {
+				t.Fatalf("Next() after recovery = (%v, %v)", lease, err)
+			}
+			if !lease.Release() {
+				t.Fatal("Release() after recovery = false")
 			}
 		})
 	}
@@ -136,7 +126,8 @@ func TestConnectionPool_ConcurrentOperations(t *testing.T) {
 		id := i
 		wg.Go(func() {
 			client := &ClientConn{
-				ID: fmt.Sprintf("%c", 'A'+id),
+				ID:       fmt.Sprintf("%c", 'A'+id),
+				Metadata: ClientMetadata{Capabilities: []string{"tcp"}},
 			}
 			client.healthy.Store(true)
 			_ = pool.Add(client)
@@ -149,8 +140,22 @@ func TestConnectionPool_ConcurrentOperations(t *testing.T) {
 	for range 16 {
 		wg.Go(func() {
 			for range 100 {
-				if _, err := pool.Select(); err != nil {
+				admission, err := pool.BeginTCPAdmission()
+				if err != nil {
 					errCh <- err
+					return
+				}
+				lease, err := admission.Next()
+				if err != nil {
+					errCh <- err
+					return
+				}
+				if lease == nil {
+					errCh <- errors.New("TCP admission returned nil lease")
+					return
+				}
+				if !lease.Release() {
+					errCh <- errors.New("TCP lease release failed")
 					return
 				}
 			}
@@ -162,26 +167,6 @@ func TestConnectionPool_ConcurrentOperations(t *testing.T) {
 
 	for err := range errCh {
 		t.Errorf("concurrent operation error: %v", err)
-	}
-}
-
-// BenchmarkConnectionPool_Select benchmarks client selection
-func BenchmarkConnectionPool_Select(b *testing.B) {
-	pool := New("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger())
-	defer pool.Stop()
-
-	// Add 10 clients
-	for i := range 10 {
-		client := &ClientConn{
-			ID: fmt.Sprintf("%c", 'A'+i),
-		}
-		client.healthy.Store(true)
-		_ = pool.Add(client)
-	}
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _ = pool.Select()
 	}
 }
 
@@ -235,45 +220,6 @@ func BenchmarkConnectionPool_Remove(b *testing.B) {
 	}
 }
 
-// BenchmarkConnectionPool_Select_Sizes compares pool and raw-balancer selection
-// on the same clients at each pool size.
-func BenchmarkConnectionPool_Select_Sizes(b *testing.B) {
-	sizes := []int{10, 100, 1000}
-
-	for _, size := range sizes {
-		b.Run(fmt.Sprintf("clients_%d", size), func(b *testing.B) {
-			pool := NewWithLimits("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger(), largeTestLimits())
-			defer pool.Stop()
-
-			// Populate pool with clients
-			for i := range size {
-				clientID := fmt.Sprintf("client-%d", i)
-				client := &ClientConn{
-					ID: clientID,
-				}
-				client.healthy.Store(true)
-				_ = pool.Add(client)
-			}
-
-			clients := pool.List()
-			balancer := NewRoundRobinBalancer()
-
-			b.Run("Pool", func(b *testing.B) {
-				b.ReportAllocs()
-				for b.Loop() {
-					_, _ = pool.Select()
-				}
-			})
-			b.Run("Balancer", func(b *testing.B) {
-				b.ReportAllocs()
-				for b.Loop() {
-					_, _ = balancer.Select(clients)
-				}
-			})
-		})
-	}
-}
-
 func populateBenchmarkPool(pool *ConnectionPool, count int) []string {
 	clientIDs := make([]string, count)
 	for i := range count {
@@ -304,22 +250,6 @@ func BenchmarkConnectionPool_Get(b *testing.B) {
 	}
 }
 
-func BenchmarkConnectionPool_SelectParallel(b *testing.B) {
-	pool := NewWithLimits("127.0.0.1:8080", NewRoundRobinBalancer(), newTestLogger(), largeTestLimits())
-	defer pool.Stop()
-
-	populateBenchmarkPool(pool, 100)
-
-	b.ReportAllocs()
-	b.ResetTimer()
-
-	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
-			_, _ = pool.Select()
-		}
-	})
-}
-
 func BenchmarkConnectionPool_HealthUpdates(b *testing.B) {
 	for _, size := range []int{10, 100, 1000} {
 		b.Run(fmt.Sprintf("clients_%d", size), func(b *testing.B) {
@@ -342,8 +272,8 @@ func BenchmarkConnectionPool_HealthUpdates(b *testing.B) {
 }
 
 // Feature: performance-optimizations, Property 3: Balancer Cache Invalidation
-// *For any* sequence of Add/Remove operations followed by Select, the balancer SHALL
-// return only clients that exist in the current pool and are healthy.
+// *For any* sequence of Add/Remove operations followed by TCP admission, the pool
+// SHALL return only clients that exist in the current pool and are healthy.
 // Validates: Requirements 2.3
 func TestCacheInvalidationCorrectness_Property(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
@@ -358,14 +288,17 @@ func TestCacheInvalidationCorrectness_Property(t *testing.T) {
 		for i := range initialCount {
 			clientIDs[i] = fmt.Sprintf("client-%d", i)
 			client := &ClientConn{
-				ID: clientIDs[i],
+				ID:       clientIDs[i],
+				Metadata: ClientMetadata{Capabilities: []string{"tcp"}},
 			}
 			client.healthy.Store(true)
 			_ = pool.Add(client)
 		}
 
-		// Perform a Select to populate the cache
-		_, _ = pool.Select()
+		// BeginTCPAdmission populates the stable membership cache.
+		if _, err := pool.BeginTCPAdmission(); err != nil {
+			t.Fatalf("BeginTCPAdmission() while warming cache error = %v", err)
+		}
 
 		// Generate number of operations (1-10)
 		opCount := rapid.IntRange(1, 10).Draw(t, "opCount")
@@ -388,7 +321,8 @@ func TestCacheInvalidationCorrectness_Property(t *testing.T) {
 				newID := fmt.Sprintf("client-%d", nextClientID)
 				nextClientID++
 				client := &ClientConn{
-					ID: newID,
+					ID:       newID,
+					Metadata: ClientMetadata{Capabilities: []string{"tcp"}},
 				}
 				client.healthy.Store(true)
 				_ = pool.Add(client)
@@ -408,23 +342,32 @@ func TestCacheInvalidationCorrectness_Property(t *testing.T) {
 			}
 		}
 
-		// Property: Select should only return clients that exist in currentClients
+		// Property: TCP admission should only return current, healthy clients.
 		if len(currentClients) > 0 {
 			for range 10 {
-				selected, err := pool.Select()
+				admission, err := pool.BeginTCPAdmission()
 				if err != nil {
-					t.Errorf("Select failed unexpectedly: %v", err)
+					t.Errorf("BeginTCPAdmission() failed unexpectedly: %v", err)
 					continue
 				}
+				lease, err := admission.Next()
+				if err != nil || lease == nil {
+					t.Errorf("Next() = (%v, %v), want lease", lease, err)
+					continue
+				}
+				selected := lease.Client()
 
 				// Verify selected client exists in current pool
 				if !currentClients[selected.ID] {
-					t.Errorf("Select returned client %s which is not in current pool", selected.ID)
+					t.Errorf("Next() returned client %s which is not in current pool", selected.ID)
 				}
 
 				// Verify selected client is healthy
 				if !selected.healthy.Load() {
-					t.Errorf("Select returned unhealthy client %s", selected.ID)
+					t.Errorf("Next() returned unhealthy client %s", selected.ID)
+				}
+				if !lease.Release() {
+					t.Errorf("Release() for client %s = false", selected.ID)
 				}
 			}
 		}

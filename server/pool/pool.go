@@ -34,8 +34,7 @@ type ConnectionPool struct {
 	balancer             LoadBalancer // Load balancing strategy
 	logger               zerolog.Logger
 
-	// Cached client slice to avoid allocation on Select
-	// Using atomic.Pointer for lock-free reads on the hot path
+	// Stable membership snapshot reused by TCP admission while holding p.mu.
 	cachedClients atomic.Pointer[[]*ClientConn]
 
 	ctx    context.Context
@@ -486,53 +485,6 @@ func (p *ConnectionPool) Remove(expected *ClientConn) bool {
 	return retirement.Done()
 }
 
-// Select chooses a client without capability filtering. Traffic routing should
-// use SelectProtocol.
-func (p *ConnectionPool) Select() (*ClientConn, error) {
-	// Fast path: use cached slice if available (lock-free read)
-	clientsPtr := p.cachedClients.Load()
-	if clientsPtr != nil {
-		clients := *clientsPtr
-		if len(clients) == 0 {
-			return nil, ErrNoClientsAvailable
-		}
-		return p.balancer.Select(clients)
-	}
-
-	// Slow path: rebuild cache (rare)
-	clients := p.rebuildClientSlice()
-	if len(clients) == 0 {
-		return nil, ErrNoClientsAvailable
-	}
-
-	return p.balancer.Select(clients)
-}
-
-// SelectProtocol chooses a healthy client that supports protocol.
-func (p *ConnectionPool) SelectProtocol(protocol string) (*ClientConn, error) {
-	clientsPtr := p.cachedClients.Load()
-	var clients []*ClientConn
-	if clientsPtr != nil {
-		clients = *clientsPtr
-	} else {
-		clients = p.rebuildClientSlice()
-	}
-	if len(clients) == 0 {
-		return nil, ErrNoClientsAvailable
-	}
-
-	eligible := make([]*ClientConn, 0, len(clients))
-	for _, conn := range clients {
-		if isEligible(conn, protocol) {
-			eligible = append(eligible, conn)
-		}
-	}
-	if len(eligible) == 0 {
-		return nil, ErrNoEligibleClients
-	}
-	return p.balancer.Select(eligible)
-}
-
 // ReserveUDP selects and reserves one exact current UDP generation.
 func (p *ConnectionPool) ReserveUDP() (*ClientConn, error) {
 	p.mu.Lock()
@@ -828,17 +780,9 @@ func (p *ConnectionPool) clientGenerationCountLocked() int64 {
 	return int64(len(p.reservations) + len(p.clients) + len(p.retiring))
 }
 
-// rebuildClientSlice rebuilds the cached client slice from the map
-func (p *ConnectionPool) rebuildClientSlice() []*ClientConn {
-	// Use write lock to prevent multiple goroutines from rebuilding simultaneously
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	return p.clientSliceLocked()
-}
-
+// clientSliceLocked returns a stable membership snapshot for TCP admission.
+// The caller must hold p.mu.
 func (p *ConnectionPool) clientSliceLocked() []*ClientConn {
-	// Double-check if another goroutine already rebuilt while we waited for the lock.
 	clientsPtr := p.cachedClients.Load()
 	if clientsPtr != nil {
 		return *clientsPtr
@@ -849,7 +793,6 @@ func (p *ConnectionPool) clientSliceLocked() []*ClientConn {
 		clients = append(clients, conn)
 	}
 
-	// Store the new slice atomically
 	p.cachedClients.Store(&clients)
 
 	return clients

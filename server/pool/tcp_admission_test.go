@@ -2,6 +2,7 @@ package pool
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -108,7 +109,7 @@ func newTCPAdmissionPool(t *testing.T) *ConnectionPool {
 	return p
 }
 
-func addTCPAdmissionClient(t *testing.T, p *ConnectionPool, id string, capabilities ...string) *ClientConn {
+func addTCPAdmissionClient(t testing.TB, p *ConnectionPool, id string, capabilities ...string) *ClientConn {
 	t.Helper()
 	client := &ClientConn{ID: id, Metadata: ClientMetadata{Capabilities: capabilities}}
 	if err := p.Add(client); err != nil {
@@ -367,5 +368,67 @@ func TestLeastConnectionsIncludesPending(t *testing.T) {
 	}
 	if selected != idle {
 		t.Fatalf("Select() = %s, want idle client", selected.ID)
+	}
+}
+
+func BenchmarkTCPAdmissionLifecycle(b *testing.B) {
+	balancers := []struct {
+		name string
+		new  func() LoadBalancer
+	}{
+		{name: "round_robin", new: func() LoadBalancer { return NewRoundRobinBalancer() }},
+		{name: "least_connections", new: func() LoadBalancer { return NewLeastConnectionsBalancer() }},
+	}
+	scenarios := []struct {
+		name      string
+		clients   int
+		unhealthy int
+	}{
+		{name: "1_healthy", clients: 1},
+		{name: "16_healthy", clients: 16},
+		{name: "16_mixed_8_healthy", clients: 16, unhealthy: 8},
+	}
+
+	for _, balancer := range balancers {
+		for _, scenario := range scenarios {
+			b.Run(balancer.name+"/"+scenario.name, func(b *testing.B) {
+				p := New("benchmark", balancer.new(), newTestLogger())
+				defer p.Stop()
+				for i := range scenario.clients {
+					client := addTCPAdmissionClient(b, p, fmt.Sprintf("client-%d", i), "tcp")
+					if i < scenario.unhealthy && !p.MarkUnhealthy(client) {
+						b.Fatalf("MarkUnhealthy(client-%d) = false", i)
+					}
+				}
+
+				b.ReportAllocs()
+				b.ResetTimer()
+				for range b.N {
+					admission, err := p.BeginTCPAdmission()
+					if err != nil {
+						b.Fatalf("BeginTCPAdmission() error = %v", err)
+					}
+					lease, err := admission.Next()
+					if err != nil || lease == nil {
+						b.Fatalf("Next() = (%v, %v), want lease", lease, err)
+					}
+					if !lease.Commit() {
+						b.Fatal("Commit() = false")
+					}
+					if !lease.Release() {
+						b.Fatal("Release() = false")
+					}
+				}
+				b.StopTimer()
+
+				snapshot := p.Snapshot()
+				if snapshot.TCPPending != 0 || snapshot.TCPActive != 0 ||
+					snapshot.TCPConnectionsPerGeneration.Current != 0 ||
+					snapshot.PendingTCPSetupsPerGeneration.Current != 0 ||
+					snapshot.AccountingFaults != 0 {
+					b.Fatalf("TCP accounting after benchmark = %+v", snapshot)
+				}
+			})
+		}
 	}
 }

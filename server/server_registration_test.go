@@ -180,9 +180,6 @@ func TestRegistrationReservationIsNotSelectableBeforeAck(t *testing.T) {
 				if got := connectionPool.Count(); got != 0 {
 					t.Errorf("pool Count() before success Ack = %d, want 0", got)
 				}
-				if _, err := connectionPool.Select(); !errors.Is(err, pool.ErrNoClientsAvailable) {
-					t.Errorf("pool Select() before success Ack error = %v, want %v", err, pool.ErrNoClientsAvailable)
-				}
 				close(ackStarted)
 				<-releaseAck
 			}
