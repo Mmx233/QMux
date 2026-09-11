@@ -888,7 +888,7 @@ func (s *Server) handleControlStream(
 	go func(ctx context.Context, stream *quic.Stream, readCh chan readResult, conn *quic.Conn) {
 		defer close(readerDone)
 		for {
-			msgType, payload, err := protocol.ReadMessage(stream)
+			msgType, payload, err := protocol.ReadMessageLimited(stream, protocol.MaxControlPayloadSize)
 			select {
 			case readCh <- readResult{msgType: msgType, payload: payload, err: err}:
 			case <-ctx.Done():

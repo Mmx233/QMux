@@ -383,7 +383,7 @@ func (sc *ServerConnection) heartbeatLoop(sendInterval time.Duration, controlStr
 	go func() {
 		defer close(readerDone)
 		for {
-			msgType, payload, err := protocol.ReadMessage(controlStream)
+			msgType, payload, err := protocol.ReadMessageLimited(controlStream, protocol.MaxControlPayloadSize)
 			result := controlReadResult{msgType: msgType, payload: payload, err: err}
 			if err == nil && msgType == protocol.MsgTypeDrainComplete {
 				result.drain, result.err = protocol.DecodeDrainComplete(payload)

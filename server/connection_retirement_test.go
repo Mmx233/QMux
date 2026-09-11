@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/x509"
+	"encoding/binary"
 	"net"
 	"testing"
 	"time"
@@ -15,6 +16,61 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/rs/zerolog"
 )
+
+func newServerControlQUICPair(t *testing.T, ctx context.Context) (*quic.Conn, *quic.Conn) {
+	t.Helper()
+	clientCertificate, clientRoots := registrationTestClientCertificate(
+		t,
+		"oversized-control-client",
+		false,
+		[]x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	)
+	serverTLS, clientTLS := registrationMTLSTLSConfigs(t, clientRoots, clientCertificate)
+	listener, err := quic.ListenAddr("127.0.0.1:0", serverTLS, &quic.Config{
+		HandshakeIdleTimeout: 5 * time.Second,
+		MaxIdleTimeout:       10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("listen raw control QUIC: %v", err)
+	}
+	type acceptResult struct {
+		conn *quic.Conn
+		err  error
+	}
+	accepted := make(chan acceptResult, 1)
+	go func() {
+		conn, acceptErr := listener.Accept(ctx)
+		accepted <- acceptResult{conn: conn, err: acceptErr}
+	}()
+	peer, err := quic.DialAddr(ctx, listener.Addr().String(), clientTLS, &quic.Config{
+		HandshakeIdleTimeout: 5 * time.Second,
+		MaxIdleTimeout:       10 * time.Second,
+	})
+	if err != nil {
+		_ = listener.Close()
+		t.Fatalf("dial raw control QUIC: %v", err)
+	}
+	var serverConn *quic.Conn
+	select {
+	case result := <-accepted:
+		if result.err != nil {
+			_ = peer.CloseWithError(0, "accept failed")
+			_ = listener.Close()
+			t.Fatalf("accept raw control QUIC: %v", result.err)
+		}
+		serverConn = result.conn
+	case <-ctx.Done():
+		_ = peer.CloseWithError(0, "accept timeout")
+		_ = listener.Close()
+		t.Fatal("accept raw control QUIC timed out")
+	}
+	t.Cleanup(func() {
+		_ = peer.CloseWithError(0, "test complete")
+		_ = serverConn.CloseWithError(0, "test complete")
+		_ = listener.Close()
+	})
+	return serverConn, peer
+}
 
 func TestTrafficConnectionFatalRetiresRegistrationForSameID(t *testing.T) {
 	clientCertificate, clientRoots := registrationTestClientCertificate(
@@ -212,6 +268,96 @@ func TestStaleControlHeartbeatRetiresOnlyItsGeneration(t *testing.T) {
 	got, ok := harness.pool.Get(clientID)
 	if !ok || got != fresh {
 		t.Fatalf("pool generation after stale cleanup = (%p, %v), want fresh %p", got, ok, fresh)
+	}
+}
+
+func TestOversizedControlPayloadRetiresOnlyItsGeneration(t *testing.T) {
+	testCtx, cancelTest := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelTest()
+	serverQUIC, peerQUIC := newServerControlQUICPair(t, testCtx)
+	peerStream, err := peerQUIC.OpenStreamSync(testCtx)
+	if err != nil {
+		t.Fatalf("open oversized control stream: %v", err)
+	}
+	var header [5]byte
+	header[0] = protocol.MsgTypeHeartbeat
+	binary.BigEndian.PutUint32(header[1:], protocol.MaxControlPayloadSize+1)
+	if n, err := peerStream.Write(header[:]); err != nil || n != len(header) {
+		t.Fatalf("write oversized control header = (%d, %v)", n, err)
+	}
+	controlStream, err := serverQUIC.AcceptStream(testCtx)
+	if err != nil {
+		t.Fatalf("accept oversized control stream: %v", err)
+	}
+
+	connectionPool := pool.New(registrationTestAddress, pool.NewRoundRobinBalancer(), zerolog.Nop())
+	t.Cleanup(connectionPool.Stop)
+	const clientID = "oversized-control-generation"
+	old := &pool.ClientConn{
+		ID:            clientID,
+		Conn:          serverQUIC,
+		ControlStream: controlStream,
+		RegisteredAt:  time.Now(),
+		Metadata:      pool.ClientMetadata{Capabilities: []string{"tcp"}},
+	}
+	if err := connectionPool.Add(old); err != nil {
+		t.Fatalf("add old control generation: %v", err)
+	}
+	s := &Server{
+		config: &config.Server{
+			HeartbeatInterval: time.Hour,
+			HealthTimeout:     2 * time.Hour,
+		},
+		logger: zerolog.Nop(),
+	}
+	type controlResult struct {
+		closeReason string
+		retirement  *pool.Retirement
+	}
+	controlDone := make(chan controlResult, 1)
+	go func() {
+		closeReason, retirement := s.handleControlStream(testCtx, connectionPool, old, registrationTestAddress)
+		controlDone <- controlResult{closeReason: closeReason, retirement: retirement}
+	}()
+
+	var result controlResult
+	select {
+	case result = <-controlDone:
+	case <-time.After(time.Second):
+		t.Fatal("oversized control handler waited for payload body or EOF")
+	}
+	if testErr, connErr := testCtx.Err(), old.Conn.Context().Err(); testErr != nil || connErr != nil {
+		t.Fatalf("oversized control handler returned after unrelated shutdown: test context = %v, old connection = %v", testErr, connErr)
+	}
+	if result.retirement == nil {
+		t.Fatalf("oversized control retirement is nil (close reason %q)", result.closeReason)
+	}
+	if current, ok := connectionPool.Get(clientID); ok || current != nil {
+		t.Fatalf("old generation remained current after oversized control payload: (%p, %t)", current, ok)
+	}
+
+	replacement := &pool.ClientConn{
+		ID:       clientID,
+		Metadata: pool.ClientMetadata{Capabilities: []string{"tcp"}},
+	}
+	if err := connectionPool.Add(replacement); err != nil {
+		t.Fatalf("add same-ID replacement before old cleanup: %v", err)
+	}
+	if err := old.Conn.CloseWithError(0, "old oversized control generation"); err != nil {
+		t.Fatalf("close old control generation: %v", err)
+	}
+	select {
+	case <-old.Conn.Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("old control generation context did not close")
+	}
+	if !result.retirement.Done() {
+		t.Fatal("complete old control generation retirement failed")
+	}
+	current, ok := connectionPool.Get(clientID)
+	if !ok || current != replacement || !connectionPool.IsCurrentEligible(replacement, "tcp") {
+		t.Fatalf("replacement after old cleanup = (%p, %t, eligible=%t), want current eligible %p",
+			current, ok, connectionPool.IsCurrentEligible(replacement, "tcp"), replacement)
 	}
 }
 

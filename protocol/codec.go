@@ -18,6 +18,10 @@ const (
 	MaxRegistrationPayloadSize = 4 * 1024
 	// MaxNewConnAckPayloadSize bounds the per-TCP-flow setup acknowledgment.
 	MaxNewConnAckPayloadSize = 4 * 1024
+	// MaxNewConnPayloadSize bounds the per-TCP-flow setup request.
+	MaxNewConnPayloadSize = 4 * 1024
+	// MaxControlPayloadSize bounds runtime control messages.
+	MaxControlPayloadSize = 4 * 1024
 )
 
 // Wire format: [1 byte type][4 bytes length][payload]

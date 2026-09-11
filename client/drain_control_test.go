@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"strings"
 	"testing"
@@ -190,6 +191,28 @@ func TestControlReaderBlockedInReadIsJoinedOnClose(t *testing.T) {
 	default:
 		t.Fatal("controlDone remained open after the reader was joined")
 	}
+}
+
+func TestHeartbeatLoopRejectsOversizedControlPayload(t *testing.T) {
+	sc, peerStream := newDrainControlPair(t)
+	var header [5]byte
+	header[0] = protocol.MsgTypeHeartbeat
+	binary.BigEndian.PutUint32(header[1:], protocol.MaxControlPayloadSize+1)
+	if n, err := peerStream.Write(header[:]); err != nil || n != len(header) {
+		t.Fatalf("write oversized control header = (%d, %v)", n, err)
+	}
+
+	sc.StartHeartbeatLoops(time.Hour)
+	awaitLifecycle(t, sc.controlDone, "oversized control exit")
+	if err := sc.controlResult(); err == nil || !strings.Contains(err.Error(), "payload too large") {
+		t.Fatalf("control result = %v, want payload too large", err)
+	}
+	joined := make(chan struct{})
+	go func() {
+		sc.waitControl()
+		close(joined)
+	}()
+	awaitLifecycle(t, joined, "oversized control reader join")
 }
 
 func TestDrainWriteDeadlineUsesFreshBound(t *testing.T) {

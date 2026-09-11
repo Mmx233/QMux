@@ -46,26 +46,46 @@ func TestValidateRegisterAckWithAuthRequiresExactEcho(t *testing.T) {
 	}
 }
 
-func TestRegistrationPayloadLimit(t *testing.T) {
-	tooLargeHeader := make([]byte, 5)
-	tooLargeHeader[0] = MsgTypeRegister
-	binary.BigEndian.PutUint32(tooLargeHeader[1:], MaxRegistrationPayloadSize+1)
-	if _, _, err := ReadMessageLimited(bytes.NewReader(tooLargeHeader), MaxRegistrationPayloadSize); err == nil || !strings.Contains(err.Error(), "payload too large") {
-		t.Fatalf("oversized registration error = %v", err)
+func TestProtocolPayloadLimits(t *testing.T) {
+	tests := []struct {
+		name    string
+		msgType byte
+		limit   uint32
+	}{
+		{"registration", MsgTypeRegister, MaxRegistrationPayloadSize},
+		{"NewConnAck", MsgTypeNewConnAck, MaxNewConnAckPayloadSize},
+		{"NewConn", MsgTypeNewConn, MaxNewConnPayloadSize},
+		{"control", MsgTypeHeartbeat, MaxControlPayloadSize},
 	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			payload := bytes.Repeat([]byte{'x'}, int(test.limit))
+			msgType, got, err := ReadMessageLimited(bytes.NewReader(frame(test.msgType, payload)), test.limit)
+			if err != nil {
+				t.Fatalf("read maximum payload: %v", err)
+			}
+			if msgType != test.msgType || !bytes.Equal(got, payload) {
+				t.Fatal("maximum payload did not round trip")
+			}
 
-	payload := bytes.Repeat([]byte{'x'}, MaxRegistrationPayloadSize)
-	msgType, got, err := ReadMessageLimited(bytes.NewReader(frame(MsgTypeRegister, payload)), MaxRegistrationPayloadSize)
-	if err != nil {
-		t.Fatalf("read maximum registration payload: %v", err)
-	}
-	if msgType != MsgTypeRegister || !bytes.Equal(got, payload) {
-		t.Fatal("maximum registration payload did not round trip")
+			tooLargeHeader := make([]byte, 5)
+			tooLargeHeader[0] = test.msgType
+			binary.BigEndian.PutUint32(tooLargeHeader[1:], test.limit+1)
+			if _, _, err := ReadMessageLimited(bytes.NewReader(tooLargeHeader), test.limit); err == nil || !strings.Contains(err.Error(), "payload too large") {
+				t.Fatalf("oversized payload error = %v", err)
+			}
+
+			truncated := frame(test.msgType, payload)
+			truncated = truncated[:len(truncated)-1]
+			if _, _, err := ReadMessageLimited(bytes.NewReader(truncated), test.limit); err == nil || !strings.Contains(err.Error(), "read payload") {
+				t.Fatalf("truncated payload error = %v", err)
+			}
+		})
 	}
 
 	genericPayload := bytes.Repeat([]byte{'x'}, MaxRegistrationPayloadSize+1)
 	if _, _, err := ReadMessage(bytes.NewReader(frame(MsgTypeRegister, genericPayload))); err != nil {
-		t.Fatalf("generic reader unexpectedly inherited registration limit: %v", err)
+		t.Fatalf("generic reader unexpectedly inherited semantic limit: %v", err)
 	}
 }
 

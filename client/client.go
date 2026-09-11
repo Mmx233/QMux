@@ -444,7 +444,7 @@ func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *Serv
 
 	// Read NewConn message
 	var msg protocol.NewConnMsg
-	if err := protocol.ReadTypedMessage(stream, protocol.MsgTypeNewConn, &msg); err != nil {
+	if err := protocol.ReadTypedMessageLimited(stream, protocol.MsgTypeNewConn, &msg, protocol.MaxNewConnPayloadSize); err != nil {
 		setupResult = stats.Result(err, "protocol_error")
 		c.logger.Error().Err(err).Str("server", sc.ServerAddr()).Msg("read NewConn message failed")
 		return
