@@ -749,34 +749,30 @@ func (h *UDPHandler) publishReadyAfterGate(state *udpSessionState, session *UDPS
 
 // readLocalResponses reads responses from local UDP service and sends back via datagram
 func (h *UDPHandler) readLocalResponses(session *UDPSession) {
-	for {
-		// Get buffer from pool at start of each iteration
-		bufPtr := protocol.GetReadBuffer()
-		buf := *bufPtr
+	bufPtr := protocol.GetReadBuffer()
+	defer protocol.PutReadBuffer(bufPtr)
+	buf := *bufPtr
 
+	for {
 		_ = session.localConn.SetReadDeadline(time.Now().Add(udpSessionTimeout))
 		n, err := session.localConn.Read(buf)
 		if err != nil {
 			select {
 			case <-h.ctx.Done():
-				protocol.PutReadBuffer(bufPtr)
 				return
 			default:
 				var netErr net.Error
 				if errors.As(err, &netErr) && netErr.Timeout() {
 					// Timeout - check if session is still active
 					if session.isExpired(udpSessionTimeout) {
-						protocol.PutReadBuffer(bufPtr)
 						return
 					}
-					protocol.PutReadBuffer(bufPtr)
 					continue
 				}
 				if !errors.Is(err, net.ErrClosed) && !h.normalTeardown(session.quicConn) {
 					h.sessionBudget.readErrors.Add(1)
 				}
 				h.logger.Debug().Err(err).Uint32("session_id", session.id).Msg("read from local failed")
-				protocol.PutReadBuffer(bufPtr)
 				return
 			}
 		}
@@ -788,17 +784,13 @@ func (h *UDPHandler) readLocalResponses(session *UDPSession) {
 
 		if err != nil {
 			h.logger.Debug().Err(err).Uint32("session_id", session.id).Int("size", n).Msg("fragment UDP failed")
-			protocol.PutReadBuffer(bufPtr)
 			continue
 		}
 
 		if err := h.sendDatagrams(datagrams, session.quicConn.SendDatagram); err != nil {
 			h.logger.Debug().Err(err).Uint32("session_id", session.id).Msg("send datagram failed")
-			protocol.PutReadBuffer(bufPtr)
 			return
 		}
-		// Return read buffer to pool after processing
-		protocol.PutReadBuffer(bufPtr)
 	}
 }
 
