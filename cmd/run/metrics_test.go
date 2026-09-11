@@ -42,7 +42,12 @@ func TestSnapshotMetrics(t *testing.T) {
 			} else {
 				collector = newClientCollector(func() client.Snapshot {
 					reads.Add(1)
-					return client.Snapshot{TLSCertificateNotAfter: identityNotAfter, TLSCANotAfter: caNotAfter, Endpoints: []client.EndpointSnapshot{{Endpoint: "server:8443", QUIC: traffic}}}
+					return client.Snapshot{
+						TLSCertificateNotAfter: identityNotAfter,
+						TLSCANotAfter:          caNotAfter,
+						Endpoints:              []client.EndpointSnapshot{{Endpoint: "server:8443", QUIC: traffic}},
+						UDPSessions:            client.UDPSessionSnapshot{PendingDrops: 17},
+					}
 				})
 				labels = `{endpoint="server:8443"}`
 			}
@@ -85,6 +90,12 @@ func TestSnapshotMetrics(t *testing.T) {
 				for _, part := range []string{"# TYPE qmux_" + role + "_quic_lost_packets gauge\n", "# TYPE qmux_" + role + "_registration_duration_seconds histogram\n", "# TYPE go_goroutines gauge\n"} {
 					if !strings.Contains(response.Body.String(), part) {
 						t.Errorf("missing %q", part)
+					}
+				}
+				if role == "client" {
+					want := "\nqmux_client_udp_drops_total{reason=\"pending_setup\"} 17\n"
+					if !strings.Contains(response.Body.String(), want) {
+						t.Errorf("missing sample %q", want)
 					}
 				}
 				for kind, notAfter := range map[string]time.Time{"identity": identityNotAfter, "ca": caNotAfter} {

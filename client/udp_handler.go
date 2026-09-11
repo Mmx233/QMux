@@ -20,13 +20,16 @@ const (
 	// Session timeout for inactive UDP sessions
 	udpSessionTimeout = 5 * time.Minute
 	// Cleanup interval for expired sessions
-	udpCleanupInterval  = 30 * time.Second
-	udpSocketBufferSize = 4 * 1024 * 1024
+	udpCleanupInterval     = 30 * time.Second
+	udpSessionSetupTimeout = 5 * time.Second
+	udpSocketBufferSize    = 4 * 1024 * 1024
+	udpPendingPacketLimit  = 8
+	udpPendingBackingLimit = 255 * protocol.MaxFragPayload
 )
 
 var (
-	errClientUDPSessionLimit   = errors.New("client UDP session limit reached")
 	errClientUDPEpochExhausted = errors.New("client UDP session epoch exhausted")
+	errClientUDPStateChanged   = errors.New("client UDP session state changed during setup")
 )
 
 func setUDPSocketBuffer(logger zerolog.Logger, name string, setter func(int) error) {
@@ -44,6 +47,7 @@ type udpSessionBudget struct {
 	limitDrops       uint64
 	accountingFaults uint64
 	decodeDrops      atomic.Uint64
+	pendingDrops     atomic.Uint64
 	createErrors     atomic.Uint64
 	readErrors       atomic.Uint64
 	writeErrors      atomic.Uint64
@@ -64,6 +68,7 @@ func (b *udpSessionBudget) snapshot() UDPSessionSnapshot {
 	}
 	b.mu.Unlock()
 	snapshot.DecodeDrops = b.decodeDrops.Load()
+	snapshot.PendingDrops = b.pendingDrops.Load()
 	snapshot.CreateErrors = b.createErrors.Load()
 	snapshot.ReadErrors = b.readErrors.Load()
 	snapshot.WriteErrors = b.writeErrors.Load()
@@ -172,6 +177,40 @@ type UDPSession struct {
 	fragmentSequence atomic.Uint32
 }
 
+type udpSessionPhase uint8
+
+const (
+	udpSessionPhaseCollecting udpSessionPhase = iota + 1
+	udpSessionPhaseDraining
+	udpSessionPhaseReady
+	udpSessionPhaseClosed
+)
+
+type udpPendingPacket struct {
+	payload       []byte
+	retainedBytes int
+}
+
+type udpSessionState struct {
+	id            uint32
+	mu            sync.Mutex
+	phase         udpSessionPhase
+	fifo          []udpPendingPacket
+	retainedBytes int
+	candidate     *net.UDPConn
+	session       *UDPSession
+	releasePermit func()
+}
+
+type udpDispatchDecision uint8
+
+const (
+	udpDispatchQueued udpDispatchDecision = iota
+	udpDispatchPendingDrop
+	udpDispatchRetry
+	udpDispatchReadyWrite
+)
+
 func (s *UDPSession) updateLastActive() {
 	s.lastActive.Store(time.Now().UnixNano())
 }
@@ -181,10 +220,123 @@ func (s *UDPSession) isExpired(timeout time.Duration) bool {
 	return time.Since(last) > timeout
 }
 
+func (s *udpSessionState) acceptAndSnapshot(packet udpPendingPacket) (udpDispatchDecision, *UDPSession) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch s.phase {
+	case udpSessionPhaseCollecting:
+		if len(s.fifo) >= udpPendingPacketLimit || packet.retainedBytes < 0 || packet.retainedBytes > udpPendingBackingLimit-s.retainedBytes {
+			return udpDispatchPendingDrop, nil
+		}
+		s.fifo = append(s.fifo, packet)
+		s.retainedBytes += packet.retainedBytes
+		return udpDispatchQueued, nil
+	case udpSessionPhaseDraining:
+		return udpDispatchPendingDrop, nil
+	case udpSessionPhaseReady:
+		if s.session != nil {
+			return udpDispatchReadyWrite, s.session
+		}
+		return udpDispatchRetry, nil
+	default:
+		return udpDispatchRetry, nil
+	}
+}
+
+func (s *udpSessionState) attachCandidate(candidate *net.UDPConn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.phase != udpSessionPhaseCollecting || s.candidate != nil {
+		return false
+	}
+	s.candidate = candidate
+	return true
+}
+
+func (s *udpSessionState) sealCollectingFIFO() ([]udpPendingPacket, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.phase != udpSessionPhaseCollecting {
+		return nil, false
+	}
+	s.phase = udpSessionPhaseDraining
+	batch := s.fifo
+	s.fifo = nil
+	s.retainedBytes = 0
+	return batch, true
+}
+
+func (s *udpSessionState) publishReady(session *UDPSession, budget *udpSessionBudget) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.phase != udpSessionPhaseDraining || s.candidate != session.localConn {
+		return false
+	}
+	budget.publish()
+	s.phase = udpSessionPhaseReady
+	s.candidate = nil
+	s.session = session
+	return true
+}
+
+func (s *udpSessionState) readySession() *UDPSession {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.phase != udpSessionPhaseReady {
+		return nil
+	}
+	return s.session
+}
+
+func (s *udpSessionState) closeLocked() (candidate *net.UDPConn, published bool, closed bool) {
+	if s.phase == udpSessionPhaseClosed {
+		return nil, false, false
+	}
+	candidate = s.candidate
+	if s.session != nil {
+		candidate = s.session.localConn
+		published = s.phase == udpSessionPhaseReady
+	}
+	clear(s.fifo)
+	s.fifo = nil
+	s.retainedBytes = 0
+	s.candidate = nil
+	s.session = nil
+	s.phase = udpSessionPhaseClosed
+	return candidate, published, true
+}
+
+func (s *udpSessionState) closePending() (*net.UDPConn, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.phase != udpSessionPhaseCollecting && s.phase != udpSessionPhaseDraining {
+		return nil, false
+	}
+	candidate, _, closed := s.closeLocked()
+	return candidate, closed
+}
+
+func (s *udpSessionState) closeReady(session *UDPSession) (*net.UDPConn, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.phase != udpSessionPhaseReady || s.session != session {
+		return nil, false
+	}
+	candidate, _, closed := s.closeLocked()
+	return candidate, closed
+}
+
+func (s *udpSessionState) close() (*net.UDPConn, bool, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closeLocked()
+}
+
 // UDPHandler handles UDP datagram forwarding on the client side
 type UDPHandler struct {
-	// Sessions indexed by session ID
-	sessions sync.Map // uint32 -> *UDPSession
+	// Sessions indexed by session ID.
+	sessionsMu sync.Mutex
+	sessions   map[uint32]*udpSessionState
 
 	localHost            string
 	localPort            int
@@ -197,7 +349,7 @@ type UDPHandler struct {
 	closed               bool
 	closeOnce            sync.Once
 	fixedWG              sync.WaitGroup
-	readerWG             sync.WaitGroup
+	sessionWG            sync.WaitGroup
 	sessionBudget        *udpSessionBudget
 	epochAllocator       atomic.Uint32
 	beforeSessionPublish func()
@@ -245,6 +397,7 @@ func newUDPHandler(
 		logger:              logger.With().Str("component", "udp_handler").Logger(),
 		fragmentAssembler:   protocol.NewShardedFragmentAssembler(protocol.DefaultShardCount, maxFragmentGroups, maxFragmentBackingBytes),
 		sessionBudget:       budget,
+		sessions:            make(map[uint32]*udpSessionState),
 		dsendStats:          stats,
 		done:                make(chan struct{}),
 	}
@@ -288,10 +441,9 @@ func (h *UDPHandler) Stop() {
 			cancel()
 		}
 		h.fragmentAssembler.Close()
-		h.sessions.Range(func(_, value any) bool {
-			h.closeSession(value.(*UDPSession))
-			return true
-		})
+		for _, state := range h.snapshotSessionStates() {
+			h.closeStateExact(state)
+		}
 		if !h.started {
 			h.doneOnce.Do(func() { close(h.done) })
 		}
@@ -299,11 +451,11 @@ func (h *UDPHandler) Stop() {
 }
 
 func (h *UDPHandler) wait() {
-	// Join the sole reader producer before its readers. The caller must first
+	// Join the sole receiver producer before its session workers. The caller must first
 	// close the owning QUIC connection because SendDatagram has no context;
-	// otherwise a blocked reader also retains its shared-budget permit.
+	// otherwise a blocked worker also retains its shared-budget permit.
 	h.fixedWG.Wait()
-	h.readerWG.Wait()
+	h.sessionWG.Wait()
 }
 
 func (h *UDPHandler) stopAndWait() {
@@ -312,7 +464,7 @@ func (h *UDPHandler) stopAndWait() {
 }
 
 // receiveDatagrams is only started after Start initializes h.ctx and is the
-// sole production producer of session readers.
+// sole production producer of session workers.
 func (h *UDPHandler) receiveDatagrams(quicConn *quic.Conn) {
 	// This fixedWG goroutine can stop itself, but must not wait for itself.
 	defer h.Stop()
@@ -339,30 +491,11 @@ func (h *UDPHandler) receiveDatagrams(quicConn *quic.Conn) {
 			continue
 		}
 
-		// Get or create session
-		session, err := h.getOrCreateSession(sessionID, quicConn)
-		if err != nil {
-			if errors.Is(err, errClientUDPSessionLimit) {
-				continue
-			}
-			if h.ctx.Err() == nil {
-				h.sessionBudget.createErrors.Add(1)
-			}
-			h.logger.Error().Err(err).Uint32("session_id", sessionID).Msg("get session failed")
-			continue
+		retainedBytes := cap(payload)
+		if dgram[0] == protocol.UDPDatagramTypeNormal {
+			retainedBytes = len(dgram)
 		}
-
-		session.updateLastActive()
-
-		// Forward to local service
-		if _, err := session.localConn.Write(payload); err != nil {
-			if h.ctx.Err() == nil {
-				h.sessionBudget.writeErrors.Add(1)
-			}
-			h.logger.Debug().Err(err).Uint32("session_id", sessionID).Msg("write to local failed")
-			h.closeSession(session)
-			continue
-		}
+		h.dispatchPayload(sessionID, udpPendingPacket{payload: payload, retainedBytes: retainedBytes}, quicConn)
 	}
 }
 
@@ -372,96 +505,246 @@ func (h *UDPHandler) recordDecodeError(err error) {
 	}
 }
 
-// getOrCreateSession gets an existing session or creates a new one
-func (h *UDPHandler) getOrCreateSession(sessionID uint32, quicConn *quic.Conn) (*UDPSession, error) {
-	// Fast path: existing session
-	if sessionI, ok := h.sessions.Load(sessionID); ok {
-		return sessionI.(*UDPSession), nil
+func (h *UDPHandler) loadSessionState(sessionID uint32) *udpSessionState {
+	h.sessionsMu.Lock()
+	defer h.sessionsMu.Unlock()
+	return h.sessions[sessionID]
+}
+
+func (h *UDPHandler) snapshotSessionStates() []*udpSessionState {
+	h.sessionsMu.Lock()
+	defer h.sessionsMu.Unlock()
+	states := make([]*udpSessionState, 0, len(h.sessions))
+	for _, state := range h.sessions {
+		states = append(states, state)
+	}
+	return states
+}
+
+func (h *UDPHandler) isExactSessionState(state *udpSessionState) bool {
+	h.sessionsMu.Lock()
+	defer h.sessionsMu.Unlock()
+	return h.sessions[state.id] == state
+}
+
+func (h *UDPHandler) deleteExactSessionState(state *udpSessionState) bool {
+	h.sessionsMu.Lock()
+	defer h.sessionsMu.Unlock()
+	if h.sessions[state.id] != state {
+		return false
+	}
+	delete(h.sessions, state.id)
+	return true
+}
+
+func (h *UDPHandler) installPendingOrLoad(sessionID uint32, packet udpPendingPacket) (*udpSessionState, bool, bool) {
+	h.sessionsMu.Lock()
+	defer h.sessionsMu.Unlock()
+	if state := h.sessions[sessionID]; state != nil {
+		return state, false, true
 	}
 	releasePermit, ok := h.sessionBudget.acquire()
 	if !ok {
-		return nil, errClientUDPSessionLimit
+		return nil, false, false
 	}
-	creatorOwnsPermit := true
-	defer func() {
-		if creatorOwnsPermit {
-			releasePermit()
+	state := &udpSessionState{
+		id:            sessionID,
+		phase:         udpSessionPhaseCollecting,
+		fifo:          []udpPendingPacket{packet},
+		retainedBytes: packet.retainedBytes,
+		releasePermit: releasePermit,
+	}
+	h.sessions[sessionID] = state
+	return state, true, true
+}
+
+func (h *UDPHandler) registerSessionProducer() bool {
+	h.lifecycleMu.Lock()
+	defer h.lifecycleMu.Unlock()
+	if !h.started || h.closed || h.ctx == nil || h.ctx.Err() != nil {
+		return false
+	}
+	h.sessionWG.Add(1)
+	return true
+}
+
+func (h *UDPHandler) dispatchPayload(sessionID uint32, packet udpPendingPacket, quicConn *quic.Conn) {
+	if packet.retainedBytes < 0 || packet.retainedBytes > udpPendingBackingLimit {
+		h.sessionBudget.pendingDrops.Add(1)
+		return
+	}
+	for range 2 {
+		state := h.loadSessionState(sessionID)
+		if state == nil {
+			var installed, admitted bool
+			state, installed, admitted = h.installPendingOrLoad(sessionID, packet)
+			if !admitted {
+				return
+			}
+			if installed {
+				if !h.registerSessionProducer() {
+					h.failPendingExact(state)
+					state.releasePermit()
+					return
+				}
+				go h.runSession(state, quicConn)
+				return
+			}
 		}
-	}()
 
-	// Slow path: create new session
-	addr, _, err := resolveServerAddress(
-		h.ctx,
-		net.DefaultResolver,
-		net.JoinHostPort(h.localHost, strconv.Itoa(h.localPort)),
-	)
+		decision, session := state.acceptAndSnapshot(packet)
+		switch decision {
+		case udpDispatchQueued:
+			return
+		case udpDispatchPendingDrop:
+			h.sessionBudget.pendingDrops.Add(1)
+			return
+		case udpDispatchRetry:
+			h.deleteExactSessionState(state)
+		case udpDispatchReadyWrite:
+			session.updateLastActive()
+			if _, err := session.localConn.Write(packet.payload); err != nil {
+				h.recordWriteFailure(session.quicConn)
+				h.logger.Debug().Err(err).Uint32("session_id", sessionID).Msg("write to local failed")
+				h.closeSessionExact(state, session)
+			}
+			return
+		}
+	}
+}
+
+func (h *UDPHandler) runSession(state *udpSessionState, quicConn *quic.Conn) {
+	defer h.sessionWG.Done()
+	defer state.releasePermit()
+
+	setupCtx, cancelSetup := context.WithTimeout(h.ctx, udpSessionSetupTimeout)
+	defer cancelSetup()
+
+	session, addr, err := h.createSessionCandidate(setupCtx, state, quicConn)
 	if err != nil {
-		return nil, err
+		h.recordCreateFailure(quicConn)
+		h.logger.Debug().Err(err).Uint32("session_id", state.id).Msg("create UDP session failed")
+		h.failPendingExact(state)
+		return
+	}
+	deadline, _ := setupCtx.Deadline()
+	if err := session.localConn.SetWriteDeadline(deadline); err != nil {
+		h.recordCreateFailure(quicConn)
+		h.logger.Debug().Err(err).Uint32("session_id", state.id).Msg("set UDP setup write deadline failed")
+		h.failPendingExact(state)
+		return
+	}
+	batch, ok := state.sealCollectingFIFO()
+	if !ok {
+		h.recordCreateFailure(quicConn)
+		h.failPendingExact(state)
+		return
+	}
+	defer clear(batch)
+	for i := range batch {
+		if _, err := session.localConn.Write(batch[i].payload); err != nil {
+			h.recordWriteFailure(quicConn)
+			h.logger.Debug().Err(err).Uint32("session_id", state.id).Msg("write initial UDP payload failed")
+			h.failPendingExact(state)
+			return
+		}
+		batch[i].payload = nil
+		batch[i].retainedBytes = 0
+		session.updateLastActive()
+	}
+	if err := session.localConn.SetWriteDeadline(time.Time{}); err != nil {
+		h.recordCreateFailure(quicConn)
+		h.logger.Debug().Err(err).Uint32("session_id", state.id).Msg("clear UDP setup write deadline failed")
+		h.failPendingExact(state)
+		return
 	}
 
-	dialer := net.Dialer{}
-	conn, err := dialer.DialContext(h.ctx, "udp", addr)
+	if h.beforeSessionPublish != nil {
+		h.beforeSessionPublish()
+	}
+	published, normalTeardown, err := h.publishReadyAfterGate(state, session, setupCtx)
+	if !published {
+		if !normalTeardown {
+			h.recordCreateFailure(quicConn)
+			h.logger.Debug().Err(err).Uint32("session_id", state.id).Msg("publish UDP session failed")
+		}
+		h.failPendingExact(state)
+		return
+	}
+
+	h.dsendStats.worker(1)
+	defer h.dsendStats.worker(-1)
+	defer h.closeSessionExact(state, session)
+	cancelSetup()
+	h.logger.Debug().Uint32("session_id", state.id).Str("local_addr", addr).Msg("UDP session created")
+	h.readLocalResponses(session)
+}
+
+func (h *UDPHandler) createSessionCandidate(ctx context.Context, state *udpSessionState, quicConn *quic.Conn) (*UDPSession, string, error) {
+	addr, _, err := resolveServerAddress(ctx, net.DefaultResolver, net.JoinHostPort(h.localHost, strconv.Itoa(h.localPort)))
 	if err != nil {
-		return nil, err
+		return nil, "", err
+	}
+	conn, err := (&net.Dialer{}).DialContext(ctx, "udp", addr)
+	if err != nil {
+		return nil, "", err
 	}
 	localConn, ok := conn.(*net.UDPConn)
 	if !ok {
 		_ = conn.Close()
-		return nil, fmt.Errorf("dial UDP returned %T, want *net.UDPConn", conn)
+		return nil, "", fmt.Errorf("dial UDP returned %T, want *net.UDPConn", conn)
 	}
-
-	// Increase UDP buffer sizes to handle large packets
+	if !state.attachCandidate(localConn) {
+		_ = localConn.Close()
+		return nil, "", errClientUDPStateChanged
+	}
 	setUDPSocketBuffer(h.logger, "read", localConn.SetReadBuffer)
 	setUDPSocketBuffer(h.logger, "write", localConn.SetWriteBuffer)
 	epoch, ok := protocol.AllocateUDPEpoch(&h.epochAllocator)
 	if !ok {
-		_ = localConn.Close()
-		return nil, errClientUDPEpochExhausted
+		return nil, "", errClientUDPEpochExhausted
 	}
+	return &UDPSession{id: state.id, epoch: epoch, localConn: localConn, quicConn: quicConn}, addr, nil
+}
 
-	session := &UDPSession{
-		id:        sessionID,
-		epoch:     epoch,
-		localConn: localConn,
-		quicConn:  quicConn,
+func (h *UDPHandler) normalTeardownLocked(quicConn *quic.Conn) bool {
+	if !h.started || h.closed || h.ctx == nil || h.ctx.Err() != nil {
+		return true
 	}
-	session.updateLastActive()
-	if h.beforeSessionPublish != nil {
-		h.beforeSessionPublish()
-	}
+	return quicConn != nil && quicConn.Context().Err() != nil
+}
 
+func (h *UDPHandler) normalTeardown(quicConn *quic.Conn) bool {
 	h.lifecycleMu.Lock()
-	if !h.started || h.closed || h.ctx.Err() != nil {
-		h.lifecycleMu.Unlock()
-		_ = localConn.Close()
-		return nil, context.Canceled
+	defer h.lifecycleMu.Unlock()
+	return h.normalTeardownLocked(quicConn)
+}
+
+func (h *UDPHandler) recordCreateFailure(quicConn *quic.Conn) {
+	if !h.normalTeardown(quicConn) {
+		h.sessionBudget.createErrors.Add(1)
 	}
+}
 
-	// Store session and register its reader while the lifecycle gate is open.
-	actual, loaded := h.sessions.LoadOrStore(sessionID, session)
-	if loaded {
-		h.lifecycleMu.Unlock()
-		_ = localConn.Close()
-		return actual.(*UDPSession), nil
+func (h *UDPHandler) recordWriteFailure(quicConn *quic.Conn) {
+	if !h.normalTeardown(quicConn) {
+		h.sessionBudget.writeErrors.Add(1)
 	}
-	h.sessionBudget.publish()
-	h.readerWG.Add(1)
-	h.dsendStats.worker(1)
-	creatorOwnsPermit = false
-	h.lifecycleMu.Unlock()
+}
 
-	h.logger.Debug().Uint32("session_id", sessionID).Str("local_addr", addr).Msg("UDP session created")
-
-	// Start reading responses from local service
-	go func() {
-		defer h.readerWG.Done()
-		defer h.dsendStats.worker(-1)
-		defer releasePermit()
-		defer h.closeSession(session)
-		h.readLocalResponses(session)
-	}()
-
-	return session, nil
+func (h *UDPHandler) publishReadyAfterGate(state *udpSessionState, session *UDPSession, setupCtx context.Context) (bool, bool, error) {
+	h.lifecycleMu.Lock()
+	defer h.lifecycleMu.Unlock()
+	if h.normalTeardownLocked(session.quicConn) {
+		return false, true, nil
+	}
+	if err := setupCtx.Err(); err != nil {
+		return false, false, err
+	}
+	if !h.isExactSessionState(state) || !state.publishReady(session, h.sessionBudget) {
+		return false, false, errClientUDPStateChanged
+	}
+	return true, false, nil
 }
 
 // readLocalResponses reads responses from local UDP service and sends back via datagram
@@ -484,18 +767,16 @@ func (h *UDPHandler) readLocalResponses(session *UDPSession) {
 					// Timeout - check if session is still active
 					if session.isExpired(udpSessionTimeout) {
 						protocol.PutReadBuffer(bufPtr)
-						h.closeSession(session)
 						return
 					}
 					protocol.PutReadBuffer(bufPtr)
 					continue
 				}
-				if h.ctx.Err() == nil && !errors.Is(err, net.ErrClosed) {
+				if !errors.Is(err, net.ErrClosed) && !h.normalTeardown(session.quicConn) {
 					h.sessionBudget.readErrors.Add(1)
 				}
 				h.logger.Debug().Err(err).Uint32("session_id", session.id).Msg("read from local failed")
 				protocol.PutReadBuffer(bufPtr)
-				h.closeSession(session)
 				return
 			}
 		}
@@ -514,7 +795,6 @@ func (h *UDPHandler) readLocalResponses(session *UDPSession) {
 		if err := h.sendDatagrams(datagrams, session.quicConn.SendDatagram); err != nil {
 			h.logger.Debug().Err(err).Uint32("session_id", session.id).Msg("send datagram failed")
 			protocol.PutReadBuffer(bufPtr)
-			h.closeSession(session)
 			return
 		}
 		// Return read buffer to pool after processing
@@ -555,14 +835,42 @@ func (h *UDPHandler) sendDatagrams(datagrams []protocol.DatagramResult, send fun
 	return nil
 }
 
-// closeSession closes a UDP session
-func (h *UDPHandler) closeSession(session *UDPSession) {
-	if !h.sessions.CompareAndDelete(session.id, session) {
+func (h *UDPHandler) failPendingExact(state *udpSessionState) {
+	candidate, closed := state.closePending()
+	if !closed {
 		return
 	}
-	_ = session.localConn.Close()
+	h.deleteExactSessionState(state)
+	if candidate != nil {
+		_ = candidate.Close()
+	}
+}
+
+func (h *UDPHandler) closeSessionExact(state *udpSessionState, session *UDPSession) {
+	candidate, closed := state.closeReady(session)
+	if !closed {
+		return
+	}
+	h.deleteExactSessionState(state)
+	if candidate != nil {
+		_ = candidate.Close()
+	}
 	h.sessionBudget.unpublish()
-	h.logger.Debug().Uint32("session_id", session.id).Msg("UDP session closed")
+	h.logger.Debug().Uint32("session_id", state.id).Msg("UDP session closed")
+}
+
+func (h *UDPHandler) closeStateExact(state *udpSessionState) {
+	candidate, published, closed := state.close()
+	if !closed {
+		return
+	}
+	h.deleteExactSessionState(state)
+	if candidate != nil {
+		_ = candidate.Close()
+	}
+	if published {
+		h.sessionBudget.unpublish()
+	}
 }
 
 // cleanupLoop periodically cleans up expired sessions
@@ -575,14 +883,16 @@ func (h *UDPHandler) cleanupLoop() {
 		case <-h.ctx.Done():
 			return
 		case <-ticker.C:
-			h.sessions.Range(func(key, value any) bool {
-				session := value.(*UDPSession)
+			for _, state := range h.snapshotSessionStates() {
+				session := state.readySession()
+				if session == nil {
+					continue
+				}
 				if session.isExpired(udpSessionTimeout) {
 					h.logger.Debug().Uint32("session_id", session.id).Msg("cleaning up expired UDP session")
-					h.closeSession(session)
+					h.closeSessionExact(state, session)
 				}
-				return true
-			})
+			}
 		}
 	}
 }

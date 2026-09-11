@@ -23,6 +23,16 @@ import (
 
 const clientUDPResolverChild = "QMUX_CLIENT_UDP_RESOLVER_CHILD"
 
+func newClientUDPBackend(t *testing.T) *net.UDPConn {
+	t.Helper()
+	backend, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = backend.Close() })
+	return backend
+}
+
 func newUDPHandlerQUICPair(t *testing.T) (*quic.Conn, *quic.Conn) {
 	t.Helper()
 	peer := newLifecyclePeer(t)
@@ -73,7 +83,12 @@ func awaitUDPHandler(t *testing.T, done <-chan struct{}, event string) {
 
 func awaitClientUDPCondition(t *testing.T, description string, condition func() bool) {
 	t.Helper()
-	deadline := time.NewTimer(3 * time.Second)
+	awaitClientUDPConditionWithin(t, 3*time.Second, description, condition)
+}
+
+func awaitClientUDPConditionWithin(t *testing.T, timeout time.Duration, description string, condition func() bool) {
+	t.Helper()
+	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	ticker := time.NewTicker(time.Millisecond)
 	defer ticker.Stop()
@@ -95,13 +110,98 @@ func literalClientUDPFragment(sessionID uint32, fragmentID uint64, index, total 
 	return append(wire, payload...)
 }
 
+func clientUDPDatagram(sessionID uint32, payload []byte) []byte {
+	wire := binary.BigEndian.AppendUint32([]byte{protocol.UDPDatagramTypeNormal}, sessionID)
+	return append(wire, payload...)
+}
+
+func sendClientUDPDatagram(t *testing.T, conn *quic.Conn, sessionID uint32, payload []byte) {
+	t.Helper()
+	if err := conn.SendDatagram(clientUDPDatagram(sessionID, payload)); err != nil {
+		t.Fatalf("send client UDP datagram: %v", err)
+	}
+}
+
+func readClientUDPBackend(t *testing.T, backend *net.UDPConn, timeout time.Duration) ([]byte, *net.UDPAddr) {
+	t.Helper()
+	if err := backend.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 64<<10)
+	n, addr, err := backend.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatalf("read client UDP backend: %v", err)
+	}
+	return buf[:n], addr
+}
+
+func readClientUDPResponse(t *testing.T, conn *quic.Conn, timeout time.Duration) (uint32, []byte) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	wire, err := conn.ReceiveDatagram(ctx)
+	if err != nil {
+		t.Fatalf("read client UDP response: %v", err)
+	}
+	parsed, err := protocol.DecodeUDPDatagram(wire)
+	if err != nil {
+		t.Fatalf("decode client UDP response: %v", err)
+	}
+	return parsed.SessionID, parsed.Payload
+}
+
+type udpSessionTestSnapshot struct {
+	phase         udpSessionPhase
+	packetCount   int
+	retainedBytes int
+	candidate     *net.UDPConn
+	session       *UDPSession
+}
+
+func snapshotUDPState(state *udpSessionState) udpSessionTestSnapshot {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return udpSessionTestSnapshot{
+		phase:         state.phase,
+		packetCount:   len(state.fifo),
+		retainedBytes: state.retainedBytes,
+		candidate:     state.candidate,
+		session:       state.session,
+	}
+}
+
+func awaitUDPState(t *testing.T, handler *UDPHandler, sessionID uint32, phase udpSessionPhase) (*udpSessionState, udpSessionTestSnapshot) {
+	t.Helper()
+	var state *udpSessionState
+	var snapshot udpSessionTestSnapshot
+	awaitClientUDPCondition(t, "UDP session state", func() bool {
+		state = handler.loadSessionState(sessionID)
+		if state == nil {
+			return false
+		}
+		snapshot = snapshotUDPState(state)
+		return snapshot.phase == phase
+	})
+	return state, snapshot
+}
+
+func startUDPHandlerForDispatch(t *testing.T, handler *UDPHandler, quicConn *quic.Conn) {
+	t.Helper()
+	handler.lifecycleMu.Lock()
+	handler.ctx, handler.cancel = context.WithCancel(context.Background())
+	handler.started = true
+	handler.lifecycleMu.Unlock()
+	t.Cleanup(func() {
+		_ = quicConn.CloseWithError(0, "test complete")
+		handler.stopAndWait()
+	})
+}
+
 func assertNoUDPSessions(t *testing.T, handler *UDPHandler) {
 	t.Helper()
-	count := 0
-	handler.sessions.Range(func(_, _ any) bool {
-		count++
-		return true
-	})
+	handler.sessionsMu.Lock()
+	count := len(handler.sessions)
+	handler.sessionsMu.Unlock()
 	if count != 0 {
 		t.Fatalf("handler retained %d UDP sessions", count)
 	}
@@ -126,23 +226,21 @@ func runUDPHandlerResolverChild(t *testing.T) {
 		},
 	}
 
+	backend := newClientUDPBackend(t)
+	clientConn, serverConn := newUDPHandlerQUICPair(t)
 	budget := newUDPSessionBudget(1)
-	handler := newUDPHandler("lif002-client.qmux.invalid", 9, true, config.DefaultMaxUDPFragmentGroupsPerHandler, config.DefaultMaxUDPFragmentBackingBytesPerHandler, zerolog.Nop(), budget)
-	handler.ctx, handler.cancel = context.WithCancel(context.Background())
-	handler.started = true
+	handler := newUDPHandler("lif002-client.qmux.invalid", backend.LocalAddr().(*net.UDPAddr).Port, true, config.DefaultMaxUDPFragmentGroupsPerHandler, config.DefaultMaxUDPFragmentBackingBytesPerHandler, zerolog.Nop(), budget)
+	handler.Start(context.Background(), clientConn)
 	go func() {
 		_, _ = io.Copy(io.Discard, os.Stdin)
 		handler.Stop()
 	}()
 
-	_, err := handler.getOrCreateSession(1, nil)
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("session creation error = %v, want context.Canceled", err)
-	}
-	handler.wait()
+	sendClientUDPDatagram(t, serverConn, 1, []byte("blocked"))
+	awaitUDPHandler(t, handler.done, "resolver cancellation cleanup")
 	assertNoUDPSessions(t, handler)
-	if snapshot := budget.snapshot(); snapshot.Current != 0 || snapshot.Permits != 0 {
-		t.Fatalf("canceled session budget = %+v, want no current session or permit", snapshot)
+	if snapshot := budget.snapshot(); snapshot.Current != 0 || snapshot.Permits != 0 || snapshot.CreateErrors != 0 || snapshot.WriteErrors != 0 {
+		t.Fatalf("canceled session budget = %+v, want no current session, permit, or error", snapshot)
 	}
 	if workers := handler.dsendStats.load().Workers; workers != 0 {
 		t.Fatalf("canceled session workers = %d, want 0", workers)
@@ -197,9 +295,8 @@ func TestUDPSessionBudgetBoundsSharedHandlersBeforeDial(t *testing.T) {
 	t.Cleanup(second.Stop)
 
 	for id, handler := range []*UDPHandler{first, second} {
-		if _, err := handler.getOrCreateSession(uint32(id+1), nil); !errors.Is(err, errClientUDPSessionLimit) {
-			t.Fatalf("handler %d error = %v, want errClientUDPSessionLimit", id, err)
-		}
+		handler.dispatchPayload(uint32(id+1), udpPendingPacket{payload: []byte("blocked"), retainedBytes: len("blocked")}, nil)
+		assertNoUDPSessions(t, handler)
 	}
 	snapshot := budget.snapshot()
 	if snapshot.Permits != 1 || snapshot.CapacityDrops != 2 {
@@ -289,66 +386,61 @@ func TestUDPSessionBudgetAccountingFaultFailsClosedAndDrainsExisting(t *testing.
 }
 
 func TestUDPHandlerCloseUsesExactSessionPointer(t *testing.T) {
+	backend := newClientUDPBackend(t)
+	clientConn, serverConn := newUDPHandlerQUICPair(t)
 	budget := newUDPSessionBudget(1)
-	release, ok := budget.acquire()
-	if !ok {
-		t.Fatal("UDP session budget acquisition failed")
-	}
-	currentConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
-	if err != nil {
-		t.Fatalf("listen current UDP session socket: %v", err)
-	}
-	staleConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
-	if err != nil {
-		_ = currentConn.Close()
-		t.Fatalf("listen stale UDP session socket: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = currentConn.Close()
-		_ = staleConn.Close()
+	handler := newUDPHandler("127.0.0.1", backend.LocalAddr().(*net.UDPAddr).Port, true, config.DefaultMaxUDPFragmentGroupsPerHandler, config.DefaultMaxUDPFragmentBackingBytesPerHandler, zerolog.Nop(), budget)
+	startUDPHandlerForDispatch(t, handler, clientConn)
+
+	const sessionID = uint32(7)
+	handler.dispatchPayload(sessionID, udpPendingPacket{payload: []byte("old"), retainedBytes: len("old")}, clientConn)
+	readClientUDPBackend(t, backend, 3*time.Second)
+	oldState, oldSnapshot := awaitUDPState(t, handler, sessionID, udpSessionPhaseReady)
+	oldSession := oldSnapshot.session
+	handler.closeSessionExact(oldState, oldSession)
+	awaitClientUDPCondition(t, "old UDP worker exit", func() bool {
+		snapshot := budget.snapshot()
+		return snapshot.Current == 0 && snapshot.Permits == 0 && handler.dsendStats.load().Workers == 0
 	})
 
-	handler := newUDPHandler("127.0.0.1", 1, true, config.DefaultMaxUDPFragmentGroupsPerHandler, config.DefaultMaxUDPFragmentBackingBytesPerHandler, zerolog.Nop(), budget)
-	t.Cleanup(handler.Stop)
-	stale := &UDPSession{id: 7, localConn: staleConn}
-	current := &UDPSession{id: 7, localConn: currentConn}
-	handler.sessions.Store(current.id, current)
-	budget.publish()
-
-	handler.closeSession(stale)
-	if got, ok := handler.sessions.Load(current.id); !ok || got != current {
-		t.Fatalf("stale close changed replacement = (%p, %v), want (%p, true)", got, ok, current)
+	handler.dispatchPayload(sessionID, udpPendingPacket{payload: []byte("new"), retainedBytes: len("new")}, clientConn)
+	_, successorAddr := readClientUDPBackend(t, backend, 3*time.Second)
+	newState, newSnapshot := awaitUDPState(t, handler, sessionID, udpSessionPhaseReady)
+	awaitClientUDPCondition(t, "replacement UDP worker", func() bool {
+		return handler.dsendStats.load().Workers == 1
+	})
+	handler.closeSessionExact(oldState, oldSession)
+	if got := handler.loadSessionState(sessionID); got != newState {
+		t.Fatalf("stale close changed replacement = %p, want %p", got, newState)
 	}
-	if snapshot := budget.snapshot(); snapshot.Current != 1 {
-		t.Fatalf("published sessions after stale close = %d, want 1", snapshot.Current)
+	if snapshot := budget.snapshot(); snapshot.Current != 1 || snapshot.Permits != 1 {
+		t.Fatalf("published sessions after stale close = %+v, want one current and permit", snapshot)
 	}
-	if err := currentConn.SetReadDeadline(time.Now()); err != nil {
-		t.Fatalf("set current session socket deadline after stale close: %v", err)
+	handler.dispatchPayload(sessionID, udpPendingPacket{payload: []byte("successor-forward"), retainedBytes: len("successor-forward")}, clientConn)
+	if payload, _ := readClientUDPBackend(t, backend, 3*time.Second); !bytes.Equal(payload, []byte("successor-forward")) {
+		t.Fatalf("replacement forward payload = %q", payload)
 	}
-	if _, err := currentConn.Read(make([]byte, 1)); err == nil {
-		t.Fatal("current session socket read unexpectedly succeeded")
-	} else {
-		var netErr net.Error
-		if !errors.As(err, &netErr) || !netErr.Timeout() {
-			t.Fatalf("current session socket after stale close error = %v, want timeout", err)
-		}
+	if _, err := backend.WriteToUDP([]byte("successor-reply"), successorAddr); err != nil {
+		t.Fatal(err)
+	}
+	if gotID, payload := readClientUDPResponse(t, serverConn, 3*time.Second); gotID != sessionID || !bytes.Equal(payload, []byte("successor-reply")) {
+		t.Fatalf("replacement reply = session %d payload %q", gotID, payload)
 	}
 
-	handler.closeSession(current)
-	release() // Direct test sessions have no reader goroutine to own this release.
-	if snapshot := budget.snapshot(); snapshot.Current != 0 || snapshot.Permits != 0 || snapshot.AccountingFaults != 0 {
+	handler.closeSessionExact(newState, newSnapshot.session)
+	awaitClientUDPCondition(t, "replacement UDP worker exit", func() bool {
+		snapshot := budget.snapshot()
+		return snapshot.Current == 0 && snapshot.Permits == 0 && handler.dsendStats.load().Workers == 0
+	})
+	if snapshot := budget.snapshot(); snapshot.AccountingFaults != 0 {
 		t.Fatalf("exact close budget = %d active/%d held/%d faults, want zero",
 			snapshot.Current, snapshot.Permits, snapshot.AccountingFaults)
 	}
 }
 
-func TestUDPHandlerDuplicatePublicationReleasesLoser(t *testing.T) {
-	backend, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
-	if err != nil {
-		t.Fatalf("listen duplicate-publication UDP backend: %v", err)
-	}
-	t.Cleanup(func() { _ = backend.Close() })
-
+func TestUDPHandlerPendingDispatchHasSingleWinner(t *testing.T) {
+	backend := newClientUDPBackend(t)
+	clientConn, _ := newUDPHandlerQUICPair(t)
 	budget := newUDPSessionBudget(2)
 	handler := newUDPHandler(
 		"127.0.0.1",
@@ -359,68 +451,61 @@ func TestUDPHandlerDuplicatePublicationReleasesLoser(t *testing.T) {
 		zerolog.Nop(),
 		budget,
 	)
-	handler.ctx = context.Background()
-	handler.started = true
-	ready := sync.WaitGroup{}
-	ready.Add(2)
+	startUDPHandlerForDispatch(t, handler, clientConn)
+	ready := make(chan struct{})
 	publish := make(chan struct{})
 	handler.beforeSessionPublish = func() {
-		ready.Done()
+		close(ready)
 		<-publish
 	}
+	var publishOnce sync.Once
+	t.Cleanup(func() { publishOnce.Do(func() { close(publish) }) })
 
-	results := make(chan *UDPSession, 2)
-	errs := make(chan error, 2)
+	start := make(chan struct{})
+	var callers sync.WaitGroup
 	for range 2 {
-		go func() {
-			session, createErr := handler.getOrCreateSession(9, nil)
-			results <- session
-			errs <- createErr
-		}()
+		callers.Go(func() {
+			<-start
+			handler.dispatchPayload(9, udpPendingPacket{payload: []byte("winner"), retainedBytes: len("winner")}, clientConn)
+		})
 	}
-	ready.Wait()
-	close(publish)
-	first, second := <-results, <-results
-	if err := <-errs; err != nil {
-		t.Fatalf("first duplicate creator: %v", err)
+	close(start)
+	callers.Wait()
+	awaitUDPHandler(t, ready, "single pending worker publish gate")
+	_, state := awaitUDPState(t, handler, 9, udpSessionPhaseDraining)
+	if state.candidate == nil || state.session != nil {
+		t.Fatalf("pending winner state = %+v", state)
 	}
-	if err := <-errs; err != nil {
-		t.Fatalf("second duplicate creator: %v", err)
+	if snapshot := budget.snapshot(); snapshot.Current != 0 || snapshot.Permits != 1 {
+		t.Fatalf("pending winner budget = %+v, want zero current and one permit", snapshot)
 	}
-	if first == nil || second != first {
-		t.Fatalf("duplicate creators returned (%p, %p), want one exact session", first, second)
+	if got := handler.epochAllocator.Load(); got != 1 || handler.dsendStats.load().Workers != 0 {
+		t.Fatalf("pending winner = %d epochs/%d ready workers, want 1/0", got, handler.dsendStats.load().Workers)
 	}
-	if snapshot := budget.snapshot(); snapshot.Current != 1 || snapshot.Permits != 1 {
-		t.Fatalf("duplicate publication budget = %d active/%d held, want 1/1", snapshot.Current, snapshot.Permits)
+	publishOnce.Do(func() { close(publish) })
+	_, state = awaitUDPState(t, handler, 9, udpSessionPhaseReady)
+	if state.session == nil || state.session.epoch != 1 {
+		t.Fatalf("published winner state = %+v", state)
 	}
-	if got := handler.epochAllocator.Load(); got != 2 || first.epoch == 0 {
-		t.Fatalf("duplicate publication epochs = allocated %d/winner %d, want 2/nonzero", got, first.epoch)
-	}
-
-	handler.Stop()
-	handler.wait()
-	if snapshot := budget.snapshot(); snapshot.Current != 0 || snapshot.Permits != 0 || snapshot.AccountingFaults != 0 {
-		t.Fatalf("duplicate publication cleanup = %d active/%d held/%d faults, want zero",
-			snapshot.Current, snapshot.Permits, snapshot.AccountingFaults)
+	awaitClientUDPCondition(t, "published winner worker", func() bool {
+		return handler.dsendStats.load().Workers == 1
+	})
+	if snapshot := budget.snapshot(); snapshot.Current != 1 || snapshot.Permits != 1 || handler.dsendStats.load().Workers != 1 {
+		t.Fatalf("published winner = budget %+v/workers %d, want 1/1", snapshot, handler.dsendStats.load().Workers)
 	}
 }
 
 func TestUDPHandlerRecreatesSameSessionIDWithIsolatedEpoch(t *testing.T) {
-	backend, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = backend.Close() })
+	backend := newClientUDPBackend(t)
+	clientConn, _ := newUDPHandlerQUICPair(t)
 	handler := newUDPHandler("127.0.0.1", backend.LocalAddr().(*net.UDPAddr).Port, true, config.DefaultMaxUDPFragmentGroupsPerHandler, config.DefaultMaxUDPFragmentBackingBytesPerHandler, zerolog.Nop(), newUDPSessionBudget(1))
-	handler.ctx = context.Background()
-	handler.started = true
-	defer handler.stopAndWait()
+	startUDPHandlerForDispatch(t, handler, clientConn)
 
 	const sessionID = uint32(77)
-	oldSession, err := handler.getOrCreateSession(sessionID, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	handler.dispatchPayload(sessionID, udpPendingPacket{payload: []byte("old-ready"), retainedBytes: len("old-ready")}, clientConn)
+	readClientUDPBackend(t, backend, 3*time.Second)
+	oldState, oldStateSnapshot := awaitUDPState(t, handler, sessionID, udpSessionPhaseReady)
+	oldSession := oldStateSnapshot.session
 	oldPayload := bytes.Repeat([]byte{0xa1}, protocol.MaxUDPPayload+1)
 	oldFragments, err := handler.fragmentDatagrams(sessionID, oldSession.epoch, oldPayload, &oldSession.fragmentSequence)
 	if err != nil {
@@ -437,15 +522,15 @@ func TestUDPHandlerRecreatesSameSessionIDWithIsolatedEpoch(t *testing.T) {
 		t.Fatalf("old first fragment = identity %#x complete %v error %v", parsedOld.FragmentID, complete, err)
 	}
 
-	handler.closeSession(oldSession)
+	handler.closeSessionExact(oldState, oldSession)
 	awaitClientUDPCondition(t, "old session permit release", func() bool {
 		snapshot := handler.sessionBudget.snapshot()
 		return snapshot.Current == 0 && snapshot.Permits == 0 && handler.dsendStats.load().Workers == 0
 	})
-	newSession, err := handler.getOrCreateSession(sessionID, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	handler.dispatchPayload(sessionID, udpPendingPacket{payload: []byte("new-ready"), retainedBytes: len("new-ready")}, clientConn)
+	readClientUDPBackend(t, backend, 3*time.Second)
+	_, newStateSnapshot := awaitUDPState(t, handler, sessionID, udpSessionPhaseReady)
+	newSession := newStateSnapshot.session
 	if newSession == oldSession || newSession.epoch == oldSession.epoch {
 		t.Fatalf("recreated session = %p epoch %d, old = %p epoch %d", newSession, newSession.epoch, oldSession, oldSession.epoch)
 	}
@@ -480,30 +565,34 @@ func TestUDPHandlerRecreatesSameSessionIDWithIsolatedEpoch(t *testing.T) {
 }
 
 func TestUDPHandlerEpochExhaustionCleansCandidateAndKeepsExistingSession(t *testing.T) {
-	backend, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = backend.Close() })
+	backend := newClientUDPBackend(t)
+	clientConn, _ := newUDPHandlerQUICPair(t)
 	budget := newUDPSessionBudget(2)
 	handler := newUDPHandler("127.0.0.1", backend.LocalAddr().(*net.UDPAddr).Port, true, config.DefaultMaxUDPFragmentGroupsPerHandler, config.DefaultMaxUDPFragmentBackingBytesPerHandler, zerolog.Nop(), budget)
-	handler.ctx = context.Background()
-	handler.started = true
+	startUDPHandlerForDispatch(t, handler, clientConn)
 	handler.epochAllocator.Store(math.MaxUint32 - 1)
-	defer handler.stopAndWait()
 
-	existing, err := handler.getOrCreateSession(1, nil)
-	if err != nil || existing == nil {
-		t.Fatalf("last epoch session = (%p, %v), want non-nil", existing, err)
-	}
+	handler.dispatchPayload(1, udpPendingPacket{payload: []byte("last"), retainedBytes: len("last")}, clientConn)
+	readClientUDPBackend(t, backend, 3*time.Second)
+	existingState, existingSnapshot := awaitUDPState(t, handler, 1, udpSessionPhaseReady)
+	existing := existingSnapshot.session
+	awaitClientUDPCondition(t, "last-epoch response worker", func() bool {
+		return handler.dsendStats.load().Workers == 1
+	})
 	if existing.epoch != math.MaxUint32 {
 		t.Fatalf("last session epoch = %d, want %d", existing.epoch, uint32(math.MaxUint32))
 	}
-	if failed, err := handler.getOrCreateSession(2, nil); failed != nil || !errors.Is(err, errClientUDPEpochExhausted) {
-		t.Fatalf("exhausted session creation = (%p, %v)", failed, err)
+	handler.dispatchPayload(2, udpPendingPacket{payload: []byte("exhausted"), retainedBytes: len("exhausted")}, clientConn)
+	awaitClientUDPCondition(t, "exhausted candidate cleanup", func() bool {
+		snapshot := budget.snapshot()
+		return handler.loadSessionState(2) == nil && snapshot.CreateErrors == 1 && snapshot.Permits == 1
+	})
+	handler.dispatchPayload(1, udpPendingPacket{payload: []byte("existing"), retainedBytes: len("existing")}, clientConn)
+	if payload, _ := readClientUDPBackend(t, backend, 3*time.Second); !bytes.Equal(payload, []byte("existing")) {
+		t.Fatalf("existing session payload after exhaustion = %q", payload)
 	}
-	if got, err := handler.getOrCreateSession(1, nil); err != nil || got != existing {
-		t.Fatalf("existing session after exhaustion = (%p, %v), want %p", got, err, existing)
+	if got := snapshotUDPState(existingState).session; got != existing {
+		t.Fatalf("existing session after exhaustion = %p, want %p", got, existing)
 	}
 	snapshot := budget.snapshot()
 	if snapshot.Current != 1 || snapshot.Permits != 1 || snapshot.AccountingFaults != 0 || handler.dsendStats.load().Workers != 1 {
@@ -524,11 +613,7 @@ func TestUDPHandlerEpochExhaustionCleansCandidateAndKeepsExistingSession(t *test
 }
 
 func TestUDPHandlerReceivesLiteralWidenedFragmentsAndRejectsLegacy(t *testing.T) {
-	backend, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = backend.Close() })
+	backend := newClientUDPBackend(t)
 	clientConn, serverConn := newUDPHandlerQUICPair(t)
 	handler := NewUDPHandler("127.0.0.1", backend.LocalAddr().(*net.UDPAddr).Port, true, config.DefaultMaxUDPFragmentGroupsPerHandler, config.DefaultMaxUDPFragmentBackingBytesPerHandler, zerolog.Nop())
 	handler.Start(context.Background(), clientConn)
@@ -612,12 +697,8 @@ func TestUDPHandlerStopBeforeStart(t *testing.T) {
 }
 
 func TestUDPHandlerStopJoinsBlockedReceiveSessionAndAssembler(t *testing.T) {
-	backend, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
-	if err != nil {
-		t.Fatalf("listen UDP backend: %v", err)
-	}
-	t.Cleanup(func() { _ = backend.Close() })
-	clientConn, _ := newUDPHandlerQUICPair(t)
+	backend := newClientUDPBackend(t)
+	clientConn, serverConn := newUDPHandlerQUICPair(t)
 	budget := newUDPSessionBudget(1)
 	handler := newUDPHandler(
 		"127.0.0.1",
@@ -637,16 +718,17 @@ func TestUDPHandlerStopJoinsBlockedReceiveSessionAndAssembler(t *testing.T) {
 		t.Fatalf("double Start replaced the live handler context: %v", err)
 	}
 
-	session, err := handler.getOrCreateSession(7, clientConn)
-	if err != nil {
-		t.Fatalf("create active UDP session: %v", err)
-	}
-	if got := handler.dsendStats.load().Workers; got != 1 {
-		t.Fatalf("Dsend workers = %d, want 1", got)
-	}
-	if _, err := handler.getOrCreateSession(8, clientConn); !errors.Is(err, errClientUDPSessionLimit) {
-		t.Fatalf("create UDP session over cap error = %v, want errClientUDPSessionLimit", err)
-	}
+	sendClientUDPDatagram(t, serverConn, 7, []byte("active"))
+	readClientUDPBackend(t, backend, 3*time.Second)
+	_, activeState := awaitUDPState(t, handler, 7, udpSessionPhaseReady)
+	session := activeState.session
+	awaitClientUDPCondition(t, "active response worker", func() bool {
+		return handler.dsendStats.load().Workers == 1
+	})
+	sendClientUDPDatagram(t, serverConn, 8, []byte("over-cap"))
+	awaitClientUDPCondition(t, "UDP capacity drop", func() bool {
+		return budget.snapshot().CapacityDrops == 1
+	})
 	if snapshot := budget.snapshot(); snapshot.Current != 1 || snapshot.Permits != 1 {
 		t.Fatalf("live UDP budget = %d active/%d held, want 1/1", snapshot.Current, snapshot.Permits)
 	}

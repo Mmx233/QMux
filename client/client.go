@@ -141,6 +141,7 @@ type UDPSessionSnapshot struct {
 	CapacityDrops    uint64
 	AccountingFaults uint64
 	DecodeDrops      uint64
+	PendingDrops     uint64
 	CreateErrors     uint64
 	ReadErrors       uint64
 	WriteErrors      uint64

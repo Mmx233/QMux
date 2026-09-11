@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -399,147 +400,357 @@ func TestReconnectReleasesSlotBeforeFreshPublicationCallback(t *testing.T) {
 }
 
 func TestClientRetiresSuccessiveExactGenerationsAndNoSuccessor(t *testing.T) {
-	peer := newLifecyclePeer(t)
-	cm := newLifecycleManager(t, peer)
-	cm.config.HeartbeatInterval = time.Hour
-	cm.config.HealthTimeout = 2 * time.Hour
-	backend, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
-	if err != nil {
-		t.Fatalf("listen generation UDP backend: %v", err)
+	if runClientUDPSetupSubprocess(t) {
+		return
 	}
-	t.Cleanup(func() { _ = backend.Close() })
-	cm.config.Local = config.LocalService{
-		Host: "127.0.0.1",
-		Port: backend.LocalAddr().(*net.UDPAddr).Port,
-	}
-	forceCtx, cancelForce := context.WithCancel(context.Background())
-	client := &Client{
-		config:          cm.config,
-		connMgr:         cm,
-		udpBudget:       newUDPSessionBudget(0),
-		dsendStats:      &clientDsendStats{},
-		liveUDPHandlers: make(map[*UDPHandler]struct{}),
-		forceCtx:        forceCtx,
-		forceCancel:     cancelForce,
-		runtimes:        make(map[*ServerConnection]*connectionRuntime),
-		logger:          zerolog.Nop(),
-	}
-	runCtx, cancelRun := context.WithCancel(context.Background())
-	client.producerWG.Go(client.handleNewConnections)
-	t.Cleanup(func() {
-		cancelRun()
-		_ = cm.Stop()
-		client.producerWG.Wait()
-		cancelForce()
-		client.udpHandlers.Range(func(_, value any) bool {
-			value.(*UDPHandler).stopAndWait()
-			return true
+
+	t.Run("collecting replacement", func(t *testing.T) {
+		gate := installClientUDPResolverGate(t)
+		gate.stall.Store(true)
+		peer := newLifecyclePeer(t)
+		cm := newLifecycleManager(t, peer)
+		cm.config.HeartbeatInterval = time.Hour
+		cm.config.HealthTimeout = 2 * time.Hour
+		backend := newClientUDPBackend(t)
+		cm.config.Local = config.LocalService{
+			Host: "udp-retirement.qmux.invalid",
+			Port: backend.LocalAddr().(*net.UDPAddr).Port,
+		}
+
+		forceCtx, cancelForce := context.WithCancel(context.Background())
+		runCtx, cancelRun := context.WithCancel(context.Background())
+		budget := newUDPSessionBudget(1)
+		client := &Client{
+			config:          cm.config,
+			connMgr:         cm,
+			udpBudget:       budget,
+			dsendStats:      &clientDsendStats{},
+			liveUDPHandlers: make(map[*UDPHandler]struct{}),
+			forceCtx:        forceCtx,
+			forceCancel:     cancelForce,
+			runtimes:        make(map[*ServerConnection]*connectionRuntime),
+			logger:          zerolog.Nop(),
+		}
+		client.producerWG.Go(client.handleNewConnections)
+		t.Cleanup(func() {
+			gate.unblock()
+			cancelRun()
+			_ = cm.Stop()
+			cancelForce()
+			client.producerWG.Wait()
+			for _, runtime := range client.runtimeSnapshot() {
+				_ = client.cleanupRuntime(runtime)
+			}
+			client.watcherWG.Wait()
 		})
+
+		connectGeneration := func(label string) (*ServerConnection, *quic.Conn, <-chan error) {
+			t.Helper()
+			remote := make(chan *quic.Conn, 1)
+			serverDone := peer.serveRegistration(func(conn *quic.Conn, stream *quic.Stream, _ protocol.RegisterMsg) error {
+				if err := writeSuccessfulLifecycleAck(stream); err != nil {
+					return err
+				}
+				remote <- conn
+				<-conn.Context().Done()
+				return nil
+			})
+			sc, err := cm.connectAndRegister(runCtx, peer.endpoint())
+			if err != nil {
+				t.Fatalf("connect %s generation: %v", label, err)
+			}
+			publishCtx, cancelPublish := context.WithTimeout(runCtx, 10*time.Second)
+			published := cm.publishServerConnection(publishCtx, sc)
+			cancelPublish()
+			if !published {
+				_ = sc.Close()
+				t.Fatalf("publish %s generation", label)
+			}
+			return sc, awaitLifecycle(t, remote, label+" remote QUIC connection"), serverDone
+		}
+		lookupRuntime := func(sc *ServerConnection, description string) *connectionRuntime {
+			t.Helper()
+			var runtime *connectionRuntime
+			awaitRetirementCondition(t, description, func() bool {
+				client.runtimesMu.Lock()
+				runtime = client.runtimes[sc]
+				client.runtimesMu.Unlock()
+				return runtime != nil && runtime.udp != nil
+			})
+			return runtime
+		}
+
+		const sessionID = uint32(70)
+		oldSC, oldRemote, oldServerDone := connectGeneration("old")
+		oldRuntime := lookupRuntime(oldSC, "old generation runtime")
+		oldHandler := oldRuntime.udp
+		sendClientUDPDatagram(t, oldRemote, sessionID, []byte("retire-while-collecting"))
+		awaitUDPHandler(t, gate.entered, "old generation DNS gate")
+		oldState, oldPending := awaitUDPState(t, oldHandler, sessionID, udpSessionPhaseCollecting)
+		if oldPending.packetCount != 1 || oldPending.candidate != nil || oldHandler.epochAllocator.Load() != 0 {
+			t.Fatalf("old collecting state = %+v/epoch %d", oldPending, oldHandler.epochAllocator.Load())
+		}
+		if _, err := oldHandler.fragmentAssembler.AddFragment(sessionID, 1, 0, 2, []byte("old-fragment")); err != nil {
+			t.Fatal(err)
+		}
+		if snapshot := budget.snapshot(); snapshot.Current != 0 || snapshot.Permits != 1 || oldHandler.dsendStats.load().Workers != 0 {
+			t.Fatalf("old collecting accounting = budget %+v/workers %d", snapshot, oldHandler.dsendStats.load().Workers)
+		}
+
+		freshSC, freshRemote, freshServerDone := connectGeneration("fresh")
+		freshRuntime := lookupRuntime(freshSC, "fresh generation runtime")
+		freshHandler := freshRuntime.udp
+		awaitUDPHandler(t, oldRuntime.cleanupDone, "old collecting runtime cleanup")
+		if err := awaitLifecycle(t, oldServerDone, "old collecting server close"); err != nil {
+			t.Fatal(err)
+		}
+		if oldSC.Connection() != nil || oldSC.State() != StateDisconnected || cm.GetConnection(oldSC.ServerAddr()) != freshSC {
+			t.Fatal("replacement did not retire only the old ServerConnection")
+		}
+		if oldHandler.loadSessionState(sessionID) != nil || snapshotUDPState(oldState).phase != udpSessionPhaseClosed {
+			t.Fatal("old collecting state survived generation retirement")
+		}
+		assertNoUDPSessions(t, oldHandler)
+		if _, err := oldHandler.fragmentAssembler.AddFragment(1, 1, 0, 2, []byte("closed")); !errors.Is(err, protocol.ErrFragmentAssemblerClosed) {
+			t.Fatalf("old collecting assembler error = %v", err)
+		}
+		if current, ok := client.udpHandlers.Load(oldSC.ServerAddr()); !ok || current != freshHandler {
+			t.Fatalf("old cleanup changed fresh handler mapping = (%p, %v), want (%p, true)", current, ok, freshHandler)
+		}
+		if snapshot := budget.snapshot(); snapshot.Current != 0 || snapshot.Permits != 0 || snapshot.AccountingFaults != 0 {
+			t.Fatalf("old collecting cleanup = %+v", snapshot)
+		}
+
+		gate.unblock()
+		sendClientUDPDatagram(t, freshRemote, sessionID, []byte("fresh-generation"))
+		if payload, _ := readClientUDPBackend(t, backend, 2*time.Second); !bytes.Equal(payload, []byte("fresh-generation")) {
+			t.Fatalf("fresh generation payload = %q", payload)
+		}
+		_, freshReady := awaitUDPState(t, freshHandler, sessionID, udpSessionPhaseReady)
+		awaitClientUDPCondition(t, "fresh generation response worker", func() bool {
+			return freshHandler.dsendStats.load().Workers == 1
+		})
+		if freshReady.session == nil || freshReady.session.epoch != 1 || oldHandler.epochAllocator.Load() != 0 {
+			t.Fatalf("fresh ready state = %+v; old epoch = %d", freshReady, oldHandler.epochAllocator.Load())
+		}
+
+		if err := client.cleanupRuntime(freshRuntime); err != nil {
+			t.Fatal(err)
+		}
+		if err := awaitLifecycle(t, freshServerDone, "fresh generation server close"); err != nil {
+			t.Fatal(err)
+		}
+		assertNoUDPSessions(t, freshHandler)
+		if _, err := freshReady.session.localConn.Write([]byte("closed")); !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("fresh socket after cleanup = %v", err)
+		}
+		if snapshot := budget.snapshot(); snapshot.Current != 0 || snapshot.Permits != 0 || snapshot.AccountingFaults != 0 || freshHandler.dsendStats.load().Workers != 0 {
+			t.Fatalf("replacement cleanup = budget %+v/workers %d", snapshot, freshHandler.dsendStats.load().Workers)
+		}
 	})
 
-	const generations = 2
-	var currentSC *ServerConnection
-	var currentHandler *UDPHandler
-	var currentSession *UDPSession
-	var currentServerDone <-chan error
-	for generation := range generations {
-		accepted := make(chan struct{})
+	t.Run("draining no successor", func(t *testing.T) {
+		peer := newLifecyclePeer(t)
+		cm := newLifecycleManager(t, peer)
+		cm.config.HeartbeatInterval = time.Hour
+		cm.config.HealthTimeout = 2 * time.Hour
+		backend := newClientUDPBackend(t)
+
+		remote := make(chan *quic.Conn, 1)
 		serverDone := peer.serveRegistration(func(conn *quic.Conn, stream *quic.Stream, _ protocol.RegisterMsg) error {
 			if err := writeSuccessfulLifecycleAck(stream); err != nil {
 				return err
 			}
-			close(accepted)
+			remote <- conn
 			<-conn.Context().Done()
 			return nil
 		})
 		sc, err := cm.connectAndRegister(context.Background(), peer.endpoint())
 		if err != nil {
-			t.Fatalf("generation %d connect: %v", generation, err)
+			t.Fatal(err)
 		}
-		awaitLifecycle(t, accepted, "generation registration acknowledgment")
-		publishCtx, cancelPublish := context.WithTimeout(runCtx, 10*time.Second)
-		published := cm.publishServerConnection(publishCtx, sc)
-		cancelPublish()
-		if !published {
+		if !cm.publishServerConnection(context.Background(), sc) {
 			_ = sc.Close()
-			t.Fatalf("generation %d publication failed", generation)
+			t.Fatal("publish draining generation")
 		}
+		oldRemote := awaitLifecycle(t, remote, "draining remote QUIC connection")
 
-		var handler *UDPHandler
-		awaitRetirementCondition(t, "generation UDP handler installation", func() bool {
-			value, ok := client.udpHandlers.Load(sc.ServerAddr())
-			if !ok {
-				return false
+		forceCtx, cancelForce := context.WithCancel(context.Background())
+		budget := newUDPSessionBudget(1)
+		stats := &clientDsendStats{}
+		client := &Client{
+			config:          cm.config,
+			connMgr:         cm,
+			udpBudget:       budget,
+			dsendStats:      stats,
+			liveUDPHandlers: make(map[*UDPHandler]struct{}),
+			forceCtx:        forceCtx,
+			forceCancel:     cancelForce,
+			runtimes:        make(map[*ServerConnection]*connectionRuntime),
+			logger:          zerolog.Nop(),
+		}
+		oldHandler := newUDPHandler("127.0.0.1", backend.LocalAddr().(*net.UDPAddr).Port, true,
+			config.DefaultMaxUDPFragmentGroupsPerHandler,
+			config.DefaultMaxUDPFragmentBackingBytesPerHandler,
+			zerolog.Nop(), budget, stats)
+		publishEntered := make(chan struct{})
+		publishRelease := make(chan struct{})
+		var publishOnce sync.Once
+		releasePublish := func() { publishOnce.Do(func() { close(publishRelease) }) }
+		t.Cleanup(releasePublish)
+		const sessionID = uint32(71)
+		oldHandler.beforeSessionPublish = func() {
+			oldHandler.lifecycleMu.Lock()
+			oldHandler.lifecycleMu.Unlock()
+			oldHandler.sessionsMu.Lock()
+			state := oldHandler.sessions[sessionID]
+			oldHandler.sessionsMu.Unlock()
+			if state == nil {
+				panic("draining state disappeared before publish hook")
 			}
-			handler = value.(*UDPHandler)
-			return handler != currentHandler
+			state.mu.Lock()
+			phase := state.phase
+			state.mu.Unlock()
+			if phase != udpSessionPhaseDraining {
+				panic("publish hook did not observe draining state")
+			}
+			close(publishEntered)
+			<-publishRelease
+		}
+		runtimeForceCtx, cancelRuntimeForce := context.WithCancel(forceCtx)
+		acceptCtx, cancelAccept := context.WithCancel(runtimeForceCtx)
+		runtime := &connectionRuntime{
+			sc: sc, conn: sc.Connection(), forceCtx: runtimeForceCtx, cancelForce: cancelRuntimeForce,
+			acceptCtx: acceptCtx, cancelAccept: cancelAccept,
+			acceptDone: make(chan struct{}), acceptErr: make(chan error, 1),
+			acceptedHigh: -1, cleanupDone: make(chan struct{}), udp: oldHandler,
+		}
+		oldHandler.Start(runtimeForceCtx, sc.Connection())
+		client.udpMu.Lock()
+		client.liveUDPHandlers[oldHandler] = struct{}{}
+		client.udpHandlers.Store(sc.ServerAddr(), oldHandler)
+		client.udpMu.Unlock()
+		client.runtimesMu.Lock()
+		client.runtimes[sc] = runtime
+		client.runtimesMu.Unlock()
+		t.Cleanup(func() {
+			releasePublish()
+			_ = client.cleanupRuntime(runtime)
+			cancelForce()
+			_ = cm.Stop()
 		})
-		if currentSC != nil {
-			if currentHandler == nil || currentSession == nil || currentServerDone == nil {
-				t.Fatal("old generation resources were not recorded")
-			}
-			if err := awaitLifecycle(t, currentServerDone, "exact old QUIC generation close"); err != nil {
-				t.Fatalf("generation %d old server connection: %v", generation, err)
-			}
-			oldWait := make(chan struct{})
-			go func(old *UDPHandler) {
-				old.wait()
-				close(oldWait)
-			}(currentHandler)
-			awaitUDPHandler(t, oldWait, "exact old UDP handler retirement")
-			if currentSC.Connection() != nil || currentSC.State() != StateDisconnected {
-				t.Fatalf("generation %d retained old ServerConnection", generation)
-			}
-			assertNoUDPSessions(t, currentHandler)
-			if _, err := currentHandler.fragmentAssembler.AddFragment(1, 1, 0, 2, []byte("closed")); !errors.Is(err, protocol.ErrFragmentAssemblerClosed) {
-				t.Fatalf("generation %d old assembler error = %v", generation, err)
-			}
-			_ = currentSession.localConn.SetReadDeadline(time.Now().Add(time.Second))
-			if _, err := currentSession.localConn.Read(make([]byte, 1)); !errors.Is(err, net.ErrClosed) {
-				t.Fatalf("generation %d old socket error = %v", generation, err)
-			}
+
+		if _, err := oldHandler.fragmentAssembler.AddFragment(sessionID, 1, 0, 2, []byte("old-fragment")); err != nil {
+			t.Fatal(err)
+		}
+		sendClientUDPDatagram(t, oldRemote, sessionID, []byte("old-draining"))
+		awaitUDPHandler(t, publishEntered, "old draining publish gate")
+		if payload, _ := readClientUDPBackend(t, backend, 2*time.Second); !bytes.Equal(payload, []byte("old-draining")) {
+			t.Fatalf("old draining payload = %q", payload)
+		}
+		oldState, oldPending := awaitUDPState(t, oldHandler, sessionID, udpSessionPhaseDraining)
+		if oldPending.candidate == nil || oldPending.session != nil || budget.snapshot().Permits != 1 || stats.load().Workers != 0 {
+			t.Fatalf("old draining state = %+v/budget %+v/workers %d", oldPending, budget.snapshot(), stats.load().Workers)
 		}
 
-		if _, err := handler.fragmentAssembler.AddFragment(uint32(generation+1), 1, 0, 2, []byte("pending")); err != nil {
-			t.Fatalf("generation %d pending fragment: %v", generation, err)
-		}
-		session, err := handler.getOrCreateSession(uint32(generation+1), sc.Connection())
-		if err != nil {
-			t.Fatalf("generation %d active UDP session: %v", generation, err)
-		}
-		currentSC, currentHandler, currentSession, currentServerDone = sc, handler, session, serverDone
-	}
+		successorClientConn, successorRemote := newUDPHandlerQUICPair(t)
+		successor := newUDPHandler("127.0.0.1", backend.LocalAddr().(*net.UDPAddr).Port, true,
+			config.DefaultMaxUDPFragmentGroupsPerHandler,
+			config.DefaultMaxUDPFragmentBackingBytesPerHandler,
+			zerolog.Nop(), budget, stats)
+		successor.Start(forceCtx, successorClientConn)
+		client.udpMu.Lock()
+		client.liveUDPHandlers[successor] = struct{}{}
+		client.udpHandlers.Store(sc.ServerAddr(), successor)
+		client.udpMu.Unlock()
+		t.Cleanup(func() {
+			_ = successorClientConn.CloseWithError(0, "test cleanup")
+			successor.stopAndWait()
+			client.retireUDPHandler(sc.ServerAddr(), successor)
+		})
 
-	if currentSC == nil || currentHandler == nil || currentSession == nil || currentServerDone == nil {
-		t.Fatal("final generation resources were not recorded")
-	}
-	cm.startReconnection(runCtx, currentSC.ServerAddr(), currentSC)
-	awaitRetirementCondition(t, "no-successor connection retirement", func() bool {
-		return cm.GetConnection(currentSC.ServerAddr()) == nil && currentSC.Connection() == nil
+		cleanupResult := make(chan error, 1)
+		go func() { cleanupResult <- client.cleanupRuntime(runtime) }()
+		awaitRetirementCondition(t, "closed draining state", func() bool {
+			return oldHandler.loadSessionState(sessionID) == nil && snapshotUDPState(oldState).phase == udpSessionPhaseClosed && sc.Connection() == nil
+		})
+		if cm.GetConnection(sc.ServerAddr()) != nil {
+			t.Fatal("no-successor cleanup retained the ServerConnection")
+		}
+		if _, err := oldPending.candidate.Write([]byte("closed")); !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("old draining socket after close = %v", err)
+		}
+		select {
+		case err := <-cleanupResult:
+			t.Fatalf("runtime cleanup returned before draining worker exit: %v", err)
+		case <-time.After(50 * time.Millisecond):
+		}
+		if snapshot := budget.snapshot(); snapshot.Current != 0 || snapshot.Permits != 1 || snapshot.AccountingFaults != 0 {
+			t.Fatalf("closed draining ownership = %+v, want worker-held permit", snapshot)
+		}
+
+		sendClientUDPDatagram(t, successorRemote, sessionID, []byte("capacity-drop"))
+		awaitClientUDPCondition(t, "successor capacity drop", func() bool {
+			return budget.snapshot().CapacityDrops == 1
+		})
+		if successor.loadSessionState(sessionID) != nil || successor.epochAllocator.Load() != 0 {
+			t.Fatal("capacity-dropped successor started session setup")
+		}
+
+		releasePublish()
+		if err := awaitLifecycle(t, cleanupResult, "draining runtime worker exit"); err != nil {
+			t.Fatal(err)
+		}
+		if err := awaitLifecycle(t, serverDone, "draining generation server close"); err != nil {
+			t.Fatal(err)
+		}
+		assertNoUDPSessions(t, oldHandler)
+		if _, err := oldHandler.fragmentAssembler.AddFragment(1, 1, 0, 2, []byte("closed")); !errors.Is(err, protocol.ErrFragmentAssemblerClosed) {
+			t.Fatalf("old draining assembler error = %v", err)
+		}
+		if current, ok := client.udpHandlers.Load(sc.ServerAddr()); !ok || current != successor {
+			t.Fatalf("old exact cleanup changed successor mapping = (%p, %v), want (%p, true)", current, ok, successor)
+		}
+		if snapshot := budget.snapshot(); snapshot.Current != 0 || snapshot.Permits != 0 || snapshot.CapacityDrops != 1 || snapshot.AccountingFaults != 0 {
+			t.Fatalf("old draining worker cleanup = %+v", snapshot)
+		}
+
+		sendClientUDPDatagram(t, successorRemote, sessionID, []byte("successor-ready"))
+		if payload, _ := readClientUDPBackend(t, backend, 2*time.Second); !bytes.Equal(payload, []byte("successor-ready")) {
+			t.Fatalf("successor payload after permit release = %q", payload)
+		}
+		_, successorReady := awaitUDPState(t, successor, sessionID, udpSessionPhaseReady)
+		awaitClientUDPCondition(t, "successor response worker", func() bool {
+			return stats.load().Workers == 1
+		})
+		if successorReady.session == nil || oldHandler.epochAllocator.Load() != 1 || successor.epochAllocator.Load() != 1 {
+			t.Fatalf("isolated handler epochs = old %d/successor %d", oldHandler.epochAllocator.Load(), successor.epochAllocator.Load())
+		}
+		oldHandler.closeStateExact(oldState)
+		if current, ok := client.udpHandlers.Load(sc.ServerAddr()); !ok || current != successor {
+			t.Fatal("stale old state close removed the successor handler")
+		}
+		if _, err := successor.fragmentAssembler.AddFragment(sessionID, 2, 0, 2, []byte("successor-fragment")); err != nil {
+			t.Fatal(err)
+		}
+
+		_ = successorClientConn.CloseWithError(0, "successor cleanup")
+		successor.stopAndWait()
+		client.retireUDPHandler(sc.ServerAddr(), successor)
+		if _, err := successorReady.session.localConn.Write([]byte("closed")); !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("successor socket after cleanup = %v", err)
+		}
+		if _, ok := client.udpHandlers.Load(sc.ServerAddr()); ok {
+			t.Fatal("successor handler mapping survived cleanup")
+		}
+		if snapshot := budget.snapshot(); snapshot.Current != 0 || snapshot.Permits != 0 || snapshot.AccountingFaults != 0 || stats.load().Workers != 0 {
+			t.Fatalf("no-successor final cleanup = budget %+v/workers %d", snapshot, stats.load().Workers)
+		}
+		cancelForce()
+		if err := cm.Stop(); err != nil {
+			t.Fatal(err)
+		}
 	})
-	if err := awaitLifecycle(t, currentServerDone, "no-successor server connection close"); err != nil {
-		t.Fatal(err)
-	}
-	lastWait := make(chan struct{})
-	go func() {
-		currentHandler.wait()
-		close(lastWait)
-	}()
-	awaitUDPHandler(t, lastWait, "no-successor UDP handler retirement")
-	assertNoUDPSessions(t, currentHandler)
-	if _, err := currentHandler.fragmentAssembler.AddFragment(1, 1, 0, 2, []byte("closed")); !errors.Is(err, protocol.ErrFragmentAssemblerClosed) {
-		t.Fatalf("no-successor assembler error = %v", err)
-	}
-	_ = currentSession.localConn.SetReadDeadline(time.Now().Add(time.Second))
-	if _, err := currentSession.localConn.Read(make([]byte, 1)); !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("no-successor socket error = %v", err)
-	}
-
-	cancelRun()
-	if err := cm.Stop(); err != nil {
-		t.Fatal(err)
-	}
-	client.producerWG.Wait()
 }
 
 func TestServerConnectionCloseCannotBeReanimatedByHeartbeatCompletion(t *testing.T) {

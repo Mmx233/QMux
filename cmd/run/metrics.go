@@ -331,6 +331,7 @@ func newClientCollector(snapshot func() client.Snapshot) prometheus.Collector {
 		c.counter(ch, "udp_send_errors_total", d.SendErrors)
 		c.counter(ch, "udp_accounting_faults_total", u.AccountingFaults)
 		c.counter(ch, "udp_drops_total", u.CapacityDrops, "session_capacity")
+		c.counter(ch, "udp_drops_total", u.PendingDrops, "pending_setup")
 		c.counter(ch, "udp_drops_total", u.DecodeDrops, "decode")
 		c.counter(ch, "udp_drops_total", d.FragmentDrops, "fragmentation")
 		c.counter(ch, "udp_local_errors_total", u.CreateErrors, "create")
