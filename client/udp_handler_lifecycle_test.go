@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -250,15 +251,16 @@ func runUDPHandlerResolverChild(t *testing.T) {
 func TestUDPDecodeErrorsIgnoreClosedAssembler(t *testing.T) {
 	handler := NewUDPHandler("127.0.0.1", 1, true, config.DefaultMaxUDPFragmentGroupsPerHandler, config.DefaultMaxUDPFragmentBackingBytesPerHandler, zerolog.Nop())
 	t.Cleanup(handler.Stop)
-	var fragmentSequence uint32
-	datagrams, err := protocol.FragmentUDP(1, 1, make([]byte, protocol.MaxUDPPayload+1), &fragmentSequence, true)
+	var fragmentSequence atomic.Uint32
+	datagrams, err := protocol.FragmentUDPPooled(1, 1, make([]byte, protocol.MaxUDPPayload+1), &fragmentSequence, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// A queued valid fragment can still be decoded after Stop closes the assembler.
 	handler.Stop()
-	_, _, _, err = protocol.DecodeAndAssembleUDPDatagram(datagrams[0], handler.fragmentAssembler)
+	_, _, _, err = protocol.DecodeAndAssembleUDPDatagram(datagrams[0].Data, handler.fragmentAssembler)
+	protocol.ReleaseDatagramResults(datagrams)
 	if !errors.Is(err, protocol.ErrFragmentAssemblerClosed) {
 		t.Fatalf("decode after Stop = %v, want closed assembler", err)
 	}

@@ -18,18 +18,19 @@ func (fn udpAssemblerFunc) AddFragment(sessionID uint32, fragID uint64, index, t
 
 func TestUDPWireV2RegressionBinaryPayload(t *testing.T) {
 	payload := []byte{0x01, 0x02, 0x80, 0x00, 0x02, 0x03}
-	var fragmentSequence uint32
-	datagrams, err := FragmentUDP(0x01020304, 1, payload, &fragmentSequence, true)
+	var fragmentSequence atomic.Uint32
+	datagrams, err := FragmentUDPPooled(0x01020304, 1, payload, &fragmentSequence, true)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer ReleaseDatagramResults(datagrams)
 
 	wantWire := []byte{0x20, 0x01, 0x02, 0x03, 0x04, 0x01, 0x02, 0x80, 0x00, 0x02, 0x03}
-	if !bytes.Equal(datagrams[0], wantWire) {
-		t.Fatalf("wire mismatch:\n got % x\nwant % x", datagrams[0], wantWire)
+	if !bytes.Equal(datagrams[0].Data, wantWire) {
+		t.Fatalf("wire mismatch:\n got % x\nwant % x", datagrams[0].Data, wantWire)
 	}
 
-	parsed, err := DecodeUDPDatagram(datagrams[0])
+	parsed, err := DecodeUDPDatagram(datagrams[0].Data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,18 +45,20 @@ func TestUDPFragmentWireV2WidenedGolden(t *testing.T) {
 	}
 
 	payload := make([]byte, MaxUDPPayload+1)
-	sequence := uint32(0x55667787)
-	datagrams, err := FragmentUDP(0x01020304, 0x11223344, payload, &sequence, true)
+	var sequence atomic.Uint32
+	sequence.Store(0x55667787)
+	datagrams, err := FragmentUDPPooled(0x01020304, 0x11223344, payload, &sequence, true)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer ReleaseDatagramResults(datagrams)
 	wantHeader := []byte{
 		0x22, 0x01, 0x02, 0x03, 0x04,
 		0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
 		0x00, 0x02,
 	}
-	if len(datagrams) != 2 || !bytes.Equal(datagrams[0][:UDPFragHeaderSize], wantHeader) {
-		t.Fatalf("fragment wire header:\n got % x\nwant % x", datagrams[0][:UDPFragHeaderSize], wantHeader)
+	if len(datagrams) != 2 || !bytes.Equal(datagrams[0].Data[:UDPFragHeaderSize], wantHeader) {
+		t.Fatalf("fragment wire header:\n got % x\nwant % x", datagrams[0].Data[:UDPFragHeaderSize], wantHeader)
 	}
 	parsed, err := DecodeUDPDatagram(append(append([]byte(nil), wantHeader...), 0xaa))
 	if err != nil {
@@ -74,22 +77,25 @@ func TestUDPWireV2ArbitraryBinaryRoundTrip(t *testing.T) {
 		if _, err := rng.Read(payload); err != nil {
 			t.Fatal(err)
 		}
-		var fragmentSequence uint32
-		datagrams, err := FragmentUDP(uint32(iteration), 1, payload, &fragmentSequence, true)
+		var fragmentSequence atomic.Uint32
+		datagrams, err := FragmentUDPPooled(uint32(iteration), 1, payload, &fragmentSequence, true)
 		if err != nil {
 			t.Fatalf("iteration %d: %v", iteration, err)
 		}
-		parsed, err := DecodeUDPDatagram(datagrams[0])
+		parsed, err := DecodeUDPDatagram(datagrams[0].Data)
 		if err != nil {
+			ReleaseDatagramResults(datagrams)
 			t.Fatalf("iteration %d: %v", iteration, err)
 		}
 		if parsed.SessionID != uint32(iteration) || parsed.IsFragmented || !bytes.Equal(parsed.Payload, payload) {
+			ReleaseDatagramResults(datagrams)
 			t.Fatalf("iteration %d did not round trip", iteration)
 		}
+		ReleaseDatagramResults(datagrams)
 	}
 }
 
-func TestUDPWireV2BoundaryAndEncoderConsistency(t *testing.T) {
+func TestUDPWireV2Boundary(t *testing.T) {
 	for _, size := range []int{0, 4, 5, 1184, 1185, 1195, 1196, 2369, 2370, 2371, 4096} {
 		t.Run(strconv.Itoa(size), func(t *testing.T) {
 			payload := make([]byte, size)
@@ -97,60 +103,61 @@ func TestUDPWireV2BoundaryAndEncoderConsistency(t *testing.T) {
 				payload[i] = byte(i*31 + 7)
 			}
 
-			plainSequence := uint32(0x55667787)
-			plain, err := FragmentUDP(99, 0x11223344, payload, &plainSequence, true)
+			var sequence atomic.Uint32
+			sequence.Store(0x55667787)
+			datagrams, err := FragmentUDPPooled(99, 0x11223344, payload, &sequence, true)
 			if err != nil {
 				t.Fatal(err)
 			}
-			var pooledSequence atomic.Uint32
-			pooledSequence.Store(0x55667787)
-			pooled, err := FragmentUDPPooled(99, 0x11223344, payload, &pooledSequence, true)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer ReleaseDatagramResults(pooled)
+			defer ReleaseDatagramResults(datagrams)
 
-			if len(plain) != len(pooled) {
-				t.Fatalf("encoder count mismatch: %d != %d", len(plain), len(pooled))
-			}
-			for i := range plain {
-				if !bytes.Equal(plain[i], pooled[i].Data) {
-					t.Fatalf("datagram %d differs between pooled and unpooled encoders", i)
-				}
-				if len(plain[i]) > MaxDatagramSize {
-					t.Fatalf("datagram %d is too large: %d", i, len(plain[i]))
-				}
-				wantType := byte(UDPDatagramTypeNormal)
-				if size > MaxUDPPayload {
-					wantType = UDPDatagramTypeFragment
-				}
-				if plain[i][0] != wantType {
-					t.Fatalf("datagram %d type=%#x, want %#x", i, plain[i][0], wantType)
-				}
-			}
+			wantCount := 1
+			wantType := byte(UDPDatagramTypeNormal)
 			wantSequence := uint32(0x55667787)
 			if size > MaxUDPPayload {
+				wantCount = (size + MaxFragPayload - 1) / MaxFragPayload
+				wantType = UDPDatagramTypeFragment
 				wantSequence++
-				if want := (size + MaxFragPayload - 1) / MaxFragPayload; len(plain) != want {
-					t.Fatalf("fragment count = %d, want %d", len(plain), want)
+			}
+			if len(datagrams) != wantCount {
+				t.Fatalf("datagram count = %d, want %d", len(datagrams), wantCount)
+			}
+			assembler := NewShardedFragmentAssembler(1, 0, 0)
+			defer assembler.Close()
+			var got []byte
+			for i, datagram := range datagrams {
+				if len(datagram.Data) > MaxDatagramSize {
+					t.Fatalf("datagram %d is too large: %d", i, len(datagram.Data))
+				}
+				if datagram.Data[0] != wantType {
+					t.Fatalf("datagram %d type=%#x, want %#x", i, datagram.Data[0], wantType)
+				}
+				sessionID, decoded, complete, err := DecodeAndAssembleUDPDatagram(datagram.Data, assembler)
+				if err != nil || sessionID != 99 {
+					t.Fatalf("datagram %d decode = session %d error %v", i, sessionID, err)
+				}
+				if complete != (i == len(datagrams)-1) {
+					t.Fatalf("datagram %d complete = %v", i, complete)
+				}
+				if complete {
+					got = decoded
 				}
 			}
-			if plainSequence != wantSequence || pooledSequence.Load() != wantSequence {
-				t.Fatalf("sequence = %#x/%#x, want %#x", plainSequence, pooledSequence.Load(), wantSequence)
+			if !bytes.Equal(got, payload) {
+				t.Fatalf("round-trip payload = %d bytes, want %d", len(got), len(payload))
+			}
+			if sequence.Load() != wantSequence {
+				t.Fatalf("sequence = %#x, want %#x", sequence.Load(), wantSequence)
 			}
 		})
 	}
 
 	oversized := make([]byte, MaxUDPPayload+1)
-	var fragmentSequence uint32
-	if _, err := FragmentUDP(1, 1, oversized, &fragmentSequence, false); !errors.Is(err, ErrFragmentationDisabled) {
-		t.Fatalf("unpooled fragmentation-disabled error=%v", err)
+	var sequence atomic.Uint32
+	if _, err := FragmentUDPPooled(1, 1, oversized, &sequence, false); !errors.Is(err, ErrFragmentationDisabled) {
+		t.Fatalf("fragmentation-disabled error=%v", err)
 	}
-	var atomicSequence atomic.Uint32
-	if _, err := FragmentUDPPooled(1, 1, oversized, &atomicSequence, false); !errors.Is(err, ErrFragmentationDisabled) {
-		t.Fatalf("pooled fragmentation-disabled error=%v", err)
-	}
-	if fragmentSequence != 0 || atomicSequence.Load() != 0 {
+	if sequence.Load() != 0 {
 		t.Fatal("fragmentation-disabled packet consumed an identity")
 	}
 }
@@ -238,35 +245,22 @@ func TestFragmentSequenceWrapPreservesEpoch(t *testing.T) {
 	}
 	payload := make([]byte, MaxUDPPayload+1)
 
-	t.Run("non-pooled", func(t *testing.T) {
-		sequence := uint32(math.MaxUint32 - 1)
-		for i, wantID := range want {
-			datagrams, err := FragmentUDP(1, epoch, payload, &sequence, true)
-			if err != nil {
-				t.Fatalf("fragment %d: %v", i, err)
-			}
-			parsed, err := DecodeUDPDatagram(datagrams[0])
-			if err != nil || parsed.FragmentID != wantID {
-				t.Fatalf("fragment %d identity = %#x, error %v, want %#x", i, parsed.FragmentID, err, wantID)
-			}
+	var sequence atomic.Uint32
+	sequence.Store(math.MaxUint32 - 1)
+	for i, wantID := range want {
+		datagrams, err := FragmentUDPPooled(1, epoch, payload, &sequence, true)
+		if err != nil {
+			t.Fatalf("fragment %d: %v", i, err)
 		}
-	})
-
-	t.Run("pooled", func(t *testing.T) {
-		var sequence atomic.Uint32
-		sequence.Store(math.MaxUint32 - 1)
-		for i, wantID := range want {
-			datagrams, err := FragmentUDPPooled(1, epoch, payload, &sequence, true)
-			if err != nil {
-				t.Fatalf("fragment %d: %v", i, err)
-			}
-			parsed, decodeErr := DecodeUDPDatagram(datagrams[0].Data)
-			ReleaseDatagramResults(datagrams)
-			if decodeErr != nil || parsed.FragmentID != wantID {
-				t.Fatalf("fragment %d identity = %#x, error %v, want %#x", i, parsed.FragmentID, decodeErr, wantID)
-			}
+		parsed, decodeErr := DecodeUDPDatagram(datagrams[0].Data)
+		ReleaseDatagramResults(datagrams)
+		if decodeErr != nil {
+			t.Fatalf("fragment %d decode: %v", i, decodeErr)
 		}
-	})
+		if parsed.FragmentID != wantID {
+			t.Fatalf("fragment %d identity = %#x, want %#x", i, parsed.FragmentID, wantID)
+		}
+	}
 }
 
 func TestFragmentIdentitySurvives65537EncoderAllocations(t *testing.T) {
@@ -279,7 +273,8 @@ func TestFragmentIdentitySurvives65537EncoderAllocations(t *testing.T) {
 	newPayload := bytes.Repeat([]byte{0xb2}, MaxUDPPayload+1)
 	probePayload := make([]byte, MaxUDPPayload+1)
 	var sequence atomic.Uint32
-	assembler := &FragmentAssembler{fragments: make(map[fragmentKey]*fragmentGroup)}
+	assembler := NewShardedFragmentAssembler(1, 0, 0)
+	defer assembler.Close()
 
 	oldFragments, err := FragmentUDPPooled(sessionID, epoch, oldPayload, &sequence, true)
 	if err != nil {
@@ -322,15 +317,15 @@ func TestFragmentIdentitySurvives65537EncoderAllocations(t *testing.T) {
 		ReleaseDatagramResults(fragments)
 	}
 
-	if len(assembler.fragments) != 1 {
-		t.Fatalf("retained groups after identity %d = %d, want 1", lastID, len(assembler.fragments))
+	if got := assembler.Snapshot().RetainedGroups; got != 1 {
+		t.Fatalf("retained groups after identity %d = %d, want 1", lastID, got)
 	}
 	_, got, complete, err := DecodeAndAssembleUDPDatagram(delayedOld, assembler)
 	if err != nil || !complete || !bytes.Equal(got, oldPayload) {
 		t.Fatalf("old identity completion: bytes=%d complete=%v error=%v", len(got), complete, err)
 	}
-	if len(assembler.fragments) != 0 {
-		t.Fatalf("completed identities retained %d groups", len(assembler.fragments))
+	if got := assembler.Snapshot().RetainedGroups; got != 0 {
+		t.Fatalf("completed identities retained %d groups", got)
 	}
 }
 
@@ -348,12 +343,13 @@ func FuzzDecodeUDPDatagram(f *testing.F) {
 
 func TestDecodeAndAssembleUDPDatagram(t *testing.T) {
 	t.Run("normal empty payload is complete", func(t *testing.T) {
-		var fragmentSequence uint32
-		datagrams, err := FragmentUDP(42, 1, nil, &fragmentSequence, true)
+		var fragmentSequence atomic.Uint32
+		datagrams, err := FragmentUDPPooled(42, 1, nil, &fragmentSequence, true)
 		if err != nil {
 			t.Fatal(err)
 		}
-		sessionID, payload, complete, err := DecodeAndAssembleUDPDatagram(datagrams[0], nil)
+		defer ReleaseDatagramResults(datagrams)
+		sessionID, payload, complete, err := DecodeAndAssembleUDPDatagram(datagrams[0].Data, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -364,15 +360,16 @@ func TestDecodeAndAssembleUDPDatagram(t *testing.T) {
 
 	t.Run("fragment incomplete then complete", func(t *testing.T) {
 		want := bytes.Repeat([]byte{0x00, 0xff, 0x80, 0x21}, 700)
-		var fragmentSequence uint32
-		datagrams, err := FragmentUDP(43, 1, want, &fragmentSequence, true)
+		var fragmentSequence atomic.Uint32
+		datagrams, err := FragmentUDPPooled(43, 1, want, &fragmentSequence, true)
 		if err != nil {
 			t.Fatal(err)
 		}
-		assembler := NewFragmentAssembler(0, 0)
+		defer ReleaseDatagramResults(datagrams)
+		assembler := NewShardedFragmentAssembler(16, 0, 0)
 		defer assembler.Close()
 		for i, datagram := range datagrams {
-			sessionID, payload, complete, err := DecodeAndAssembleUDPDatagram(datagram, assembler)
+			sessionID, payload, complete, err := DecodeAndAssembleUDPDatagram(datagram.Data, assembler)
 			if err != nil {
 				t.Fatalf("fragment %d: %v", i, err)
 			}
@@ -414,30 +411,24 @@ func TestDecodeAndAssembleUDPDatagram(t *testing.T) {
 }
 
 func TestDecodeAndAssembleUDPDatagramSameFragmentIDDifferentSessions(t *testing.T) {
-	type closeAssembler interface {
-		UDPFragmentAssembler
-		Close()
-	}
-	assemblers := map[string]func() closeAssembler{
-		"regular": func() closeAssembler { return NewFragmentAssembler(0, 0) },
-		"sharded": func() closeAssembler { return NewShardedFragmentAssembler(16, 0, 0) },
-	}
 	firstPayload := bytes.Repeat([]byte("first"), 500)
 	secondPayload := bytes.Repeat([]byte("second"), 500)
-	var firstCounter, secondCounter uint32
-	first, err := FragmentUDP(1, 1, firstPayload, &firstCounter, true)
+	var firstCounter, secondCounter atomic.Uint32
+	first, err := FragmentUDPPooled(1, 1, firstPayload, &firstCounter, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := FragmentUDP(2, 1, secondPayload, &secondCounter, true)
+	defer ReleaseDatagramResults(first)
+	second, err := FragmentUDPPooled(2, 1, secondPayload, &secondCounter, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstHeader, err := DecodeUDPDatagram(first[0])
+	defer ReleaseDatagramResults(second)
+	firstHeader, err := DecodeUDPDatagram(first[0].Data)
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondHeader, err := DecodeUDPDatagram(second[0])
+	secondHeader, err := DecodeUDPDatagram(second[0].Data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -449,29 +440,25 @@ func TestDecodeAndAssembleUDPDatagramSameFragmentIDDifferentSessions(t *testing.
 		wire      []byte
 		want      []byte
 	}{
-		{sessionID: 1, wire: first[2]},
-		{sessionID: 1, wire: first[2]}, // duplicate, out of order
-		{sessionID: 2, wire: second[0]},
-		{sessionID: 2, wire: second[0]}, // duplicate
-		{sessionID: 1, wire: first[0]},
-		{sessionID: 2, wire: second[2]},
-		{sessionID: 1, wire: first[1], want: firstPayload},
-		{sessionID: 2, wire: second[1], want: secondPayload},
+		{sessionID: 1, wire: first[2].Data},
+		{sessionID: 1, wire: first[2].Data}, // duplicate, out of order
+		{sessionID: 2, wire: second[0].Data},
+		{sessionID: 2, wire: second[0].Data}, // duplicate
+		{sessionID: 1, wire: first[0].Data},
+		{sessionID: 2, wire: second[2].Data},
+		{sessionID: 1, wire: first[1].Data, want: firstPayload},
+		{sessionID: 2, wire: second[1].Data, want: secondPayload},
 	}
 
-	for name, newAssembler := range assemblers {
-		t.Run(name, func(t *testing.T) {
-			assembler := newAssembler()
-			defer assembler.Close()
-			for i, fragment := range sequence {
-				sessionID, payload, complete, err := DecodeAndAssembleUDPDatagram(fragment.wire, assembler)
-				if err != nil {
-					t.Fatalf("fragment %d: %v", i, err)
-				}
-				if sessionID != fragment.sessionID || complete != (fragment.want != nil) || !bytes.Equal(payload, fragment.want) {
-					t.Fatalf("fragment %d: session=%d payload bytes=%d complete=%v, want session=%d payload bytes=%d", i, sessionID, len(payload), complete, fragment.sessionID, len(fragment.want))
-				}
-			}
-		})
+	assembler := NewShardedFragmentAssembler(16, 0, 0)
+	defer assembler.Close()
+	for i, fragment := range sequence {
+		sessionID, payload, complete, err := DecodeAndAssembleUDPDatagram(fragment.wire, assembler)
+		if err != nil {
+			t.Fatalf("fragment %d: %v", i, err)
+		}
+		if sessionID != fragment.sessionID || complete != (fragment.want != nil) || !bytes.Equal(payload, fragment.want) {
+			t.Fatalf("fragment %d: session=%d payload bytes=%d complete=%v, want session=%d payload bytes=%d", i, sessionID, len(payload), complete, fragment.sessionID, len(fragment.want))
+		}
 	}
 }

@@ -9,27 +9,19 @@ import (
 
 func TestFragmentUDPPooledRejectsOversizedPacket(t *testing.T) {
 	maxPacket := make([]byte, 255*MaxFragPayload)
-	var plainSequence uint32
-	plain, err := FragmentUDP(12345, 1, maxPacket, &plainSequence, true)
-	if err != nil || len(plain) != 255 || plainSequence != 1 {
-		t.Fatalf("maximum non-pooled packet = %d fragments, sequence %d, error %v", len(plain), plainSequence, err)
-	}
 	var counter atomic.Uint32
-	pooled, err := FragmentUDPPooled(12345, 1, maxPacket, &counter, true)
-	if err != nil || len(pooled) != 255 || counter.Load() != 1 {
-		t.Fatalf("maximum pooled packet = %d fragments, sequence %d, error %v", len(pooled), counter.Load(), err)
+	datagrams, err := FragmentUDPPooled(12345, 1, maxPacket, &counter, true)
+	if err != nil || len(datagrams) != 255 || counter.Load() != 1 {
+		t.Fatalf("maximum packet = %d fragments, sequence %d, error %v", len(datagrams), counter.Load(), err)
 	}
-	ReleaseDatagramResults(pooled)
+	ReleaseDatagramResults(datagrams)
 
 	data := make([]byte, 256*MaxFragPayload)
 	if _, err := FragmentUDPPooled(12345, 1, data, &counter, true); !errors.Is(err, ErrPacketTooLarge) {
 		t.Fatalf("expected ErrPacketTooLarge, got %v", err)
 	}
-	if _, err := FragmentUDP(12345, 1, data, &plainSequence, true); !errors.Is(err, ErrPacketTooLarge) {
-		t.Fatalf("non-pooled oversized error = %v, want %v", err, ErrPacketTooLarge)
-	}
-	if counter.Load() != 1 || plainSequence != 1 {
-		t.Fatalf("oversized packet consumed identity: pooled %d/non-pooled %d", counter.Load(), plainSequence)
+	if counter.Load() != 1 {
+		t.Fatalf("oversized packet consumed identity: %d", counter.Load())
 	}
 }
 
@@ -77,36 +69,8 @@ func TestShardedFragmentAssemblerLargePayload(t *testing.T) {
 	}
 }
 
-func TestFragmentAssemblerConstructorsEnforceConfiguredLimits(t *testing.T) {
-	t.Run("regular group limit", func(t *testing.T) {
-		assembler := NewFragmentAssembler(1, 1024)
-		defer assembler.Close()
-		if _, err := assembler.AddFragment(1, 1, 0, 2, []byte("a")); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := assembler.AddFragment(2, 1, 0, 2, []byte("b")); !errors.Is(err, ErrFragmentAssemblerFull) {
-			t.Fatalf("second group error = %v, want %v", err, ErrFragmentAssemblerFull)
-		}
-		if len(assembler.fragments) != 1 || assembler.retainedBytes != 1 {
-			t.Fatalf("rejected group changed ownership: groups=%d bytes=%d", len(assembler.fragments), assembler.retainedBytes)
-		}
-	})
-
-	t.Run("regular byte limit", func(t *testing.T) {
-		assembler := NewFragmentAssembler(2, 1)
-		defer assembler.Close()
-		if _, err := assembler.AddFragment(1, 1, 0, 2, []byte("a")); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := assembler.AddFragment(1, 1, 1, 2, []byte("b")); !errors.Is(err, ErrFragmentAssemblerFull) {
-			t.Fatalf("second byte error = %v, want %v", err, ErrFragmentAssemblerFull)
-		}
-		if len(assembler.fragments) != 1 || assembler.retainedBytes != 1 {
-			t.Fatalf("rejected byte changed ownership: groups=%d bytes=%d", len(assembler.fragments), assembler.retainedBytes)
-		}
-	})
-
-	t.Run("sharded group limit", func(t *testing.T) {
+func TestShardedFragmentAssemblerConstructorEnforcesConfiguredLimits(t *testing.T) {
+	t.Run("group limit", func(t *testing.T) {
 		assembler := NewShardedFragmentAssembler(1, 1, 2*int64(FragmentBufferSize))
 		defer assembler.Close()
 		if _, err := assembler.AddFragment(1, 1, 0, 2, []byte("a")); err != nil {
@@ -120,7 +84,7 @@ func TestFragmentAssemblerConstructorsEnforceConfiguredLimits(t *testing.T) {
 		}
 	})
 
-	t.Run("sharded byte limit", func(t *testing.T) {
+	t.Run("byte limit", func(t *testing.T) {
 		assembler := NewShardedFragmentAssembler(1, 2, int64(FragmentBufferSize))
 		defer assembler.Close()
 		if _, err := assembler.AddFragment(1, 1, 0, 2, []byte("a")); err != nil {
@@ -135,24 +99,13 @@ func TestFragmentAssemblerConstructorsEnforceConfiguredLimits(t *testing.T) {
 	})
 }
 
-func TestFragmentAssemblerConstructorsRespectLimitsAboveOldDefaults(t *testing.T) {
+func TestShardedFragmentAssemblerConstructorRespectsLimitsAboveOldDefaults(t *testing.T) {
 	groupLimit := maxRetainedFragmentGroups + 1
 	byteLimit := int64(maxRetainedFragmentBytes + 1)
-	regular := NewFragmentAssembler(groupLimit, byteLimit)
-	defer regular.Close()
-	sharded := NewShardedFragmentAssembler(1, groupLimit, byteLimit)
-	defer sharded.Close()
-
-	for name, limits := range map[string]struct {
-		groups int
-		bytes  int64
-	}{
-		"regular": {fragmentGroupLimit(regular.maxGroups), fragmentByteLimit(regular.maxBytes)},
-		"sharded": {fragmentGroupLimit(sharded.maxGroups), fragmentByteLimit(sharded.maxBytes)},
-	} {
-		if limits.groups != groupLimit || limits.bytes != byteLimit {
-			t.Fatalf("%s effective limits = %d/%d, want %d/%d", name, limits.groups, limits.bytes, groupLimit, byteLimit)
-		}
+	assembler := NewShardedFragmentAssembler(1, groupLimit, byteLimit)
+	defer assembler.Close()
+	if groups, effectiveBytes := fragmentGroupLimit(assembler.maxGroups), fragmentByteLimit(assembler.maxBytes); groups != groupLimit || effectiveBytes != byteLimit {
+		t.Fatalf("effective limits = %d/%d, want %d/%d", groups, effectiveBytes, groupLimit, byteLimit)
 	}
 }
 

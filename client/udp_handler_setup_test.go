@@ -365,12 +365,13 @@ func TestUDPHandlerPendingPayloadOwnershipAndZeroLength(t *testing.T) {
 		gate.stall.Store(true)
 
 		want := bytes.Repeat([]byte{0xa6}, protocol.MaxUDPPayload+200)
-		var sequence uint32
-		fragments, err := protocol.FragmentUDP(22, 7, want, &sequence, true)
+		var sequence atomic.Uint32
+		fragments, err := protocol.FragmentUDPPooled(22, 7, want, &sequence, true)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := serverConn.SendDatagram(fragments[0]); err != nil {
+		defer protocol.ReleaseDatagramResults(fragments)
+		if err := serverConn.SendDatagram(fragments[0].Data); err != nil {
 			t.Fatal(err)
 		}
 		awaitClientUDPCondition(t, "incomplete fragment retention", func() bool {
@@ -380,7 +381,7 @@ func TestUDPHandlerPendingPayloadOwnershipAndZeroLength(t *testing.T) {
 			t.Fatal("incomplete fragment created a UDP session")
 		}
 		for _, fragment := range fragments[1:] {
-			if err := serverConn.SendDatagram(fragment); err != nil {
+			if err := serverConn.SendDatagram(fragment.Data); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -393,8 +394,9 @@ func TestUDPHandlerPendingPayloadOwnershipAndZeroLength(t *testing.T) {
 			t.Fatalf("completed fragment retained assembler ownership: %+v", snapshot)
 		}
 		for _, fragment := range fragments {
-			clear(fragment)
+			clear(fragment.Data)
 		}
+		protocol.ReleaseDatagramResults(fragments)
 		sendClientUDPDatagram(t, serverConn, 22, []byte("after-fragment"))
 		awaitClientUDPCondition(t, "fragment and successor pending", func() bool {
 			return snapshotUDPState(state).packetCount == 2
@@ -463,16 +465,17 @@ func TestUDPHandlerFailureCountersAreOperationClassified(t *testing.T) {
 		gate.stall.Store(true)
 
 		payload := bytes.Repeat([]byte{0xe1}, udpPendingBackingLimit)
-		var sequence uint32
-		fragments, err := protocol.FragmentUDP(31, 1, payload, &sequence, true)
+		var sequence atomic.Uint32
+		fragments, err := protocol.FragmentUDPPooled(31, 1, payload, &sequence, true)
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer protocol.ReleaseDatagramResults(fragments)
 		if len(fragments) != 255 {
 			t.Fatalf("maximum payload fragments = %d, want 255", len(fragments))
 		}
 		for i, fragment := range fragments {
-			if err := serverConn.SendDatagram(fragment); err != nil {
+			if err := serverConn.SendDatagram(fragment.Data); err != nil {
 				t.Fatal(err)
 			}
 			if i+1 < len(fragments) {
@@ -482,6 +485,7 @@ func TestUDPHandlerFailureCountersAreOperationClassified(t *testing.T) {
 				})
 			}
 		}
+		protocol.ReleaseDatagramResults(fragments)
 		awaitUDPHandler(t, gate.entered, "oversized payload DNS gate")
 		_, pending := awaitUDPState(t, handler, 31, udpSessionPhaseCollecting)
 		if pending.packetCount != 1 || pending.retainedBytes != udpPendingBackingLimit {

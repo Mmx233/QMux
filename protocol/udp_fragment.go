@@ -61,7 +61,7 @@ type UDPDatagram struct {
 	Payload       []byte
 }
 
-// UDPFragmentAssembler is implemented by the regular and sharded fragment assemblers.
+// UDPFragmentAssembler accepts fragments for DecodeAndAssembleUDPDatagram.
 type UDPFragmentAssembler interface {
 	AddFragment(sessionID uint32, fragID uint64, index, total uint8, payload []byte) ([]byte, error)
 }
@@ -183,19 +183,6 @@ func FragmentUDPPooled(sessionID, epoch uint32, data []byte, fragmentSequence *a
 	return results, nil
 }
 
-// FragmentAssembler reassembles fragmented UDP packets
-type FragmentAssembler struct {
-	mu            sync.Mutex
-	fragments     map[fragmentKey]*fragmentGroup
-	retainedBytes int64
-	maxGroups     int
-	maxBytes      int64
-	closed        bool
-	stopCh        chan struct{}
-	doneCh        chan struct{}
-	closeOnce     sync.Once
-}
-
 type fragmentKey struct {
 	sessionID uint32
 	fragID    uint64
@@ -295,115 +282,6 @@ func releaseAllFragmentGroups(groups map[fragmentKey]*fragmentGroup) (int64, int
 		releasedGroups++
 	}
 	return releasedGroups, releasedBytes
-}
-
-// NewFragmentAssembler creates a new fragment assembler
-func NewFragmentAssembler(maxGroups int, maxBackingBytes int64) *FragmentAssembler {
-	fa := &FragmentAssembler{
-		fragments: make(map[fragmentKey]*fragmentGroup),
-		maxGroups: maxGroups,
-		maxBytes:  maxBackingBytes,
-		stopCh:    make(chan struct{}),
-		doneCh:    make(chan struct{}),
-	}
-	go fa.cleanupLoop()
-	return fa
-}
-
-// cleanupLoop removes expired fragment groups
-func (fa *FragmentAssembler) cleanupLoop() {
-	ticker := time.NewTicker(FragmentTimeout)
-	defer ticker.Stop()
-	defer close(fa.doneCh)
-
-	for {
-		select {
-		case <-ticker.C:
-			fa.mu.Lock()
-			_, releasedBytes := cleanupExpiredFragmentGroups(fa.fragments, time.Now())
-			fa.retainedBytes -= releasedBytes
-			fa.mu.Unlock()
-		case <-fa.stopCh:
-			return
-		}
-	}
-}
-
-// Close stops cleanup, waits for its goroutine to exit, and releases all
-// pending fragment groups. It is safe to call multiple times.
-func (fa *FragmentAssembler) Close() {
-	fa.closeOnce.Do(func() {
-		fa.mu.Lock()
-		fa.closed = true
-		_, releasedBytes := releaseAllFragmentGroups(fa.fragments)
-		fa.retainedBytes -= releasedBytes
-		stopCh, doneCh := fa.stopCh, fa.doneCh
-		if stopCh != nil {
-			close(stopCh)
-		}
-		fa.mu.Unlock()
-
-		if doneCh != nil {
-			<-doneCh
-		}
-	})
-}
-
-// AddFragment adds a fragment and returns the complete packet if all fragments received
-// Returns (nil, nil) if more fragments are needed
-func (fa *FragmentAssembler) AddFragment(sessionID uint32, fragID uint64, index, total uint8, payload []byte) ([]byte, error) {
-	if err := validateFragmentInput(index, total); err != nil {
-		return nil, err
-	}
-
-	fa.mu.Lock()
-	defer fa.mu.Unlock()
-	if fa.closed {
-		return nil, ErrFragmentAssemblerClosed
-	}
-
-	key := fragmentKey{sessionID: sessionID, fragID: fragID}
-	group, exists := fa.fragments[key]
-	if exists {
-		if err := validateFragmentGroup(group, index, total); err != nil {
-			if errors.Is(err, ErrFragmentTotalMismatch) {
-				fa.retainedBytes -= releaseFragmentGroup(group)
-				delete(fa.fragments, key)
-			}
-			return nil, err
-		}
-		if group.data[index] != nil {
-			return nil, nil
-		}
-	}
-
-	retainedBytes := int64(len(payload))
-	if (!exists && len(fa.fragments) >= fragmentGroupLimit(fa.maxGroups)) || retainedBytes > fragmentByteLimit(fa.maxBytes)-fa.retainedBytes {
-		return nil, ErrFragmentAssemblerFull
-	}
-	fa.retainedBytes += retainedBytes
-	if !exists {
-		group = &fragmentGroup{
-			total:     total,
-			data:      make([][]byte, total),
-			createdAt: time.Now(),
-		}
-		fa.fragments[key] = group
-	}
-	group.retainedBytes += retainedBytes
-	group.data[index] = make([]byte, len(payload))
-	copy(group.data[index], payload)
-	group.received++
-
-	if group.received == group.total {
-		// All fragments received, reassemble
-		result := joinFragmentGroup(group)
-		delete(fa.fragments, key)
-		fa.retainedBytes -= releaseFragmentGroup(group)
-		return result, nil
-	}
-
-	return nil, nil // More fragments needed
 }
 
 // fragmentShard holds fragments for a subset of fragment IDs
@@ -644,49 +522,6 @@ func (sfa *ShardedFragmentAssembler) AddFragment(sessionID uint32, fragID uint64
 	}
 
 	return nil, nil
-}
-
-// FragmentUDP splits a UDP packet into fragments if needed
-// Returns a slice of datagrams ready to send
-// If enableFragmentation is false and packet is too large, returns error
-func FragmentUDP(sessionID, epoch uint32, data []byte, fragmentSequence *uint32, enableFragmentation bool) ([][]byte, error) {
-	if len(data) <= MaxUDPPayload {
-		// No fragmentation needed - use simple header
-		dgram := make([]byte, UDPHeaderSize+len(data))
-		writeUDPHeader(dgram, sessionID)
-		copy(dgram[UDPHeaderSize:], data)
-		return [][]byte{dgram}, nil
-	}
-
-	if !enableFragmentation {
-		return nil, ErrFragmentationDisabled
-	}
-
-	// Need fragmentation
-	numFragments := (len(data) + MaxFragPayload - 1) / MaxFragPayload
-	if numFragments > 255 {
-		return nil, ErrPacketTooLarge
-	}
-
-	*fragmentSequence++
-	fragID := fragmentIdentity(epoch, *fragmentSequence)
-
-	result := make([][]byte, numFragments)
-	offset := 0
-
-	for i := range numFragments {
-		end := min(offset+MaxFragPayload, len(data))
-		payload := data[offset:end]
-		offset = end
-
-		dgram := make([]byte, UDPFragHeaderSize+len(payload))
-		writeUDPFragmentHeader(dgram, sessionID, fragID, byte(i), byte(numFragments))
-		copy(dgram[UDPFragHeaderSize:], payload)
-
-		result[i] = dgram
-	}
-
-	return result, nil
 }
 
 // DecodeUDPDatagram strictly parses and validates a UDP wire v2 datagram.

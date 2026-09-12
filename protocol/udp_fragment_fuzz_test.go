@@ -1,11 +1,10 @@
 package protocol
 
 import (
-	"hash/maphash"
 	"testing"
 )
 
-func FuzzFragmentAssemblersNeverPanic(f *testing.F) {
+func FuzzShardedFragmentAssemblerNeverPanics(f *testing.F) {
 	f.Add([]byte{
 		1, 7, 0, 2, 'A',
 		1, 7, 3, 4, 'X',
@@ -30,16 +29,8 @@ func FuzzFragmentAssemblersNeverPanic(f *testing.F) {
 			sequence = sequence[:4096]
 		}
 
-		regular := &FragmentAssembler{fragments: make(map[fragmentKey]*fragmentGroup)}
-		sharded := &ShardedFragmentAssembler{
-			shards: make([]fragmentShard, 4),
-			seed:   maphash.MakeSeed(),
-		}
-		for i := range sharded.shards {
-			sharded.shards[i].fragments = make(map[fragmentKey]*fragmentGroup)
-		}
-
-		assemblers := []UDPFragmentAssembler{regular, sharded}
+		assembler := NewShardedFragmentAssembler(4, 0, 0)
+		defer assembler.Close()
 		for offset := 0; offset+5 <= len(sequence); offset += 5 {
 			sessionID := uint32(sequence[offset])
 			fragID := uint64(sequence[offset+1])<<32 | uint64(sequence[offset+1])
@@ -47,20 +38,9 @@ func FuzzFragmentAssemblersNeverPanic(f *testing.F) {
 			total := sequence[offset+3]
 			payload := sequence[offset+4 : offset+5]
 
-			for _, assembler := range assemblers {
-				result, err := assembler.AddFragment(sessionID, fragID, index, total, payload)
-				if result != nil && err != nil {
-					t.Fatalf("assembler returned payload and error together: payload=%q, err=%v", result, err)
-				}
-			}
-		}
-
-		for _, group := range regular.fragments {
-			releaseFragmentGroup(group)
-		}
-		for i := range sharded.shards {
-			for _, group := range sharded.shards[i].fragments {
-				releaseFragmentGroup(group)
+			result, err := assembler.AddFragment(sessionID, fragID, index, total, payload)
+			if result != nil && err != nil {
+				t.Fatalf("assembler returned payload and error together: payload=%q, err=%v", result, err)
 			}
 		}
 	})
