@@ -120,9 +120,10 @@ func TestClientTCPRelayDeliversResponseAfterRequestFIN(t *testing.T) {
 		copyBufferPool: protocol.NewCopyBufferPool(protocol.DefaultCopyBufferSize),
 		logger:         zerolog.Nop(),
 	}
+	runtime := &connectionRuntime{}
 	handlerDone := make(chan struct{})
 	go func() {
-		c.handleStream(testCtx, clientStream, &ServerConnection{serverAddr: "relay-test"})
+		c.handleStream(testCtx, clientStream, &ServerConnection{serverAddr: "relay-test"}, runtime)
 		close(handlerDone)
 	}()
 	if err := readClientNewConnAck(peerStream, 1); err != nil {
@@ -178,12 +179,13 @@ func TestClientTCPSetupFailureResetsBothStreamDirections(t *testing.T) {
 		copyBufferPool: protocol.NewCopyBufferPool(protocol.DefaultCopyBufferSize),
 		logger:         zerolog.Nop(),
 	}
+	runtime := &connectionRuntime{}
 	handlerDone := make(chan struct{})
 	if err := backend.Close(); err != nil {
 		t.Fatalf("release unavailable backend port: %v", err)
 	}
 	go func() {
-		c.handleStream(testCtx, clientStream, &ServerConnection{serverAddr: "relay-test"})
+		c.handleStream(testCtx, clientStream, &ServerConnection{serverAddr: "relay-test"}, runtime)
 		close(handlerDone)
 	}()
 
@@ -261,6 +263,7 @@ func TestClientRejectsConcurrentOversizedNewConnPayloads(t *testing.T) {
 		logger:         zerolog.Nop(),
 	}
 	sc := &ServerConnection{serverAddr: "relay-test"}
+	runtime := &connectionRuntime{}
 
 	const streamCount = 4
 	peerStreams := make([]*quic.Stream, 0, streamCount)
@@ -292,7 +295,7 @@ func TestClientRejectsConcurrentOversizedNewConnPayloads(t *testing.T) {
 		handlerDone[i] = make(chan struct{})
 		go func() {
 			<-start
-			c.handleStream(testCtx, stream, sc)
+			c.handleStream(testCtx, stream, sc, runtime)
 			close(handlerDone[i])
 		}()
 	}
@@ -381,7 +384,7 @@ func TestClientRejectsConcurrentOversizedNewConnPayloads(t *testing.T) {
 	}
 	legalDone := make(chan struct{})
 	go func() {
-		c.handleStream(testCtx, legalClient, sc)
+		c.handleStream(testCtx, legalClient, sc, runtime)
 		close(legalDone)
 	}()
 	if err := readClientNewConnAck(legalPeer, 99); err != nil {
@@ -410,6 +413,320 @@ func TestClientRejectsConcurrentOversizedNewConnPayloads(t *testing.T) {
 	}
 	if pending, active := c.tcpPending.Load(), c.tcpActive.Load(); pending != 0 || active != 0 {
 		t.Fatalf("final TCP accounting = pending %d, active %d; want 0, 0", pending, active)
+	}
+}
+
+func TestClientTCPRuntimeOwnershipIsolatedAcrossServers(t *testing.T) {
+	testCtx, cancelTest := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancelTest()
+	testDeadline, ok := testCtx.Deadline()
+	if !ok {
+		t.Fatal("runtime ownership test context has no deadline")
+	}
+
+	backend, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatalf("listen for runtime ownership backend: %v", err)
+	}
+	t.Cleanup(func() { _ = backend.Close() })
+
+	peers := []*lifecyclePeer{newLifecycleStartPeer(t), newLifecycleStartPeer(t)}
+	type peerFlow struct {
+		endpoint string
+		marker   byte
+		stream   *quic.Stream
+	}
+	flowReady := make(chan peerFlow, len(peers))
+	peerDone := make([]<-chan error, len(peers))
+	for i, peer := range peers {
+		endpoint := peer.endpoint().Address
+		marker := byte('A' + i)
+		peerDone[i] = peer.serveRegistration(func(conn *quic.Conn, control *quic.Stream, _ protocol.RegisterMsg) error {
+			if err := writeSuccessfulLifecycleAck(control); err != nil {
+				return err
+			}
+			stream, err := conn.OpenStreamSync(testCtx)
+			if err != nil {
+				return fmt.Errorf("open %s TCP stream: %w", endpoint, err)
+			}
+			if err := stream.SetDeadline(testDeadline); err != nil {
+				return fmt.Errorf("set %s TCP stream deadline: %w", endpoint, err)
+			}
+			if err := protocol.WriteNewConn(stream, 1, "tcp", endpoint, "local", time.Now().Unix()); err != nil {
+				return fmt.Errorf("write %s NewConn: %w", endpoint, err)
+			}
+			if err := readClientNewConnAck(stream, 1); err != nil {
+				return fmt.Errorf("%s: %w", endpoint, err)
+			}
+			if _, err := stream.Write([]byte{marker}); err != nil {
+				return fmt.Errorf("write %s marker: %w", endpoint, err)
+			}
+			flowReady <- peerFlow{endpoint: endpoint, marker: marker, stream: stream}
+			<-conn.Context().Done()
+			return nil
+		})
+	}
+
+	c := newClientLifecycleClient(t, "same-conn-id-runtime-ownership", peers[0].endpoint(), peers[1].endpoint())
+	c.config.Local.Port = backend.Addr().(*net.TCPAddr).Port
+	t.Cleanup(func() { _ = c.Stop() })
+	startDone := callClientLifecycle(func() error { return c.Start(context.Background()) })
+
+	flows := make(map[string]peerFlow, len(peers))
+	for range peers {
+		flow := awaitLifecycle(t, flowReady, "same-ID peer flow")
+		flows[flow.endpoint] = flow
+	}
+	if err := backend.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set runtime ownership backend deadline: %v", err)
+	}
+	backendByMarker := make(map[byte]*net.TCPConn, len(peers))
+	for range peers {
+		conn, err := backend.AcceptTCP()
+		if err != nil {
+			t.Fatalf("accept runtime ownership backend: %v", err)
+		}
+		t.Cleanup(func() { _ = conn.Close() })
+		if err := conn.SetDeadline(testDeadline); err != nil {
+			t.Fatalf("set runtime ownership connection deadline: %v", err)
+		}
+		if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+			t.Fatalf("set runtime ownership marker deadline: %v", err)
+		}
+		var marker [1]byte
+		if _, err := io.ReadFull(conn, marker[:]); err != nil {
+			t.Fatalf("read runtime ownership marker: %v", err)
+		}
+		if _, exists := backendByMarker[marker[0]]; exists {
+			t.Fatalf("duplicate runtime ownership marker %q", marker[0])
+		}
+		backendByMarker[marker[0]] = conn
+		if err := conn.SetReadDeadline(time.Time{}); err != nil {
+			t.Fatalf("clear runtime ownership marker deadline: %v", err)
+		}
+	}
+
+	runtimeByEndpoint := make(map[string]*connectionRuntime, len(peers))
+	awaitRetirementCondition(t, "same-ID active runtimes", func() bool {
+		clear(runtimeByEndpoint)
+		for _, runtime := range c.runtimeSnapshot() {
+			runtimeByEndpoint[runtime.sc.ServerAddr()] = runtime
+		}
+		return len(runtimeByEndpoint) == len(peers) && c.tcpActive.Load() == int64(len(peers))
+	})
+	firstEndpoint := peers[0].endpoint().Address
+	secondEndpoint := peers[1].endpoint().Address
+	firstRuntime := runtimeByEndpoint[firstEndpoint]
+	secondRuntime := runtimeByEndpoint[secondEndpoint]
+	firstOwner, firstActive := firstRuntime.localConns.Load(uint64(1))
+	secondOwner, secondActive := secondRuntime.localConns.Load(uint64(1))
+	if !firstActive || !secondActive || firstOwner == secondOwner {
+		t.Fatalf("same-ID runtime owners = first(%t, %p) second(%t, %p), want distinct live sockets", firstActive, firstOwner, secondActive, secondOwner)
+	}
+
+	firstFlow := flows[firstEndpoint]
+	firstBackend := backendByMarker[firstFlow.marker]
+	if err := firstFlow.stream.Close(); err != nil {
+		t.Fatalf("close first peer send side: %v", err)
+	}
+	if err := firstBackend.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("set first backend FIN deadline: %v", err)
+	}
+	var probe [1]byte
+	if n, err := firstBackend.Read(probe[:]); n != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("first backend after peer FIN = (%d, %v), want EOF", n, err)
+	}
+	if err := firstBackend.Close(); err != nil {
+		t.Fatalf("close first backend: %v", err)
+	}
+	awaitRetirementCondition(t, "first same-ID handler completion", func() bool {
+		_, active := firstRuntime.localConns.Load(uint64(1))
+		return !active && c.tcpActive.Load() == 1
+	})
+	if current, active := secondRuntime.localConns.Load(uint64(1)); !active || current != secondOwner {
+		t.Fatalf("second same-ID owner after first flow = (%t, %p), want original %p", active, current, secondOwner)
+	}
+
+	if err := firstRuntime.sc.Close(); err != nil {
+		t.Fatalf("retire first runtime connection: %v", err)
+	}
+	awaitLifecycle(t, firstRuntime.cleanupDone, "first same-ID runtime cleanup")
+	if current := c.connMgr.GetConnection(firstEndpoint); current != nil {
+		t.Fatalf("retired endpoint retained connection %p", current)
+	}
+	if current := c.connMgr.GetConnection(secondEndpoint); current != secondRuntime.sc {
+		t.Fatalf("surviving endpoint connection = %p, want %p", current, secondRuntime.sc)
+	}
+	if runtimes := c.runtimeSnapshot(); len(runtimes) != 1 || runtimes[0] != secondRuntime {
+		t.Fatalf("runtimes after first retirement = %v, want only second runtime", runtimes)
+	}
+
+	secondFlow := flows[secondEndpoint]
+	secondBackend := backendByMarker[secondFlow.marker]
+	peerPayload := []byte("peer after other runtime retired")
+	if _, err := secondFlow.stream.Write(peerPayload); err != nil {
+		t.Fatalf("write surviving peer payload: %v", err)
+	}
+	if err := secondBackend.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("set surviving backend read deadline: %v", err)
+	}
+	gotPeer := make([]byte, len(peerPayload))
+	if _, err := io.ReadFull(secondBackend, gotPeer); err != nil || !bytes.Equal(gotPeer, peerPayload) {
+		t.Fatalf("surviving backend payload = %q, %v; want %q", gotPeer, err, peerPayload)
+	}
+	backendPayload := []byte("backend after other runtime retired")
+	if _, err := secondBackend.Write(backendPayload); err != nil {
+		t.Fatalf("write surviving backend payload: %v", err)
+	}
+	if err := secondFlow.stream.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("set surviving peer read deadline: %v", err)
+	}
+	gotBackend := make([]byte, len(backendPayload))
+	if _, err := io.ReadFull(secondFlow.stream, gotBackend); err != nil || !bytes.Equal(gotBackend, backendPayload) {
+		t.Fatalf("surviving peer payload = %q, %v; want %q", gotBackend, err, backendPayload)
+	}
+	if err := secondBackend.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("clear surviving backend read deadline: %v", err)
+	}
+
+	stopDone := callClientLifecycle(c.Stop)
+	if err := secondBackend.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("set surviving backend Stop deadline: %v", err)
+	}
+	if n, err := secondBackend.Read(probe[:]); n != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("surviving backend after Stop = (%d, %v), want EOF", n, err)
+	}
+	if err := awaitClientLifecycle(t, stopDone, "same-ID Client.Stop"); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	if err := awaitClientLifecycle(t, startDone, "same-ID Client.Start join"); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	for i, done := range peerDone {
+		if err := awaitLifecycle(t, done, fmt.Sprintf("same-ID peer %d close", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if runtimes := c.runtimeSnapshot(); len(runtimes) != 0 {
+		t.Fatalf("same-ID runtimes after Stop = %d, want 0", len(runtimes))
+	}
+	for _, runtime := range []*connectionRuntime{firstRuntime, secondRuntime} {
+		if _, active := runtime.localConns.Load(uint64(1)); active {
+			t.Fatal("same-ID runtime retained local connection after Stop")
+		}
+	}
+	if pending, active := c.tcpPending.Load(), c.tcpActive.Load(); pending != 0 || active != 0 {
+		t.Fatalf("same-ID TCP accounting after Stop = pending %d, active %d; want 0, 0", pending, active)
+	}
+}
+
+func TestClientStopClosesTCPBeforeRuntimePublication(t *testing.T) {
+	testCtx, cancelTest := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelTest()
+	testDeadline, ok := testCtx.Deadline()
+	if !ok {
+		t.Fatal("pre-publication test context has no deadline")
+	}
+
+	backend, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatalf("listen for pre-publication backend: %v", err)
+	}
+	t.Cleanup(func() { _ = backend.Close() })
+	peer := newLifecycleStartPeer(t)
+	ackSeen := make(chan struct{})
+	serverDone := peer.serveRegistration(func(conn *quic.Conn, control *quic.Stream, _ protocol.RegisterMsg) error {
+		if err := writeSuccessfulLifecycleAck(control); err != nil {
+			return err
+		}
+		stream, err := conn.OpenStreamSync(testCtx)
+		if err != nil {
+			return err
+		}
+		if err := stream.SetDeadline(testDeadline); err != nil {
+			return err
+		}
+		if err := protocol.WriteNewConn(stream, 7, "tcp", "peer", "local", time.Now().Unix()); err != nil {
+			return err
+		}
+		if err := readClientNewConnAck(stream, 7); err != nil {
+			return err
+		}
+		close(ackSeen)
+		if _, err := stream.Write([]byte("ready")); err != nil {
+			return err
+		}
+		<-conn.Context().Done()
+		return nil
+	})
+
+	c := newClientLifecycleClient(t, "stop-before-runtime-publication", peer.endpoint())
+	c.config.Local.Port = backend.Addr().(*net.TCPAddr).Port
+	t.Cleanup(func() { _ = c.Stop() })
+	c.runtimesMu.Lock()
+	runtimesLocked := true
+	releaseRuntimes := func() {
+		if runtimesLocked {
+			runtimesLocked = false
+			c.runtimesMu.Unlock()
+		}
+	}
+	defer releaseRuntimes()
+
+	startDone := callClientLifecycle(func() error { return c.Start(context.Background()) })
+	awaitLifecycle(t, ackSeen, "pre-publication NewConn acknowledgment")
+	if err := backend.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set pre-publication backend deadline: %v", err)
+	}
+	backendConn, err := backend.AcceptTCP()
+	if err != nil {
+		t.Fatalf("accept pre-publication backend: %v", err)
+	}
+	t.Cleanup(func() { _ = backendConn.Close() })
+	if err := backendConn.SetDeadline(testDeadline); err != nil {
+		t.Fatalf("set pre-publication connection deadline: %v", err)
+	}
+	if err := backendConn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("set pre-publication marker deadline: %v", err)
+	}
+	marker := make([]byte, len("ready"))
+	if _, err := io.ReadFull(backendConn, marker); err != nil || string(marker) != "ready" {
+		t.Fatalf("pre-publication backend marker = %q, %v; want ready", marker, err)
+	}
+	if len(c.runtimes) != 0 {
+		t.Fatalf("runtime published while runtimesMu held: %d", len(c.runtimes))
+	}
+
+	stopDone := callClientLifecycle(c.Stop)
+	awaitLifecycle(t, c.forceCtx.Done(), "pre-publication force cancellation")
+	if err := backendConn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("set pre-publication Stop deadline: %v", err)
+	}
+	var probe [1]byte
+	if n, err := backendConn.Read(probe[:]); n != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("pre-publication backend after Stop = (%d, %v), want EOF", n, err)
+	}
+	select {
+	case err := <-stopDone:
+		t.Fatalf("Stop returned before runtime publication lock released: %v", err)
+	default:
+	}
+
+	releaseRuntimes()
+	if err := awaitClientLifecycle(t, stopDone, "pre-publication Client.Stop"); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	if err := awaitClientLifecycle(t, startDone, "pre-publication Client.Start join"); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if err := awaitLifecycle(t, serverDone, "pre-publication peer close"); err != nil {
+		t.Fatal(err)
+	}
+	if runtimes := c.runtimeSnapshot(); len(runtimes) != 0 {
+		t.Fatalf("pre-publication runtimes after Stop = %d, want 0", len(runtimes))
+	}
+	if pending, active := c.tcpPending.Load(), c.tcpActive.Load(); pending != 0 || active != 0 {
+		t.Fatalf("pre-publication TCP accounting after Stop = pending %d, active %d; want 0, 0", pending, active)
 	}
 }
 
@@ -464,9 +781,10 @@ func newBlockedClientRelay(
 		copyBufferPool: protocol.NewCopyBufferPool(protocol.DefaultCopyBufferSize),
 		logger:         zerolog.Nop(),
 	}
+	runtime := &connectionRuntime{}
 	handlerDone := make(chan struct{})
 	go func() {
-		c.handleStream(flowCtx, clientStream, &ServerConnection{serverAddr: "relay-test"})
+		c.handleStream(flowCtx, clientStream, &ServerConnection{serverAddr: "relay-test"}, runtime)
 		close(handlerDone)
 	}()
 	if err := readClientNewConnAck(peerStream, connID); err != nil {
@@ -478,7 +796,7 @@ func newBlockedClientRelay(
 	ticker := time.NewTicker(time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if _, active := c.localConns.Load(connID); active {
+		if _, active := runtime.localConns.Load(connID); active {
 			break
 		}
 		select {

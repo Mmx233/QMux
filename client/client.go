@@ -37,7 +37,6 @@ type Client struct {
 	copyBufferPool                       *protocol.CopyBufferPool
 	maxUDPFragmentGroupsPerHandler       int
 	maxUDPFragmentBackingBytesPerHandler int64
-	localConns                           sync.Map // connID -> net.Conn
 	udpBudget                            *udpSessionBudget
 	dsendStats                           *clientDsendStats
 	tcpSetups                            stats.Operation
@@ -413,7 +412,7 @@ func (runtime *connectionRuntime) setFence(fence int64) error {
 }
 
 // handleStream handles a single stream from server
-func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *ServerConnection, runtimes ...*connectionRuntime) {
+func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *ServerConnection, runtime *connectionRuntime) {
 	setupStarted := c.tcpSetups.Start()
 	c.tcpPending.Add(1)
 	setupFinished := false
@@ -499,12 +498,8 @@ func (c *Client) handleStream(ctx context.Context, stream *quic.Stream, sc *Serv
 		logger.Warn().Err(err).Msg("set write buffer failed")
 	}
 
-	c.localConns.Store(msg.ConnID, localConn)
-	defer c.localConns.Delete(msg.ConnID)
-	if len(runtimes) != 0 {
-		runtimes[0].localConns.Store(msg.ConnID, localConn)
-		defer runtimes[0].localConns.Delete(msg.ConnID)
-	}
+	runtime.localConns.Store(msg.ConnID, localConn)
+	defer runtime.localConns.Delete(msg.ConnID)
 	if err := protocol.WriteNewConnAck(stream, msg.ConnID); err != nil {
 		setupResult = stats.Result(err, "ack_error")
 		logger.Error().Err(err).Msg("write NewConn acknowledgment failed")
@@ -653,10 +648,6 @@ func (c *Client) forceOwned() {
 			return true
 		})
 	}
-	c.localConns.Range(func(_, value any) bool {
-		_ = value.(net.Conn).Close()
-		return true
-	})
 }
 
 func (c *Client) runCoordinator() {
