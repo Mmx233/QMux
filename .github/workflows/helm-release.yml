@@ -1,12 +1,6 @@
 name: Helm Release
 
 on:
-  workflow_call:
-    inputs:
-      chart_ref:
-        description: Git ref containing the chart to publish
-        required: true
-        type: string
   workflow_dispatch:
     inputs:
       chart_ref:
