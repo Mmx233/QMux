@@ -2,7 +2,7 @@
 
 [![Lisense](https://img.shields.io/github/license/Mmx233/QMux)](https://github.com/Mmx233/QMux/blob/main/LICENSE)
 [![Test Status](https://img.shields.io/github/actions/workflow/status/Mmx233/QMux/test.yml?label=test)](https://github.com/Mmx233/QMux/actions/workflows/test.yml)
-[![Release](https://img.shields.io/github/v/release/Mmx233/QMux?color=blueviolet&include_prereleases)](https://github.com/Mmx233/QMux/releases)
+[![Release](https://img.shields.io/github/v/release/Mmx233/QMux?color=blueviolet&include_prereleases&filter=v*)](https://github.com/Mmx233/QMux/releases)
 [![Dockerhub](https://img.shields.io/docker/pulls/mmx233/qmux)](https://hub.docker.com/repository/docker/mmx233/qmux)
 
 A high-availability L4 (transport layer) NAT traversal tool built on the QUIC protocol.
