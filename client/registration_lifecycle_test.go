@@ -871,7 +871,7 @@ func TestRegistrationLifecycleSuccessfulAckClearsAttemptDeadline(t *testing.T) {
 func TestRegistrationLifecycleSuccessfulPublicationStartsHeartbeat(t *testing.T) {
 	peer := newLifecyclePeer(t)
 	cm := newLifecycleManager(t, peer)
-	heartbeatSeen := make(chan struct{})
+	heartbeatReturned := make(chan struct{})
 	serverDone := peer.serveRegistration(func(conn *quic.Conn, stream *quic.Stream, _ protocol.RegisterMsg) error {
 		if err := writeSuccessfulLifecycleAck(stream); err != nil {
 			return err
@@ -880,7 +880,10 @@ func TestRegistrationLifecycleSuccessfulPublicationStartsHeartbeat(t *testing.T)
 		if err := protocol.ReadTypedMessage(stream, protocol.MsgTypeHeartbeat, &heartbeat); err != nil {
 			return fmt.Errorf("read published heartbeat: %w", err)
 		}
-		close(heartbeatSeen)
+		if err := protocol.WriteHeartbeat(stream, heartbeat.Timestamp); err != nil {
+			return fmt.Errorf("return published heartbeat: %w", err)
+		}
+		close(heartbeatReturned)
 		<-conn.Context().Done()
 		return nil
 	})
@@ -905,12 +908,113 @@ func TestRegistrationLifecycleSuccessfulPublicationStartsHeartbeat(t *testing.T)
 	if got := awaitLifecycle(t, cm.NewConns, "published connection delivery"); got != sc {
 		t.Fatalf("delivered connection = %p, want %p", got, sc)
 	}
-	awaitLifecycle(t, heartbeatSeen, "heartbeat after successful publication")
+	select {
+	case <-heartbeatReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("published heartbeat was not returned")
+	}
+	select {
+	case <-sc.controlProgress:
+	case <-time.After(2 * time.Second):
+		t.Fatal("returned heartbeat was not fully processed")
+	}
+	if cm.GetConnection(sc.ServerAddr()) != sc || !sc.IsHealthy() || sc.LastReceivedFromServer().IsZero() {
+		t.Fatal("published heartbeat did not preserve current, healthy, received generation")
+	}
+	if sc.reconnectStable.Load() {
+		t.Fatal("fresh production heartbeat loop marked generation retry-stable")
+	}
 	if err := cm.Stop(); err != nil {
 		t.Fatal(err)
 	}
 	if err := awaitLifecycle(t, serverDone, "published connection close"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestHeartbeatLoopReconnectStabilityRequiresServerReceive(t *testing.T) {
+	peer := newLifecyclePeer(t)
+	cm := newLifecycleManager(t, peer)
+	defer func() { _ = cm.Stop() }()
+	clientHeartbeats := make(chan struct{}, 2)
+	releaseServerHeartbeat := make(chan struct{})
+	serverHeartbeatSent := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseServer := func() { releaseOnce.Do(func() { close(releaseServerHeartbeat) }) }
+	defer releaseServer()
+
+	serverDone := peer.serveRegistration(func(conn *quic.Conn, stream *quic.Stream, _ protocol.RegisterMsg) error {
+		if err := writeSuccessfulLifecycleAck(stream); err != nil {
+			return err
+		}
+		for range 2 {
+			var heartbeat protocol.HeartbeatMsg
+			if err := protocol.ReadTypedMessage(stream, protocol.MsgTypeHeartbeat, &heartbeat); err != nil {
+				return fmt.Errorf("read client-only heartbeat: %w", err)
+			}
+			clientHeartbeats <- struct{}{}
+		}
+		<-releaseServerHeartbeat
+		if err := protocol.WriteHeartbeat(stream, time.Now().Unix()); err != nil {
+			return fmt.Errorf("send qualifying server heartbeat: %w", err)
+		}
+		close(serverHeartbeatSent)
+		<-conn.Context().Done()
+		return nil
+	})
+
+	sc, err := cm.connectAndRegister(context.Background(), peer.endpoint())
+	if err != nil {
+		t.Fatalf("connect and register aged heartbeat loop: %v", err)
+	}
+	sc.SetHealthConfig(cm.config.HealthTimeout)
+	controlStream := sc.controlStream.Load()
+	if controlStream == nil {
+		t.Fatal("registration did not install a control stream")
+	}
+	loopDone := make(chan error, 1)
+	go func() {
+		loopDone <- sc.heartbeatLoop(cm.config.HeartbeatInterval, controlStream, time.Now().Add(-reconnectStableGrace))
+	}()
+	defer func() {
+		releaseServer()
+		_ = sc.Close()
+		select {
+		case <-loopDone:
+		case <-time.After(2 * time.Second):
+			t.Error("test-owned heartbeat loop did not stop")
+		}
+		select {
+		case <-serverDone:
+		case <-time.After(2 * time.Second):
+			t.Error("heartbeat peer did not stop")
+		}
+	}()
+
+	for range 2 {
+		select {
+		case <-clientHeartbeats:
+		case <-time.After(2 * time.Second):
+			t.Fatal("aged heartbeat loop did not send two client heartbeats")
+		}
+	}
+	if sc.reconnectStable.Load() {
+		t.Fatal("client heartbeat sends marked generation retry-stable")
+	}
+
+	releaseServer()
+	select {
+	case <-serverHeartbeatSent:
+	case <-time.After(2 * time.Second):
+		t.Fatal("peer did not send qualifying server heartbeat")
+	}
+	select {
+	case <-sc.controlProgress:
+	case <-time.After(2 * time.Second):
+		t.Fatal("qualifying server heartbeat was not fully processed")
+	}
+	if !sc.reconnectStable.Load() {
+		t.Fatal("server heartbeat did not mark aged generation retry-stable")
 	}
 }
 

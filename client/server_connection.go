@@ -63,8 +63,9 @@ type ServerConnection struct {
 	capabilities  []string
 
 	// Health tracking
-	healthy       atomic.Bool
-	lastHeartbeat atomic.Int64
+	healthy         atomic.Bool
+	reconnectStable atomic.Bool
+	lastHeartbeat   atomic.Int64
 
 	// Bidirectional heartbeat tracking - tracks when heartbeats are received from server
 	lastReceivedFromServer atomic.Int64
@@ -359,11 +360,17 @@ func (sc *ServerConnection) CheckReceivedHealth() bool {
 	return time.Since(lastReceived) <= sc.healthTimeout
 }
 
+func (sc *ServerConnection) markReconnectStable(controlStartedAt time.Time) {
+	if time.Since(controlStartedAt) >= reconnectStableGrace {
+		sc.reconnectStable.Store(true)
+	}
+}
+
 // heartbeatLoop handles bidirectional heartbeat messages in a single goroutine.
 // It sends heartbeats to the server at the configured interval,
 // receives heartbeats from the server updating lastReceivedFromServer timestamp,
 // and checks for heartbeat timeout to detect unhealthy connection.
-func (sc *ServerConnection) heartbeatLoop(sendInterval time.Duration, controlStream *quic.Stream) error {
+func (sc *ServerConnection) heartbeatLoop(sendInterval time.Duration, controlStream *quic.Stream, controlStartedAt time.Time) error {
 	sc.logger.Debug().
 		Dur("send_interval", sendInterval).
 		Dur("health_timeout", sc.healthTimeout).
@@ -465,6 +472,7 @@ func (sc *ServerConnection) heartbeatLoop(sendInterval time.Duration, controlStr
 			case protocol.MsgTypeHeartbeat:
 				// Update last received timestamp and reset deadline
 				sc.UpdateLastReceivedFromServer()
+				sc.markReconnectStable(controlStartedAt)
 				sc.logger.Debug().Msg("heartbeat received from server")
 				healthExpiry = time.Now().Add(sc.healthTimeout)
 				heartbeatDeadline = time.After(time.Until(healthExpiry))
@@ -573,7 +581,8 @@ func (sc *ServerConnection) StartHeartbeatLoops(heartbeatInterval time.Duration)
 		sc.controlStarted.Store(true)
 		controlStream := sc.controlStream.Load()
 		sc.controlWG.Go(func() {
-			err := sc.heartbeatLoop(heartbeatInterval, controlStream)
+			controlStartedAt := time.Now()
+			err := sc.heartbeatLoop(heartbeatInterval, controlStream, controlStartedAt)
 			if err != nil && sc.ctx.Err() == nil {
 				sc.MarkUnhealthy()
 				if sc.reconnectCallback != nil {

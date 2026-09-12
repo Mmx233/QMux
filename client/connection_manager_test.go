@@ -5,6 +5,7 @@ import (
 	"math/rand/v2"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/Mmx233/QMux/config"
@@ -14,6 +15,16 @@ import (
 type observedDoneContext struct {
 	context.Context
 	observed chan<- struct{}
+}
+
+type cancelOnErrContext struct {
+	context.Context
+	cancel context.CancelFunc
+}
+
+func (c cancelOnErrContext) Err() error {
+	c.cancel()
+	return c.Context.Err()
 }
 
 func (c observedDoneContext) Done() <-chan struct{} {
@@ -132,6 +143,115 @@ func TestWaitForReconnect(t *testing.T) {
 	t.Run("timer delivery", func(t *testing.T) {
 		if !waitForReconnect(context.Background(), context.Background(), time.Millisecond) {
 			t.Fatal("timer delivery did not complete reconnect wait")
+		}
+	})
+	for _, test := range []struct {
+		name          string
+		cancelManager bool
+	}{
+		{name: "caller cancellation after timer wake"},
+		{name: "manager cancellation after timer wake", cancelManager: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			canceling := cancelOnErrContext{Context: ctx, cancel: cancel}
+			callerCtx, managerCtx := context.Context(canceling), context.Background()
+			if test.cancelManager {
+				callerCtx, managerCtx = managerCtx, callerCtx
+			}
+			if waitForReconnect(callerCtx, managerCtx, 0) {
+				t.Fatal("reconnect wait admitted cancellation observed after timer wake")
+			}
+		})
+	}
+	for _, test := range []struct {
+		name          string
+		cancelManager bool
+	}{
+		{name: "caller and timer already ready"},
+		{name: "manager and timer already ready", cancelManager: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			callerCtx, managerCtx := ctx, context.Background()
+			if test.cancelManager {
+				callerCtx, managerCtx = managerCtx, callerCtx
+			}
+			if waitForReconnect(callerCtx, managerCtx, 0) {
+				t.Fatal("reconnect wait admitted with cancellation and timer both ready")
+			}
+		})
+	}
+}
+
+func TestReconnectStagePersistsAcrossWorkers(t *testing.T) {
+	lifecycleTLSConfigs(t)
+	synctest.Test(t, func(t *testing.T) {
+		cfg := completeConnectionManagerTestConfig(t, &config.Client{
+			ClientID: "persistent-reconnect-stage",
+			Server: config.ClientServer{Servers: []config.ServerEndpoint{{
+				Address:    "127.0.0.1:8443",
+				ServerName: "localhost",
+			}}},
+		})
+		cm, err := NewConnectionManager(cfg, zerolog.Nop())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var cancelWorker context.CancelFunc
+		defer func() {
+			if cancelWorker != nil {
+				cancelWorker()
+			}
+			if err := cm.Stop(); err != nil {
+				t.Error(err)
+			}
+		}()
+		cm.tlsState.Store(nil)
+		endpoint := cm.config.Server.GetServers()[0]
+		state := func() (int, uint64) {
+			cm.reconnectMu.Lock()
+			defer cm.reconnectMu.Unlock()
+			return cm.endpoints[0].nextReconnectStage, cm.endpoints[0].reconnectAttempts.Load()
+		}
+
+		if sc, err := cm.connectAndRegister(context.Background(), endpoint); err == nil || sc != nil {
+			t.Fatalf("initial attempt = (%p, %v), want nil TLS-state failure", sc, err)
+		}
+		if stage, attempts := state(); stage != 0 || attempts != 0 {
+			t.Fatalf("initial attempt left stage=%d attempts=%d, want 0/0", stage, attempts)
+		}
+
+		firstCtx, cancelFirst := context.WithTimeout(context.Background(), 75*time.Second)
+		cancelWorker = cancelFirst
+		cm.startReconnection(firstCtx, endpoint.Address, nil)
+		cm.wg.Wait()
+		cancelFirst()
+		cancelWorker = nil
+		stage, baseline := state()
+		if stage != maxReconnectStage || baseline < uint64(maxReconnectStage) {
+			t.Fatalf("first worker left stage=%d attempts=%d, want saturated stage and at least %d attempts", stage, baseline, maxReconnectStage)
+		}
+
+		secondCtx, cancelSecond := context.WithCancel(context.Background())
+		cancelWorker = cancelSecond
+		cm.startReconnection(secondCtx, endpoint.Address, nil)
+		synctest.Wait()
+		synctest.Sleep(30*time.Second - time.Nanosecond)
+		if stage, attempts := state(); stage != maxReconnectStage || attempts != baseline {
+			t.Fatalf("stage-4 worker admitted before 30s: stage=%d attempts=%d, want %d/%d", stage, attempts, maxReconnectStage, baseline)
+		}
+		synctest.Sleep(30 * time.Second)
+		if stage, attempts := state(); stage != maxReconnectStage || attempts != baseline+1 {
+			t.Fatalf("stage-4 worker at 60s-1ns left stage=%d attempts=%d, want %d/%d", stage, attempts, maxReconnectStage, baseline+1)
+		}
+
+		cancelSecond()
+		cm.wg.Wait()
+		cancelWorker = nil
+		if stage, attempts := state(); stage != maxReconnectStage || attempts != baseline+1 {
+			t.Fatalf("canceled worker changed stage/attempts to %d/%d, want %d/%d", stage, attempts, maxReconnectStage, baseline+1)
 		}
 	})
 }

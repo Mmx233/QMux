@@ -270,7 +270,12 @@ func TestReconnectWorkerStaleExpectedAndInitialFailureAreNoOps(t *testing.T) {
 	stale := newDisconnectedRetirementConnection(address)
 	fresh := newDisconnectedRetirementConnection(address)
 	fresh.MarkHealthy()
+	stale.reconnectStable.Store(true)
 	cm.connections.Store(address, fresh)
+	cm.reconnectMu.Lock()
+	cm.endpoints[0].nextReconnectStage = maxReconnectStage
+	cm.reconnectMu.Unlock()
+	before := cm.endpointSnapshot()[0]
 
 	cm.startReconnection(context.Background(), address, stale)
 	cm.startReconnection(context.Background(), address, nil)
@@ -310,9 +315,75 @@ func TestReconnectWorkerStaleExpectedAndInitialFailureAreNoOps(t *testing.T) {
 	if remaining != 0 {
 		t.Fatalf("initial-failure worker retained %d reconnect slots", remaining)
 	}
+	cm.reconnectMu.Lock()
+	stage := cm.endpoints[0].nextReconnectStage
+	attempts := cm.endpoints[0].reconnectAttempts.Load()
+	cm.reconnectMu.Unlock()
+	if stage != maxReconnectStage || attempts != 0 {
+		t.Fatalf("stale stable generation changed retry state to stage=%d attempts=%d", stage, attempts)
+	}
+	after := cm.endpointSnapshot()[0]
+	if after.Handshaking != before.Handshaking || after.Pending != before.Pending ||
+		after.Registered != before.Registered || after.Retiring != before.Retiring ||
+		after.GenerationHighWater != before.GenerationHighWater || after.AccountingFaults != before.AccountingFaults {
+		t.Fatalf("stale workers changed endpoint accounting from %+v to %+v", before, after)
+	}
 
 	if err := cm.Stop(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestStableExactGenerationResetsOnlyOwnEndpointStage(t *testing.T) {
+	const first, second = "127.0.0.1:8443", "127.0.0.1:9443"
+	cm := newCapacitySnapshotManager(t, first, second)
+	stable := newCapacitySnapshotConnection(first)
+	if !cm.publishServerConnection(context.Background(), stable) {
+		t.Fatal("publish stable generation")
+	}
+	if got := awaitLifecycle(t, cm.NewConns, "stable generation delivery"); got != stable {
+		t.Fatalf("delivered generation = %p, want %p", got, stable)
+	}
+	stable.reconnectStable.Store(true)
+	stable.MarkUnhealthy()
+	cm.reconnectMu.Lock()
+	cm.endpoints[0].nextReconnectStage = maxReconnectStage
+	cm.endpoints[1].nextReconnectStage = 3
+	cm.reconnectMu.Unlock()
+
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	defer cancelRun()
+	cm.startReconnection(runCtx, first, stable)
+	awaitRetirementCondition(t, "stable exact generation detach", func() bool {
+		return cm.GetConnection(first) == nil
+	})
+	cm.publishMu.Lock()
+	cm.reconnectMu.Lock()
+	firstStage := cm.endpoints[0].nextReconnectStage
+	secondStage := cm.endpoints[1].nextReconnectStage
+	firstAttempts := cm.endpoints[0].reconnectAttempts.Load()
+	secondAttempts := cm.endpoints[1].reconnectAttempts.Load()
+	slotHeld := cm.reconnecting[first]
+	cm.reconnectMu.Unlock()
+	cm.publishMu.Unlock()
+	if firstStage != 0 || secondStage != 3 {
+		t.Fatalf("stable reset left endpoint stages %d/%d, want 0/3", firstStage, secondStage)
+	}
+	if firstAttempts != 0 || secondAttempts != 0 || !slotHeld {
+		t.Fatalf("stable reset dispatched retry or lost slot: attempts=%d/%d slot=%t", firstAttempts, secondAttempts, slotHeld)
+	}
+
+	cancelRun()
+	cm.wg.Wait()
+	cm.reconnectMu.Lock()
+	firstStage = cm.endpoints[0].nextReconnectStage
+	secondStage = cm.endpoints[1].nextReconnectStage
+	firstAttempts = cm.endpoints[0].reconnectAttempts.Load()
+	secondAttempts = cm.endpoints[1].reconnectAttempts.Load()
+	_, slotHeld = cm.reconnecting[first]
+	cm.reconnectMu.Unlock()
+	if firstStage != 0 || secondStage != 3 || firstAttempts != 0 || secondAttempts != 0 || slotHeld {
+		t.Fatalf("canceled reset worker left stages=%d/%d attempts=%d/%d slot=%t", firstStage, secondStage, firstAttempts, secondAttempts, slotHeld)
 	}
 }
 
@@ -361,6 +432,13 @@ func TestReconnectReleasesSlotBeforeFreshPublicationCallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	awaitLifecycle(t, freshRegistered, "fresh reconnect registration")
+	cm.reconnectMu.Lock()
+	firstStage := cm.endpoints[0].nextReconnectStage
+	firstAttempts := cm.endpoints[0].reconnectAttempts.Load()
+	cm.reconnectMu.Unlock()
+	if firstStage != 1 || firstAttempts != 1 {
+		t.Fatalf("stage-0 retry registration left stage=%d attempts=%d, want 1/1", firstStage, firstAttempts)
+	}
 
 	var fresh *ServerConnection
 	awaitRetirementCondition(t, "fresh generation blocked at NewConns delivery", func() bool {
@@ -389,10 +467,24 @@ func TestReconnectReleasesSlotBeforeFreshPublicationCallback(t *testing.T) {
 		defer cm.reconnectMu.Unlock()
 		return cm.reconnecting[address] && cm.GetConnection(address) == nil
 	})
+	cm.reconnectMu.Lock()
+	secondStage := cm.endpoints[0].nextReconnectStage
+	secondAttempts := cm.endpoints[0].reconnectAttempts.Load()
+	cm.reconnectMu.Unlock()
+	if secondStage != 1 || secondAttempts != 1 {
+		t.Fatalf("unstable successor changed stage/attempts to %d/%d, want 1/1", secondStage, secondAttempts)
+	}
 
 	cancelRun()
 	if err := cm.Stop(); err != nil {
 		t.Fatal(err)
+	}
+	cm.reconnectMu.Lock()
+	finalStage := cm.endpoints[0].nextReconnectStage
+	finalAttempts := cm.endpoints[0].reconnectAttempts.Load()
+	cm.reconnectMu.Unlock()
+	if finalStage != 1 || finalAttempts != 1 {
+		t.Fatalf("canceled successor changed stage/attempts to %d/%d, want 1/1", finalStage, finalAttempts)
 	}
 	if err := awaitLifecycle(t, freshServerDone, "fresh callback generation retirement"); err != nil {
 		t.Fatal(err)

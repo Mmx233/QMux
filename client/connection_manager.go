@@ -20,6 +20,8 @@ import (
 const (
 	initialReconnectDelay           = 5 * time.Second
 	maxReconnectDelay               = 60 * time.Second
+	reconnectStableGrace            = 60 * time.Second
+	maxReconnectStage               = 4
 	defaultConnectionAttemptTimeout = 30 * time.Second
 )
 
@@ -92,6 +94,7 @@ type clientEndpointPhases struct {
 	connect             stats.Operation
 	registration        stats.Operation
 	reconnectAttempts   atomic.Uint64
+	nextReconnectStage  int
 }
 
 // NewConnectionManager creates a new ConnectionManager instance.
@@ -367,12 +370,10 @@ func reconnectDelay(attempt int, int64n func(int64) int64) time.Duration {
 func waitForReconnect(ctx, managerCtx context.Context, delay time.Duration) bool {
 	select {
 	case <-ctx.Done():
-		return false
 	case <-managerCtx.Done():
-		return false
 	case <-time.After(delay):
-		return true
 	}
+	return ctx.Err() == nil && managerCtx.Err() == nil
 }
 
 // startReconnection starts a reconnection goroutine for a server if not already reconnecting.
@@ -418,7 +419,7 @@ func (cm *ConnectionManager) reconnectionLoop(ctx context.Context, serverAddr st
 	}
 	defer releaseSlot()
 
-	// Find the server endpoint configuration
+	// Find the immutable endpoint configuration and its persistent retry state.
 	var endpoint *config.ServerEndpoint
 	for _, s := range cm.config.Server.GetServers() {
 		if s.Address == serverAddr {
@@ -430,6 +431,17 @@ func (cm *ConnectionManager) reconnectionLoop(ctx context.Context, serverAddr st
 		cm.logger.Error().Str("server", serverAddr).Msg("server not found in configuration")
 		return
 	}
+	var endpointState *clientEndpointPhases
+	for i := range cm.endpoints {
+		if cm.endpoints[i].endpoint == endpoint.Address {
+			endpointState = &cm.endpoints[i]
+			break
+		}
+	}
+	if endpointState == nil {
+		cm.logger.Error().Str("server", serverAddr).Msg("server retry state not found")
+		return
+	}
 
 	cm.publishMu.Lock()
 	if expected != nil {
@@ -439,6 +451,11 @@ func (cm *ConnectionManager) reconnectionLoop(ctx context.Context, serverAddr st
 			return
 		}
 		cm.detachGenerationLocked(expected)
+		if expected.reconnectStable.Load() {
+			cm.reconnectMu.Lock()
+			endpointState.nextReconnectStage = 0
+			cm.reconnectMu.Unlock()
+		}
 		cm.publishMu.Unlock()
 		_ = expected.Close()
 	} else {
@@ -459,10 +476,14 @@ func (cm *ConnectionManager) reconnectionLoop(ctx context.Context, serverAddr st
 		default:
 		}
 
-		backoff := reconnectDelay(attempt, rand.Int64N)
+		cm.reconnectMu.Lock()
+		stage := endpointState.nextReconnectStage
+		cm.reconnectMu.Unlock()
+		backoff := reconnectDelay(stage, rand.Int64N)
 		cm.logger.Info().
 			Str("server", serverAddr).
 			Int("attempt", attempt+1).
+			Int("backoff_stage", stage).
 			Dur("backoff", backoff).
 			Msg("scheduling reconnection attempt")
 
@@ -470,17 +491,16 @@ func (cm *ConnectionManager) reconnectionLoop(ctx context.Context, serverAddr st
 			return
 		}
 
-		for i := range cm.endpoints {
-			if cm.endpoints[i].endpoint == endpoint.Address {
-				cm.endpoints[i].reconnectAttempts.Add(1)
-				break
-			}
-		}
+		cm.reconnectMu.Lock()
+		endpointState.nextReconnectStage = min(stage+1, maxReconnectStage)
+		endpointState.reconnectAttempts.Add(1)
+		cm.reconnectMu.Unlock()
 		sc, err := cm.connectAndRegister(ctx, *endpoint)
 		if err != nil {
 			cm.logger.Warn().
 				Str("server", serverAddr).
 				Int("attempt", attempt+1).
+				Int("backoff_stage", stage).
 				Err(err).
 				Msg("reconnection attempt failed")
 			attempt++
@@ -498,6 +518,7 @@ func (cm *ConnectionManager) reconnectionLoop(ctx context.Context, serverAddr st
 		cm.logger.Info().
 			Str("server", serverAddr).
 			Int("attempts", attempt+1).
+			Int("backoff_stage", stage).
 			Msg("reconnection successful")
 
 		return

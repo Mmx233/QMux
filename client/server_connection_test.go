@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -106,6 +107,38 @@ func TestServerConnectionReceivedHealthConcurrent(t *testing.T) {
 	if conn.LastReceivedFromServer().IsZero() {
 		t.Fatal("concurrent updates left the timestamp unset")
 	}
+}
+
+func TestServerConnectionReconnectStabilityGrace(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		first := newTestServerConnection()
+		second := newTestServerConnection()
+		controlStartedAt := time.Now()
+
+		first.MarkHealthy()
+		first.markReconnectStable(controlStartedAt)
+		if first.reconnectStable.Load() {
+			t.Fatal("new connection became retry-stable before grace")
+		}
+
+		synctest.Sleep(reconnectStableGrace - time.Nanosecond)
+		first.markReconnectStable(controlStartedAt)
+		if first.reconnectStable.Load() {
+			t.Fatal("connection became retry-stable before exact grace boundary")
+		}
+		if second.reconnectStable.Load() {
+			t.Fatal("one generation changed another generation's retry stability")
+		}
+
+		synctest.Sleep(time.Nanosecond)
+		first.markReconnectStable(controlStartedAt)
+		if !first.reconnectStable.Load() {
+			t.Fatal("connection did not become retry-stable at exact grace boundary")
+		}
+		if second.reconnectStable.Load() {
+			t.Fatal("stable generation changed another generation's retry stability")
+		}
+	})
 }
 
 func TestConnectionStateString(t *testing.T) {
