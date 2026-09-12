@@ -429,9 +429,6 @@ func TestQueuedControlErrorCannotQuiesceAsSuccess(t *testing.T) {
 			if err := protocol.DecodeDrainRequest(payload); err != nil {
 				return err
 			}
-			if err := protocol.WriteMessage(stream, 0x20, struct{}{}); err != nil {
-				return err
-			}
 			if err := protocol.WriteDrainComplete(stream, -1); err != nil {
 				return err
 			}
@@ -456,33 +453,36 @@ func TestQueuedControlErrorCannotQuiesceAsSuccess(t *testing.T) {
 		runtime = runtimes[0]
 		return true
 	})
-	handlerEntered := make(chan struct{})
-	releaseHandler := make(chan struct{})
+	writeStarted := make(chan struct{})
+	releaseWrite := make(chan struct{})
 	defer func() {
 		select {
-		case <-releaseHandler:
+		case <-releaseWrite:
 		default:
-			close(releaseHandler)
+			close(releaseWrite)
 		}
 	}()
-	runtime.sc.SetNonHeartbeatHandler(func(byte, []byte) error {
-		close(handlerEntered)
-		<-releaseHandler
+	runtime.sc.writeDrain = func(stream *quic.Stream) error {
+		if err := protocol.WriteDrainRequest(stream); err != nil {
+			return err
+		}
+		close(writeStarted)
+		<-releaseWrite
 		return nil
-	})
+	}
 
 	shutdownDone := callClientLifecycle(func() error { return c.Shutdown(context.Background()) })
+	awaitLifecycle(t, writeStarted, "blocked drain request write")
 	awaitLifecycle(t, framesSent, "queued control frames")
-	awaitLifecycle(t, handlerEntered, "blocked control handler")
 	awaitRetirementCondition(t, "queued conflicting drain complete", func() bool {
-		return runtime.sc.controlPending.Load() == 3
+		return runtime.sc.controlPending.Load() == 2
 	})
 	select {
 	case err := <-shutdownDone:
 		t.Fatalf("Shutdown returned before queued control error was processed: %v", err)
 	default:
 	}
-	close(releaseHandler)
+	close(releaseWrite)
 
 	if err := awaitClientLifecycle(t, shutdownDone, "queued control error shutdown"); err == nil {
 		t.Fatal("Shutdown succeeded with a queued conflicting DrainComplete")

@@ -65,7 +65,6 @@ type ServerConnection struct {
 	// Health tracking
 	healthy         atomic.Bool
 	reconnectStable atomic.Bool
-	lastHeartbeat   atomic.Int64
 
 	// Bidirectional heartbeat tracking - tracks when heartbeats are received from server
 	lastReceivedFromServer atomic.Int64
@@ -97,8 +96,6 @@ type ServerConnection struct {
 	drainComplete   chan int64
 	drainEpoch      atomic.Uint32
 	writeDrain      func(*quic.Stream) error
-	handlerMu       sync.RWMutex
-	nonHeartbeat    NonHeartbeatHandler
 
 	closeOnce sync.Once
 	closeMu   sync.Mutex
@@ -248,19 +245,16 @@ func (sc *ServerConnection) Connection() *quic.Conn {
 // --- Health Tracking Methods ---
 
 // IsHealthy returns the current health status of the connection.
-// A connection is healthy if it has successfully sent heartbeats
-// within the configured timeout.
 func (sc *ServerConnection) IsHealthy() bool {
 	return sc.healthy.Load()
 }
 
-// MarkHealthy marks the connection as healthy and updates the last heartbeat timestamp.
+// MarkHealthy marks the connection as healthy.
 func (sc *ServerConnection) MarkHealthy() {
 	if sc.ctx.Err() != nil {
 		return
 	}
 	wasHealthy := sc.healthy.Swap(true)
-	sc.lastHeartbeat.Store(time.Now().UnixNano())
 
 	if !wasHealthy {
 		sc.state.Store(int32(StateConnected))
@@ -289,33 +283,6 @@ func (sc *ServerConnection) MarkUnhealthy() {
 		sc.healthy.Store(false)
 		sc.state.Store(int32(StateDisconnected))
 	}
-}
-
-// LastHeartbeat returns the timestamp of the last successful heartbeat.
-// Returns zero time if no heartbeat has been sent.
-func (sc *ServerConnection) LastHeartbeat() time.Time {
-	ns := sc.lastHeartbeat.Load()
-	if ns == 0 {
-		return time.Time{}
-	}
-	return time.Unix(0, ns)
-}
-
-// CheckHealth checks if the connection is healthy based on the heartbeat timeout.
-// If the time since the last heartbeat exceeds the timeout, the connection is marked unhealthy.
-func (sc *ServerConnection) CheckHealth(timeout time.Duration) bool {
-	lastHB := sc.LastHeartbeat()
-	if lastHB.IsZero() {
-		// No heartbeat yet - consider unhealthy if we've been connected for a while
-		return false
-	}
-
-	if time.Since(lastHB) > timeout {
-		sc.MarkUnhealthy()
-		return false
-	}
-
-	return sc.IsHealthy()
 }
 
 // --- Bidirectional Heartbeat Methods ---
@@ -347,17 +314,6 @@ func (sc *ServerConnection) SetHealthConfig(healthTimeout time.Duration) {
 // This is called when the health check detects a timeout.
 func (sc *ServerConnection) SetReconnectCallback(callback ReconnectionCallback) {
 	sc.reconnectCallback = callback
-}
-
-// CheckReceivedHealth checks if the connection is healthy based on received heartbeats.
-// Returns true if a heartbeat has been received within the configured healthTimeout.
-// Returns false if no heartbeat has been received or if the timeout has been exceeded.
-func (sc *ServerConnection) CheckReceivedHealth() bool {
-	lastReceived := sc.LastReceivedFromServer()
-	if lastReceived.IsZero() {
-		return false
-	}
-	return time.Since(lastReceived) <= sc.healthTimeout
 }
 
 func (sc *ServerConnection) markReconnectStable(controlStartedAt time.Time) {
@@ -502,22 +458,9 @@ func (sc *ServerConnection) heartbeatLoop(sendInterval time.Duration, controlStr
 			case protocol.MsgTypeDrainRequest:
 				return fmt.Errorf("wrong-direction drain request")
 			default:
-				// Route non-heartbeat messages to handler
-				sc.handlerMu.RLock()
-				handler := sc.nonHeartbeat
-				sc.handlerMu.RUnlock()
-				if handler != nil {
-					if err := handler(result.msgType, result.payload); err != nil {
-						sc.logger.Warn().
-							Uint8("msg_type", result.msgType).
-							Err(err).
-							Msg("error handling non-heartbeat message")
-					}
-				} else {
-					sc.logger.Debug().
-						Uint8("msg_type", result.msgType).
-						Msg("received non-heartbeat message (no handler set)")
-				}
+				sc.logger.Debug().
+					Uint8("msg_type", result.msgType).
+					Msg("received unknown control message")
 			}
 			sc.controlReadDone()
 
@@ -548,18 +491,6 @@ func (sc *ServerConnection) controlReadDone() {
 	case sc.controlProgress <- struct{}{}:
 	default:
 	}
-}
-
-// NonHeartbeatHandler is a function type for handling non-heartbeat messages received on the control stream.
-// It receives the message type and payload, and returns an error if handling fails.
-type NonHeartbeatHandler func(msgType byte, payload []byte) error
-
-// SetNonHeartbeatHandler sets the handler for non-heartbeat messages received on the control stream.
-// This allows routing of non-heartbeat messages to appropriate handlers without blocking heartbeat processing.
-func (sc *ServerConnection) SetNonHeartbeatHandler(handler NonHeartbeatHandler) {
-	sc.handlerMu.Lock()
-	sc.nonHeartbeat = handler
-	sc.handlerMu.Unlock()
 }
 
 // StartHeartbeatLoops starts the unified heartbeat loop for this connection.
@@ -819,39 +750,6 @@ func (sc *ServerConnection) acceptRegisterAckWithAuth(ack protocol.RegisterAckMs
 	return protocol.ValidateRegisterAckWithAuth(ack, expectedAuthScheme)
 }
 
-// SendHeartbeat sends a heartbeat message on the control stream with a health-timeout deadline.
-// It must not run concurrently with the active heartbeat loop.
-// On success, the connection is marked healthy. On failure, it's marked unhealthy
-// and reconnection is triggered if a callback is set.
-func (sc *ServerConnection) SendHeartbeat() error {
-	timeout := sc.healthTimeout
-	if timeout <= 0 {
-		timeout = config.DefaultHealthTimeout
-	}
-	return sc.sendHeartbeat(sc.controlStream.Load(), time.Now().Add(timeout))
-}
-
-func (sc *ServerConnection) sendHeartbeat(controlStream *quic.Stream, deadline time.Time) error {
-	err := writeHeartbeat(controlStream, deadline)
-	if err != nil {
-		// Heartbeat write failures mark the generation unhealthy (Requirement 1.3).
-		sc.MarkUnhealthy()
-		sc.logger.Error().Err(err).Msg("heartbeat send failed")
-
-		// Trigger reconnection if callback is set (Requirement 1.3)
-		if sc.reconnectCallback != nil {
-			sc.logger.Info().Msg("triggering reconnection due to heartbeat write error")
-			sc.reconnectCallback(sc.serverAddr)
-		}
-
-		return fmt.Errorf("send heartbeat: %w", err)
-	}
-
-	sc.MarkHealthy()
-	sc.logger.Debug().Msg("heartbeat sent")
-	return nil
-}
-
 func writeHeartbeat(controlStream *quic.Stream, deadline time.Time) error {
 	if controlStream == nil {
 		return fmt.Errorf("no control stream")
@@ -919,26 +817,4 @@ func (sc *ServerConnection) setOnClosed(onClosed func()) bool {
 	}
 	sc.closeMu.Unlock()
 	return false
-}
-
-// ServerConnectionInfo provides connection status information for monitoring.
-type ServerConnectionInfo struct {
-	Address                string
-	ServerName             string
-	State                  ConnectionState
-	Healthy                bool
-	LastHeartbeat          time.Time
-	LastReceivedFromServer time.Time
-}
-
-// Info returns current connection status information.
-func (sc *ServerConnection) Info() ServerConnectionInfo {
-	return ServerConnectionInfo{
-		Address:                sc.serverAddr,
-		ServerName:             sc.serverName,
-		State:                  sc.State(),
-		Healthy:                sc.IsHealthy(),
-		LastHeartbeat:          sc.LastHeartbeat(),
-		LastReceivedFromServer: sc.LastReceivedFromServer(),
-	}
 }

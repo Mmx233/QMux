@@ -452,16 +452,17 @@ func TestReconnectReleasesSlotBeforeFreshPublicationCallback(t *testing.T) {
 		t.Fatal("successful Register retained the old reconnect slot before publication")
 	}
 
-	controlStream := fresh.controlStream.Swap(nil)
+	if delivered := awaitLifecycle(t, cm.NewConns, "fresh reconnect generation delivery"); delivered != fresh {
+		t.Fatalf("fresh delivery = %p, want %p", delivered, fresh)
+	}
+	awaitRetirementCondition(t, "fresh generation control loop", func() bool {
+		return fresh.controlAlive()
+	})
+	controlStream := fresh.controlStream.Load()
 	if controlStream == nil {
 		t.Fatal("fresh registration did not install a control stream")
 	}
-	if err := controlStream.Close(); err != nil {
-		t.Fatalf("close fresh control stream: %v", err)
-	}
-	if err := fresh.SendHeartbeat(); err == nil {
-		t.Fatal("heartbeat with retired control stream unexpectedly succeeded")
-	}
+	controlStream.CancelRead(0)
 	awaitRetirementCondition(t, "fresh callback reconnect intent", func() bool {
 		cm.reconnectMu.Lock()
 		defer cm.reconnectMu.Unlock()

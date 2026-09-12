@@ -17,55 +17,6 @@ import (
 const heartbeatTestStreamWindow = 64
 
 func TestHeartbeatWriteDeadlineBoundsFlowControlStall(t *testing.T) {
-	t.Run("production helper times out", func(t *testing.T) {
-		parkedHeartbeats := calibrateParkedHeartbeats(t)
-		sender, _ := newHeartbeatFlowControlPair(t)
-		stream := openHeartbeatTestStream(t, sender)
-		if err := stream.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
-			t.Fatalf("set prefill deadline: %v", err)
-		}
-		for range max(0, parkedHeartbeats-2) {
-			if err := protocol.WriteHeartbeat(stream, 1_700_000_000); err != nil {
-				t.Fatalf("prefill flow-controlled stream: %v", err)
-			}
-		}
-
-		const writeTimeout = 250 * time.Millisecond
-		sc := NewServerConnection("heartbeat.test:8443", "heartbeat.test", tls.NewLRUClientSessionCache(1), zerolog.Nop())
-		sc.SetHealthConfig(writeTimeout)
-		sc.controlStream.Store(stream)
-		sc.MarkHealthy()
-		var reconnects atomic.Int32
-		sc.SetReconnectCallback(func(string) { reconnects.Add(1) })
-
-		var err error
-		var elapsed time.Duration
-		for range parkedHeartbeats {
-			started := time.Now()
-			result := make(chan error, 1)
-			go func() { result <- sc.SendHeartbeat() }()
-			select {
-			case err = <-result:
-				elapsed = time.Since(started)
-			case <-time.After(3 * time.Second):
-				_ = sender.CloseWithError(0, "unblock missed heartbeat deadline")
-				t.Fatal("heartbeat write did not honor its deadline")
-			}
-			if err != nil {
-				break
-			}
-		}
-		if !errors.Is(err, os.ErrDeadlineExceeded) {
-			t.Fatalf("sendHeartbeat() error = %T %v, want os.ErrDeadlineExceeded", err, err)
-		}
-		if elapsed < writeTimeout*9/10 {
-			t.Fatalf("sendHeartbeat() returned after %v, want at least %v", elapsed, writeTimeout*9/10)
-		}
-		if sc.IsHealthy() || reconnects.Load() != 1 {
-			t.Fatalf("deadline failure left healthy=%t reconnects=%d, want false/1", sc.IsHealthy(), reconnects.Load())
-		}
-	})
-
 	t.Run("heartbeat loop exits stalled write", func(t *testing.T) {
 		parkedHeartbeats := calibrateParkedHeartbeats(t)
 		sender, receiver := newHeartbeatFlowControlPair(t)

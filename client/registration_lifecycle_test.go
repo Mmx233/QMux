@@ -850,7 +850,7 @@ func TestRegistrationLifecycleSuccessfulAckClearsAttemptDeadline(t *testing.T) {
 	if stream == nil {
 		t.Fatal("registration did not publish the control stream")
 	}
-	// Direct I/O must retain the cleared deadline; SendHeartbeat sets a new write deadline.
+	// Direct I/O must retain the cleared deadline; the heartbeat loop sets a new write deadline.
 	for i := range heartbeatCount {
 		if err := protocol.WriteHeartbeat(stream, int64(i+1)); err != nil {
 			t.Fatalf("heartbeat %d after attempt deadline: %v", i+1, err)
