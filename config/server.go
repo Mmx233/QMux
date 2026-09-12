@@ -2,12 +2,9 @@ package config
 
 import (
 	"cmp"
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"strconv"
 	"time"
 
@@ -104,23 +101,6 @@ type ServerAuth struct {
 	Method     string `yaml:"method"`       // "mtls", "token", etc.
 	CACertFile string `yaml:"ca_cert_file"` // Path to CA certificate file (for mTLS)
 	Token      string `yaml:"token"`        // Secret for exporter-bound token auth
-
-	// Loaded certificate (not from YAML)
-	CACertPool *x509.CertPool `yaml:"-"`
-}
-
-// LoadCACertificate loads the CA certificate from file into the CACertPool
-func (a *ServerAuth) LoadCACertificate() error {
-	caCertPEM, err := os.ReadFile(a.CACertFile)
-	if err != nil {
-		return fmt.Errorf("read CA cert: %w", err)
-	}
-
-	a.CACertPool = x509.NewCertPool()
-	if !a.CACertPool.AppendCertsFromPEM(caCertPEM) {
-		return fmt.Errorf("failed to parse CA certificate")
-	}
-	return nil
 }
 
 // Validate validates the auth configuration based on the selected method.
@@ -176,9 +156,6 @@ type ServerTLS struct {
 	// Number of old keys retained during custom rotation. Omitted or null uses
 	// the default of 7; an explicit zero retains no old keys.
 	SessionTicketEncryptionKeyRotationOverlap *uint8 `yaml:"session_ticket_encryption_key_rotation_overlap"`
-
-	// Loaded certificate (not from YAML)
-	ServerCert tls.Certificate `yaml:"-"`
 }
 
 // RotationOldKeyLimit returns the configured old-key limit for custom rotation.
@@ -187,18 +164,6 @@ func (t *ServerTLS) RotationOldKeyLimit() uint8 {
 		return DefaultSessionTicketEncryptionKeyRotationOverlap
 	}
 	return *t.SessionTicketEncryptionKeyRotationOverlap
-}
-
-// LoadCertificates loads server TLS certificate and key from files
-func (t *ServerTLS) LoadCertificates() error {
-	// Load server certificate and key
-	cert, err := tls.LoadX509KeyPair(t.ServerCertFile, t.ServerKeyFile)
-	if err != nil {
-		return fmt.Errorf("load server cert/key: %w", err)
-	}
-	t.ServerCert = cert
-
-	return nil
 }
 
 // ApplyDefaults applies default values to zero-value fields.

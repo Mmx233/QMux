@@ -273,11 +273,9 @@ func TestSuperviseServerCancelsRealListenerHostnameResolve(t *testing.T) {
 }
 
 func TestStartListenerPreservesLiteralAndEmptyHost(t *testing.T) {
-	certificate, _ := registrationTestCertificate(t)
 	srv := &Server{
 		config: &config.Server{
 			Auth: config.ServerAuth{Method: "token"},
-			TLS:  config.ServerTLS{ServerCert: certificate},
 		},
 		logger: zerolog.Nop(),
 	}

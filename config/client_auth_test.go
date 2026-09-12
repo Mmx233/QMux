@@ -1,12 +1,6 @@
 package config
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/x509"
-	"encoding/pem"
-	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
@@ -107,60 +101,6 @@ func TestClientAuthValidationAndConditionalCertificates(t *testing.T) {
 	}
 }
 
-func TestLoadCredentialsSelectsFilesByAuthMethod(t *testing.T) {
-	certPEM, keyPEM := testCertificate(t)
-	tempDir := t.TempDir()
-	caPath := filepath.Join(tempDir, "ca.pem")
-	certPath := filepath.Join(tempDir, "client.pem")
-	keyPath := filepath.Join(tempDir, "client-key.pem")
-	for path, contents := range map[string][]byte{
-		caPath:   certPEM,
-		certPath: certPEM,
-		keyPath:  keyPEM,
-	} {
-		if err := os.WriteFile(path, contents, 0600); err != nil {
-			t.Fatalf("write %s: %v", path, err)
-		}
-	}
-
-	t.Run("token loads CA only", func(t *testing.T) {
-		client := Client{
-			Auth: ClientAuth{Method: ClientAuthMethodToken, Token: strings.Repeat("t", sharedtoken.MinSecretSize)},
-			TLS: ClientTLS{
-				CACertFile:     caPath,
-				ClientCertFile: filepath.Join(tempDir, "does-not-exist.pem"),
-				ClientKeyFile:  filepath.Join(tempDir, "does-not-exist-key.pem"),
-			},
-		}
-		if err := client.LoadCredentials(); err != nil {
-			t.Fatalf("LoadCredentials: %v", err)
-		}
-		if client.TLS.CACertPool == nil {
-			t.Fatal("CA certificate was not loaded")
-		}
-		if len(client.TLS.ClientCert.Certificate) != 0 {
-			t.Fatal("token auth unexpectedly loaded a client certificate")
-		}
-	})
-
-	t.Run("mtls retains combined loader behavior", func(t *testing.T) {
-		client := Client{
-			Auth: ClientAuth{Method: ClientAuthMethodMTLS},
-			TLS: ClientTLS{
-				CACertFile:     caPath,
-				ClientCertFile: certPath,
-				ClientKeyFile:  keyPath,
-			},
-		}
-		if err := client.LoadCredentials(); err != nil {
-			t.Fatalf("LoadCredentials: %v", err)
-		}
-		if client.TLS.CACertPool == nil || len(client.TLS.ClientCert.Certificate) == 0 {
-			t.Fatal("mTLS credentials were not fully loaded")
-		}
-	})
-}
-
 func TestLoadClientConfigTokenAuthWithoutClientKeyPair(t *testing.T) {
 	content := `client_id: token-client
 server:
@@ -187,32 +127,4 @@ tls:
 	if cfg.Auth.Method != ClientAuthMethodToken || cfg.TLS.ClientCertFile != "" || cfg.TLS.ClientKeyFile != "" {
 		t.Fatalf("loaded token config = %+v, TLS = %+v", cfg.Auth, cfg.TLS)
 	}
-}
-
-func testCertificate(t *testing.T) ([]byte, []byte) {
-	t.Helper()
-	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("generate key: %v", err)
-	}
-	now := time.Now()
-	template := &x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		NotBefore:             now.Add(-time.Hour),
-		NotAfter:              now.Add(time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
-		BasicConstraintsValid: true,
-		IsCA:                  true,
-	}
-	certificateDER, err := x509.CreateCertificate(rand.Reader, template, template, &privateKey.PublicKey, privateKey)
-	if err != nil {
-		t.Fatalf("create certificate: %v", err)
-	}
-	keyDER, err := x509.MarshalECPrivateKey(privateKey)
-	if err != nil {
-		t.Fatalf("marshal key: %v", err)
-	}
-	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificateDER}),
-		pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 }

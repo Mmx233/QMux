@@ -1,8 +1,8 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
-	"crypto/tls"
 	"fmt"
 	"strings"
 	"testing"
@@ -159,43 +159,33 @@ func TestTokenAuthenticationStillVerifiesServerCertificate(t *testing.T) {
 		ctx,
 		newTokenServerConfig(serverCertDir, "tcp", tokenE2ETestSecret, quicPort, trafficPort),
 	)
+	waitForQUICListener(t, ctx, newTokenClientConfig(
+		serverCertDir,
+		"trusted-readiness-probe",
+		tokenE2ETestSecret,
+		1,
+		quicPort,
+	), serverErr)
 
 	clientConfig := newTokenClientConfig(untrustedCertDir, "untrusted-server-client", tokenE2ETestSecret, 1, quicPort)
-	if err := clientConfig.LoadCredentials(); err != nil {
-		t.Fatalf("load untrusted client CA: %v", err)
+	var logs bytes.Buffer
+	manager, err := client.NewConnectionManager(clientConfig, zerolog.New(zerolog.SyncWriter(&logs)))
+	if err != nil {
+		t.Fatalf("create untrusted client connection manager: %v", err)
 	}
-	tlsConfig := &tls.Config{
-		RootCAs:    clientConfig.TLS.CACertPool,
-		ServerName: "localhost",
+	if err := manager.Start(ctx); err != nil {
+		t.Fatalf("start untrusted client connection manager: %v", err)
 	}
-
-	deadline := time.NewTimer(5 * time.Second)
-	defer deadline.Stop()
-	ticker := time.NewTicker(20 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		sc := client.NewServerConnection(
-			fmt.Sprintf("127.0.0.1:%d", quicPort),
-			"localhost",
-			tls.NewLRUClientSessionCache(1),
-			zerolog.Nop(),
-		)
-		attemptCtx, cancelAttempt := context.WithTimeout(ctx, 500*time.Millisecond)
-		err := sc.Connect(attemptCtx, tlsConfig, clientConfig.Quic.GetConfig())
-		cancelAttempt()
-		_ = sc.Close()
-		if err != nil && strings.Contains(err.Error(), "certificate signed by unknown authority") {
-			return
-		}
-
-		select {
-		case serverStartErr := <-serverErr:
-			t.Fatalf("token server failed during certificate test: %v", serverStartErr)
-		case <-deadline.C:
-			t.Fatalf("token client did not reject the untrusted server certificate: last error: %v", err)
-		case <-ticker.C:
-		case <-ctx.Done():
-			t.Fatalf("certificate test context ended: %v", context.Cause(ctx))
-		}
+	if got := manager.HealthyCount(); got != 0 {
+		t.Fatalf("untrusted client became healthy: %d connections", got)
+	}
+	if got := manager.TotalCount(); got != 0 {
+		t.Fatalf("untrusted connection was published: %d connections", got)
+	}
+	if err := manager.Stop(); err != nil {
+		t.Fatalf("stop untrusted client connection manager: %v", err)
+	}
+	if !strings.Contains(logs.String(), "certificate signed by unknown authority") {
+		t.Fatalf("untrusted client error did not preserve unknown-authority cause: %s", logs.String())
 	}
 }

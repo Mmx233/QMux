@@ -252,6 +252,9 @@ func TestConnectionManagerTokenModeOmitsConfiguredClientIdentity(t *testing.T) {
 	peer := newLifecyclePeerWithTLS(t, serverTLS, nil)
 	cfg := tlsReloadClientConfig(t, lifecycleClientTLSFiles(t))
 	cfg.Auth = tokenTestAuth()
+	missingDir := t.TempDir()
+	cfg.TLS.ClientCertFile = filepath.Join(missingDir, "missing-client.crt")
+	cfg.TLS.ClientKeyFile = filepath.Join(missingDir, "missing-client.key")
 	cfg.Server.Servers[0] = peer.endpoint()
 	cm, err := NewConnectionManager(cfg, zerolog.Nop())
 	if err != nil {

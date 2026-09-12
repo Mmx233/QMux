@@ -1,12 +1,9 @@
 package config
 
 import (
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -168,21 +165,6 @@ func (a *ClientAuth) Validate() error {
 	}
 }
 
-// LoadCredentials validates and loads the credentials required by the selected
-// client authentication method.
-func (c *Client) LoadCredentials() error {
-	if err := c.Auth.Validate(); err != nil {
-		return fmt.Errorf("auth: %w", err)
-	}
-	if err := c.TLS.Validate(c.Auth.Method); err != nil {
-		return fmt.Errorf("tls: %w", err)
-	}
-	if c.Auth.Method == ClientAuthMethodToken {
-		return c.TLS.LoadCACertificate()
-	}
-	return c.TLS.LoadCertificates()
-}
-
 // ServerEndpoint represents a single server endpoint
 type ServerEndpoint struct {
 	Address    string `yaml:"address"`     // host:port
@@ -208,10 +190,6 @@ type ClientTLS struct {
 	ClientCertFile string `yaml:"client_cert_file"`
 	ClientKeyFile  string `yaml:"client_key_file"`
 	AutoReload     bool   `yaml:"auto_reload"`
-
-	// Loaded certificates (not from YAML)
-	CACertPool *x509.CertPool  `yaml:"-"`
-	ClientCert tls.Certificate `yaml:"-"`
 }
 
 // Validate checks the certificate paths required by the selected auth method.
@@ -230,38 +208,6 @@ func (t *ClientTLS) Validate(authMethod string) error {
 		return errors.New("client_cert_file and client_key_file must be provided together")
 	}
 	return nil
-}
-
-// LoadCACertificate loads the server CA certificate from disk.
-func (t *ClientTLS) LoadCACertificate() error {
-	caCertPEM, err := os.ReadFile(t.CACertFile)
-	if err != nil {
-		return fmt.Errorf("read CA cert: %w", err)
-	}
-
-	t.CACertPool = x509.NewCertPool()
-	if !t.CACertPool.AppendCertsFromPEM(caCertPEM) {
-		return fmt.Errorf("failed to parse CA certificate")
-	}
-	return nil
-}
-
-// LoadClientKeyPair loads the client certificate and private key from disk.
-func (t *ClientTLS) LoadClientKeyPair() error {
-	cert, err := tls.LoadX509KeyPair(t.ClientCertFile, t.ClientKeyFile)
-	if err != nil {
-		return fmt.Errorf("load client cert/key: %w", err)
-	}
-	t.ClientCert = cert
-	return nil
-}
-
-// LoadCertificates loads TLS certificates from files
-func (t *ClientTLS) LoadCertificates() error {
-	if err := t.LoadCACertificate(); err != nil {
-		return err
-	}
-	return t.LoadClientKeyPair()
 }
 
 const MinServers = 1

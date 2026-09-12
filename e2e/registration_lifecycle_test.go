@@ -273,14 +273,24 @@ func waitForQUICListener(
 	serverErr <-chan error,
 ) {
 	t.Helper()
-	if err := clientConfig.TLS.LoadCertificates(); err != nil {
-		t.Fatalf("load probe certificates: %v", err)
+	caPEM, err := os.ReadFile(clientConfig.TLS.CACertFile)
+	if err != nil {
+		t.Fatalf("read probe CA certificate: %v", err)
 	}
-
+	rootCAs := x509.NewCertPool()
+	if !rootCAs.AppendCertsFromPEM(caPEM) {
+		t.Fatal("parse probe CA certificate")
+	}
 	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{clientConfig.TLS.ClientCert},
-		RootCAs:      clientConfig.TLS.CACertPool,
-		ServerName:   clientConfig.Server.Servers[0].ServerName,
+		RootCAs:    rootCAs,
+		ServerName: clientConfig.Server.Servers[0].ServerName,
+	}
+	if clientConfig.Auth.Method != config.ClientAuthMethodToken {
+		certificate, err := tls.LoadX509KeyPair(clientConfig.TLS.ClientCertFile, clientConfig.TLS.ClientKeyFile)
+		if err != nil {
+			t.Fatalf("load probe client certificate: %v", err)
+		}
+		tlsConfig.Certificates = []tls.Certificate{certificate}
 	}
 	deadline := time.NewTimer(3 * time.Second)
 	defer deadline.Stop()

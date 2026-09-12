@@ -1,8 +1,6 @@
 package config
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -42,52 +40,6 @@ func TestServerAuthYAML(t *testing.T) {
 			}
 			if got.Method != test.want.Method || got.CACertFile != test.want.CACertFile || got.Token != test.want.Token {
 				t.Fatalf("ServerAuth = %+v, want %+v", got, test.want)
-			}
-		})
-	}
-}
-
-func TestServerAuthLoadCACertificate(t *testing.T) {
-	validCert, _ := testCertificate(t)
-	tests := []struct {
-		name        string
-		content     []byte
-		missingFile bool
-		wantError   string
-	}{
-		{name: "valid", content: validCert},
-		{name: "missing file", missingFile: true, wantError: "read CA cert"},
-		{name: "invalid PEM", content: []byte("not a certificate"), wantError: "failed to parse CA certificate"},
-		{name: "empty file", content: nil, wantError: "failed to parse CA certificate"},
-		{
-			name:      "malformed PEM",
-			content:   []byte("-----BEGIN CERTIFICATE-----\nnot-valid-base64-content!!!\n-----END CERTIFICATE-----"),
-			wantError: "failed to parse CA certificate",
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "ca.crt")
-			if test.missingFile {
-				path = filepath.Join(t.TempDir(), "missing.crt")
-			} else if err := os.WriteFile(path, test.content, 0o644); err != nil {
-				t.Fatalf("write CA file: %v", err)
-			}
-
-			auth := ServerAuth{Method: "mtls", CACertFile: path}
-			err := auth.LoadCACertificate()
-			if test.wantError != "" {
-				if err == nil || !strings.Contains(err.Error(), test.wantError) {
-					t.Fatalf("LoadCACertificate error = %v, want containing %q", err, test.wantError)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("LoadCACertificate: %v", err)
-			}
-			if auth.CACertPool == nil {
-				t.Fatal("CA certificate pool was not loaded")
 			}
 		})
 	}
@@ -159,9 +111,6 @@ func TestServerAuthCreateAuthenticator(t *testing.T) {
 			case "mtls":
 				if _, ok := authenticator.(*mtls.MTLSAuth); !ok {
 					t.Fatalf("authenticator type = %T, want *mtls.MTLSAuth", authenticator)
-				}
-				if test.auth.CACertPool != nil {
-					t.Fatal("CreateAuthenticator mutated the CA pool")
 				}
 			case "token":
 				if _, ok := authenticator.(*tokenauth.TokenAuth); !ok {

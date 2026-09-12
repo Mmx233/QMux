@@ -582,13 +582,11 @@ func TestSessionTicketRotationModeLogs(t *testing.T) {
 		{name: "custom", interval: time.Hour, overlap: new(uint8(7)), message: "session ticket key rotation enabled"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			certificate, _ := registrationTestCertificate(t)
 			capture := &sessionTicketLogCapture{events: make(chan []byte, 16)}
 			srv := &Server{
 				config: &config.Server{
 					Auth: config.ServerAuth{Method: "token"},
 					TLS: config.ServerTLS{
-						ServerCert: certificate,
 						SessionTicketEncryptionKeyRotationInterval: test.interval,
 						SessionTicketEncryptionKeyRotationOverlap:  test.overlap,
 					},
