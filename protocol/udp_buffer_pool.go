@@ -1,28 +1,14 @@
 package protocol
 
-import (
-	"fmt"
-	"sync"
-)
+import "sync"
 
-// Default UDP buffer size constants
 const (
-	// DefaultDatagramBufferSize is the default size for QUIC datagram buffers
-	DefaultDatagramBufferSize = MaxDatagramSize // 1200 bytes
-
-	// DefaultReadBufferSize is the default size for UDP read buffers
-	DefaultReadBufferSize = 65535
-
-	// DefaultFragmentBufferSize is the default size for fragment storage
-	// Calculated as: DatagramSize - FragmentHeaderSize (15 bytes)
-	DefaultFragmentBufferSize = DefaultDatagramBufferSize - UDPFragHeaderSize
-)
-
-// Current buffer sizes (can be configured via InitBufferPool)
-var (
-	DatagramBufferSize = DefaultDatagramBufferSize
-	ReadBufferSize     = DefaultReadBufferSize
-	FragmentBufferSize = DefaultFragmentBufferSize
+	// DatagramBufferSize is the size of QUIC datagram buffers.
+	DatagramBufferSize = MaxDatagramSize
+	// ReadBufferSize is the size of UDP socket read buffers.
+	ReadBufferSize = 65535
+	// FragmentBufferSize is the size of fragment storage buffers.
+	FragmentBufferSize = MaxFragPayload
 )
 
 // UDPBufferPool provides pooled buffers for UDP operations.
@@ -36,63 +22,25 @@ type UDPBufferPool struct {
 	fragmentPool sync.Pool
 }
 
-// udpPool is the global UDP buffer pool instance
-var udpPool *UDPBufferPool
-
-func init() {
-	// Initialize with default sizes
-	initPool(DefaultDatagramBufferSize, DefaultReadBufferSize, DefaultFragmentBufferSize)
-}
-
-// initPool initializes the buffer pool with specified sizes
-func initPool(datagramSize, readSize, fragmentSize int) {
-	DatagramBufferSize = datagramSize
-	ReadBufferSize = readSize
-	FragmentBufferSize = fragmentSize
-
-	udpPool = &UDPBufferPool{
-		datagramPool: sync.Pool{
-			New: func() any {
-				buf := make([]byte, DatagramBufferSize)
-				return &buf
-			},
+var udpPool = UDPBufferPool{
+	datagramPool: sync.Pool{
+		New: func() any {
+			buf := make([]byte, DatagramBufferSize)
+			return &buf
 		},
-		readPool: sync.Pool{
-			New: func() any {
-				buf := make([]byte, ReadBufferSize)
-				return &buf
-			},
+	},
+	readPool: sync.Pool{
+		New: func() any {
+			buf := make([]byte, ReadBufferSize)
+			return &buf
 		},
-		fragmentPool: sync.Pool{
-			New: func() any {
-				buf := make([]byte, FragmentBufferSize)
-				return &buf
-			},
+	},
+	fragmentPool: sync.Pool{
+		New: func() any {
+			buf := make([]byte, FragmentBufferSize)
+			return &buf
 		},
-	}
-}
-
-// InitBufferPool initializes the buffer pool with custom sizes.
-// It may only be called during startup, before any buffer operation, and must
-// not run concurrently with Get or Put calls. If any size is <= 0, its default
-// is used. datagramSize must be at least MaxDatagramSize because UDP wire v2
-// fixes the maximum datagram size at that value. On validation failure, the
-// current pool and sizes remain unchanged.
-func InitBufferPool(datagramSize, readSize, fragmentSize int) error {
-	if datagramSize <= 0 {
-		datagramSize = DefaultDatagramBufferSize
-	}
-	if readSize <= 0 {
-		readSize = DefaultReadBufferSize
-	}
-	if fragmentSize <= 0 {
-		fragmentSize = DefaultFragmentBufferSize
-	}
-	if datagramSize < MaxDatagramSize {
-		return fmt.Errorf("datagram buffer size %d is below minimum %d", datagramSize, MaxDatagramSize)
-	}
-	initPool(datagramSize, readSize, fragmentSize)
-	return nil
+	},
 }
 
 // GetDatagramBuffer returns a buffer for datagram operations.

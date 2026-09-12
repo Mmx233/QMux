@@ -212,19 +212,7 @@ func TestUDPSenderWholeBatchAdmissionAndOwnership(t *testing.T) {
 		}
 	})
 
-	t.Run("backing limit uses configured pooled capacity", func(t *testing.T) {
-		originalDatagramSize := protocol.DatagramBufferSize
-		originalReadSize := protocol.ReadBufferSize
-		originalFragmentSize := protocol.FragmentBufferSize
-		t.Cleanup(func() {
-			if err := protocol.InitBufferPool(originalDatagramSize, originalReadSize, originalFragmentSize); err != nil {
-				t.Errorf("restore UDP buffer pool: %v", err)
-			}
-		})
-		if err := protocol.InitBufferPool(64<<10, originalReadSize, originalFragmentSize); err != nil {
-			t.Fatalf("initialize large UDP datagram pool: %v", err)
-		}
-
+	t.Run("backing limit uses pooled capacity", func(t *testing.T) {
 		handler := &UDPHandler{
 			maxSenderQueuedFrames:       9,
 			maxSenderQueuedBackingBytes: 7 * int64(protocol.DatagramBufferSize),
@@ -1085,37 +1073,22 @@ func TestUDPReceiverAcceptsLiteralWidenedFragmentsAndRejectsLegacy(t *testing.T)
 }
 
 func TestUDPPooledBackingFormula(t *testing.T) {
-	originalDatagramSize := protocol.DatagramBufferSize
-	originalReadSize := protocol.ReadBufferSize
-	originalFragmentSize := protocol.FragmentBufferSize
-	t.Cleanup(func() {
-		if err := protocol.InitBufferPool(originalDatagramSize, originalReadSize, originalFragmentSize); err != nil {
-			t.Errorf("restore UDP buffer pool: %v", err)
+	for _, payloadSize := range []int{1000, protocol.ReadBufferSize} {
+		var counter atomic.Uint32
+		datagrams, err := protocol.FragmentUDPPooled(1, 1, make([]byte, payloadSize), &counter, true)
+		if err != nil {
+			t.Fatalf("fragment %d-byte payload: %v", payloadSize, err)
 		}
-	})
-
-	for _, datagramSize := range []int{protocol.DefaultDatagramBufferSize, protocol.DefaultDatagramBufferSize + 512} {
-		if err := protocol.InitBufferPool(datagramSize, protocol.DefaultReadBufferSize, protocol.DefaultFragmentBufferSize); err != nil {
-			t.Fatalf("initialize UDP buffer pool: %v", err)
+		want := datagramBackingBytes(datagrams)
+		got := int64(len(datagrams)) * int64(protocol.DatagramBufferSize)
+		for i := range datagrams {
+			if datagrams[i].Buffer == nil || len(*datagrams[i].Buffer) != protocol.DatagramBufferSize || cap(*datagrams[i].Buffer) != protocol.DatagramBufferSize {
+				t.Fatalf("payload %d datagram %d buffer = %v, want exact len/cap %d", payloadSize, i, datagrams[i].Buffer, protocol.DatagramBufferSize)
+			}
 		}
-		for _, payloadSize := range []int{1000, 65535} {
-			var counter atomic.Uint32
-			datagrams, err := protocol.FragmentUDPPooled(1, 1, make([]byte, payloadSize), &counter, true)
-			if err != nil {
-				t.Fatalf("fragment %d-byte payload with %d-byte datagrams: %v", payloadSize, datagramSize, err)
-			}
-			want := datagramBackingBytes(datagrams)
-			got := int64(len(datagrams)) * int64(protocol.DatagramBufferSize)
-			for i := range datagrams {
-				if datagrams[i].Buffer == nil || len(*datagrams[i].Buffer) != datagramSize || cap(*datagrams[i].Buffer) != datagramSize {
-					t.Fatalf("payload %d datagram %d buffer = %v, want exact len/cap %d", payloadSize, i, datagrams[i].Buffer, datagramSize)
-				}
-			}
-			protocol.ReleaseDatagramResults(datagrams)
-			if got != want {
-				t.Fatalf("%d-byte pooled backing formula with %d-byte datagrams = %d, want scan result %d",
-					payloadSize, datagramSize, got, want)
-			}
+		protocol.ReleaseDatagramResults(datagrams)
+		if got != want {
+			t.Fatalf("%d-byte pooled backing formula = %d, want scan result %d", payloadSize, got, want)
 		}
 	}
 }

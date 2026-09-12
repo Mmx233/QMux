@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"reflect"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -253,51 +252,35 @@ func TestClientDsendSnapshotOwnsAndReleasesBatch(t *testing.T) {
 }
 
 func TestClientDsendBackingProjectionForPooledBatches(t *testing.T) {
-	originalDatagramSize := protocol.DatagramBufferSize
-	originalReadSize := protocol.ReadBufferSize
-	originalFragmentSize := protocol.FragmentBufferSize
-	t.Cleanup(func() {
-		if err := protocol.InitBufferPool(originalDatagramSize, originalReadSize, originalFragmentSize); err != nil {
-			t.Errorf("restore UDP buffer pool: %v", err)
+	for _, payloadSize := range []int{1, protocol.ReadBufferSize} {
+		stats := &clientDsendStats{}
+		handler := newUDPHandler("127.0.0.1", 1, true, config.DefaultMaxUDPFragmentGroupsPerHandler, config.DefaultMaxUDPFragmentBackingBytesPerHandler, zerolog.Nop(), nil, stats)
+		var counter atomic.Uint32
+		datagrams, err := handler.fragmentDatagrams(1, 1, make([]byte, payloadSize), &counter)
+		if err != nil {
+			handler.Stop()
+			t.Fatal(err)
 		}
-	})
-
-	for _, datagramSize := range []int{protocol.DefaultDatagramBufferSize, protocol.DefaultDatagramBufferSize + 512} {
-		t.Run(strconv.Itoa(datagramSize), func(t *testing.T) {
-			if err := protocol.InitBufferPool(datagramSize, protocol.DefaultReadBufferSize, protocol.DefaultFragmentBufferSize); err != nil {
-				t.Fatalf("initialize UDP buffer pool: %v", err)
-			}
-			for _, payloadSize := range []int{1, protocol.DefaultReadBufferSize} {
-				stats := &clientDsendStats{}
-				handler := newUDPHandler("127.0.0.1", 1, true, config.DefaultMaxUDPFragmentGroupsPerHandler, config.DefaultMaxUDPFragmentBackingBytesPerHandler, zerolog.Nop(), nil, stats)
-				var counter atomic.Uint32
-				datagrams, err := handler.fragmentDatagrams(1, 1, make([]byte, payloadSize), &counter)
-				if err != nil {
-					handler.Stop()
-					t.Fatal(err)
-				}
-				actualBacking := pooledDatagramBacking(t, datagrams)
-				wantItems := int64(len(datagrams))
-				wantBacking := wantItems * int64(datagramSize)
-				if snapshot := stats.load(); actualBacking != wantBacking ||
-					snapshot.OwnedItems != wantItems || snapshot.OwnedBacking != wantBacking ||
-					snapshot.OwnedItemsHighWater != wantItems || snapshot.OwnedBackingHighWater != wantBacking {
-					handler.Stop()
-					t.Fatalf("payload %d projection = %+v, actual backing %d, want %d items/%d backing",
-						payloadSize, snapshot, actualBacking, wantItems, wantBacking)
-				}
-				if err := handler.sendDatagrams(datagrams, func([]byte) error { return nil }); err != nil {
-					handler.Stop()
-					t.Fatal(err)
-				}
-				if snapshot := stats.load(); snapshot.OwnedItems != 0 || snapshot.OwnedBacking != 0 ||
-					snapshot.OwnedItemsHighWater != wantItems || snapshot.OwnedBackingHighWater != wantBacking {
-					handler.Stop()
-					t.Fatalf("payload %d released projection = %+v", payloadSize, snapshot)
-				}
-				handler.Stop()
-			}
-		})
+		actualBacking := pooledDatagramBacking(t, datagrams)
+		wantItems := int64(len(datagrams))
+		wantBacking := wantItems * int64(protocol.DatagramBufferSize)
+		if snapshot := stats.load(); actualBacking != wantBacking ||
+			snapshot.OwnedItems != wantItems || snapshot.OwnedBacking != wantBacking ||
+			snapshot.OwnedItemsHighWater != wantItems || snapshot.OwnedBackingHighWater != wantBacking {
+			handler.Stop()
+			t.Fatalf("payload %d projection = %+v, actual backing %d, want %d items/%d backing",
+				payloadSize, snapshot, actualBacking, wantItems, wantBacking)
+		}
+		if err := handler.sendDatagrams(datagrams, func([]byte) error { return nil }); err != nil {
+			handler.Stop()
+			t.Fatal(err)
+		}
+		if snapshot := stats.load(); snapshot.OwnedItems != 0 || snapshot.OwnedBacking != 0 ||
+			snapshot.OwnedItemsHighWater != wantItems || snapshot.OwnedBackingHighWater != wantBacking {
+			handler.Stop()
+			t.Fatalf("payload %d released projection = %+v", payloadSize, snapshot)
+		}
+		handler.Stop()
 	}
 }
 
