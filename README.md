@@ -3,6 +3,7 @@
 [![Lisense](https://img.shields.io/github/license/Mmx233/QMux)](https://github.com/Mmx233/QMux/blob/main/LICENSE)
 [![Test Status](https://img.shields.io/github/actions/workflow/status/Mmx233/QMux/test.yml?label=test)](https://github.com/Mmx233/QMux/actions/workflows/test.yml)
 [![Release](https://img.shields.io/github/v/release/Mmx233/QMux?color=blueviolet&include_prereleases&filter=v*)](https://github.com/Mmx233/QMux/releases)
+[![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/qmux)](https://artifacthub.io/packages/search?repo=qmux)
 [![Dockerhub](https://img.shields.io/docker/pulls/mmx233/qmux)](https://hub.docker.com/repository/docker/mmx233/qmux)
 
 A high-availability L4 (transport layer) NAT traversal tool built on the QUIC protocol.
@@ -244,7 +245,7 @@ Set `tls.session_ticket_encryption_key_rotation_interval` to a positive duration
 | QMux hosts    | Separate `c6i.large` server/client and separate `c6i.4xlarge` server/client |
 | Traffic hosts | Separate `c6i.4xlarge` load generator and backend                           |
 | Network       | Same-AZ private VPC; ENA                                                    |
-| Software      | Amazon Linux 2023; stripped Linux/amd64 build                               |
+| Software      | QMux v2.2.1; Go 1.27.1; Amazon Linux 2023; stripped Linux/amd64/v1 build    |
 | Security      | Mutual TLS; TLS 1.3; one QUIC connection per client                         |
 
 ## Transport Throughput
@@ -253,15 +254,15 @@ Set `tls.session_ticket_encryption_key_rotation_interval` to a positive duration
 
 | QMux server/client | TCP forward P1 | TCP forward P4 | TCP reverse P1 | TCP reverse P4 | UDP forward delivered / loss |
 |--------------------|---------------:|---------------:|---------------:|---------------:|-----------------------------:|
-| `c6i.large`        |   2.942 Gbit/s |   3.163 Gbit/s |   2.949 Gbit/s |   2.861 Gbit/s |        499.8 Mbit/s / 0.035% |
-| `c6i.4xlarge`      |   4.622 Gbit/s |   5.104 Gbit/s |   4.843 Gbit/s |   4.682 Gbit/s |        999.8 Mbit/s / 0.022% |
+| `c6i.large`        |   3.777 Gbit/s |   3.457 Gbit/s |   3.716 Gbit/s |   3.492 Gbit/s |        499.7 Mbit/s / 0.053% |
+| `c6i.4xlarge`      |   5.845 Gbit/s |   5.792 Gbit/s |   5.866 Gbit/s |   5.520 Gbit/s |        999.8 Mbit/s / 0.019% |
 
 ### Small-Packet UDP
 
 | QMux server/client | Payload / parallel |    Delivered | Packet rate |   Loss |
 |--------------------|--------------------|-------------:|------------:|-------:|
 | `c6i.large`        | 256-byte / P4      | 100.0 Mbit/s |   48.8 kpps |     0% |
-| `c6i.4xlarge`      | 256-byte / P4      | 499.5 Mbit/s |  243.9 kpps | 0.092% |
+| `c6i.4xlarge`      | 256-byte / P4      | 499.7 Mbit/s |  244.0 kpps | 0.064% |
 
 TCP reached host bandwidth limits; formal UDP points had no host drops.
 
@@ -271,14 +272,14 @@ Request path: user → QMux server → QMux client → nginx. Concurrency 32; 30
 
 | QMux server/client | Workload              |              Requests/s (min-max) |      p50 |      p99 | Errors / requests |
 |--------------------|-----------------------|----------------------------------:|---------:|---------:|------------------:|
-| `c6i.large`        | 1 KiB, keep-alive     |            48,817 (48,777-48,901) | 0.637 ms | 1.171 ms |     0 / 4,394,910 |
-| `c6i.large`        | 1 KiB, new connection |               5,425 (5,424-5,464) | 5.873 ms | 9.114 ms |       0 / 489,440 |
-| `c6i.large`        | 64 KiB, keep-alive    | 4,741 (4,706-4,756), 2.486 Gbit/s | 6.677 ms | 9.428 ms |       0 / 426,174 |
-| `c6i.4xlarge`      | 1 KiB, keep-alive     |            68,216 (68,054-68,229) | 0.459 ms | 0.768 ms |     1 / 6,135,055 |
-| `c6i.4xlarge`      | 1 KiB, new connection |            11,149 (11,130-11,224) | 2.844 ms | 4.440 ms |     0 / 1,005,168 |
-| `c6i.4xlarge`      | 64 KiB, keep-alive    | 7,205 (7,034-7,374), 3.778 Gbit/s | 4.224 ms | 5.950 ms |      13 / 665,758 |
+| `c6i.large`        | 1 KiB, keep-alive     |            50,145 (50,095-50,783) | 0.624 ms | 1.059 ms |     0 / 4,530,822 |
+| `c6i.large`        | 1 KiB, new connection |               8,009 (8,005-8,046) | 3.940 ms | 6.521 ms |       0 / 721,859 |
+| `c6i.large`        | 64 KiB, keep-alive    | 5,570 (5,122-5,578), 2.920 Gbit/s | 5.728 ms | 7.910 ms |       3 / 501,084 |
+| `c6i.4xlarge`      | 1 KiB, keep-alive     |            70,011 (69,986-70,159) | 0.452 ms | 0.676 ms |     1 / 6,304,755 |
+| `c6i.4xlarge`      | 1 KiB, new connection |            24,495 (24,461-24,532) | 1.266 ms | 2.355 ms |     0 / 2,204,724 |
+| `c6i.4xlarge`      | 64 KiB, keep-alive    | 9,109 (8,495-9,287), 4.776 Gbit/s | 3.350 ms | 4.790 ms |      21 / 835,257 |
 
-4xlarge keep-alive errors reproduced in confirmation runs.
+Low-rate keep-alive socket errors remained in the three-run samples and are reported rather than discarded.
 
 ## Ten-Minute Stability
 
@@ -286,10 +287,10 @@ One 600 s connection per row. Delivered/loss: final 5 min. CPU: full run, client
 
 | QMux server/client | Workload                           | Final 5 min delivered |    Loss / retransmits | Combined CPU-s/GiB | Maximum combined RSS |
 |--------------------|------------------------------------|----------------------:|----------------------:|-------------------:|---------------------:|
-| `c6i.large`        | TCP forward P4                     |          3.170 Gbit/s |    0 tail retransmits |               8.79 |             34.4 MiB |
-| `c6i.large`        | UDP 1,200 B P1, 500 Mbit/s offered |        499.729 Mbit/s |          0.0542% loss |              44.50 |             34.5 MiB |
-| `c6i.4xlarge`      | TCP forward P4                     |          5.139 Gbit/s |    0 tail retransmits |               8.12 |             39.3 MiB |
-| `c6i.4xlarge`      | UDP 1,200 B P1, 1 Gbit/s offered   |        980.534 Mbit/s | 1.947% loss; >1% FAIL |              35.06 |             47.7 MiB |
+| `c6i.large`        | TCP forward P4                     |          3.360 Gbit/s |    8 tail retransmits |               7.73 |             42.0 MiB |
+| `c6i.large`        | UDP 1,200 B P1, 500 Mbit/s offered |        499.552 Mbit/s |          0.0900% loss |              43.01 |             38.0 MiB |
+| `c6i.4xlarge`      | TCP forward P4                     |          5.699 Gbit/s |     1 tail retransmit |               7.12 |             46.2 MiB |
+| `c6i.4xlarge`      | UDP 1,200 B P1, 1 Gbit/s offered   |        999.919 Mbit/s |          0.0079% loss |              32.85 |             40.4 MiB |
 
 ## Client Failover
 
@@ -297,9 +298,9 @@ One 600 s connection per row. Delivered/loss: final 5 min. CPU: full run, client
 
 | Metric                                  |                            Result |
 |-----------------------------------------|----------------------------------:|
-| Confirmed recovery time                 | 26.273 s median (22.201-27.246 s) |
-| Start of stable zero-error period       | 24.223 s median (20.152-25.195 s) |
-| Failed requests per 5,000-request trial |                 37 median (32-39) |
+| Confirmed recovery time                 | 30.165 s median (26.149-31.238 s) |
+| Start of stable zero-error period       | 28.116 s median (24.100-29.189 s) |
+| Failed requests per 5,000-request trial |                 30 median (28-42) |
 
 New TCP flows only; established connections are not migrated.
 
