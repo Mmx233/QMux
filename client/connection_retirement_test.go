@@ -606,8 +606,12 @@ func TestClientRetiresSuccessiveExactGenerationsAndNoSuccessor(t *testing.T) {
 		if _, err := oldHandler.fragmentAssembler.AddFragment(1, 1, 0, 2, []byte("closed")); !errors.Is(err, protocol.ErrFragmentAssemblerClosed) {
 			t.Fatalf("old collecting assembler error = %v", err)
 		}
-		if current, ok := client.udpHandlers.Load(oldSC.ServerAddr()); !ok || current != freshHandler {
-			t.Fatalf("old cleanup changed fresh handler mapping = (%p, %v), want (%p, true)", current, ok, freshHandler)
+		client.udpMu.Lock()
+		_, oldLive := client.liveUDPHandlers[oldRuntime.udp]
+		_, freshLive := client.liveUDPHandlers[freshRuntime.udp]
+		client.udpMu.Unlock()
+		if oldLive || !freshLive {
+			t.Fatalf("live handlers after replacement = old %t/fresh %t, want false/true", oldLive, freshLive)
 		}
 		if snapshot := budget.snapshot(); snapshot.Current != 0 || snapshot.Permits != 0 || snapshot.AccountingFaults != 0 {
 			t.Fatalf("old collecting cleanup = %+v", snapshot)
@@ -635,6 +639,12 @@ func TestClientRetiresSuccessiveExactGenerationsAndNoSuccessor(t *testing.T) {
 		assertNoUDPSessions(t, freshHandler)
 		if _, err := freshReady.session.localConn.Write([]byte("closed")); !errors.Is(err, net.ErrClosed) {
 			t.Fatalf("fresh socket after cleanup = %v", err)
+		}
+		client.udpMu.Lock()
+		liveHandlers := len(client.liveUDPHandlers)
+		client.udpMu.Unlock()
+		if liveHandlers != 0 {
+			t.Fatalf("live handlers after final replacement cleanup = %d, want 0", liveHandlers)
 		}
 		if snapshot := budget.snapshot(); snapshot.Current != 0 || snapshot.Permits != 0 || snapshot.AccountingFaults != 0 || freshHandler.dsendStats.load().Workers != 0 {
 			t.Fatalf("replacement cleanup = budget %+v/workers %d", snapshot, freshHandler.dsendStats.load().Workers)
@@ -720,7 +730,6 @@ func TestClientRetiresSuccessiveExactGenerationsAndNoSuccessor(t *testing.T) {
 		oldHandler.Start(runtimeForceCtx, sc.Connection())
 		client.udpMu.Lock()
 		client.liveUDPHandlers[oldHandler] = struct{}{}
-		client.udpHandlers.Store(sc.ServerAddr(), oldHandler)
 		client.udpMu.Unlock()
 		client.runtimesMu.Lock()
 		client.runtimes[sc] = runtime
@@ -753,12 +762,11 @@ func TestClientRetiresSuccessiveExactGenerationsAndNoSuccessor(t *testing.T) {
 		successor.Start(forceCtx, successorClientConn)
 		client.udpMu.Lock()
 		client.liveUDPHandlers[successor] = struct{}{}
-		client.udpHandlers.Store(sc.ServerAddr(), successor)
 		client.udpMu.Unlock()
 		t.Cleanup(func() {
 			_ = successorClientConn.CloseWithError(0, "test cleanup")
 			successor.stopAndWait()
-			client.retireUDPHandler(sc.ServerAddr(), successor)
+			client.retireUDPHandler(successor)
 		})
 
 		cleanupResult := make(chan error, 1)
@@ -800,8 +808,12 @@ func TestClientRetiresSuccessiveExactGenerationsAndNoSuccessor(t *testing.T) {
 		if _, err := oldHandler.fragmentAssembler.AddFragment(1, 1, 0, 2, []byte("closed")); !errors.Is(err, protocol.ErrFragmentAssemblerClosed) {
 			t.Fatalf("old draining assembler error = %v", err)
 		}
-		if current, ok := client.udpHandlers.Load(sc.ServerAddr()); !ok || current != successor {
-			t.Fatalf("old exact cleanup changed successor mapping = (%p, %v), want (%p, true)", current, ok, successor)
+		client.udpMu.Lock()
+		_, oldLive := client.liveUDPHandlers[runtime.udp]
+		_, successorLive := client.liveUDPHandlers[successor]
+		client.udpMu.Unlock()
+		if oldLive || !successorLive {
+			t.Fatalf("live handlers after exact cleanup = old %t/successor %t, want false/true", oldLive, successorLive)
 		}
 		if snapshot := budget.snapshot(); snapshot.Current != 0 || snapshot.Permits != 0 || snapshot.CapacityDrops != 1 || snapshot.AccountingFaults != 0 {
 			t.Fatalf("old draining worker cleanup = %+v", snapshot)
@@ -819,21 +831,21 @@ func TestClientRetiresSuccessiveExactGenerationsAndNoSuccessor(t *testing.T) {
 			t.Fatalf("isolated handler epochs = old %d/successor %d", oldHandler.epochAllocator.Load(), successor.epochAllocator.Load())
 		}
 		oldHandler.closeStateExact(oldState)
-		if current, ok := client.udpHandlers.Load(sc.ServerAddr()); !ok || current != successor {
-			t.Fatal("stale old state close removed the successor handler")
-		}
 		if _, err := successor.fragmentAssembler.AddFragment(sessionID, 2, 0, 2, []byte("successor-fragment")); err != nil {
 			t.Fatal(err)
 		}
 
 		_ = successorClientConn.CloseWithError(0, "successor cleanup")
 		successor.stopAndWait()
-		client.retireUDPHandler(sc.ServerAddr(), successor)
+		client.retireUDPHandler(successor)
 		if _, err := successorReady.session.localConn.Write([]byte("closed")); !errors.Is(err, net.ErrClosed) {
 			t.Fatalf("successor socket after cleanup = %v", err)
 		}
-		if _, ok := client.udpHandlers.Load(sc.ServerAddr()); ok {
-			t.Fatal("successor handler mapping survived cleanup")
+		client.udpMu.Lock()
+		liveHandlers := len(client.liveUDPHandlers)
+		client.udpMu.Unlock()
+		if liveHandlers != 0 {
+			t.Fatalf("live handlers after no-successor cleanup = %d, want 0", liveHandlers)
 		}
 		if snapshot := budget.snapshot(); snapshot.Current != 0 || snapshot.Permits != 0 || snapshot.AccountingFaults != 0 || stats.load().Workers != 0 {
 			t.Fatalf("no-successor final cleanup = budget %+v/workers %d", snapshot, stats.load().Workers)

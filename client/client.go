@@ -37,7 +37,6 @@ type Client struct {
 	copyBufferPool                       *protocol.CopyBufferPool
 	maxUDPFragmentGroupsPerHandler       int
 	maxUDPFragmentBackingBytesPerHandler int64
-	udpHandlers                          sync.Map // serverAddr -> *UDPHandler
 	localConns                           sync.Map // connID -> net.Conn
 	udpBudget                            *udpSessionBudget
 	dsendStats                           *clientDsendStats
@@ -329,14 +328,13 @@ func (c *Client) installRuntime(sc *ServerConnection) {
 	}
 	c.liveUDPHandlers[runtime.udp] = struct{}{}
 	runtime.udp.Start(forceCtx, conn)
-	c.udpHandlers.Store(sc.ServerAddr(), runtime.udp)
 	c.udpMu.Unlock()
 	c.runtimesMu.Lock()
 	c.runtimes[sc] = runtime
 	c.runtimesMu.Unlock()
 	c.watcherWG.Go(func() {
 		<-runtime.udp.done
-		c.retireUDPHandler(sc.ServerAddr(), runtime.udp)
+		c.retireUDPHandler(runtime.udp)
 	})
 	c.watcherWG.Go(func() {
 		<-conn.Context().Done()
@@ -826,7 +824,7 @@ func (c *Client) cleanupRuntime(runtime *connectionRuntime) error {
 		runtime.handlerWG.Wait()
 		if runtime.udp != nil {
 			runtime.udp.wait()
-			c.retireUDPHandler(runtime.sc.ServerAddr(), runtime.udp)
+			c.retireUDPHandler(runtime.udp)
 		}
 		runtime.sc.waitControl()
 		c.runtimesMu.Lock()
@@ -854,7 +852,7 @@ func (c *Client) sharedResult() error {
 	return errors.Join(c.terminalSemantic, c.terminalTeardown)
 }
 
-func (c *Client) retireUDPHandler(endpoint string, handler *UDPHandler) {
+func (c *Client) retireUDPHandler(handler *UDPHandler) {
 	c.udpMu.Lock()
 	defer c.udpMu.Unlock()
 	if _, live := c.liveUDPHandlers[handler]; !live {
@@ -865,7 +863,6 @@ func (c *Client) retireUDPHandler(endpoint string, handler *UDPHandler) {
 	c.retiredFragments.ByteCapacityDrops += fragment.ByteCapacityDrops
 	c.retiredFragments.ExpiredGroups += fragment.ExpiredGroups
 	delete(c.liveUDPHandlers, handler)
-	c.udpHandlers.CompareAndDelete(endpoint, handler)
 }
 
 // Snapshot takes subsystem-local cuts. The two DSend ownership projection pairs

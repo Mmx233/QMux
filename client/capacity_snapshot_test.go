@@ -352,8 +352,6 @@ func TestClientSnapshotAggregatesLiveAndRetiredAssemblers(t *testing.T) {
 	client.udpMu.Lock()
 	client.liveUDPHandlers[first] = struct{}{}
 	client.liveUDPHandlers[second] = struct{}{}
-	client.udpHandlers.Store("127.0.0.1:8443", first)
-	client.udpHandlers.Store("127.0.0.1:9443", second)
 	client.udpMu.Unlock()
 	if got := client.Snapshot(); got.LiveAssemblers != 2 ||
 		got.Fragments.RetainedGroups != firstFragment.RetainedGroups+secondFragment.RetainedGroups ||
@@ -364,7 +362,9 @@ func TestClientSnapshotAggregatesLiveAndRetiredAssemblers(t *testing.T) {
 
 	first.Stop()
 	first.wait()
-	client.retireUDPHandler("127.0.0.1:8443", first)
+	client.retireUDPHandler(first)
+	// The done watcher and runtime cleanup can both retire the same handler.
+	client.retireUDPHandler(first)
 	if got := client.Snapshot(); got.LiveAssemblers != 1 ||
 		got.Fragments.RetainedGroups != secondFragment.RetainedGroups ||
 		got.Fragments.RetainedBackingBytes != secondFragment.RetainedBackingBytes ||
@@ -374,7 +374,7 @@ func TestClientSnapshotAggregatesLiveAndRetiredAssemblers(t *testing.T) {
 
 	second.Stop()
 	second.wait()
-	client.retireUDPHandler("127.0.0.1:9443", second)
+	client.retireUDPHandler(second)
 	got := client.Snapshot()
 	if got.LiveAssemblers != 0 || got.Fragments.RetainedGroups != 0 || got.Fragments.RetainedBackingBytes != 0 || got.Fragments.GroupCapacityDrops != 1 {
 		t.Fatalf("retired fragment snapshot = %+v", got)
