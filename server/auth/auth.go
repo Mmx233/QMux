@@ -15,11 +15,26 @@ type Registration struct {
 	Proof        []byte
 }
 
+// MeshRegistration is the authentication-relevant mesh registration transcript.
+type MeshRegistration struct {
+	Version        string
+	Capabilities   []string
+	Role           string
+	TargetServerID string
+	PeerServerID   string
+	InstanceID     string
+	GroupID        string
+	Scheme         string
+	Proof          []byte
+}
+
 type Auth interface {
 	// Verify authenticates a registration against an already completed TLS
 	// handshake. Implementations are selected exclusively by server policy.
 	Verify(state tls.ConnectionState, registration Registration) error
+	VerifyMesh(state tls.ConnectionState, registration MeshRegistration) error
 
 	// SelectedScheme is echoed only after a successful registration.
 	SelectedScheme() string
+	SelectedMeshScheme() string
 }

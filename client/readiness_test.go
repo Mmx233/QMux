@@ -13,7 +13,10 @@ func TestClientReady(t *testing.T) {
 			{Address: "server-a:8443"},
 			{Address: "server-b:8443"},
 		}}},
-		connMgr: &ConnectionManager{},
+		connMgr: &ConnectionManager{endpoints: []clientEndpointPhases{
+			{endpoint: "server-a:8443"},
+			{endpoint: "server-b:8443"},
+		}},
 	}
 	client.started = true
 
@@ -24,13 +27,17 @@ func TestClientReady(t *testing.T) {
 		_ = second.Close()
 	})
 	first.MarkHealthy()
-	client.connMgr.connections.Store(first.ServerAddr(), first)
+	client.connMgr.publishMu.Lock()
+	client.connMgr.endpoints[0].lifecycle.Publish(first)
+	client.connMgr.publishMu.Unlock()
 	if client.Ready() {
 		t.Fatal("client was ready with one configured server disconnected")
 	}
 
 	second.MarkHealthy()
-	client.connMgr.connections.Store(second.ServerAddr(), second)
+	client.connMgr.publishMu.Lock()
+	client.connMgr.endpoints[1].lifecycle.Publish(second)
+	client.connMgr.publishMu.Unlock()
 	if !client.Ready() {
 		t.Fatal("client was not ready with every configured server healthy")
 	}

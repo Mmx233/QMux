@@ -57,6 +57,41 @@ func WriteMessage(w io.Writer, msgType byte, payload any) error {
 	return nil
 }
 
+func writeMessageLimited(w io.Writer, msgType byte, payload any, maxPayloadSize uint32) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal payload: %w", err)
+	}
+	if uint64(len(data)) > uint64(maxPayloadSize) {
+		return fmt.Errorf("payload too large: %d bytes (maximum %d)", len(data), maxPayloadSize)
+	}
+	return writeEncodedMessage(w, msgType, data)
+}
+
+func writeEncodedMessage(w io.Writer, msgType byte, data []byte) error {
+	buf := GetBuffer()
+	defer PutBuffer(buf)
+
+	// Write header (type + length) directly without binary.Write
+	header := [5]byte{msgType}
+	binary.BigEndian.PutUint32(header[1:], uint32(len(data)))
+
+	// Write header and payload to pooled buffer first, then flush to writer
+	buf.Write(header[:])
+	buf.Write(data)
+
+	// Single write to the underlying writer
+	n, err := w.Write(buf.Bytes())
+	if err != nil {
+		return fmt.Errorf("write message: %w", err)
+	}
+	if n != buf.Len() {
+		return fmt.Errorf("write message: %w", io.ErrShortWrite)
+	}
+
+	return nil
+}
+
 // ReadMessage reads a message from the reader with optimized allocations.
 // Uses a fixed header buffer to avoid allocations for header reading.
 func ReadMessage(r io.Reader) (msgType byte, payload []byte, err error) {
@@ -202,6 +237,65 @@ func ReadTypedMessageLimited(r io.Reader, expectedType byte, msg any, maxPayload
 	}
 
 	return DecodeMessage(payload, msg)
+}
+
+// WriteMeshRegister writes a strictly bounded mesh registration header.
+func WriteMeshRegister(w io.Writer, registration MeshRegister) error {
+	if err := validateMeshRegisterShape(registration); err != nil {
+		return err
+	}
+	return writeMessageLimited(w, MsgTypeMeshRegister, registration, MaxRegistrationPayloadSize)
+}
+
+// ReadMeshRegister reads and strictly decodes one bounded mesh registration.
+func ReadMeshRegister(r io.Reader) (MeshRegister, error) {
+	payload, err := readMeshPayload(r, MsgTypeMeshRegister)
+	if err != nil {
+		return MeshRegister{}, err
+	}
+	var registration MeshRegister
+	if err := json.Unmarshal(payload, &registration, json.RejectUnknownMembers(true)); err != nil {
+		return MeshRegister{}, fmt.Errorf("decode mesh registration: %w", err)
+	}
+	if err := validateMeshRegisterShape(registration); err != nil {
+		return MeshRegister{}, err
+	}
+	return registration, nil
+}
+
+// WriteMeshRegisterAck writes a strictly bounded mesh registration acknowledgment.
+func WriteMeshRegisterAck(w io.Writer, ack MeshRegisterAck) error {
+	if err := validateMeshRegisterAckShape(ack); err != nil {
+		return err
+	}
+	return writeMessageLimited(w, MsgTypeMeshRegisterAck, ack, MaxRegistrationPayloadSize)
+}
+
+// ReadMeshRegisterAck reads and strictly decodes one bounded acknowledgment.
+func ReadMeshRegisterAck(r io.Reader) (MeshRegisterAck, error) {
+	payload, err := readMeshPayload(r, MsgTypeMeshRegisterAck)
+	if err != nil {
+		return MeshRegisterAck{}, err
+	}
+	var ack MeshRegisterAck
+	if err := json.Unmarshal(payload, &ack, json.RejectUnknownMembers(true)); err != nil {
+		return MeshRegisterAck{}, fmt.Errorf("decode mesh registration acknowledgment: %w", err)
+	}
+	if err := validateMeshRegisterAckShape(ack); err != nil {
+		return MeshRegisterAck{}, err
+	}
+	return ack, nil
+}
+
+func readMeshPayload(r io.Reader, expectedType byte) ([]byte, error) {
+	msgType, payload, err := ReadMessageLimited(r, MaxRegistrationPayloadSize)
+	if err != nil {
+		return nil, err
+	}
+	if msgType != expectedType {
+		return nil, fmt.Errorf("unexpected message type: got 0x%02x, expected 0x%02x", msgType, expectedType)
+	}
+	return payload, nil
 }
 
 // WriteRegisterWithAuth writes a registration message with an optional

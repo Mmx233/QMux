@@ -17,6 +17,14 @@ func New() auth.Auth {
 }
 
 func (*MTLSAuth) Verify(state tls.ConnectionState, _ auth.Registration) error {
+	return verifyTLS(state)
+}
+
+func (*MTLSAuth) VerifyMesh(state tls.ConnectionState, _ auth.MeshRegistration) error {
+	return verifyTLS(state)
+}
+
+func verifyTLS(state tls.ConnectionState) error {
 	if !state.HandshakeComplete {
 		return errors.New("TLS handshake is incomplete")
 	}
@@ -27,5 +35,9 @@ func (*MTLSAuth) Verify(state tls.ConnectionState, _ auth.Registration) error {
 }
 
 func (m *MTLSAuth) SelectedScheme() string {
+	return ""
+}
+
+func (m *MTLSAuth) SelectedMeshScheme() string {
 	return ""
 }

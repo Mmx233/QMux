@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
-	"net/netip"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -13,6 +12,7 @@ import (
 
 	sharedtoken "github.com/Mmx233/QMux/auth/token"
 	"github.com/Mmx233/QMux/config"
+	"github.com/Mmx233/QMux/internal/outbound"
 	"github.com/Mmx233/QMux/internal/stats"
 	"github.com/Mmx233/QMux/protocol"
 	"github.com/quic-go/quic-go"
@@ -82,6 +82,7 @@ type ServerConnection struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+	owner  *outbound.Owner
 
 	controlOnce     sync.Once
 	controlWG       sync.WaitGroup
@@ -150,6 +151,8 @@ func NewServerConnection(serverAddr, serverName string, sessionCache tls.ClientS
 		drainComplete:   make(chan int64, 1),
 		closeDone:       make(chan struct{}),
 	}
+	sc.owner = outbound.NewOwner(nil)
+	sc.owner.SetResource(func() { _ = sc.Close() }, sc.waitControl)
 
 	// Initialize as disconnected and unhealthy
 	sc.state.Store(int32(StateDisconnected))
@@ -165,20 +168,7 @@ func (sc *ServerConnection) Connect(ctx context.Context, baseTLSConfig *tls.Conf
 	sc.state.Store(int32(StateConnecting))
 	sc.logger.Info().Msg("connecting to server")
 
-	// Create TLS config with isolated session cache
-	tlsConfig := baseTLSConfig.Clone()
-	tlsConfig.ServerName = sc.serverName
-	tlsConfig.ClientSessionCache = sc.sessionCache
-	dialAddr, originalHost, err := resolveServerAddress(ctx, net.DefaultResolver, sc.serverAddr)
-	if err != nil {
-		sc.state.Store(int32(StateDisconnected))
-		return fmt.Errorf("resolve server %s: %w", sc.serverAddr, err)
-	}
-	if tlsConfig.ServerName == "" {
-		tlsConfig.ServerName = originalHost
-	}
-
-	conn, err := quic.DialAddr(ctx, dialAddr, tlsConfig, quicConfig)
+	conn, err := outbound.Dial(ctx, sc.serverAddr, sc.serverName, baseTLSConfig, sc.sessionCache, quicConfig)
 	if err != nil {
 		sc.state.Store(int32(StateDisconnected))
 		return fmt.Errorf("dial server %s: %w", sc.serverAddr, err)
@@ -193,32 +183,11 @@ func (sc *ServerConnection) Connect(ctx context.Context, baseTLSConfig *tls.Conf
 }
 
 func resolveServerAddress(ctx context.Context, resolver *net.Resolver, address string) (string, string, error) {
-	host, port, err := net.SplitHostPort(address)
-	if err != nil {
-		return "", "", err
-	}
-	if _, err := netip.ParseAddr(host); err == nil {
-		return address, host, nil
-	}
-
-	addresses, err := resolver.LookupIPAddr(ctx, host)
-	if err != nil {
-		return "", "", err
-	}
-	if len(addresses) == 0 {
-		return "", "", fmt.Errorf("host %q resolved without an address", host)
-	}
-	selectedAddress := preferredServerIP(addresses)
-	return net.JoinHostPort(selectedAddress.String(), port), host, nil
+	return outbound.ResolveAddress(ctx, resolver, address)
 }
 
 func preferredServerIP(addresses []net.IPAddr) net.IPAddr {
-	for _, address := range addresses {
-		if address.IP.To4() != nil {
-			return address
-		}
-	}
-	return addresses[0]
+	return outbound.PreferredIP(addresses)
 }
 
 // ServerAddr returns the server address this connection is for.

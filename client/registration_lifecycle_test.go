@@ -581,9 +581,9 @@ func TestRegistrationLifecycleStartAttemptDeadlineSchedulesFreshReconnect(t *tes
 	}
 	awaitLifecycle(t, firstConnection.Context().Done(), "attempt-deadline connection close")
 
-	cm.reconnectMu.Lock()
-	reconnectScheduled := cm.reconnecting[endpoint.Address]
-	cm.reconnectMu.Unlock()
+	cm.publishMu.Lock()
+	reconnectScheduled := cm.endpoints[0].lifecycle.Reconnecting()
+	cm.publishMu.Unlock()
 	if !reconnectScheduled {
 		t.Fatal("internal attempt deadline did not schedule reconnect")
 	}

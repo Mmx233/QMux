@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Mmx233/QMux/config"
+	"github.com/Mmx233/QMux/internal/outbound"
 	"github.com/Mmx233/QMux/internal/stats"
 	"github.com/Mmx233/QMux/internal/tlsreload"
 	"github.com/quic-go/quic-go"
@@ -18,20 +19,19 @@ import (
 )
 
 const (
-	initialReconnectDelay           = 5 * time.Second
-	maxReconnectDelay               = 60 * time.Second
-	reconnectStableGrace            = 60 * time.Second
-	maxReconnectStage               = 4
-	defaultConnectionAttemptTimeout = 30 * time.Second
+	initialReconnectDelay           = outbound.InitialReconnectDelay
+	maxReconnectDelay               = outbound.MaxReconnectDelay
+	reconnectStableGrace            = outbound.ReconnectStableGrace
+	maxReconnectStage               = outbound.MaxReconnectStage
+	defaultConnectionAttemptTimeout = outbound.AttemptTimeout
 )
 
 // ConnectionManager manages connections to multiple servers.
 // It orchestrates ServerConnection instances and handles lifecycle management.
 type ConnectionManager struct {
-	config      *config.Client
-	auth        config.ClientAuth
-	connections sync.Map // map[string]*ServerConnection (key: server address)
-	logger      zerolog.Logger
+	config *config.Client
+	auth   config.ClientAuth
+	logger zerolog.Logger
 
 	// TLS and QUIC configuration
 	tlsState      atomic.Pointer[clientTLSState]
@@ -54,10 +54,6 @@ type ConnectionManager struct {
 
 	// Internal test seam; the production default remains fixed and is not config.
 	attemptTimeout time.Duration
-
-	// Reconnection tracking
-	reconnectMu  sync.Mutex
-	reconnecting map[string]bool
 
 	// NewConns delivers newly established ServerConnections (initial + reconnected)
 	// to the Client layer for stream acceptance and UDP handler setup.
@@ -93,8 +89,7 @@ type clientEndpointPhases struct {
 	transport           stats.Transport
 	connect             stats.Operation
 	registration        stats.Operation
-	reconnectAttempts   atomic.Uint64
-	nextReconnectStage  int
+	lifecycle           outbound.Endpoint[*ServerConnection]
 }
 
 // NewConnectionManager creates a new ConnectionManager instance.
@@ -127,7 +122,6 @@ func NewConnectionManager(cfg *config.Client, logger zerolog.Logger) (*Connectio
 		ctx:            ctx,
 		cancel:         cancel,
 		attemptTimeout: defaultConnectionAttemptTimeout,
-		reconnecting:   make(map[string]bool),
 		NewConns:       make(chan *ServerConnection, max(16, len(cfg.Server.GetServers()))),
 	}
 	paths := tlsreload.Paths{CAFile: cfg.TLS.CACertFile}
@@ -215,7 +209,7 @@ func (cm *ConnectionManager) Start(ctx context.Context) error {
 			}
 
 			if !cm.publishServerConnection(ctx, sc) {
-				_ = sc.Close()
+				sc.owner.Stop()
 				return
 			}
 
@@ -265,7 +259,7 @@ func (cm *ConnectionManager) connectAndRegister(ctx context.Context, endpoint co
 	err := sc.Connect(attemptCtx, state.baseTLSConfig, cm.quicConfig)
 	observed.connect.Finish(started, stats.Result(err, "dial_error"))
 	if err != nil {
-		_ = sc.Close()
+		sc.owner.Stop()
 		return nil, err
 	}
 	cm.publishMu.Lock()
@@ -275,28 +269,25 @@ func (cm *ConnectionManager) connectAndRegister(ctx context.Context, endpoint co
 	err = sc.RegisterWithAuth(attemptCtx, cm.config.ClientID, cm.auth)
 	observed.registration.Finish(started, stats.Result(err, "protocol_error"))
 	if err != nil {
-		_ = sc.Close()
+		sc.owner.Stop()
 		return nil, err
 	}
 	return sc, nil
 }
 
 func (cm *ConnectionManager) newAttemptContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	attemptCtx, cancelAttempt := context.WithTimeout(ctx, cm.attemptTimeout)
-	stopManagerCancellation := context.AfterFunc(cm.ctx, cancelAttempt)
-	if cm.ctx.Err() != nil {
-		cancelAttempt()
-	}
-	return attemptCtx, func() {
-		stopManagerCancellation()
-		cancelAttempt()
-	}
+	return outbound.AttemptContext(ctx, cm.ctx, cm.attemptTimeout)
 }
 
 // publishServerConnection is the formal commit point for a registered connection.
 func (cm *ConnectionManager) publishServerConnection(ctx context.Context, sc *ServerConnection) bool {
 	cm.publishMu.Lock()
 	if cm.closed || ctx.Err() != nil || cm.ctx.Err() != nil {
+		cm.publishMu.Unlock()
+		return false
+	}
+	endpoint := cm.endpointLocked(sc.ServerAddr())
+	if endpoint == nil {
 		cm.publishMu.Unlock()
 		return false
 	}
@@ -314,40 +305,31 @@ func (cm *ConnectionManager) publishServerConnection(ctx context.Context, sc *Se
 		cm.startReconnection(ctx, serverAddr, sc)
 	})
 	sc.MarkHealthy()
-	previousI, replaced := cm.connections.Swap(sc.ServerAddr(), sc)
+	previous, replaced := endpoint.lifecycle.Replace(sc)
 	cm.moveGenerationLocked(sc, clientGenerationPending, clientGenerationRegistered)
-	if replaced && previousI != sc {
-		cm.detachGenerationLocked(previousI.(*ServerConnection))
+	if replaced && previous != sc {
+		cm.detachGenerationLocked(previous)
 	}
 	cm.publishMu.Unlock()
 	// Keep this Close before delivery: the consumer's old stopAndWait relies on
 	// closing its owning QUIC connection to unblock context-free SendDatagram.
-	if replaced {
-		previous := previousI.(*ServerConnection)
-		if previous != sc {
-			_ = previous.Close()
-		}
+	if replaced && previous != sc {
+		previous.owner.Stop()
 	}
 
-	select {
-	case cm.NewConns <- sc:
-	case <-ctx.Done():
-		cm.rollbackPublication(sc)
-		return false
-	case <-cm.ctx.Done():
+	if !outbound.DeliverThenStart(ctx, cm.ctx, cm.NewConns, sc, func() {
+		sc.StartHeartbeatLoops(cm.config.HeartbeatInterval)
+	}) {
 		cm.rollbackPublication(sc)
 		return false
 	}
-
-	// Delivery commits ownership. Control ownership starts even if shutdown
-	// closes the publication gate immediately after the send.
-	sc.StartHeartbeatLoops(cm.config.HeartbeatInterval)
 	return true
 }
 
 func (cm *ConnectionManager) rollbackPublication(sc *ServerConnection) {
 	cm.publishMu.Lock()
-	removed := cm.connections.CompareAndDelete(sc.ServerAddr(), sc)
+	endpoint := cm.endpointLocked(sc.ServerAddr())
+	removed := endpoint != nil && endpoint.lifecycle.Retire(sc)
 	if removed {
 		cm.detachGenerationLocked(sc)
 	}
@@ -358,22 +340,11 @@ func (cm *ConnectionManager) rollbackPublication(sc *ServerConnection) {
 }
 
 func reconnectDelay(attempt int, int64n func(int64) int64) time.Duration {
-	delayCap := initialReconnectDelay
-	for attempt > 0 && delayCap < maxReconnectDelay {
-		delayCap = min(delayCap*2, maxReconnectDelay)
-		attempt--
-	}
-	half := delayCap / 2
-	return half + time.Duration(int64n(int64(half)))
+	return outbound.ReconnectDelay(attempt, int64n)
 }
 
 func waitForReconnect(ctx, managerCtx context.Context, delay time.Duration) bool {
-	select {
-	case <-ctx.Done():
-	case <-managerCtx.Done():
-	case <-time.After(delay):
-	}
-	return ctx.Err() == nil && managerCtx.Err() == nil
+	return outbound.WaitReconnect(ctx, managerCtx, delay)
 }
 
 // startReconnection starts a reconnection goroutine for a server if not already reconnecting.
@@ -383,22 +354,10 @@ func (cm *ConnectionManager) startReconnection(ctx context.Context, serverAddr s
 	if cm.closed || ctx.Err() != nil || cm.ctx.Err() != nil {
 		return
 	}
-	current, exists := cm.connections.Load(serverAddr)
-	if expected != nil {
-		if !exists || current != expected {
-			return
-		}
-	} else if exists {
+	endpoint := cm.endpointLocked(serverAddr)
+	if endpoint == nil || !endpoint.lifecycle.ClaimReconnect(expected) {
 		return
 	}
-
-	cm.reconnectMu.Lock()
-	if cm.reconnecting[serverAddr] {
-		cm.reconnectMu.Unlock()
-		return
-	}
-	cm.reconnecting[serverAddr] = true
-	cm.reconnectMu.Unlock()
 
 	cm.wg.Go(func() {
 		cm.reconnectionLoop(ctx, serverAddr, expected)
@@ -412,9 +371,11 @@ func (cm *ConnectionManager) reconnectionLoop(ctx context.Context, serverAddr st
 		if !ownsSlot {
 			return
 		}
-		cm.reconnectMu.Lock()
-		delete(cm.reconnecting, serverAddr)
-		cm.reconnectMu.Unlock()
+		cm.publishMu.Lock()
+		if endpoint := cm.endpointLocked(serverAddr); endpoint != nil {
+			endpoint.lifecycle.ReleaseReconnect()
+		}
+		cm.publishMu.Unlock()
 		ownsSlot = false
 	}
 	defer releaseSlot()
@@ -431,13 +392,9 @@ func (cm *ConnectionManager) reconnectionLoop(ctx context.Context, serverAddr st
 		cm.logger.Error().Str("server", serverAddr).Msg("server not found in configuration")
 		return
 	}
-	var endpointState *clientEndpointPhases
-	for i := range cm.endpoints {
-		if cm.endpoints[i].endpoint == endpoint.Address {
-			endpointState = &cm.endpoints[i]
-			break
-		}
-	}
+	cm.publishMu.Lock()
+	endpointState := cm.endpointLocked(endpoint.Address)
+	cm.publishMu.Unlock()
 	if endpointState == nil {
 		cm.logger.Error().Str("server", serverAddr).Msg("server retry state not found")
 		return
@@ -445,21 +402,16 @@ func (cm *ConnectionManager) reconnectionLoop(ctx context.Context, serverAddr st
 
 	cm.publishMu.Lock()
 	if expected != nil {
-		detached := cm.connections.CompareAndDelete(serverAddr, expected)
+		detached := endpointState.lifecycle.RetireForReconnect(expected, expected.reconnectStable.Load())
 		if !detached {
 			cm.publishMu.Unlock()
 			return
 		}
 		cm.detachGenerationLocked(expected)
-		if expected.reconnectStable.Load() {
-			cm.reconnectMu.Lock()
-			endpointState.nextReconnectStage = 0
-			cm.reconnectMu.Unlock()
-		}
 		cm.publishMu.Unlock()
-		_ = expected.Close()
+		expected.owner.Stop()
 	} else {
-		_, exists := cm.connections.Load(serverAddr)
+		exists := !endpointState.lifecycle.Empty()
 		cm.publishMu.Unlock()
 		if exists {
 			return
@@ -476,9 +428,9 @@ func (cm *ConnectionManager) reconnectionLoop(ctx context.Context, serverAddr st
 		default:
 		}
 
-		cm.reconnectMu.Lock()
-		stage := endpointState.nextReconnectStage
-		cm.reconnectMu.Unlock()
+		cm.publishMu.Lock()
+		stage := endpointState.lifecycle.RetryStage()
+		cm.publishMu.Unlock()
 		backoff := reconnectDelay(stage, rand.Int64N)
 		cm.logger.Info().
 			Str("server", serverAddr).
@@ -491,10 +443,9 @@ func (cm *ConnectionManager) reconnectionLoop(ctx context.Context, serverAddr st
 			return
 		}
 
-		cm.reconnectMu.Lock()
-		endpointState.nextReconnectStage = min(stage+1, maxReconnectStage)
-		endpointState.reconnectAttempts.Add(1)
-		cm.reconnectMu.Unlock()
+		cm.publishMu.Lock()
+		endpointState.lifecycle.AdvanceRetry(stage, maxReconnectStage)
+		cm.publishMu.Unlock()
 		sc, err := cm.connectAndRegister(ctx, *endpoint)
 		if err != nil {
 			cm.logger.Warn().
@@ -511,7 +462,7 @@ func (cm *ConnectionManager) reconnectionLoop(ctx context.Context, serverAddr st
 		// callback can claim the next reconnect intent.
 		releaseSlot()
 		if !cm.publishServerConnection(ctx, sc) {
-			_ = sc.Close()
+			sc.owner.Stop()
 			return
 		}
 
@@ -533,23 +484,23 @@ func (cm *ConnectionManager) Stop() error {
 
 	cm.publishMu.Lock()
 	var published []*ServerConnection
-	cm.connections.Range(func(key, value any) bool {
-		sc := value.(*ServerConnection)
-		published = append(published, sc)
-		cm.connections.Delete(key)
-		cm.detachGenerationLocked(sc)
-		return true
-	})
+	for i := range cm.endpoints {
+		if sc := cm.endpoints[i].lifecycle.Take(); sc != nil {
+			published = append(published, sc)
+			cm.detachGenerationLocked(sc)
+		}
+	}
 	cm.publishMu.Unlock()
 
 	var closeErrors []error
 	for _, sc := range published {
-		if err := sc.Close(); err != nil {
-			closeErrors = append(closeErrors, fmt.Errorf("close %s: %w", sc.ServerAddr(), err))
+		sc.owner.Stop()
+		if sc.closeErr != nil {
+			closeErrors = append(closeErrors, fmt.Errorf("close %s: %w", sc.ServerAddr(), sc.closeErr))
 		}
 	}
 	for _, sc := range published {
-		sc.waitControl()
+		sc.owner.Join()
 	}
 
 	if len(closeErrors) > 0 {
@@ -571,16 +522,28 @@ func (cm *ConnectionManager) stopPublishing() {
 }
 
 func (cm *ConnectionManager) isCurrent(sc *ServerConnection) bool {
-	current, ok := cm.connections.Load(sc.ServerAddr())
-	return ok && current == sc
+	cm.publishMu.Lock()
+	defer cm.publishMu.Unlock()
+	endpoint := cm.endpointLocked(sc.ServerAddr())
+	return endpoint != nil && endpoint.lifecycle.Is(sc)
 }
 
 func (cm *ConnectionManager) retireConnection(sc *ServerConnection) {
 	cm.publishMu.Lock()
-	if cm.connections.CompareAndDelete(sc.ServerAddr(), sc) {
+	endpoint := cm.endpointLocked(sc.ServerAddr())
+	if endpoint != nil && endpoint.lifecycle.Retire(sc) {
 		cm.detachGenerationLocked(sc)
 	}
 	cm.publishMu.Unlock()
+}
+
+func (cm *ConnectionManager) endpointLocked(serverAddr string) *clientEndpointPhases {
+	for i := range cm.endpoints {
+		if cm.endpoints[i].endpoint == serverAddr {
+			return &cm.endpoints[i]
+		}
+	}
+	return nil
 }
 
 func (cm *ConnectionManager) trackGenerationLocked(sc *ServerConnection, phase clientGenerationPhase) {
@@ -677,6 +640,7 @@ func (cm *ConnectionManager) generationFaultLocked(sc *ServerConnection) {
 
 func (cm *ConnectionManager) endpointSnapshot() []EndpointSnapshot {
 	cm.publishMu.Lock()
+	defer cm.publishMu.Unlock()
 	snapshot := make([]EndpointSnapshot, len(cm.endpoints))
 	for i := range cm.endpoints {
 		endpoint := &cm.endpoints[i]
@@ -688,19 +652,13 @@ func (cm *ConnectionManager) endpointSnapshot() []EndpointSnapshot {
 			Retiring:            endpoint.retiring,
 			GenerationHighWater: endpoint.generationHighWater,
 			AccountingFaults:    endpoint.accountingFaults,
+			ReconnectAttempts:   endpoint.lifecycle.ReconnectAttempts(),
+			Reconnecting:        endpoint.lifecycle.Reconnecting(),
+			QUIC:                endpoint.transport.Snapshot(),
+			Connect:             endpoint.connect.Snapshot(),
+			Registration:        endpoint.registration.Snapshot(),
 		}
-	}
-	cm.publishMu.Unlock()
-	for i := range snapshot {
-		endpoint := &cm.endpoints[i]
-		snapshot[i].QUIC = endpoint.transport.Snapshot()
-		snapshot[i].Connect = endpoint.connect.Snapshot()
-		snapshot[i].Registration = endpoint.registration.Snapshot()
-		snapshot[i].ReconnectAttempts = endpoint.reconnectAttempts.Load()
-		cm.reconnectMu.Lock()
-		snapshot[i].Reconnecting = cm.reconnecting[endpoint.endpoint]
-		cm.reconnectMu.Unlock()
-		if connection := cm.GetConnection(endpoint.endpoint); connection != nil {
+		if connection := endpoint.lifecycle.Load(); connection != nil {
 			snapshot[i].Healthy = connection.IsHealthy()
 			snapshot[i].LastHeartbeat = connection.LastReceivedFromServer()
 		}
@@ -710,41 +668,50 @@ func (cm *ConnectionManager) endpointSnapshot() []EndpointSnapshot {
 
 // GetAllConnections returns all server connections.
 func (cm *ConnectionManager) GetAllConnections() []*ServerConnection {
-	var conns []*ServerConnection
-	cm.connections.Range(func(key, value any) bool {
-		conns = append(conns, value.(*ServerConnection))
-		return true
-	})
+	cm.publishMu.Lock()
+	defer cm.publishMu.Unlock()
+	conns := make([]*ServerConnection, 0, len(cm.endpoints))
+	for i := range cm.endpoints {
+		if connection := cm.endpoints[i].lifecycle.Load(); connection != nil {
+			conns = append(conns, connection)
+		}
+	}
 	return conns
 }
 
 // GetConnection returns the connection for a specific server address.
 func (cm *ConnectionManager) GetConnection(serverAddr string) *ServerConnection {
-	if value, ok := cm.connections.Load(serverAddr); ok {
-		return value.(*ServerConnection)
+	cm.publishMu.Lock()
+	defer cm.publishMu.Unlock()
+	if endpoint := cm.endpointLocked(serverAddr); endpoint != nil {
+		return endpoint.lifecycle.Load()
 	}
 	return nil
 }
 
 // HealthyCount returns the number of healthy connections.
 func (cm *ConnectionManager) HealthyCount() int {
+	cm.publishMu.Lock()
+	defer cm.publishMu.Unlock()
 	count := 0
-	cm.connections.Range(func(_, value any) bool {
-		if sc := value.(*ServerConnection); sc.IsHealthy() {
+	for i := range cm.endpoints {
+		if sc := cm.endpoints[i].lifecycle.Load(); sc != nil && sc.IsHealthy() {
 			count++
 		}
-		return true
-	})
+	}
 	return count
 }
 
 // TotalCount returns the total number of connections.
 func (cm *ConnectionManager) TotalCount() int {
+	cm.publishMu.Lock()
+	defer cm.publishMu.Unlock()
 	count := 0
-	cm.connections.Range(func(_, _ any) bool {
-		count++
-		return true
-	})
+	for i := range cm.endpoints {
+		if !cm.endpoints[i].lifecycle.Empty() {
+			count++
+		}
+	}
 	return count
 }
 

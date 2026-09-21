@@ -211,9 +211,9 @@ func TestReconnectStagePersistsAcrossWorkers(t *testing.T) {
 		cm.tlsState.Store(nil)
 		endpoint := cm.config.Server.GetServers()[0]
 		state := func() (int, uint64) {
-			cm.reconnectMu.Lock()
-			defer cm.reconnectMu.Unlock()
-			return cm.endpoints[0].nextReconnectStage, cm.endpoints[0].reconnectAttempts.Load()
+			cm.publishMu.Lock()
+			defer cm.publishMu.Unlock()
+			return cm.endpoints[0].lifecycle.RetryStage(), cm.endpoints[0].lifecycle.ReconnectAttempts()
 		}
 
 		if sc, err := cm.connectAndRegister(context.Background(), endpoint); err == nil || sc != nil {
@@ -402,11 +402,11 @@ func TestStartReconnectionRejectsCanceledRunContext(t *testing.T) {
 
 	cm.startReconnection(runCtx, cfg.Server.Servers[0].Address, nil)
 
-	cm.reconnectMu.Lock()
-	reconnecting := len(cm.reconnecting)
-	cm.reconnectMu.Unlock()
-	if reconnecting != 0 {
-		t.Fatalf("canceled run started %d reconnection workers", reconnecting)
+	cm.publishMu.Lock()
+	reconnecting := cm.endpoints[0].lifecycle.Reconnecting()
+	cm.publishMu.Unlock()
+	if reconnecting {
+		t.Fatal("canceled run started a reconnection worker")
 	}
 	if err := cm.Stop(); err != nil {
 		t.Fatal(err)

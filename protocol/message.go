@@ -7,15 +7,17 @@ import (
 
 // Message types
 const (
-	MsgTypeRegister      = 0x01 // Client registration
-	MsgTypeRegisterAck   = 0x02 // Server acknowledgment
-	MsgTypeHeartbeat     = 0x03 // Keepalive
-	MsgTypeNewConn       = 0x04 // New connection metadata
-	MsgTypeDrainRequest  = 0x05 // Client requests retirement from TCP selection
-	MsgTypeConnClose     = 0x06 // Connection closed
-	MsgTypeDrainComplete = 0x07 // Server reports the final accepted TCP stream
-	MsgTypeNewConnAck    = 0x08 // Client confirms its backend connection is ready
-	MsgTypeError         = 0xFF // Error message
+	MsgTypeRegister        = 0x01 // Client registration
+	MsgTypeRegisterAck     = 0x02 // Server acknowledgment
+	MsgTypeHeartbeat       = 0x03 // Keepalive
+	MsgTypeNewConn         = 0x04 // New connection metadata
+	MsgTypeDrainRequest    = 0x05 // Client requests retirement from TCP selection
+	MsgTypeConnClose       = 0x06 // Connection closed
+	MsgTypeDrainComplete   = 0x07 // Server reports the final accepted TCP stream
+	MsgTypeNewConnAck      = 0x08 // Client confirms its backend connection is ready
+	MsgTypeMeshRegister    = 0x09 // Mesh client or peer registration
+	MsgTypeMeshRegisterAck = 0x0A // Mesh registration acknowledgment
+	MsgTypeError           = 0xFF // Error message
 )
 
 // RegisterMsg is sent by client to register with server
@@ -39,6 +41,37 @@ type RegisterAckMsg struct {
 	ServerVersion        string   // Protocol version selected by the server
 	SelectedCapabilities []string // Capabilities selected for this connection
 	SelectedAuthScheme   string   `json:",omitempty"` // Authentication scheme selected by the server
+}
+
+const (
+	MeshProtocolVersion     = "1.0"
+	CapabilityMeshSessionV1 = "mesh-session-v1"
+	MeshRoleClient          = "client"
+	MeshRolePeer            = "peer"
+)
+
+// MeshRegister is the mesh-only registration header. Initial group and route
+// state is intentionally carried by later mesh tasks on the same transaction.
+type MeshRegister struct {
+	Version        string
+	Capabilities   []string
+	Role           string
+	TargetServerID string
+	PeerServerID   string        `json:",omitempty"`
+	InstanceID     string        `json:",omitempty"`
+	GroupID        string        `json:",omitempty"`
+	Auth           *RegisterAuth `json:",omitempty"`
+}
+
+// MeshRegisterAck is the mesh-only registration acknowledgment.
+type MeshRegisterAck struct {
+	Success              bool
+	Message              string   `json:",omitempty"`
+	ServerID             string   `json:",omitempty"`
+	Role                 string   `json:",omitempty"`
+	SelectedVersion      string   `json:",omitempty"`
+	SelectedCapabilities []string `json:",omitempty"`
+	SelectedAuthScheme   string   `json:",omitempty"`
 }
 
 // HeartbeatMsg is sent periodically to keep connection alive
@@ -146,6 +179,120 @@ func ValidateRegisterAckWithAuth(ack RegisterAckMsg, expectedAuthScheme string) 
 	}
 	if ack.SelectedAuthScheme != expectedAuthScheme {
 		return fmt.Errorf("invalid registration acknowledgment: selected auth scheme got %q, require %q", ack.SelectedAuthScheme, expectedAuthScheme)
+	}
+	return nil
+}
+
+// MeshCapabilities returns the capabilities supported by the mesh registration
+// transaction without adding them to the ordinary L4 capability list.
+func MeshCapabilities() []string {
+	return []string{CapabilityMeshSessionV1}
+}
+
+// ValidateMeshRegistration verifies the mesh wire version and required
+// capability after authentication has bound both fields to the TLS session.
+func ValidateMeshRegistration(version string, capabilities []string) error {
+	if version != MeshProtocolVersion {
+		return fmt.Errorf("incompatible mesh protocol version: got %q, require %q", version, MeshProtocolVersion)
+	}
+	if err := validateCapabilities(capabilities); err != nil {
+		return err
+	}
+	if !HasCapability(capabilities, CapabilityMeshSessionV1) {
+		return fmt.Errorf("required capability %q is missing", CapabilityMeshSessionV1)
+	}
+	return nil
+}
+
+// ValidateMeshRegisterAck verifies exact mesh negotiation and remote identity.
+func ValidateMeshRegisterAck(
+	ack MeshRegisterAck,
+	expectedServerID, expectedRole, expectedAuthScheme string,
+	requestedCapabilities []string,
+) error {
+	if !ack.Success {
+		return fmt.Errorf("mesh registration failed: %s", ack.Message)
+	}
+	if ack.ServerID != expectedServerID {
+		return fmt.Errorf("invalid mesh registration acknowledgment: server_id got %q, require %q", ack.ServerID, expectedServerID)
+	}
+	if ack.Role != expectedRole {
+		return fmt.Errorf("invalid mesh registration acknowledgment: role got %q, require %q", ack.Role, expectedRole)
+	}
+	if err := ValidateMeshRegistration(ack.SelectedVersion, ack.SelectedCapabilities); err != nil {
+		return fmt.Errorf("invalid mesh registration acknowledgment: %w", err)
+	}
+	if ack.SelectedAuthScheme != expectedAuthScheme {
+		return fmt.Errorf("invalid mesh registration acknowledgment: selected auth scheme got %q, require %q", ack.SelectedAuthScheme, expectedAuthScheme)
+	}
+	if err := validateCapabilities(requestedCapabilities); err != nil {
+		return fmt.Errorf("invalid requested capabilities: %w", err)
+	}
+	for _, selected := range ack.SelectedCapabilities {
+		if !HasCapability(requestedCapabilities, selected) {
+			return fmt.Errorf("invalid mesh registration acknowledgment: unrequested capability %q", selected)
+		}
+	}
+	return nil
+}
+
+func validateMeshRegisterShape(registration MeshRegister) error {
+	if registration.Version == "" {
+		return fmt.Errorf("mesh registration version is required")
+	}
+	if registration.TargetServerID == "" {
+		return fmt.Errorf("mesh registration target server_id is required")
+	}
+	if err := validateCapabilities(registration.Capabilities); err != nil {
+		return err
+	}
+	switch registration.Role {
+	case MeshRoleClient:
+		if registration.InstanceID == "" || registration.GroupID == "" {
+			return fmt.Errorf("mesh client registration requires instance_id and group_id")
+		}
+		if registration.PeerServerID != "" {
+			return fmt.Errorf("mesh client registration must not carry peer server_id")
+		}
+	case MeshRolePeer:
+		if registration.PeerServerID == "" {
+			return fmt.Errorf("mesh peer registration requires peer server_id")
+		}
+		if registration.InstanceID != "" || registration.GroupID != "" {
+			return fmt.Errorf("mesh peer registration must not carry client identity")
+		}
+	default:
+		return fmt.Errorf("invalid mesh registration role %q", registration.Role)
+	}
+	return nil
+}
+
+func validateMeshRegisterAckShape(ack MeshRegisterAck) error {
+	if err := validateCapabilities(ack.SelectedCapabilities); err != nil {
+		return err
+	}
+	if !ack.Success {
+		return nil
+	}
+	if ack.ServerID == "" || ack.SelectedVersion == "" {
+		return fmt.Errorf("successful mesh registration acknowledgment requires server_id and selected version")
+	}
+	if ack.Role != MeshRoleClient && ack.Role != MeshRolePeer {
+		return fmt.Errorf("invalid mesh registration acknowledgment role %q", ack.Role)
+	}
+	return nil
+}
+
+func validateCapabilities(capabilities []string) error {
+	seen := make(map[string]struct{}, len(capabilities))
+	for _, capability := range capabilities {
+		if capability == "" {
+			return fmt.Errorf("capability must not be empty")
+		}
+		if _, exists := seen[capability]; exists {
+			return fmt.Errorf("duplicate capability %q", capability)
+		}
+		seen[capability] = struct{}{}
 	}
 	return nil
 }

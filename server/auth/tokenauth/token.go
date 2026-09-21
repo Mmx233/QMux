@@ -41,6 +41,33 @@ func (a *TokenAuth) Verify(state tls.ConnectionState, registration auth.Registra
 	return nil
 }
 
+func (a *TokenAuth) VerifyMesh(state tls.ConnectionState, registration auth.MeshRegistration) error {
+	if registration.Scheme != sharedtoken.MeshScheme {
+		return fmt.Errorf("required mesh token authentication proof is missing")
+	}
+	if err := sharedtoken.VerifyMesh(
+		a.secret,
+		sharedtoken.MeshTranscript{
+			Version:        registration.Version,
+			Capabilities:   registration.Capabilities,
+			Role:           registration.Role,
+			TargetServerID: registration.TargetServerID,
+			PeerServerID:   registration.PeerServerID,
+			InstanceID:     registration.InstanceID,
+			GroupID:        registration.GroupID,
+		},
+		registration.Proof,
+		state,
+	); err != nil {
+		return fmt.Errorf("verify mesh token proof: %w", err)
+	}
+	return nil
+}
+
 func (a *TokenAuth) SelectedScheme() string {
 	return sharedtoken.Scheme
+}
+
+func (a *TokenAuth) SelectedMeshScheme() string {
+	return sharedtoken.MeshScheme
 }

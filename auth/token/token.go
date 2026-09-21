@@ -18,13 +18,18 @@ const (
 	Scheme = "qmux-token-ekm-hmac-sha512-v1"
 	// ExporterLabel isolates QMux token key material from other TLS exporters.
 	ExporterLabel = "EXPERIMENTAL-QMux-token-auth-v1"
+	// MeshScheme identifies the independent mesh registration proof.
+	MeshScheme = "qmux-mesh-token-ekm-hmac-sha512-v1"
+	// MeshExporterLabel isolates mesh registration key material from ordinary L4.
+	MeshExporterLabel = "EXPERIMENTAL-QMux-mesh-token-auth-v1"
 	// MinSecretSize is the minimum accepted token length in bytes.
 	MinSecretSize = 16
 	// ProofSize is the size of an HMAC-SHA512 proof in bytes.
 	ProofSize = sha512.Size
 
-	proofDomain    = "QMux token authentication proof"
-	exporterLength = 32
+	proofDomain     = "QMux token authentication proof"
+	meshProofDomain = "QMux mesh token authentication proof"
+	exporterLength  = 32
 )
 
 // Transcript contains the semantic registration fields authenticated by a
@@ -33,6 +38,19 @@ type Transcript struct {
 	ClientID     string
 	Version      string
 	Capabilities []string
+}
+
+// MeshTranscript contains every role and identity field authenticated by a
+// mesh token proof. Capability order is significant and empty role-inapplicable
+// identity fields are encoded explicitly.
+type MeshTranscript struct {
+	Version        string
+	Capabilities   []string
+	Role           string
+	TargetServerID string
+	PeerServerID   string
+	InstanceID     string
+	GroupID        string
 }
 
 // Compute returns the token proof for transcript on a completed TLS 1.3
@@ -67,6 +85,30 @@ func Verify(secret []byte, transcript Transcript, proof []byte, state tls.Connec
 		return fmt.Errorf("invalid token proof size: got %d, require %d", len(proof), ProofSize)
 	}
 	expected, err := Compute(secret, transcript, state)
+	if err != nil {
+		return err
+	}
+	if !hmac.Equal(proof, expected) {
+		return errors.New("invalid token proof")
+	}
+	return nil
+}
+
+// ComputeMesh returns the independent exporter-bound mesh registration proof.
+func ComputeMesh(secret []byte, transcript MeshTranscript, state tls.ConnectionState) ([]byte, error) {
+	canonical, err := marshalMeshTranscript(transcript)
+	if err != nil {
+		return nil, err
+	}
+	return computeWithExporter(secret, canonical, MeshExporterLabel, state)
+}
+
+// VerifyMesh checks a mesh registration proof without accepting ordinary L4 proofs.
+func VerifyMesh(secret []byte, transcript MeshTranscript, proof []byte, state tls.ConnectionState) error {
+	if len(proof) != ProofSize {
+		return fmt.Errorf("invalid token proof size: got %d, require %d", len(proof), ProofSize)
+	}
+	expected, err := ComputeMesh(secret, transcript, state)
 	if err != nil {
 		return err
 	}
@@ -119,6 +161,80 @@ func marshalTranscript(transcript Transcript) ([]byte, error) {
 		writeString(&canonical, capability)
 	}
 	return canonical.Bytes(), nil
+}
+
+func marshalMeshTranscript(transcript MeshTranscript) ([]byte, error) {
+	return marshalMeshTranscriptWithScheme(transcript, MeshScheme)
+}
+
+func marshalMeshTranscriptWithScheme(transcript MeshTranscript, scheme string) ([]byte, error) {
+	prefix := []string{meshProofDomain, scheme, transcript.Version}
+	suffix := []string{
+		transcript.Role,
+		transcript.TargetServerID,
+		transcript.PeerServerID,
+		transcript.InstanceID,
+		transcript.GroupID,
+	}
+	total := uint64(4)
+	for _, field := range append(append([]string(nil), prefix...), suffix...) {
+		var err error
+		total, err = addEncodedStringSize(total, field)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if uint64(len(transcript.Capabilities)) > math.MaxUint32 {
+		return nil, errors.New("too many capabilities to encode")
+	}
+	seen := make(map[string]struct{}, len(transcript.Capabilities))
+	for _, capability := range transcript.Capabilities {
+		if _, exists := seen[capability]; exists {
+			return nil, fmt.Errorf("duplicate capability %q", capability)
+		}
+		seen[capability] = struct{}{}
+		var err error
+		total, err = addEncodedStringSize(total, capability)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if total > uint64(maxInt()) {
+		return nil, errors.New("token transcript is too large to encode")
+	}
+
+	var canonical bytes.Buffer
+	canonical.Grow(int(total))
+	for _, field := range prefix {
+		writeString(&canonical, field)
+	}
+	var count [4]byte
+	binary.BigEndian.PutUint32(count[:], uint32(len(transcript.Capabilities)))
+	canonical.Write(count[:])
+	for _, capability := range transcript.Capabilities {
+		writeString(&canonical, capability)
+	}
+	for _, field := range suffix {
+		writeString(&canonical, field)
+	}
+	return canonical.Bytes(), nil
+}
+
+func computeWithExporter(secret, canonical []byte, label string, state tls.ConnectionState) ([]byte, error) {
+	if len(secret) < MinSecretSize {
+		return nil, fmt.Errorf("token secret must be at least %d bytes", MinSecretSize)
+	}
+	if !state.HandshakeComplete {
+		return nil, errors.New("TLS handshake is not complete")
+	}
+	if state.Version != tls.VersionTLS13 {
+		return nil, fmt.Errorf("token authentication requires TLS 1.3, got 0x%04x", state.Version)
+	}
+	ekm, err := state.ExportKeyingMaterial(label, nil, exporterLength)
+	if err != nil {
+		return nil, fmt.Errorf("export TLS keying material: %w", err)
+	}
+	return computeProof(secret, canonical, ekm), nil
 }
 
 func addEncodedStringSize(total uint64, value string) (uint64, error) {

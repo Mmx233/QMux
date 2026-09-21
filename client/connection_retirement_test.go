@@ -271,24 +271,28 @@ func TestReconnectWorkerStaleExpectedAndInitialFailureAreNoOps(t *testing.T) {
 	fresh := newDisconnectedRetirementConnection(address)
 	fresh.MarkHealthy()
 	stale.reconnectStable.Store(true)
-	cm.connections.Store(address, fresh)
-	cm.reconnectMu.Lock()
-	cm.endpoints[0].nextReconnectStage = maxReconnectStage
-	cm.reconnectMu.Unlock()
+	cm.publishMu.Lock()
+	cm.endpoints[0].lifecycle.Replace(fresh)
+	cm.endpoints[0].lifecycle.SetRetryStage(maxReconnectStage)
+	cm.publishMu.Unlock()
 	before := cm.endpointSnapshot()[0]
 
 	cm.startReconnection(context.Background(), address, stale)
 	cm.startReconnection(context.Background(), address, nil)
-	cm.reconnectMu.Lock()
-	if len(cm.reconnecting) != 0 {
-		cm.reconnectMu.Unlock()
+	cm.publishMu.Lock()
+	if cm.endpoints[0].lifecycle.Reconnecting() {
+		cm.publishMu.Unlock()
 		t.Fatal("stale or initial callback acquired a reconnect slot")
 	}
-	cm.reconnectMu.Unlock()
+	cm.publishMu.Unlock()
 
-	cm.reconnectMu.Lock()
-	cm.reconnecting[address] = true
-	cm.reconnectMu.Unlock()
+	cm.publishMu.Lock()
+	claimed := cm.endpoints[0].lifecycle.ClaimReconnect(fresh)
+	reconnecting := cm.endpoints[0].lifecycle.Reconnecting()
+	cm.publishMu.Unlock()
+	if !claimed || !reconnecting {
+		t.Fatal("stale worker did not start with a claimed reconnect slot")
+	}
 	cm.reconnectionLoop(context.Background(), address, stale)
 	if got := cm.GetConnection(address); got != fresh {
 		t.Fatalf("stale worker changed current connection to %p", got)
@@ -296,29 +300,31 @@ func TestReconnectWorkerStaleExpectedAndInitialFailureAreNoOps(t *testing.T) {
 	if !fresh.IsHealthy() || fresh.State() != StateConnected {
 		t.Fatalf("stale worker retired fresh connection: state=%s healthy=%t", fresh.State(), fresh.IsHealthy())
 	}
-	cm.reconnectMu.Lock()
-	remaining := len(cm.reconnecting)
-	cm.reconnectMu.Unlock()
-	if remaining != 0 {
-		t.Fatalf("stale worker retained %d reconnect slots", remaining)
+	cm.publishMu.Lock()
+	reconnecting = cm.endpoints[0].lifecycle.Reconnecting()
+	cm.publishMu.Unlock()
+	if reconnecting {
+		t.Fatal("stale worker retained a reconnect slot")
 	}
-	cm.reconnectMu.Lock()
-	cm.reconnecting[address] = true
-	cm.reconnectMu.Unlock()
+	cm.publishMu.Lock()
+	claimed = cm.endpoints[0].lifecycle.ClaimReconnect(fresh)
+	reconnecting = cm.endpoints[0].lifecycle.Reconnecting()
+	cm.publishMu.Unlock()
+	if !claimed || !reconnecting {
+		t.Fatal("initial-failure worker did not start with a claimed reconnect slot")
+	}
 	cm.reconnectionLoop(context.Background(), address, nil)
 	if got := cm.GetConnection(address); got != fresh {
 		t.Fatalf("initial-failure worker changed current connection to %p", got)
 	}
-	cm.reconnectMu.Lock()
-	remaining = len(cm.reconnecting)
-	cm.reconnectMu.Unlock()
-	if remaining != 0 {
-		t.Fatalf("initial-failure worker retained %d reconnect slots", remaining)
+	cm.publishMu.Lock()
+	reconnecting = cm.endpoints[0].lifecycle.Reconnecting()
+	stage := cm.endpoints[0].lifecycle.RetryStage()
+	attempts := cm.endpoints[0].lifecycle.ReconnectAttempts()
+	cm.publishMu.Unlock()
+	if reconnecting {
+		t.Fatal("initial-failure worker retained a reconnect slot")
 	}
-	cm.reconnectMu.Lock()
-	stage := cm.endpoints[0].nextReconnectStage
-	attempts := cm.endpoints[0].reconnectAttempts.Load()
-	cm.reconnectMu.Unlock()
 	if stage != maxReconnectStage || attempts != 0 {
 		t.Fatalf("stale stable generation changed retry state to stage=%d attempts=%d", stage, attempts)
 	}
@@ -346,10 +352,10 @@ func TestStableExactGenerationResetsOnlyOwnEndpointStage(t *testing.T) {
 	}
 	stable.reconnectStable.Store(true)
 	stable.MarkUnhealthy()
-	cm.reconnectMu.Lock()
-	cm.endpoints[0].nextReconnectStage = maxReconnectStage
-	cm.endpoints[1].nextReconnectStage = 3
-	cm.reconnectMu.Unlock()
+	cm.publishMu.Lock()
+	cm.endpoints[0].lifecycle.SetRetryStage(maxReconnectStage)
+	cm.endpoints[1].lifecycle.SetRetryStage(3)
+	cm.publishMu.Unlock()
 
 	runCtx, cancelRun := context.WithCancel(context.Background())
 	defer cancelRun()
@@ -358,13 +364,11 @@ func TestStableExactGenerationResetsOnlyOwnEndpointStage(t *testing.T) {
 		return cm.GetConnection(first) == nil
 	})
 	cm.publishMu.Lock()
-	cm.reconnectMu.Lock()
-	firstStage := cm.endpoints[0].nextReconnectStage
-	secondStage := cm.endpoints[1].nextReconnectStage
-	firstAttempts := cm.endpoints[0].reconnectAttempts.Load()
-	secondAttempts := cm.endpoints[1].reconnectAttempts.Load()
-	slotHeld := cm.reconnecting[first]
-	cm.reconnectMu.Unlock()
+	firstStage := cm.endpoints[0].lifecycle.RetryStage()
+	secondStage := cm.endpoints[1].lifecycle.RetryStage()
+	firstAttempts := cm.endpoints[0].lifecycle.ReconnectAttempts()
+	secondAttempts := cm.endpoints[1].lifecycle.ReconnectAttempts()
+	slotHeld := cm.endpoints[0].lifecycle.Reconnecting()
 	cm.publishMu.Unlock()
 	if firstStage != 0 || secondStage != 3 {
 		t.Fatalf("stable reset left endpoint stages %d/%d, want 0/3", firstStage, secondStage)
@@ -375,13 +379,13 @@ func TestStableExactGenerationResetsOnlyOwnEndpointStage(t *testing.T) {
 
 	cancelRun()
 	cm.wg.Wait()
-	cm.reconnectMu.Lock()
-	firstStage = cm.endpoints[0].nextReconnectStage
-	secondStage = cm.endpoints[1].nextReconnectStage
-	firstAttempts = cm.endpoints[0].reconnectAttempts.Load()
-	secondAttempts = cm.endpoints[1].reconnectAttempts.Load()
-	_, slotHeld = cm.reconnecting[first]
-	cm.reconnectMu.Unlock()
+	cm.publishMu.Lock()
+	firstStage = cm.endpoints[0].lifecycle.RetryStage()
+	secondStage = cm.endpoints[1].lifecycle.RetryStage()
+	firstAttempts = cm.endpoints[0].lifecycle.ReconnectAttempts()
+	secondAttempts = cm.endpoints[1].lifecycle.ReconnectAttempts()
+	slotHeld = cm.endpoints[0].lifecycle.Reconnecting()
+	cm.publishMu.Unlock()
 	if firstStage != 0 || secondStage != 3 || firstAttempts != 0 || secondAttempts != 0 || slotHeld {
 		t.Fatalf("canceled reset worker left stages=%d/%d attempts=%d/%d slot=%t", firstStage, secondStage, firstAttempts, secondAttempts, slotHeld)
 	}
@@ -432,10 +436,10 @@ func TestReconnectReleasesSlotBeforeFreshPublicationCallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	awaitLifecycle(t, freshRegistered, "fresh reconnect registration")
-	cm.reconnectMu.Lock()
-	firstStage := cm.endpoints[0].nextReconnectStage
-	firstAttempts := cm.endpoints[0].reconnectAttempts.Load()
-	cm.reconnectMu.Unlock()
+	cm.publishMu.Lock()
+	firstStage := cm.endpoints[0].lifecycle.RetryStage()
+	firstAttempts := cm.endpoints[0].lifecycle.ReconnectAttempts()
+	cm.publishMu.Unlock()
 	if firstStage != 1 || firstAttempts != 1 {
 		t.Fatalf("stage-0 retry registration left stage=%d attempts=%d, want 1/1", firstStage, firstAttempts)
 	}
@@ -445,9 +449,9 @@ func TestReconnectReleasesSlotBeforeFreshPublicationCallback(t *testing.T) {
 		fresh = cm.GetConnection(address)
 		return fresh != nil && fresh != old
 	})
-	cm.reconnectMu.Lock()
-	firstSlotHeld := cm.reconnecting[address]
-	cm.reconnectMu.Unlock()
+	cm.publishMu.Lock()
+	firstSlotHeld := cm.endpoints[0].lifecycle.Reconnecting()
+	cm.publishMu.Unlock()
 	if firstSlotHeld {
 		t.Fatal("successful Register retained the old reconnect slot before publication")
 	}
@@ -464,14 +468,14 @@ func TestReconnectReleasesSlotBeforeFreshPublicationCallback(t *testing.T) {
 	}
 	controlStream.CancelRead(0)
 	awaitRetirementCondition(t, "fresh callback reconnect intent", func() bool {
-		cm.reconnectMu.Lock()
-		defer cm.reconnectMu.Unlock()
-		return cm.reconnecting[address] && cm.GetConnection(address) == nil
+		cm.publishMu.Lock()
+		defer cm.publishMu.Unlock()
+		return cm.endpoints[0].lifecycle.Reconnecting() && cm.endpoints[0].lifecycle.Empty()
 	})
-	cm.reconnectMu.Lock()
-	secondStage := cm.endpoints[0].nextReconnectStage
-	secondAttempts := cm.endpoints[0].reconnectAttempts.Load()
-	cm.reconnectMu.Unlock()
+	cm.publishMu.Lock()
+	secondStage := cm.endpoints[0].lifecycle.RetryStage()
+	secondAttempts := cm.endpoints[0].lifecycle.ReconnectAttempts()
+	cm.publishMu.Unlock()
 	if secondStage != 1 || secondAttempts != 1 {
 		t.Fatalf("unstable successor changed stage/attempts to %d/%d, want 1/1", secondStage, secondAttempts)
 	}
@@ -480,10 +484,10 @@ func TestReconnectReleasesSlotBeforeFreshPublicationCallback(t *testing.T) {
 	if err := cm.Stop(); err != nil {
 		t.Fatal(err)
 	}
-	cm.reconnectMu.Lock()
-	finalStage := cm.endpoints[0].nextReconnectStage
-	finalAttempts := cm.endpoints[0].reconnectAttempts.Load()
-	cm.reconnectMu.Unlock()
+	cm.publishMu.Lock()
+	finalStage := cm.endpoints[0].lifecycle.RetryStage()
+	finalAttempts := cm.endpoints[0].lifecycle.ReconnectAttempts()
+	cm.publishMu.Unlock()
 	if finalStage != 1 || finalAttempts != 1 {
 		t.Fatalf("canceled successor changed stage/attempts to %d/%d, want 1/1", finalStage, finalAttempts)
 	}

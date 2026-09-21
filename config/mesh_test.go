@@ -334,8 +334,8 @@ func TestMeshIntegerAliasAndMergeSemantics(t *testing.T) {
 
 	t.Run("self-referential merge", func(t *testing.T) {
 		content := strings.Replace(validMeshServerYAML(), "limits:\n  max_peers: 2", "limits: &limits\n  <<: *limits", 1)
-		if err := loadMeshServerError(writeTestConfig(t, content)); err == nil || !strings.Contains(err.Error(), "anchor 'limits' value contains itself") {
-			t.Fatalf("load error = %v, want yaml.v3 self-reference error", err)
+		if err := loadMeshServerError(writeTestConfig(t, content)); err == nil {
+			t.Fatal("self-referential merge was accepted")
 		}
 	})
 

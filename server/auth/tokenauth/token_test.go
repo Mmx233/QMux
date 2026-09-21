@@ -43,6 +43,9 @@ func TestVerifyExporterBoundProof(t *testing.T) {
 	if err := authenticator.Verify(serverState, registration); err != nil {
 		t.Fatalf("Verify() error = %v", err)
 	}
+	if got := authenticator.SelectedScheme(); got != sharedtoken.Scheme {
+		t.Fatalf("SelectedScheme() = %q, want %q", got, sharedtoken.Scheme)
+	}
 	for _, scheme := range []string{"", "mtls", sharedtoken.Scheme + "-other"} {
 		t.Run("reject scheme "+scheme, func(t *testing.T) {
 			wrongScheme := registration
@@ -56,6 +59,49 @@ func TestVerifyExporterBoundProof(t *testing.T) {
 	registration.Proof[0] ^= 0xff
 	if err := authenticator.Verify(serverState, registration); err == nil {
 		t.Fatal("Verify() accepted a modified proof")
+	}
+}
+
+func TestVerifyMeshExporterBoundProof(t *testing.T) {
+	clientState, serverState := connectedTLSStates(t)
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	registration := auth.MeshRegistration{
+		Version:        "1.0",
+		Capabilities:   []string{"mesh-session-v1"},
+		Role:           "client",
+		TargetServerID: "edge-a",
+		InstanceID:     "instance-a",
+		GroupID:        "group-a",
+		Scheme:         sharedtoken.MeshScheme,
+	}
+	proof, err := sharedtoken.ComputeMesh(secret, sharedtoken.MeshTranscript{
+		Version:        registration.Version,
+		Capabilities:   registration.Capabilities,
+		Role:           registration.Role,
+		TargetServerID: registration.TargetServerID,
+		PeerServerID:   registration.PeerServerID,
+		InstanceID:     registration.InstanceID,
+		GroupID:        registration.GroupID,
+	}, clientState)
+	if err != nil {
+		t.Fatalf("ComputeMesh() error = %v", err)
+	}
+	registration.Proof = proof
+
+	authenticator, err := New(secret)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if err := authenticator.VerifyMesh(serverState, registration); err != nil {
+		t.Fatalf("VerifyMesh() error = %v", err)
+	}
+	if got := authenticator.SelectedMeshScheme(); got != sharedtoken.MeshScheme {
+		t.Fatalf("SelectedMeshScheme() = %q, want %q", got, sharedtoken.MeshScheme)
+	}
+
+	registration.Scheme = sharedtoken.Scheme
+	if err := authenticator.VerifyMesh(serverState, registration); err == nil {
+		t.Fatal("VerifyMesh() accepted the ordinary L4 token scheme")
 	}
 }
 
