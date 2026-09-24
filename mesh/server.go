@@ -30,10 +30,12 @@ var (
 )
 
 type Server struct {
-	config        config.MeshServer
-	registry      *Registry
-	authenticator auth.Auth
-	logger        zerolog.Logger
+	config         config.MeshServer
+	registry       *Registry
+	tunnelSource   *tcpSource
+	ingressSources []*tcpSource
+	authenticator  auth.Auth
+	logger         zerolog.Logger
 
 	inboundTLS       atomic.Pointer[inboundTLSState]
 	outboundTLS      atomic.Pointer[outboundTLSState]
@@ -85,6 +87,12 @@ func NewServer(conf *config.MeshServer) (*Server, error) {
 	owned := *conf
 	owned.Tunnel.Peering.Peers = slices.Clone(conf.Tunnel.Peering.Peers)
 	owned.Ingress.Listeners = slices.Clone(conf.Ingress.Listeners)
+	for i := range owned.Ingress.Listeners {
+		if limit := owned.Ingress.Listeners[i].MaxInflightRequests; limit != nil {
+			value := *limit
+			owned.Ingress.Listeners[i].MaxInflightRequests = &value
+		}
+	}
 	owned.ApplyDefaults()
 	if err := owned.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid mesh server config: %w", err)
@@ -106,6 +114,14 @@ func NewServer(conf *config.MeshServer) (*Server, error) {
 		ready:               make(chan struct{}),
 		done:                make(chan struct{}),
 		acceptDone:          make(chan struct{}),
+		tunnelSource:        newTCPSource(owned.Tunnel.Capacity, 0),
+	}
+	for _, listener := range owned.Ingress.Listeners {
+		requestLimit := 0
+		if listener.MaxInflightRequests != nil {
+			requestLimit = *listener.MaxInflightRequests
+		}
+		server.ingressSources = append(server.ingressSources, newTCPSource(listener.Capacity, requestLimit))
 	}
 	server.inboundReloader, err = newInboundTLSReloader(
 		"mesh-server-inbound",
@@ -170,6 +186,7 @@ func (s *Server) Start(ctx context.Context) (runErr error) {
 	registryStopped := false
 	defer func() {
 		s.cancelRun(ErrMeshServerStopped)
+		s.closeSources()
 		if !registryStopped {
 			s.registry.Stop()
 		}
@@ -220,6 +237,7 @@ func (s *Server) Start(ctx context.Context) (runErr error) {
 	s.cancelRun(ErrMeshServerStopped)
 	_ = listener.Close()
 	<-s.acceptDone
+	s.closeSources()
 	s.registry.Stop()
 	registryStopped = true
 	s.workerWG.Wait()
@@ -243,6 +261,7 @@ func (s *Server) Stop() error {
 	cancel := s.cancel
 	listener := s.listener
 	s.lifecycleMu.Unlock()
+	s.closeSources()
 	if !started {
 		s.registry.Stop()
 		s.stopTLS()
@@ -259,6 +278,13 @@ func (s *Server) Stop() error {
 	}
 	<-s.done
 	return nil
+}
+
+func (s *Server) closeSources() {
+	s.tunnelSource.close()
+	for _, source := range s.ingressSources {
+		source.close()
+	}
 }
 
 func (s *Server) prepareTLS(ctx context.Context, fatal chan<- error) error {

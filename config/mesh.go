@@ -91,6 +91,7 @@ type MeshServerTunnel struct {
 	Listen            MeshTunnelListen `yaml:"listen"`
 	Peering           MeshPeering      `yaml:"peering"`
 	Quic              Quic             `yaml:"quic"`
+	Capacity          MeshTCPCapacity  `yaml:"capacity"`
 	HeartbeatInterval time.Duration    `yaml:"heartbeat_interval"`
 	HealthTimeout     time.Duration    `yaml:"health_timeout"`
 	TCPCopyBufferSize int              `yaml:"tcp_copy_buffer_size"`
@@ -121,9 +122,11 @@ type MeshIngress struct {
 }
 
 type MeshIngressListener struct {
-	Address      string                   `yaml:"address"`
-	Protocol     string                   `yaml:"protocol"`
-	Certificates []MeshIngressCertificate `yaml:"certificates"`
+	Address             string                   `yaml:"address"`
+	Protocol            string                   `yaml:"protocol"`
+	Certificates        []MeshIngressCertificate `yaml:"certificates"`
+	Capacity            MeshTCPCapacity          `yaml:"capacity"`
+	MaxInflightRequests *int                     `yaml:"max_inflight_requests"`
 }
 
 type MeshIngressCertificate struct {
@@ -145,24 +148,29 @@ type MeshProbeScheduler struct {
 	MaxQueued        int           `yaml:"max_queued"`
 }
 
+// MeshTCPCapacity keeps mesh TCP sources independent without exposing ordinary
+// L4 registration or UDP capacity fields.
+type MeshTCPCapacity struct {
+	MaxTCPConnections                int `yaml:"max_tcp_connections"`
+	MaxPendingTCPSetups              int `yaml:"max_pending_tcp_setups"`
+	MaxTCPConnectionsPerGeneration   int `yaml:"max_tcp_connections_per_generation"`
+	MaxPendingTCPSetupsPerGeneration int `yaml:"max_pending_tcp_setups_per_generation"`
+}
+
 // MeshServerLimits is intentionally separate from ListenerCapacity so mesh
 // configuration cannot accept ordinary L4 UDP capacity fields.
 type MeshServerLimits struct {
-	MaxClientGenerations             int   `yaml:"max_client_generations"`
-	MaxPendingRegistrations          int   `yaml:"max_pending_registrations"`
-	MaxTCPConnections                int   `yaml:"max_tcp_connections"`
-	MaxPendingTCPSetups              int   `yaml:"max_pending_tcp_setups"`
-	MaxTCPConnectionsPerGeneration   int   `yaml:"max_tcp_connections_per_generation"`
-	MaxPendingTCPSetupsPerGeneration int   `yaml:"max_pending_tcp_setups_per_generation"`
-	MaxPeers                         int   `yaml:"max_peers"`
-	MaxGroups                        int   `yaml:"max_groups"`
-	MaxGroupDeclarationBytes         int64 `yaml:"max_group_declaration_bytes"`
-	MaxTotalGroupDeclarationBytes    int64 `yaml:"max_total_group_declaration_bytes"`
-	MaxPathsPerGroup                 int   `yaml:"max_paths_per_group"`
-	MaxTotalPaths                    int   `yaml:"max_total_paths"`
-	MaxPathHops                      int   `yaml:"max_path_hops"`
-	MaxControlQueueMessages          int   `yaml:"max_control_queue_messages"`
-	MaxControlQueueBytes             int64 `yaml:"max_control_queue_bytes"`
+	MaxClientGenerations          int   `yaml:"max_client_generations"`
+	MaxPendingRegistrations       int   `yaml:"max_pending_registrations"`
+	MaxPeers                      int   `yaml:"max_peers"`
+	MaxGroups                     int   `yaml:"max_groups"`
+	MaxGroupDeclarationBytes      int64 `yaml:"max_group_declaration_bytes"`
+	MaxTotalGroupDeclarationBytes int64 `yaml:"max_total_group_declaration_bytes"`
+	MaxPathsPerGroup              int   `yaml:"max_paths_per_group"`
+	MaxTotalPaths                 int   `yaml:"max_total_paths"`
+	MaxPathHops                   int   `yaml:"max_path_hops"`
+	MaxControlQueueMessages       int   `yaml:"max_control_queue_messages"`
+	MaxControlQueueBytes          int64 `yaml:"max_control_queue_bytes"`
 }
 
 type MeshClient struct {
@@ -295,21 +303,7 @@ func loadMeshConfig[T any](path string) (*T, error) {
 	if err := validateMeshIntegerData(data, reflect.TypeFor[T]()); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
-
-	var cfg T
-	decoder := yaml.NewDecoder(bytes.NewReader(data))
-	decoder.KnownFields(true)
-	if err := decoder.Decode(&cfg); err != nil && err != io.EOF {
-		return nil, fmt.Errorf("parse config: %w", err)
-	}
-	var extra any
-	if err := decoder.Decode(&extra); err != io.EOF {
-		if err != nil {
-			return nil, fmt.Errorf("parse config: %w", err)
-		}
-		return nil, errors.New("parse config: multiple YAML documents are not allowed")
-	}
-	return &cfg, nil
+	return decodeConfig[T](data)
 }
 
 type meshYAMLIntegerNode struct {
@@ -327,7 +321,45 @@ func validateMeshIntegerData(data []byte, target reflect.Type) error {
 	if err := decoder.Decode(shadow.Interface()); err != nil && err != io.EOF {
 		return err
 	}
-	return validateMeshIntegerValues(shadow.Elem(), target, "")
+	if err := validateMeshIntegerValues(shadow.Elem(), target, ""); err != nil {
+		return err
+	}
+	if target == reflect.TypeFor[MeshServer]() {
+		return validateMeshInflightNull(data)
+	}
+	return nil
+}
+
+func validateMeshInflightNull(data []byte) error {
+	var document yaml.Node
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		return err
+	}
+	if len(document.Content) == 0 {
+		return nil
+	}
+	field := func(node *yaml.Node, name string) *yaml.Node {
+		if node == nil || node.Kind != yaml.MappingNode {
+			return nil
+		}
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			if node.Content[i].Value == name {
+				return node.Content[i+1]
+			}
+		}
+		return nil
+	}
+	listeners := field(field(document.Content[0], "ingress"), "listeners")
+	if listeners == nil || listeners.Kind != yaml.SequenceNode {
+		return nil
+	}
+	for i, listener := range listeners.Content {
+		limit := field(listener, "max_inflight_requests")
+		if limit != nil && limit.ShortTag() == "!!null" {
+			return fmt.Errorf("ingress.listeners[%d].max_inflight_requests must be an integer", i)
+		}
+	}
+	return nil
 }
 
 func meshYAMLShadowType(target reflect.Type) reflect.Type {
@@ -470,6 +502,18 @@ func (s *MeshServer) ApplyDefaults() {
 		s.Tunnel.Peering.Auth.ApplyDefaults()
 	}
 	s.ProbeScheduler.ApplyDefaults()
+	s.Tunnel.Capacity.ApplyDefaults()
+	for i := range s.Ingress.Listeners {
+		listener := &s.Ingress.Listeners[i]
+		listener.Capacity.ApplyDefaults()
+		if listener.Protocol != MeshIngressProtocolTLSPassthrough && listener.MaxInflightRequests == nil {
+			value := 128
+			listener.MaxInflightRequests = &value
+		} else if listener.MaxInflightRequests != nil && *listener.MaxInflightRequests == 0 {
+			value := 128
+			listener.MaxInflightRequests = &value
+		}
+	}
 	s.Limits.ApplyDefaults()
 }
 
@@ -499,10 +543,6 @@ func (p *MeshProbeScheduler) ApplyDefaults() {
 func (l *MeshServerLimits) ApplyDefaults() {
 	l.MaxClientGenerations = cmp.Or(l.MaxClientGenerations, DefaultMaxClientGenerations)
 	l.MaxPendingRegistrations = cmp.Or(l.MaxPendingRegistrations, DefaultMaxPendingRegistrations)
-	l.MaxTCPConnections = cmp.Or(l.MaxTCPConnections, DefaultMaxTCPConnections)
-	l.MaxPendingTCPSetups = cmp.Or(l.MaxPendingTCPSetups, DefaultMaxPendingTCPSetups)
-	l.MaxTCPConnectionsPerGeneration = cmp.Or(l.MaxTCPConnectionsPerGeneration, DefaultMaxTCPConnectionsPerGeneration)
-	l.MaxPendingTCPSetupsPerGeneration = cmp.Or(l.MaxPendingTCPSetupsPerGeneration, DefaultMaxPendingTCPSetupsPerGeneration)
 	l.MaxPeers = cmp.Or(l.MaxPeers, defaultMeshMaxPeers)
 	l.MaxGroups = cmp.Or(l.MaxGroups, defaultMeshMaxGroups)
 	l.MaxGroupDeclarationBytes = cmp.Or(l.MaxGroupDeclarationBytes, int64(defaultMeshMaxGroupDeclarationBytes))
@@ -512,6 +552,31 @@ func (l *MeshServerLimits) ApplyDefaults() {
 	l.MaxPathHops = cmp.Or(l.MaxPathHops, defaultMeshMaxPathHops)
 	l.MaxControlQueueMessages = cmp.Or(l.MaxControlQueueMessages, defaultMeshMaxControlQueueMessages)
 	l.MaxControlQueueBytes = cmp.Or(l.MaxControlQueueBytes, int64(defaultMeshMaxControlQueueBytes))
+}
+
+func (c *MeshTCPCapacity) ApplyDefaults() {
+	c.MaxTCPConnections = cmp.Or(c.MaxTCPConnections, DefaultMaxTCPConnections)
+	c.MaxPendingTCPSetups = cmp.Or(c.MaxPendingTCPSetups, DefaultMaxPendingTCPSetups)
+	c.MaxTCPConnectionsPerGeneration = cmp.Or(c.MaxTCPConnectionsPerGeneration, DefaultMaxTCPConnectionsPerGeneration)
+	c.MaxPendingTCPSetupsPerGeneration = cmp.Or(c.MaxPendingTCPSetupsPerGeneration, DefaultMaxPendingTCPSetupsPerGeneration)
+}
+
+func (c *MeshTCPCapacity) Validate(path string) error {
+	values := []struct {
+		name  string
+		value int
+	}{
+		{"max_tcp_connections", c.MaxTCPConnections},
+		{"max_pending_tcp_setups", c.MaxPendingTCPSetups},
+		{"max_tcp_connections_per_generation", c.MaxTCPConnectionsPerGeneration},
+		{"max_pending_tcp_setups_per_generation", c.MaxPendingTCPSetupsPerGeneration},
+	}
+	for _, value := range values {
+		if value.value < 0 {
+			return fmt.Errorf("%s.%s must not be negative", path, value.name)
+		}
+	}
+	return nil
 }
 
 func (g *MeshGroup) ApplyDefaults() {
@@ -570,6 +635,9 @@ func (s *MeshServer) Validate() error {
 		return err
 	}
 	if err := s.Tunnel.Quic.Validate("tunnel.quic"); err != nil {
+		return err
+	}
+	if err := s.Tunnel.Capacity.Validate("tunnel.capacity"); err != nil {
 		return err
 	}
 	if err := validateMeshTunnelSettings(s.Tunnel.HeartbeatInterval, s.Tunnel.HealthTimeout, s.Tunnel.TCPCopyBufferSize, "tunnel"); err != nil {
@@ -682,10 +750,6 @@ func (l *MeshServerLimits) Validate(path string) error {
 	}{
 		{"max_client_generations", int64(l.MaxClientGenerations)},
 		{"max_pending_registrations", int64(l.MaxPendingRegistrations)},
-		{"max_tcp_connections", int64(l.MaxTCPConnections)},
-		{"max_pending_tcp_setups", int64(l.MaxPendingTCPSetups)},
-		{"max_tcp_connections_per_generation", int64(l.MaxTCPConnectionsPerGeneration)},
-		{"max_pending_tcp_setups_per_generation", int64(l.MaxPendingTCPSetupsPerGeneration)},
 		{"max_peers", int64(l.MaxPeers)},
 		{"max_groups", int64(l.MaxGroups)},
 		{"max_group_declaration_bytes", l.MaxGroupDeclarationBytes},
@@ -700,18 +764,6 @@ func (l *MeshServerLimits) Validate(path string) error {
 		if value.value <= 0 {
 			return fmt.Errorf("%s.%s must be positive", path, value.name)
 		}
-	}
-	if l.MaxPendingTCPSetups > l.MaxTCPConnections {
-		return fmt.Errorf("%s.max_pending_tcp_setups must not exceed %s.max_tcp_connections", path, path)
-	}
-	if l.MaxTCPConnectionsPerGeneration > l.MaxTCPConnections {
-		return fmt.Errorf("%s.max_tcp_connections_per_generation must not exceed %s.max_tcp_connections", path, path)
-	}
-	if l.MaxPendingTCPSetupsPerGeneration > l.MaxTCPConnectionsPerGeneration {
-		return fmt.Errorf("%s.max_pending_tcp_setups_per_generation must not exceed %s.max_tcp_connections_per_generation", path, path)
-	}
-	if l.MaxPendingTCPSetupsPerGeneration > l.MaxPendingTCPSetups {
-		return fmt.Errorf("%s.max_pending_tcp_setups_per_generation must not exceed %s.max_pending_tcp_setups", path, path)
 	}
 	if l.MaxGroupDeclarationBytes > l.MaxTotalGroupDeclarationBytes {
 		return fmt.Errorf("%s.max_group_declaration_bytes must not exceed %s.max_total_group_declaration_bytes", path, path)
@@ -899,6 +951,9 @@ func (s *MeshServer) validateIngress() error {
 		if err := validateListenerAddress(listener.Address); err != nil {
 			return fmt.Errorf("%s.address: %w", path, err)
 		}
+		if err := listener.Capacity.Validate(path + ".capacity"); err != nil {
+			return err
+		}
 		switch listener.Protocol {
 		case MeshIngressProtocolHTTPS:
 			if len(listener.Certificates) == 0 {
@@ -910,6 +965,13 @@ func (s *MeshServer) validateIngress() error {
 			}
 		default:
 			return fmt.Errorf("%s.protocol must be http, https, or tls_passthrough", path)
+		}
+		if listener.Protocol == MeshIngressProtocolTLSPassthrough {
+			if listener.MaxInflightRequests != nil {
+				return fmt.Errorf("%s.max_inflight_requests is not valid for tls_passthrough", path)
+			}
+		} else if listener.MaxInflightRequests != nil && *listener.MaxInflightRequests < 0 {
+			return fmt.Errorf("%s.max_inflight_requests must not be negative", path)
 		}
 		for certificateIndex, certificate := range listener.Certificates {
 			certificatePath := fmt.Sprintf("%s.certificates[%d]", path, certificateIndex)

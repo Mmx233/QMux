@@ -32,24 +32,27 @@ func TestMeshDefaultsAndLimitsSchema(t *testing.T) {
 		t.Fatalf("probe scheduler defaults = %+v, want %+v", server.ProbeScheduler, wantScheduler)
 	}
 	wantLimits := MeshServerLimits{
-		MaxClientGenerations:             16,
-		MaxPendingRegistrations:          128,
-		MaxTCPConnections:                128,
-		MaxPendingTCPSetups:              128,
-		MaxTCPConnectionsPerGeneration:   100,
-		MaxPendingTCPSetupsPerGeneration: 16,
-		MaxPeers:                         32,
-		MaxGroups:                        1024,
-		MaxGroupDeclarationBytes:         1 << 20,
-		MaxTotalGroupDeclarationBytes:    64 << 20,
-		MaxPathsPerGroup:                 256,
-		MaxTotalPaths:                    16384,
-		MaxPathHops:                      16,
-		MaxControlQueueMessages:          1024,
-		MaxControlQueueBytes:             16 << 20,
+		MaxClientGenerations:          16,
+		MaxPendingRegistrations:       128,
+		MaxPeers:                      32,
+		MaxGroups:                     1024,
+		MaxGroupDeclarationBytes:      1 << 20,
+		MaxTotalGroupDeclarationBytes: 64 << 20,
+		MaxPathsPerGroup:              256,
+		MaxTotalPaths:                 16384,
+		MaxPathHops:                   16,
+		MaxControlQueueMessages:       1024,
+		MaxControlQueueBytes:          16 << 20,
 	}
 	if server.Limits != wantLimits {
 		t.Fatalf("server limits defaults = %+v, want %+v", server.Limits, wantLimits)
+	}
+	wantCapacity := MeshTCPCapacity{128, 128, 100, 16}
+	if server.Tunnel.Capacity != wantCapacity || server.Ingress.Listeners[0].Capacity != wantCapacity {
+		t.Fatalf("source capacity defaults = tunnel %+v, ingress %+v", server.Tunnel.Capacity, server.Ingress.Listeners[0].Capacity)
+	}
+	if got := server.Ingress.Listeners[0].MaxInflightRequests; got == nil || *got != 128 {
+		t.Fatalf("HTTP in-flight default = %v", got)
 	}
 
 	client := validMeshClient()
@@ -64,9 +67,7 @@ func TestMeshDefaultsAndLimitsSchema(t *testing.T) {
 
 	limitsType := reflect.TypeFor[MeshServerLimits]()
 	wantKeys := []string{
-		"max_client_generations", "max_pending_registrations", "max_tcp_connections",
-		"max_pending_tcp_setups", "max_tcp_connections_per_generation",
-		"max_pending_tcp_setups_per_generation", "max_peers", "max_groups",
+		"max_client_generations", "max_pending_registrations", "max_peers", "max_groups",
 		"max_group_declaration_bytes", "max_total_group_declaration_bytes",
 		"max_paths_per_group", "max_total_paths", "max_path_hops",
 		"max_control_queue_messages", "max_control_queue_bytes",
@@ -77,6 +78,14 @@ func TestMeshDefaultsAndLimitsSchema(t *testing.T) {
 	}
 	if !slices.Equal(gotKeys, wantKeys) {
 		t.Fatalf("mesh limits YAML keys = %q, want %q", gotKeys, wantKeys)
+	}
+	capacityType := reflect.TypeFor[MeshTCPCapacity]()
+	wantCapacityKeys := []string{"max_tcp_connections", "max_pending_tcp_setups", "max_tcp_connections_per_generation", "max_pending_tcp_setups_per_generation"}
+	for i := range capacityType.NumField() {
+		field := capacityType.Field(i)
+		if field.Tag.Get("yaml") != wantCapacityKeys[i] {
+			t.Fatalf("TCP capacity field %d = %q, want %q", i, field.Tag.Get("yaml"), wantCapacityKeys[i])
+		}
 	}
 }
 
@@ -90,11 +99,20 @@ func TestMeshTypedLoadersStrictness(t *testing.T) {
 		{"server unknown field", validMeshServerYAML() + "unknown: true\n", loadMeshServerError, "field unknown not found"},
 		{"client unknown field", validMeshClientYAML() + "unknown: true\n", loadMeshClientError, "field unknown not found"},
 		{"server UDP capacity key", strings.Replace(validMeshServerYAML(), "  max_peers: 2\n", "  max_peers: 2\n  max_udp_sessions: 2\n", 1), loadMeshServerError, "field max_udp_sessions not found"},
+		{"tunnel UDP capacity key", strings.Replace(validMeshServerYAML(), "  peering:\n", "  capacity:\n    max_udp_sessions: 2\n  peering:\n", 1), loadMeshServerError, "field max_udp_sessions not found"},
 		{"multiple server documents", validMeshServerYAML() + "---\nserver_id: other\n", loadMeshServerError, "multiple YAML documents"},
 		{"multiple client documents", validMeshClientYAML() + "---\ninstance_id: other\n", loadMeshClientError, "multiple YAML documents"},
 		{"client file as server", validMeshClientYAML(), loadMeshServerError, "field instance_id not found"},
 		{"server file as client", validMeshServerYAML(), loadMeshClientError, "field server_id not found"},
 		{"integer overflow", strings.Replace(validMeshServerYAML(), "  max_peers: 2", "  max_peers: 9223372036854775808", 1), loadMeshServerError, "parse config"},
+	}
+	for _, field := range []string{"max_tcp_connections", "max_pending_tcp_setups", "max_tcp_connections_per_generation", "max_pending_tcp_setups_per_generation"} {
+		tests = append(tests, struct {
+			name    string
+			content string
+			load    func(string) error
+			want    string
+		}{"old TCP limit " + field, strings.Replace(validMeshServerYAML(), "  max_peers: 2\n", "  max_peers: 2\n  "+field+": 2\n", 1), loadMeshServerError, "field " + field + " not found"})
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -118,6 +136,24 @@ func TestMeshTypedLoadersStrictness(t *testing.T) {
 	if client.Group.OutdatedClientPolicy != MeshOutdatedClientPolicyApplyLatestRules || len(client.Group.CanonicalBytes()) == 0 {
 		t.Fatalf("loaded client defaults/canonical = %+v", client.Group)
 	}
+}
+
+func TestMeshSourceCapacityYAML(t *testing.T) {
+	content := strings.Replace(validMeshServerYAML(), "  peering:\n", "  capacity:\n    max_tcp_connections: 1\n    max_pending_tcp_setups: 2\n    max_tcp_connections_per_generation: 3\n    max_pending_tcp_setups_per_generation: 4\n  peering:\n", 1)
+	content = strings.Replace(content, "limits:\n", "ingress:\n  listeners:\n    - address: 127.0.0.1:8080\n      protocol: http\n      max_inflight_requests: 0\n      capacity:\n        max_tcp_connections: 4\n        max_pending_tcp_setups: 3\n        max_tcp_connections_per_generation: 2\n        max_pending_tcp_setups_per_generation: 1\nlimits:\n", 1)
+	server, err := LoadMeshServerConfig(writeTestConfig(t, content))
+	if err != nil {
+		t.Fatalf("load source capacity: %v", err)
+	}
+	if got := server.Tunnel.Capacity; got != (MeshTCPCapacity{1, 2, 3, 4}) {
+		t.Fatalf("tunnel capacity = %+v", got)
+	}
+	listener := server.Ingress.Listeners[0]
+	if listener.Capacity != (MeshTCPCapacity{4, 3, 2, 1}) || listener.MaxInflightRequests == nil || *listener.MaxInflightRequests != 128 {
+		t.Fatalf("listener capacity = %+v", listener)
+	}
+	content = strings.Replace(content, "protocol: http", "protocol: tls_passthrough", 1)
+	assertMeshValidationError(t, loadMeshServerError(writeTestConfig(t, content)), "max_inflight_requests is not valid")
 }
 
 func TestMeshTypedLoadersRejectInvalidValues(t *testing.T) {
@@ -223,6 +259,18 @@ func TestMeshTypedLoadersRejectInvalidIntegerScalars(t *testing.T) {
 			loadMeshServerError,
 			"tunnel.listen.tls.session_ticket_encryption_key_rotation_overlap must be an unsigned 8-bit integer",
 		},
+		{
+			"HTTP in-flight float",
+			strings.Replace(validMeshServerYAML(), "limits:\n", "ingress:\n  listeners:\n    - address: 127.0.0.1:8080\n      protocol: http\n      max_inflight_requests: 1.5\nlimits:\n", 1),
+			loadMeshServerError,
+			"ingress.listeners[0].max_inflight_requests must be an integer",
+		},
+		{
+			"TLS passthrough in-flight null",
+			strings.Replace(validMeshServerYAML(), "limits:\n", "ingress:\n  listeners:\n    - address: 127.0.0.1:8444\n      protocol: tls_passthrough\n      max_inflight_requests: null\nlimits:\n", 1),
+			loadMeshServerError,
+			"ingress.listeners[0].max_inflight_requests must be an integer",
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -240,6 +288,13 @@ func TestMeshTypedLoadersRejectInvalidIntegerScalars(t *testing.T) {
 		{"tunnel copy buffer", strings.Replace(validMeshServerYAML(), "  peering:\n", "  tcp_copy_buffer_size: 1.5\n  peering:\n", 1), "tunnel.tcp_copy_buffer_size"},
 		{"peer metric", strings.Replace(validMeshServerYAML(), "      - server_id: edge-b", "      - server_id: edge-b\n        metric: 1.5", 1), "tunnel.peering.peers[0].metric"},
 		{"STEK overlap", strings.Replace(validMeshServerYAML(), "      server_key_file: server-key.pem", "      server_key_file: server-key.pem\n      session_ticket_encryption_key_rotation_overlap: 1.5", 1), "tunnel.listen.tls.session_ticket_encryption_key_rotation_overlap"},
+	}
+	for _, field := range []string{"max_tcp_connections", "max_pending_tcp_setups", "max_tcp_connections_per_generation", "max_pending_tcp_setups_per_generation"} {
+		serverFields = append(serverFields, struct {
+			name    string
+			content string
+			path    string
+		}{"tunnel capacity " + field, strings.Replace(validMeshServerYAML(), "  peering:\n", "  capacity:\n    "+field+": 1.5\n  peering:\n", 1), "tunnel.capacity." + field})
 	}
 	for _, field := range []string{"initial_stream_receive_window", "max_stream_receive_window", "initial_connection_receive_window", "max_connection_receive_window", "max_incoming_streams"} {
 		serverFields = append(serverFields, struct {
@@ -260,9 +315,7 @@ func TestMeshTypedLoadersRejectInvalidIntegerScalars(t *testing.T) {
 		}{"scheduler " + field, validMeshServerYAML() + "probe_scheduler:\n  " + field + ": 1.5\n", "probe_scheduler." + field})
 	}
 	for _, field := range []string{
-		"max_client_generations", "max_pending_registrations", "max_tcp_connections",
-		"max_pending_tcp_setups", "max_tcp_connections_per_generation",
-		"max_pending_tcp_setups_per_generation", "max_peers", "max_groups",
+		"max_client_generations", "max_pending_registrations", "max_peers", "max_groups",
 		"max_group_declaration_bytes", "max_total_group_declaration_bytes",
 		"max_paths_per_group", "max_total_paths", "max_path_hops",
 		"max_control_queue_messages", "max_control_queue_bytes",
@@ -477,6 +530,15 @@ func TestMeshServerSocketAndIngressValidation(t *testing.T) {
 			s.Ingress.Listeners[0].Protocol = MeshIngressProtocolTLSPassthrough
 			s.Ingress.Listeners[0].Certificates = []MeshIngressCertificate{{CertFile: "cert.pem", KeyFile: "key.pem"}}
 		}, "only valid for https"},
+		{"TLS passthrough with explicit in-flight zero", func(s *MeshServer) {
+			s.Ingress.Listeners[0].Protocol = MeshIngressProtocolTLSPassthrough
+			zero := 0
+			s.Ingress.Listeners[0].MaxInflightRequests = &zero
+		}, "max_inflight_requests is not valid"},
+		{"HTTP negative in-flight", func(s *MeshServer) {
+			negative := -1
+			s.Ingress.Listeners[0].MaxInflightRequests = &negative
+		}, "max_inflight_requests must not be negative"},
 		{"incomplete certificate", func(s *MeshServer) {
 			s.Ingress.Listeners[0].Protocol = MeshIngressProtocolHTTPS
 			s.Ingress.Listeners[0].Certificates = []MeshIngressCertificate{{CertFile: "cert.pem"}}
@@ -527,17 +589,6 @@ func TestMeshSchedulerAndLimitsValidation(t *testing.T) {
 		want string
 	}{
 		{"negative", func(l *MeshServerLimits) { l.MaxGroups = -1 }, "limits.max_groups"},
-		{"pending exceeds connections", func(l *MeshServerLimits) { l.MaxTCPConnections = 4; l.MaxPendingTCPSetups = 5 }, "max_pending_tcp_setups must not exceed"},
-		{"generation connections exceed total", func(l *MeshServerLimits) {
-			l.MaxTCPConnections = 4
-			l.MaxPendingTCPSetups = 4
-			l.MaxTCPConnectionsPerGeneration = 5
-		}, "max_tcp_connections_per_generation must not exceed"},
-		{"generation pending exceeds generation connections", func(l *MeshServerLimits) {
-			l.MaxTCPConnectionsPerGeneration = 4
-			l.MaxPendingTCPSetupsPerGeneration = 5
-		}, "max_pending_tcp_setups_per_generation must not exceed limits.max_tcp_connections_per_generation"},
-		{"generation pending exceeds total pending", func(l *MeshServerLimits) { l.MaxPendingTCPSetups = 4; l.MaxPendingTCPSetupsPerGeneration = 5 }, "max_pending_tcp_setups_per_generation must not exceed limits.max_pending_tcp_setups"},
 		{"group declaration exceeds total", func(l *MeshServerLimits) { l.MaxGroupDeclarationBytes = 5; l.MaxTotalGroupDeclarationBytes = 4 }, "max_group_declaration_bytes must not exceed"},
 		{"group paths exceed total", func(l *MeshServerLimits) { l.MaxPathsPerGroup = 5; l.MaxTotalPaths = 4 }, "max_paths_per_group must not exceed"},
 	}
@@ -547,6 +598,30 @@ func TestMeshSchedulerAndLimitsValidation(t *testing.T) {
 			test.edit(&limits)
 			assertMeshValidationError(t, limits.Validate("limits"), test.want)
 		})
+	}
+	for _, field := range []struct {
+		name string
+		edit func(*MeshTCPCapacity)
+	}{
+		{"max_tcp_connections", func(c *MeshTCPCapacity) { c.MaxTCPConnections = -1 }},
+		{"max_pending_tcp_setups", func(c *MeshTCPCapacity) { c.MaxPendingTCPSetups = -1 }},
+		{"max_tcp_connections_per_generation", func(c *MeshTCPCapacity) { c.MaxTCPConnectionsPerGeneration = -1 }},
+		{"max_pending_tcp_setups_per_generation", func(c *MeshTCPCapacity) { c.MaxPendingTCPSetupsPerGeneration = -1 }},
+	} {
+		t.Run("negative "+field.name, func(t *testing.T) {
+			server := validMeshServer()
+			field.edit(&server.Tunnel.Capacity)
+			assertMeshValidationError(t, server.Validate(), "tunnel.capacity."+field.name)
+			server = validMeshServer()
+			field.edit(&server.Ingress.Listeners[0].Capacity)
+			assertMeshValidationError(t, server.Validate(), "ingress.listeners[0].capacity."+field.name)
+		})
+	}
+	server := validMeshServer()
+	server.Tunnel.Capacity = MeshTCPCapacity{1, 2, 3, 4}
+	server.Ingress.Listeners[0].Capacity = MeshTCPCapacity{4, 3, 2, 1}
+	if err := server.Validate(); err != nil {
+		t.Fatalf("independent out-of-order TCP limits: %v", err)
 	}
 
 	for _, count := range []int{defaultMeshMaxPeers, defaultMeshMaxPeers + 1} {

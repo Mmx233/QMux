@@ -16,7 +16,10 @@ func LoadConfig[T any](path string) (*T, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read config file: %w", err)
 	}
+	return decodeConfig[T](data)
+}
 
+func decodeConfig[T any](data []byte) (*T, error) {
 	var cfg T
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
 	decoder.KnownFields(true)

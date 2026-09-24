@@ -64,6 +64,10 @@ type Generation struct {
 	groupID    string
 	peerID     string
 	owner      Owner
+	forwarding ForwardingEligibility
+	l7Health   InstanceL7Health
+	inflight   int
+	traffic    map[*tcpSource]*generationTraffic
 }
 
 func (g *Generation) ID() uint64 { return g.id }
@@ -146,21 +150,24 @@ type Registry struct {
 	// shard by identity only if registration contention is measured.
 	mu sync.Mutex
 
-	closed       bool
-	stopDone     chan struct{}
-	changed      chan struct{}
-	nextID       uint64
-	nextArbID    uint64
-	maxPending   int
-	maxClients   int
-	maxPeers     int
-	clientHigh   int
-	peerHigh     int
-	pendingHigh  int
-	all          map[uint64]*Generation
-	clients      map[string]*clientEntry
-	peers        map[string]*peerEntry
-	arbitrations map[string]*Arbitration
+	closed         bool
+	stopDone       chan struct{}
+	changed        chan struct{}
+	nextID         uint64
+	nextArbID      uint64
+	maxPending     int
+	maxClients     int
+	maxPeers       int
+	clientHigh     int
+	peerHigh       int
+	pendingHigh    int
+	all            map[uint64]*Generation
+	clients        map[string]*clientEntry
+	peers          map[string]*peerEntry
+	arbitrations   map[string]*Arbitration
+	groupAvailable map[string]bool
+	groupChanged   chan struct{}
+	roundRobin     map[string]uint64
 }
 
 type RegistrySnapshot struct {
@@ -187,15 +194,18 @@ type RegistrySnapshot struct {
 
 func NewRegistry(maxPending, maxClients, maxPeers int) *Registry {
 	return &Registry{
-		maxPending:   maxPending,
-		maxClients:   maxClients,
-		maxPeers:     maxPeers,
-		stopDone:     make(chan struct{}),
-		changed:      make(chan struct{}),
-		all:          make(map[uint64]*Generation),
-		clients:      make(map[string]*clientEntry),
-		peers:        make(map[string]*peerEntry),
-		arbitrations: make(map[string]*Arbitration),
+		maxPending:     maxPending,
+		maxClients:     maxClients,
+		maxPeers:       maxPeers,
+		stopDone:       make(chan struct{}),
+		changed:        make(chan struct{}),
+		all:            make(map[uint64]*Generation),
+		clients:        make(map[string]*clientEntry),
+		peers:          make(map[string]*peerEntry),
+		arbitrations:   make(map[string]*Arbitration),
+		groupAvailable: make(map[string]bool),
+		groupChanged:   make(chan struct{}),
+		roundRobin:     make(map[string]uint64),
 	}
 }
 
@@ -457,6 +467,9 @@ func (r *Registry) BeginRetire(generation *Generation) bool {
 		r.unlinkActiveLocked(generation)
 		generation.phase = PhaseRetiring
 		r.addRetiringLocked(generation)
+		if generation.role == RoleClient {
+			r.refreshGroupLocked(generation.groupID)
+		}
 		r.signalLocked()
 		return true
 	case PhaseRetiring:
@@ -486,8 +499,15 @@ func (r *Registry) Release(generation *Generation) bool {
 			return true
 		}
 	}
+	groupID := ""
+	if generation != nil && generation.registry == r && generation.role == RoleClient {
+		groupID = generation.groupID
+	}
 	removed := r.removeLocked(generation)
 	if removed {
+		if groupID != "" {
+			r.refreshGroupLocked(groupID)
+		}
 		r.signalLocked()
 	}
 	return removed
@@ -571,6 +591,8 @@ func (r *Registry) Stop() {
 		return
 	}
 	r.closed = true
+	clear(r.groupAvailable)
+	close(r.groupChanged)
 	clear(r.arbitrations)
 	r.signalLocked()
 	generations := make([]*Generation, 0, len(r.all))
