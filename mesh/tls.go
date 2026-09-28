@@ -60,7 +60,7 @@ func newOutboundTLSReloader(
 	logger zerolog.Logger,
 ) (*tlsreload.Reloader, error) {
 	paths := tlsreload.Paths{CAFile: tlsConfig.CACertFile}
-	if tlsConfig.ClientCertFile != "" || tlsConfig.ClientKeyFile != "" {
+	if authConfig.Method == "" || authConfig.Method == config.ClientAuthMethodMTLS {
 		paths.CertFile = tlsConfig.ClientCertFile
 		paths.KeyFile = tlsConfig.ClientKeyFile
 	}

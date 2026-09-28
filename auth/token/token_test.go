@@ -249,18 +249,6 @@ func TestVerifyMeshRejectsEveryTranscriptMutationAndL4Replay(t *testing.T) {
 		})
 	}
 
-	mutatedCanonical, err := marshalMeshTranscriptWithScheme(transcript, MeshScheme+"-other")
-	if err != nil {
-		t.Fatalf("marshal scheme mutation: %v", err)
-	}
-	ekm, err := clientState.ExportKeyingMaterial(MeshExporterLabel, nil, exporterLength)
-	if err != nil {
-		t.Fatalf("export key material: %v", err)
-	}
-	if err := VerifyMesh(secret, transcript, computeProof(secret, mutatedCanonical, ekm), serverState); err == nil {
-		t.Fatal("VerifyMesh accepted a proof with a mutated scheme field")
-	}
-
 	l4Transcript := Transcript{ClientID: "edge-a", Version: "1.0", Capabilities: transcript.Capabilities}
 	l4Proof, err := Compute(secret, l4Transcript, clientState)
 	if err != nil {

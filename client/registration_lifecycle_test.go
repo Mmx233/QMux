@@ -16,6 +16,7 @@ import (
 
 	certgen "github.com/Mmx233/QMux/cmd/generate/certs"
 	"github.com/Mmx233/QMux/config"
+	"github.com/Mmx233/QMux/internal/outbound"
 	"github.com/Mmx233/QMux/protocol"
 	"github.com/quic-go/quic-go"
 	"github.com/rs/zerolog"
@@ -221,7 +222,7 @@ func newLifecycleManager(t *testing.T, peer *lifecyclePeer) *ConnectionManager {
 	if err != nil {
 		t.Fatalf("create connection manager: %v", err)
 	}
-	cm.tlsState.Store(&clientTLSState{baseTLSConfig: peer.clientTLS.Clone(), sessionCaches: NewSessionCacheManager()})
+	cm.tlsState.Store(&clientTLSState{baseTLSConfig: peer.clientTLS.Clone(), sessionCaches: outbound.NewSessionCacheManager()})
 	cm.quicConfig = &quic.Config{
 		HandshakeIdleTimeout: 10 * time.Second,
 		MaxIdleTimeout:       30 * time.Second,
@@ -307,44 +308,6 @@ func TestRegistrationIOErrorPreservesContextAndTransportCauses(t *testing.T) {
 			t.Fatalf("error does not preserve transport cause: %v", err)
 		}
 	})
-}
-
-func TestPreferredServerIP(t *testing.T) {
-	tests := []struct {
-		name      string
-		addresses []net.IPAddr
-		wantIP    string
-		wantZone  string
-	}{
-		{
-			name: "IPv4 preferred after IPv6",
-			addresses: []net.IPAddr{
-				{IP: net.ParseIP("2001:db8::1")},
-				{IP: net.ParseIP("192.0.2.10")},
-			},
-			wantIP: "192.0.2.10",
-		},
-		{
-			name:      "IPv6 only",
-			addresses: []net.IPAddr{{IP: net.ParseIP("2001:db8::2")}},
-			wantIP:    "2001:db8::2",
-		},
-		{
-			name:      "zoned IPv6",
-			addresses: []net.IPAddr{{IP: net.ParseIP("fe80::1"), Zone: "en0"}},
-			wantIP:    "fe80::1",
-			wantZone:  "en0",
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			got := preferredServerIP(test.addresses)
-			if got.IP.String() != test.wantIP || got.Zone != test.wantZone {
-				t.Fatalf("preferred address = %s zone %q, want %s zone %q", got.IP, got.Zone, test.wantIP, test.wantZone)
-			}
-		})
-	}
 }
 
 func TestResolveServerAddressPreservesIPLiteral(t *testing.T) {

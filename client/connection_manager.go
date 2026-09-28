@@ -19,8 +19,6 @@ import (
 )
 
 const (
-	initialReconnectDelay           = outbound.InitialReconnectDelay
-	maxReconnectDelay               = outbound.MaxReconnectDelay
 	reconnectStableGrace            = outbound.ReconnectStableGrace
 	maxReconnectStage               = outbound.MaxReconnectStage
 	defaultConnectionAttemptTimeout = outbound.AttemptTimeout
@@ -62,7 +60,7 @@ type ConnectionManager struct {
 
 type clientTLSState struct {
 	baseTLSConfig       *tls.Config
-	sessionCaches       *SessionCacheManager
+	sessionCaches       *outbound.SessionCacheManager
 	certificateNotAfter time.Time
 	caNotAfter          time.Time
 }
@@ -136,7 +134,7 @@ func NewConnectionManager(cfg *config.Client, logger zerolog.Logger) (*Connectio
 		}
 		cm.tlsState.Store(&clientTLSState{
 			baseTLSConfig:       baseTLSConfig,
-			sessionCaches:       NewSessionCacheManager(),
+			sessionCaches:       outbound.NewSessionCacheManager(),
 			certificateNotAfter: bundle.CertificateNotAfter,
 			caNotAfter:          bundle.CANotAfter,
 		})
@@ -717,7 +715,7 @@ func (cm *ConnectionManager) TotalCount() int {
 
 // SessionCacheManager returns the session cache manager.
 // This is useful for testing session cache persistence.
-func (cm *ConnectionManager) SessionCacheManager() *SessionCacheManager {
+func (cm *ConnectionManager) SessionCacheManager() *outbound.SessionCacheManager {
 	state := cm.tlsState.Load()
 	if state == nil {
 		return nil

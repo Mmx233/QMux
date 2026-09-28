@@ -228,7 +228,7 @@ func (c *Client) endpointWorker(ctx context.Context, endpoint *clientEndpointSta
 			endpoint.lifecycle.AdvanceRetry(stage, outbound.MaxReconnectStage)
 			c.publishMu.Unlock()
 		}
-		_, err := c.runEndpointAttempt(ctx, endpoint)
+		err := c.runEndpointAttempt(ctx, endpoint)
 		if err != nil && ctx.Err() == nil {
 			c.logger.Debug().Str("server_id", endpoint.endpoint.ServerID).Err(err).Msg("mesh client connection ended")
 		}
@@ -242,20 +242,21 @@ func (c *Client) endpointWorker(ctx context.Context, endpoint *clientEndpointSta
 func (c *Client) runEndpointAttempt(
 	ctx context.Context,
 	endpoint *clientEndpointState,
-) (stable bool, resultErr error) {
+) (resultErr error) {
 	attemptCtx, cancel := outbound.AttemptContext(ctx, ctx, c.attemptTimeout)
 	owner := outbound.NewOwner(cancel)
 	var session *Session
 	defer func() {
 		c.publishMu.Lock()
-		exactCurrent := session != nil && endpoint.lifecycle.RetireForReconnect(session, session.ReconnectStable())
-		stable = exactCurrent && session.ReconnectStable()
+		if session != nil {
+			endpoint.lifecycle.RetireForReconnect(session, session.ReconnectStable())
+		}
 		c.publishMu.Unlock()
 		owner.Finish()
 	}()
 	state := c.tlsState.Load()
 	if state == nil {
-		return false, errors.New("mesh client TLS state is unavailable")
+		return errors.New("mesh client TLS state is unavailable")
 	}
 	configured := endpoint.endpoint
 	conn, err := outbound.Dial(
@@ -267,7 +268,7 @@ func (c *Client) runEndpointAttempt(
 		c.config.Tunnel.Quic.GetConfig(),
 	)
 	if err != nil {
-		return false, err
+		return err
 	}
 	installConnectionOwner(owner, conn)
 	registration := protocol.MeshRegister{
@@ -280,7 +281,7 @@ func (c *Client) runEndpointAttempt(
 	}
 	stream, _, err := outboundRegistration(attemptCtx, conn, registration, c.config.Tunnel.Auth, c.declaration, nil, nil, config.MeshServerLimits{}, nil)
 	if err != nil {
-		return false, err
+		return err
 	}
 	owner.Cancel()
 	session = newSession(
@@ -299,16 +300,16 @@ func (c *Client) runEndpointAttempt(
 	c.publishMu.Lock()
 	if c.closed || ctx.Err() != nil || !endpoint.lifecycle.Publish(session) {
 		c.publishMu.Unlock()
-		return false, errors.New("mesh client publication gate is closed")
+		return errors.New("mesh client publication gate is closed")
 	}
 	c.publishMu.Unlock()
 
 	if !outbound.DeliverThenStart(ctx, conn.Context(), c.sessions, session, func() {
 		resultErr = session.run(c.config.Tunnel.HeartbeatInterval, c.config.Tunnel.HealthTimeout)
 	}) {
-		return false, context.Cause(ctx)
+		return context.Cause(ctx)
 	}
-	return false, resultErr
+	return resultErr
 }
 
 func (c *Client) closePublishing() {

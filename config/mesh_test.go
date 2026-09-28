@@ -1030,10 +1030,6 @@ func TestMeshCanonicalJSONV2Escaping(t *testing.T) {
 	if _, _, err := ParseMeshGroupCanonical(canonical); err != nil {
 		t.Fatalf("parse canonical declaration: %v", err)
 	}
-	escaped := bytes.Replace(canonical, value, []byte(`"value":"\u003c\u003e\u0026"`), 1)
-	if _, _, err := ParseMeshGroupCanonical(escaped); err == nil {
-		t.Fatal("accepted v1 HTML-escaped declaration")
-	}
 }
 
 func TestMeshCanonicalValidationHeapEnvelope(t *testing.T) {

@@ -39,17 +39,6 @@ func (m *SessionCacheManager) GetOrCreate(address string) tls.ClientSessionCache
 	return cache.(tls.ClientSessionCache)
 }
 
-func (m *SessionCacheManager) Get(address string) tls.ClientSessionCache {
-	if cache, ok := m.caches.Load(address); ok {
-		return cache.(tls.ClientSessionCache)
-	}
-	return nil
-}
-
-func (m *SessionCacheManager) Clear(address string) {
-	m.caches.Delete(address)
-}
-
 func (m *SessionCacheManager) Count() int {
 	count := 0
 	m.caches.Range(func(_, _ any) bool {
@@ -57,15 +46,6 @@ func (m *SessionCacheManager) Count() int {
 		return true
 	})
 	return count
-}
-
-func (m *SessionCacheManager) Addresses() []string {
-	var addresses []string
-	m.caches.Range(func(key, _ any) bool {
-		addresses = append(addresses, key.(string))
-		return true
-	})
-	return addresses
 }
 
 // ResolveAddress resolves one hostname while preserving the original host for

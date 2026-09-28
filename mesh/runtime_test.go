@@ -326,6 +326,45 @@ func TestMeshClientServerRealQUICAuthentication(t *testing.T) {
 	}
 }
 
+func TestMeshTokenModeOmitsConfiguredClientIdentity(t *testing.T) {
+	files := testMeshMaterial(t)
+	missing := t.TempDir()
+	certFile := filepath.Join(missing, "missing-client.crt")
+	keyFile := filepath.Join(missing, "missing-client.key")
+
+	t.Run("client", func(t *testing.T) {
+		cfg := testMeshClientConfig("instance-a", "group-a", config.ClientAuthMethodToken, files,
+			[]config.MeshServerEndpoint{{ServerID: "edge-a", Address: reserveMeshUDPAddress(t), ServerName: "localhost"}})
+		cfg.Tunnel.TLS.ClientCertFile = certFile
+		cfg.Tunnel.TLS.ClientKeyFile = keyFile
+		cfg.Tunnel.TLS.AutoReload = true
+		client, err := NewClient(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = client.Stop() })
+		if state := client.tlsState.Load(); state == nil || state.baseTLSConfig.RootCAs == nil || len(state.baseTLSConfig.Certificates) != 0 {
+			t.Fatalf("token client TLS state = %+v", state)
+		}
+	})
+
+	t.Run("outbound peer", func(t *testing.T) {
+		cfg := testMeshServerConfig("edge-a", reserveMeshUDPAddress(t), config.ClientAuthMethodToken, files,
+			[]config.MeshPeer{{ServerID: "edge-b", Address: reserveMeshUDPAddress(t), ServerName: "localhost"}}, 1)
+		cfg.Tunnel.Peering.TLS.ClientCertFile = certFile
+		cfg.Tunnel.Peering.TLS.ClientKeyFile = keyFile
+		cfg.Tunnel.Peering.TLS.AutoReload = true
+		server, err := NewServer(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = server.Stop() })
+		if state := server.outboundTLS.Load(); state == nil || state.baseTLSConfig.RootCAs == nil || len(state.baseTLSConfig.Certificates) != 0 {
+			t.Fatalf("token peer TLS state = %+v", state)
+		}
+	})
+}
+
 func TestMeshPublishedSessionOutlivesAttemptDeadline(t *testing.T) {
 	files := testMeshMaterial(t)
 	address := reserveMeshUDPAddress(t)

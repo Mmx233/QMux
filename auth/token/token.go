@@ -119,76 +119,37 @@ func VerifyMesh(secret []byte, transcript MeshTranscript, proof []byte, state tl
 }
 
 func marshalTranscript(transcript Transcript) ([]byte, error) {
-	fields := []string{proofDomain, Scheme, transcript.ClientID, transcript.Version}
-	total := uint64(4) // Capability count.
-	for _, field := range fields {
-		var err error
-		total, err = addEncodedStringSize(total, field)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if uint64(len(transcript.Capabilities)) > math.MaxUint32 {
-		return nil, errors.New("too many capabilities to encode")
-	}
-
-	seen := make(map[string]struct{}, len(transcript.Capabilities))
-	for _, capability := range transcript.Capabilities {
-		if _, exists := seen[capability]; exists {
-			return nil, fmt.Errorf("duplicate capability %q", capability)
-		}
-		seen[capability] = struct{}{}
-
-		var err error
-		total, err = addEncodedStringSize(total, capability)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if total > uint64(maxInt()) {
-		return nil, errors.New("token transcript is too large to encode")
-	}
-
-	var canonical bytes.Buffer
-	canonical.Grow(int(total))
-	for _, field := range fields {
-		writeString(&canonical, field)
-	}
-	var count [4]byte
-	binary.BigEndian.PutUint32(count[:], uint32(len(transcript.Capabilities)))
-	canonical.Write(count[:])
-	for _, capability := range transcript.Capabilities {
-		writeString(&canonical, capability)
-	}
-	return canonical.Bytes(), nil
+	return marshalTokenTranscript(
+		[]string{proofDomain, Scheme, transcript.ClientID, transcript.Version},
+		transcript.Capabilities,
+		nil,
+	)
 }
 
 func marshalMeshTranscript(transcript MeshTranscript) ([]byte, error) {
-	return marshalMeshTranscriptWithScheme(transcript, MeshScheme)
+	return marshalTokenTranscript(
+		[]string{meshProofDomain, MeshScheme, transcript.Version},
+		transcript.Capabilities,
+		[]string{transcript.Role, transcript.TargetServerID, transcript.PeerServerID, transcript.InstanceID, transcript.GroupID},
+	)
 }
 
-func marshalMeshTranscriptWithScheme(transcript MeshTranscript, scheme string) ([]byte, error) {
-	prefix := []string{meshProofDomain, scheme, transcript.Version}
-	suffix := []string{
-		transcript.Role,
-		transcript.TargetServerID,
-		transcript.PeerServerID,
-		transcript.InstanceID,
-		transcript.GroupID,
-	}
-	total := uint64(4)
-	for _, field := range append(append([]string(nil), prefix...), suffix...) {
-		var err error
-		total, err = addEncodedStringSize(total, field)
-		if err != nil {
-			return nil, err
+func marshalTokenTranscript(prefix, capabilities, suffix []string) ([]byte, error) {
+	total := uint64(4) // Capability count.
+	for _, fields := range [2][]string{prefix, suffix} {
+		for _, field := range fields {
+			var err error
+			total, err = addEncodedStringSize(total, field)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
-	if uint64(len(transcript.Capabilities)) > math.MaxUint32 {
+	if uint64(len(capabilities)) > math.MaxUint32 {
 		return nil, errors.New("too many capabilities to encode")
 	}
-	seen := make(map[string]struct{}, len(transcript.Capabilities))
-	for _, capability := range transcript.Capabilities {
+	seen := make(map[string]struct{}, len(capabilities))
+	for _, capability := range capabilities {
 		if _, exists := seen[capability]; exists {
 			return nil, fmt.Errorf("duplicate capability %q", capability)
 		}
@@ -209,9 +170,9 @@ func marshalMeshTranscriptWithScheme(transcript MeshTranscript, scheme string) (
 		writeString(&canonical, field)
 	}
 	var count [4]byte
-	binary.BigEndian.PutUint32(count[:], uint32(len(transcript.Capabilities)))
+	binary.BigEndian.PutUint32(count[:], uint32(len(capabilities)))
 	canonical.Write(count[:])
-	for _, capability := range transcript.Capabilities {
+	for _, capability := range capabilities {
 		writeString(&canonical, capability)
 	}
 	for _, field := range suffix {

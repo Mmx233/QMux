@@ -734,6 +734,9 @@ func TestMeshServerOwnsSourceConfig(t *testing.T) {
 	files := testMeshMaterial(t)
 	conf := testMeshServerConfig("edge-a", reserveMeshUDPAddress(t), config.ClientAuthMethodToken, files, nil, 2)
 	conf.Tunnel.Capacity = config.MeshTCPCapacity{MaxTCPConnections: 3}
+	overlap := uint8(2)
+	conf.Tunnel.Listen.TLS.SessionTicketEncryptionKeyRotationInterval = time.Hour
+	conf.Tunnel.Listen.TLS.SessionTicketEncryptionKeyRotationOverlap = &overlap
 	limit := 2
 	conf.Ingress.Listeners = []config.MeshIngressListener{{Address: "127.0.0.1:8080", Protocol: config.MeshIngressProtocolHTTP, Capacity: config.MeshTCPCapacity{MaxTCPConnections: 1}, MaxInflightRequests: &limit}}
 	server, err := NewServer(conf)
@@ -746,6 +749,7 @@ func TestMeshServerOwnsSourceConfig(t *testing.T) {
 		}
 	})
 	limit = 99
+	overlap = 99
 	conf.Tunnel.Capacity.MaxTCPConnections = 99
 	conf.Ingress.Listeners[0].Capacity.MaxTCPConnections = 99
 	if got := server.tunnelSource.capacity.MaxTCPConnections; got != 3 {
@@ -753,5 +757,8 @@ func TestMeshServerOwnsSourceConfig(t *testing.T) {
 	}
 	if got := server.ingressSources[0].capacity.MaxTCPConnections; got != 1 || server.ingressSources[0].requestLimit != 2 || *server.config.Ingress.Listeners[0].MaxInflightRequests != 2 {
 		t.Fatalf("ingress source was aliased to caller: capacity %d, request %d", got, server.ingressSources[0].requestLimit)
+	}
+	if got := server.config.Tunnel.Listen.TLS.RotationOldKeyLimit(); got != 2 {
+		t.Fatalf("TLS rotation overlap was aliased to caller: %d", got)
 	}
 }

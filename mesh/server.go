@@ -92,6 +92,10 @@ func NewServer(conf *config.MeshServer) (*Server, error) {
 		return nil, errors.New("mesh server config is nil")
 	}
 	owned := *conf
+	if value := conf.Tunnel.Listen.TLS.SessionTicketEncryptionKeyRotationOverlap; value != nil {
+		copied := *value
+		owned.Tunnel.Listen.TLS.SessionTicketEncryptionKeyRotationOverlap = &copied
+	}
 	owned.Tunnel.Peering.Peers = slices.Clone(conf.Tunnel.Peering.Peers)
 	owned.Ingress.Listeners = slices.Clone(conf.Ingress.Listeners)
 	for i := range owned.Ingress.Listeners {

@@ -99,12 +99,6 @@ func (q *controlQueue) done(frame queuedControlFrame) {
 	q.mu.Unlock()
 }
 
-func (q *controlQueue) ready() <-chan struct{} {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return q.changed
-}
-
 func (q *controlQueue) peek() (queuedControlFrame, bool, bool, <-chan struct{}) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -344,13 +338,13 @@ func (s *controlState) publishPath(path protocol.MeshPath) error {
 	}
 	previous := s.paths[path.PathID]
 	count := s.pathRecords
-	bytes := s.pathBytes
+	retainedBytes := s.pathBytes
 	if previous != nil && previous.refs == 1 {
 		count--
-		bytes -= previous.backing
+		retainedBytes -= previous.backing
 	}
 	backing := int64(cap(frame) + len(path.PathID) + len(path.GroupID))
-	if count >= s.limits.MaxTotalPaths || backing > s.maxPathBytes-bytes {
+	if count >= s.limits.MaxTotalPaths || backing > s.maxPathBytes-retainedBytes {
 		s.mu.Unlock()
 		return errors.New("mesh published path transition capacity reached")
 	}

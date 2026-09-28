@@ -186,10 +186,6 @@ func resolveServerAddress(ctx context.Context, resolver *net.Resolver, address s
 	return outbound.ResolveAddress(ctx, resolver, address)
 }
 
-func preferredServerIP(addresses []net.IPAddr) net.IPAddr {
-	return outbound.PreferredIP(addresses)
-}
-
 // ServerAddr returns the server address this connection is for.
 func (sc *ServerConnection) ServerAddr() string {
 	return sc.serverAddr

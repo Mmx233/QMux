@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Mmx233/QMux/config"
+	"github.com/Mmx233/QMux/internal/outbound"
 	"github.com/Mmx233/QMux/protocol"
 	"github.com/quic-go/quic-go"
 	"github.com/rs/zerolog"
@@ -424,7 +425,7 @@ func TestClientFragmentLimitsReachInstalledRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New client: %v", err)
 	}
-	client.connMgr.tlsState.Store(&clientTLSState{baseTLSConfig: peer.clientTLS.Clone(), sessionCaches: NewSessionCacheManager()})
+	client.connMgr.tlsState.Store(&clientTLSState{baseTLSConfig: peer.clientTLS.Clone(), sessionCaches: outbound.NewSessionCacheManager()})
 	client.connMgr.quicConfig = conf.Quic.GetConfig()
 	conf.Capacity.MaxUDPFragmentGroupsPerHandler = 99
 	conf.Capacity.MaxUDPFragmentBackingBytesPerHandler = 99 * int64(protocol.FragmentBufferSize)
