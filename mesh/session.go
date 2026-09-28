@@ -1,7 +1,9 @@
 package mesh
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Mmx233/QMux/config"
 	"github.com/Mmx233/QMux/internal/outbound"
 	"github.com/Mmx233/QMux/protocol"
 	"github.com/quic-go/quic-go"
@@ -28,8 +31,14 @@ type Session struct {
 	groupID    string
 	peerID     string
 
-	conn    *quic.Conn
-	control *quic.Stream
+	conn     *quic.Conn
+	control  *quic.Stream
+	outbound *controlQueue
+	apply    *controlQueue
+	staged   *stagedState
+	ledger   *declarationLedger
+	paths    *pathBudget
+	limits   config.MeshServerLimits
 
 	ctx            context.Context
 	cancel         context.CancelFunc
@@ -38,6 +47,7 @@ type Session struct {
 	started        atomic.Bool
 	stable         atomic.Bool
 	heartbeatWrite atomic.Pointer[func(io.Writer, int64) error]
+	controlWrite   atomic.Pointer[func(io.Writer, []byte) (int, error)]
 	errMu          sync.Mutex
 	err            error
 
@@ -91,10 +101,25 @@ func (s *Session) Err() error {
 func (s *Session) Close() {
 	s.closeOnce.Do(func() {
 		s.cancel()
+		if s.outbound != nil {
+			s.outbound.clear()
+		}
+		if s.apply != nil {
+			s.apply.clear()
+		}
 		s.control.CancelRead(meshStreamError)
 		s.control.CancelWrite(meshStreamError)
 		_ = s.conn.CloseWithError(meshApplicationError, "mesh session closed")
 	})
+}
+
+func (s *Session) configurePeerControl(outbound *controlQueue, staged *stagedState, ledger *declarationLedger, paths *pathBudget, limits config.MeshServerLimits) {
+	s.outbound = outbound
+	s.apply = newControlQueue(limits)
+	s.staged = staged
+	s.ledger = ledger
+	s.paths = paths
+	s.limits = limits
 }
 
 func (s *Session) Wait() { <-s.done }
@@ -120,10 +145,54 @@ func (s *Session) controlLoop(startedAt time.Time, heartbeatInterval, healthTime
 	readCtx, cancelRead := context.WithCancel(s.ctx)
 	readDone := make(chan struct{})
 	reads := make(chan meshControlRead, 1)
+	applyCtx, cancelApply := context.WithCancel(s.ctx)
+	applyDone := make(chan struct{})
+	applyErrors := make(chan error, 1)
+	if s.apply != nil {
+		go func() {
+			defer close(applyDone)
+			applier := newDeltaApplier(applyCtx, s.staged, s.ledger, s.paths, s.limits, s.staged.revision)
+			defer applier.close()
+			for {
+				frame, err := s.apply.take(applyCtx)
+				if err != nil {
+					if applyCtx.Err() == nil {
+						applyErrors <- err
+					}
+					return
+				}
+				kind, payload, err := protocol.ReadMessageLimited(bytes.NewReader(frame.data), protocol.MaxControlPayloadSize)
+				if err == nil {
+					var message any
+					message, err = protocol.DecodeMeshControl(kind, payload)
+					if err == nil {
+						err = applier.apply(message)
+					}
+				}
+				if err != nil {
+					applyErrors <- err
+					return
+				}
+				s.apply.done(frame)
+			}
+		}()
+	} else {
+		close(applyDone)
+	}
 	go func() {
 		defer close(readDone)
 		for {
-			msgType, _, err := protocol.ReadMessageLimited(s.control, protocol.MaxControlPayloadSize)
+			msgType, payload, err := protocol.ReadMessageLimited(s.control, protocol.MaxControlPayloadSize)
+			if err == nil && msgType != protocol.MsgTypeHeartbeat && s.apply != nil {
+				frame := make([]byte, 5+len(payload))
+				frame[0] = msgType
+				binary.BigEndian.PutUint32(frame[1:], uint32(len(payload)))
+				copy(frame[5:], payload)
+				err = s.apply.push([]queuedControlFrame{{data: frame}})
+				if err == nil {
+					continue
+				}
+			}
 			select {
 			case reads <- meshControlRead{msgType: msgType, err: err}:
 			case <-readCtx.Done():
@@ -138,14 +207,18 @@ func (s *Session) controlLoop(startedAt time.Time, heartbeatInterval, healthTime
 	}()
 	defer func() {
 		cancelRead()
+		cancelApply()
 		s.control.CancelRead(meshStreamError)
 		<-readDone
+		<-applyDone
 	}()
 
-	heartbeats := time.NewTicker(heartbeatInterval)
-	defer heartbeats.Stop()
+	nextHeartbeat := startedAt.Add(heartbeatInterval)
+	heartbeatTimer := time.NewTimer(heartbeatInterval)
+	defer heartbeatTimer.Stop()
 	health := time.NewTimer(healthTimeout)
 	defer health.Stop()
+	lastHealthy := startedAt
 	resetHealth := func() {
 		if !health.Stop() {
 			select {
@@ -154,9 +227,92 @@ func (s *Session) controlLoop(startedAt time.Time, heartbeatInterval, healthTime
 			}
 		}
 		health.Reset(healthTimeout)
+		lastHealthy = time.Now()
+	}
+	handleRead := func(result meshControlRead) error {
+		if result.err != nil {
+			return fmt.Errorf("read mesh control: %w", result.err)
+		}
+		if result.msgType != protocol.MsgTypeHeartbeat {
+			return fmt.Errorf("unexpected mesh control message 0x%02x", result.msgType)
+		}
+		resetHealth()
+		if time.Since(startedAt) >= s.stableGrace {
+			s.stable.Store(true)
+		}
+		return nil
+	}
+	writeHeartbeat := func() error {
+		now := time.Now()
+		deadline := minTime(now.Add(heartbeatInterval), lastHealthy.Add(healthTimeout))
+		if err := s.control.SetWriteDeadline(deadline); err != nil {
+			return fmt.Errorf("set mesh heartbeat deadline: %w", err)
+		}
+		write := protocol.WriteHeartbeat
+		if injected := s.heartbeatWrite.Load(); injected != nil {
+			write = *injected
+		}
+		if err := write(s.control, now.Unix()); err != nil {
+			return fmt.Errorf("write mesh heartbeat: %w", err)
+		}
+		if time.Now().After(deadline) {
+			return errors.New("mesh heartbeat missed its write deadline")
+		}
+		nextHeartbeat = time.Now().Add(heartbeatInterval)
+		return nil
 	}
 
 	for {
+		select {
+		case result := <-reads:
+			if err := handleRead(result); err != nil {
+				return err
+			}
+			continue
+		case err := <-applyErrors:
+			return fmt.Errorf("apply mesh control: %w", err)
+		default:
+		}
+		if !time.Now().Before(lastHealthy.Add(healthTimeout)) {
+			return errors.New("mesh heartbeat timeout")
+		}
+		if !time.Now().Before(nextHeartbeat) {
+			if err := writeHeartbeat(); err != nil {
+				return err
+			}
+			continue
+		}
+		var changed <-chan struct{}
+		if s.outbound != nil {
+			frame, hasFrame, failed, signal := s.outbound.peek()
+			if failed {
+				return errMeshControlQueueFull
+			}
+			if hasFrame {
+				deadline := meshDataWriteDeadline(time.Now(), nextHeartbeat, lastHealthy, heartbeatInterval, healthTimeout)
+				if err := s.control.SetWriteDeadline(deadline); err != nil {
+					return fmt.Errorf("set mesh control frame deadline: %w", err)
+				}
+				write := func(w io.Writer, data []byte) (int, error) { return w.Write(data) }
+				if injected := s.controlWrite.Load(); injected != nil {
+					write = *injected
+				}
+				n, err := write(s.control, frame.data)
+				if err != nil {
+					return fmt.Errorf("write mesh control frame: %w", err)
+				}
+				if n != len(frame.data) {
+					return fmt.Errorf("write mesh control frame: %w", io.ErrShortWrite)
+				}
+				if time.Now().After(deadline) {
+					return errors.New("mesh control frame missed heartbeat deadline")
+				}
+				s.outbound.done(frame)
+				continue
+			}
+			changed = signal
+		}
+		heartbeatTimer.Reset(time.Until(nextHeartbeat))
 		select {
 		case <-s.ctx.Done():
 			return context.Cause(s.ctx)
@@ -164,30 +320,30 @@ func (s *Session) controlLoop(startedAt time.Time, heartbeatInterval, healthTime
 			return context.Cause(s.conn.Context())
 		case <-health.C:
 			return errors.New("mesh heartbeat timeout")
-		case now := <-heartbeats.C:
-			if err := s.control.SetWriteDeadline(now.Add(heartbeatInterval)); err != nil {
-				return fmt.Errorf("set mesh heartbeat deadline: %w", err)
-			}
-			write := protocol.WriteHeartbeat
-			if injected := s.heartbeatWrite.Load(); injected != nil {
-				write = *injected
-			}
-			if err := write(s.control, now.Unix()); err != nil {
-				return fmt.Errorf("write mesh heartbeat: %w", err)
+		case <-heartbeatTimer.C:
+			if err := writeHeartbeat(); err != nil {
+				return err
 			}
 		case result := <-reads:
-			if result.err != nil {
-				return fmt.Errorf("read mesh control: %w", result.err)
+			if err := handleRead(result); err != nil {
+				return err
 			}
-			if result.msgType != protocol.MsgTypeHeartbeat {
-				return fmt.Errorf("unexpected mesh control message 0x%02x", result.msgType)
-			}
-			resetHealth()
-			if time.Since(startedAt) >= s.stableGrace {
-				s.stable.Store(true)
-			}
+		case err := <-applyErrors:
+			return fmt.Errorf("apply mesh control: %w", err)
+		case <-changed:
 		}
 	}
+}
+
+func minTime(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
+}
+
+func meshDataWriteDeadline(now, nextHeartbeat, lastHealthy time.Time, heartbeatInterval, healthTimeout time.Duration) time.Time {
+	return minTime(minTime(nextHeartbeat, lastHealthy.Add(healthTimeout)), now.Add(heartbeatInterval))
 }
 
 func registryOwner(owner *outbound.Owner) Owner {

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -945,6 +946,166 @@ func TestMeshGroupCanonicalEquivalenceAndPrivacy(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			if got := loadMeshCanonical(t, canonicalMeshClientYAML(test.opts)); bytes.Equal(first, got) {
 				t.Fatalf("public %s change did not alter canonical bytes", test.name)
+			}
+		})
+	}
+}
+
+func TestMeshTypedDeclarationFreezeAndStrictWireParse(t *testing.T) {
+	client := validMeshClient()
+	client.Group.Routes.HTTP = []MeshHTTPRoute{{
+		Hostnames: []string{"z.example.com", "a.example.com"},
+		Matches: []MeshHTTPMatch{{
+			Headers: []MeshHTTPHeaderMatch{{Name: "X-Test", Value: "value"}},
+		}},
+	}}
+	client.Group.OriginTLS = MeshOriginTLS{
+		Enabled: true, Verify: true,
+		ExtraCAFiles: []string{writeCertificateFile(t, testCertificatePEM(t, 19))},
+	}
+	before := CloneMeshClientConfig(&client)
+	owned := CloneMeshClientConfig(&client)
+	if err := FinalizeMeshClientConfig(&owned); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(client, before) {
+		t.Fatal("finalization changed the typed caller configuration")
+	}
+	canonical := owned.Group.CanonicalBytes()
+	groupID, version, err := ParseMeshGroupCanonical(canonical)
+	if err != nil || groupID != client.Group.GroupID || version != client.Group.RuleVersion {
+		t.Fatalf("wire parse = %q/%d, %v", groupID, version, err)
+	}
+	_, _, work, err := ParseMeshGroupCanonicalMeasured(canonical)
+	if err != nil || work.PeakBytes <= int64(len(canonical)) {
+		t.Fatalf("canonical/DER validation backing = %+v, %v", work, err)
+	}
+	client.Group.Routes.HTTP[0].Hostnames[0] = "changed.example.com"
+	client.Group.Routes.HTTP[0].Matches[0].Headers[0].Value = "changed"
+	client.Group.OriginTLS.ExtraCAFiles[0] = "changed.pem"
+	if !bytes.Equal(canonical, owned.Group.CanonicalBytes()) {
+		t.Fatal("caller mutation changed frozen declaration")
+	}
+
+	for name, mutated := range map[string][]byte{
+		"unknown field":      bytes.Replace(canonical, []byte(`"group_id":`), []byte(`"unknown":1,"group_id":`), 1),
+		"duplicate field":    bytes.Replace(canonical, []byte(`"group_id":`), []byte(`"group_id":"other","group_id":`), 1),
+		"non canonical":      bytes.Replace(canonical, []byte(`"metric":0`), []byte(`"metric": 0`), 1),
+		"invalid DER":        bytes.Replace(canonical, []byte(`"extra_ca_certificates":[`), []byte(`"extra_ca_certificates":["YQ==",`), 1),
+		"CA requires verify": bytes.Replace(canonical, []byte(`"verify":true`), []byte(`"verify":false`), 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if bytes.Equal(mutated, canonical) {
+				t.Fatal("mutation did not change declaration")
+			}
+			if _, _, err := ParseMeshGroupCanonical(mutated); err == nil {
+				t.Fatal("invalid declaration accepted")
+			}
+			if name == "invalid DER" {
+				_, _, work, err := ParseMeshGroupCanonicalMeasured(mutated)
+				if err == nil || work.PeakBytes == 0 {
+					t.Fatalf("invalid DER work accounting = %+v, %v", work, err)
+				}
+			}
+		})
+	}
+}
+
+func TestMeshCanonicalJSONV2Escaping(t *testing.T) {
+	client := validMeshClient()
+	client.Group.Routes.HTTP = []MeshHTTPRoute{{
+		Hostnames: []string{"api.example.com"},
+		Matches: []MeshHTTPMatch{{
+			Headers: []MeshHTTPHeaderMatch{{Name: "X-Test", Value: "<>&"}},
+		}},
+	}}
+	if err := FinalizeMeshClientConfig(&client); err != nil {
+		t.Fatal(err)
+	}
+	canonical := client.Group.CanonicalBytes()
+	value := []byte(`"value":"<>&"`)
+	if !bytes.Contains(canonical, value) {
+		t.Fatalf("canonical declaration did not use JSON v2 escaping: %s", canonical)
+	}
+	if _, _, err := ParseMeshGroupCanonical(canonical); err != nil {
+		t.Fatalf("parse canonical declaration: %v", err)
+	}
+	escaped := bytes.Replace(canonical, value, []byte(`"value":"\u003c\u003e\u0026"`), 1)
+	if _, _, err := ParseMeshGroupCanonical(escaped); err == nil {
+		t.Fatal("accepted v1 HTML-escaped declaration")
+	}
+}
+
+func TestMeshCanonicalValidationHeapEnvelope(t *testing.T) {
+	plain := validMeshClient()
+	if err := FinalizeMeshClientConfig(&plain); err != nil {
+		t.Fatal(err)
+	}
+	base := plain.Group.CanonicalBytes()
+	if !bytes.Contains(base, []byte(`"http":[]`)) {
+		t.Fatal("canonical fixture has no empty HTTP array")
+	}
+	overschema := bytes.Replace(base, []byte(`"http":[]`),
+		[]byte(`"http":[`+strings.Join(slices.Repeat([]string{"{}"}, 100000), ",")+`]`), 1)
+
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 128)
+	for i := range names {
+		names[i] = fmt.Sprintf("name-%03d.%s.example", i, strings.Repeat("a", 90))
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(41), Subject: pkix.Name{CommonName: "complex-ca"},
+		NotBefore: time.Unix(1, 0), NotAfter: time.Unix(2, 0),
+		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign,
+		DNSNames: names,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, publicKey, privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withCA := validMeshClient()
+	withCA.Group.OriginTLS = MeshOriginTLS{
+		Enabled: true, Verify: true,
+		ExtraCAFiles: []string{writeCertificateFile(t, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))},
+	}
+	if err := FinalizeMeshClientConfig(&withCA); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name      string
+		input     []byte
+		wantError bool
+	}{
+		{"overschema HTTP array", overschema, true},
+		{"complex DER", withCA.Group.CanonicalBytes(), false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runtime.GC()
+			var before, sampled, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			peak := before.HeapAlloc
+			var active int64
+			_, _, work, err := ParseMeshGroupCanonicalMeasured(test.input, func(delta int64) {
+				active += delta
+				runtime.ReadMemStats(&sampled)
+				peak = max(peak, sampled.HeapAlloc)
+			})
+			if (err != nil) != test.wantError {
+				t.Fatalf("validation result = %v, want error %t", err, test.wantError)
+			}
+			if active != 0 {
+				t.Fatalf("validation returned with %d owned work bytes", active)
+			}
+			runtime.GC()
+			runtime.ReadMemStats(&after)
+			peakGrowth := int64(peak) - int64(before.HeapAlloc)
+			retainedGrowth := int64(after.HeapAlloc) - int64(before.HeapAlloc)
+			t.Logf("input=%d sampled_heap_peak_growth=%d post_gc_retained_growth=%d explicit_byte_peak=%d", len(test.input), peakGrowth, retainedGrowth, work.PeakBytes)
+			if peakGrowth > 64<<20 || retainedGrowth > 8<<20 {
+				t.Fatalf("validation heap envelope exceeded: peak %d, retained %d", peakGrowth, retainedGrowth)
 			}
 		})
 	}

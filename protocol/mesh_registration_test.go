@@ -40,6 +40,7 @@ func TestMeshRegistrationStrictRoundTrip(t *testing.T) {
 
 	ack := MeshRegisterAck{
 		Success:              true,
+		State:                MeshStateStaged,
 		Message:              "registered",
 		ServerID:             registration.TargetServerID,
 		Role:                 registration.Role,
@@ -102,7 +103,7 @@ func TestMeshRegistrationStrictDecode(t *testing.T) {
 }
 
 func TestMeshRegistrationAckStrictDecode(t *testing.T) {
-	valid := `{"Success":true,"ServerID":"edge-a","Role":"client","SelectedVersion":"1.0","SelectedCapabilities":["mesh-session-v1"]}`
+	valid := `{"Success":true,"State":"staged","ServerID":"edge-a","Role":"client","SelectedVersion":"1.0","SelectedCapabilities":["mesh-session-v1"]}`
 	tests := []struct {
 		name    string
 		payload string
@@ -155,6 +156,7 @@ func TestMeshRegistrationFixedPayloadLimit(t *testing.T) {
 func TestValidateMeshRegisterAckExactNegotiation(t *testing.T) {
 	valid := MeshRegisterAck{
 		Success:              true,
+		State:                MeshStateStaged,
 		ServerID:             "edge-a",
 		Role:                 MeshRolePeer,
 		SelectedVersion:      MeshProtocolVersion,

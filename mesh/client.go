@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,10 +28,11 @@ type clientEndpointState struct {
 }
 
 type Client struct {
-	config   config.MeshClient
-	logger   zerolog.Logger
-	tlsState atomic.Pointer[outboundTLSState]
-	reloader *tlsreload.Reloader
+	config      config.MeshClient
+	declaration []byte
+	logger      zerolog.Logger
+	tlsState    atomic.Pointer[outboundTLSState]
+	reloader    *tlsreload.Reloader
 
 	attemptTimeout time.Duration
 	stableGrace    time.Duration
@@ -74,15 +74,14 @@ func NewClient(conf *config.MeshClient) (*Client, error) {
 	if conf == nil {
 		return nil, errors.New("mesh client config is nil")
 	}
-	owned := *conf
-	owned.Tunnel.Servers = slices.Clone(conf.Tunnel.Servers)
-	owned.ApplyDefaults()
-	if err := owned.Validate(); err != nil {
+	owned := config.CloneMeshClientConfig(conf)
+	if err := config.FinalizeMeshClientConfig(&owned); err != nil {
 		return nil, fmt.Errorf("invalid mesh client config: %w", err)
 	}
 	logger := log.With().Str("com", "mesh-client").Str("instance_id", owned.InstanceID).Logger()
 	client := &Client{
 		config:         owned,
+		declaration:    owned.Group.CanonicalBytes(),
 		logger:         logger,
 		attemptTimeout: outbound.AttemptTimeout,
 		stableGrace:    defaultStableGrace(),
@@ -279,7 +278,7 @@ func (c *Client) runEndpointAttempt(
 		InstanceID:     c.config.InstanceID,
 		GroupID:        c.config.Group.GroupID,
 	}
-	stream, err := outboundRegistration(attemptCtx, conn, registration, c.config.Tunnel.Auth)
+	stream, _, err := outboundRegistration(attemptCtx, conn, registration, c.config.Tunnel.Auth, c.declaration, nil, nil, config.MeshServerLimits{}, nil)
 	if err != nil {
 		return false, err
 	}

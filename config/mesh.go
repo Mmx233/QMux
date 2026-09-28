@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"crypto/x509"
-	"encoding/json"
+	"encoding/json/v2"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -13,6 +13,7 @@ import (
 	"os"
 	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -276,22 +277,65 @@ func LoadMeshClientConfig(path string) (*MeshClient, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := FinalizeMeshClientConfig(cfg); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// FinalizeMeshClientConfig prepares the same public declaration for loaded and
+// typed configurations. It does not trust a cached canonical projection.
+func FinalizeMeshClientConfig(cfg *MeshClient) error {
 	cfg.ApplyDefaults()
 	if err := cfg.Validate(); err != nil {
-		return nil, fmt.Errorf("mesh client configuration validation failed: %w", err)
+		return fmt.Errorf("mesh client configuration validation failed: %w", err)
 	}
-
 	cfg.Group.normalize()
 	certificates, err := loadMeshExtraCACertificates(cfg.Group.OriginTLS.ExtraCAFiles)
 	if err != nil {
-		return nil, fmt.Errorf("mesh client configuration validation failed: %w", err)
+		return fmt.Errorf("mesh client configuration validation failed: %w", err)
 	}
 	cfg.Group.OriginTLS.ExtraCACertificates = certificates
 	cfg.Group.canonicalBytes, err = marshalMeshGroupCanonical(cfg.Group)
 	if err != nil {
-		return nil, fmt.Errorf("marshal mesh group canonical declaration: %w", err)
+		return fmt.Errorf("marshal mesh group canonical declaration: %w", err)
 	}
-	return cfg, nil
+	return nil
+}
+
+// CloneMeshClientConfig isolates mutable nested values before defaults and
+// normalization are applied to a typed configuration.
+func CloneMeshClientConfig(cfg *MeshClient) MeshClient {
+	owned := *cfg
+	owned.Tunnel.Servers = slices.Clone(cfg.Tunnel.Servers)
+	g := &owned.Group
+	g.Routes.HTTP = slices.Clone(cfg.Group.Routes.HTTP)
+	for i := range g.Routes.HTTP {
+		route := &g.Routes.HTTP[i]
+		route.Hostnames = slices.Clone(route.Hostnames)
+		route.Matches = slices.Clone(route.Matches)
+		for j := range route.Matches {
+			match := &route.Matches[j]
+			if match.Path != nil {
+				path := *match.Path
+				match.Path = &path
+			}
+			match.Headers = slices.Clone(match.Headers)
+			match.QueryParams = slices.Clone(match.QueryParams)
+		}
+	}
+	if g.Routes.TLSPassthrough != nil {
+		route := *g.Routes.TLSPassthrough
+		route.Hostnames = slices.Clone(route.Hostnames)
+		g.Routes.TLSPassthrough = &route
+	}
+	g.OriginTLS.ExtraCAFiles = slices.Clone(cfg.Group.OriginTLS.ExtraCAFiles)
+	g.OriginTLS.ExtraCACertificates = slices.Clone(cfg.Group.OriginTLS.ExtraCACertificates)
+	for i, certificate := range cfg.Group.OriginTLS.ExtraCACertificates {
+		g.OriginTLS.ExtraCACertificates[i] = bytes.Clone(certificate)
+	}
+	g.canonicalBytes = nil
+	return owned
 }
 
 func loadMeshConfig[T any](path string) (*T, error) {
@@ -1301,6 +1345,123 @@ func (g *MeshGroup) CanonicalBytes() []byte {
 	return bytes.Clone(g.canonicalBytes)
 }
 
+// ParseMeshGroupCanonical strictly validates one public wire declaration and
+// returns only its identity; parsed route and certificate objects are discarded.
+func ParseMeshGroupCanonical(data []byte) (string, uint64, error) {
+	groupID, version, _, err := ParseMeshGroupCanonicalMeasured(data)
+	return groupID, version, err
+}
+
+// MeshGroupValidationWork records the peak capacity of byte buffers explicitly
+// owned by canonical validation. Decoder and x509 object allocations are not
+// included.
+type MeshGroupValidationWork struct {
+	PeakBytes int64
+}
+
+type meshGroupWorkTracker struct {
+	current int64
+	peak    int64
+	change  func(int64)
+}
+
+func (w *meshGroupWorkTracker) add(size int64) {
+	w.current += size
+	w.peak = max(w.peak, w.current)
+	if w.change != nil {
+		w.change(size)
+	}
+}
+
+func (w *meshGroupWorkTracker) release(size int64) {
+	w.current -= size
+	if w.change != nil {
+		w.change(-size)
+	}
+}
+
+func ParseMeshGroupCanonicalMeasured(data []byte, change ...func(int64)) (_ string, _ uint64, work MeshGroupValidationWork, err error) {
+	tracker := &meshGroupWorkTracker{}
+	if len(change) > 0 {
+		tracker.change = change[0]
+	}
+	defer func() { work.PeakBytes = tracker.peak }()
+	var declaration meshGroupCanonical
+	decodeErr := json.Unmarshal(data, &declaration, json.RejectUnknownMembers(true))
+	var certificateBytes int64
+	for _, der := range declaration.OriginTLS.ExtraCACertificates {
+		certificateBytes += int64(cap(der))
+	}
+	tracker.add(certificateBytes)
+	defer tracker.release(certificateBytes)
+	if decodeErr != nil {
+		return "", 0, work, fmt.Errorf("decode mesh group declaration: %w", decodeErr)
+	}
+	group := MeshGroup{
+		GroupID:              declaration.GroupID,
+		RuleVersion:          declaration.RuleVersion,
+		Metric:               declaration.Metric,
+		OutdatedClientPolicy: declaration.OutdatedClientPolicy,
+		Probe: MeshProbe{
+			Type: declaration.Probe.Type,
+			Host: declaration.Probe.Host,
+			Path: declaration.Probe.Path,
+		},
+		OriginTLS: MeshOriginTLS{
+			Enabled:             declaration.OriginTLS.Enabled,
+			Verify:              declaration.OriginTLS.Verify,
+			ExtraCACertificates: declaration.OriginTLS.ExtraCACertificates,
+		},
+	}
+	for _, route := range declaration.Routes.HTTP {
+		converted := MeshHTTPRoute{Hostnames: route.Hostnames}
+		for _, match := range route.Matches {
+			convertedMatch := MeshHTTPMatch{
+				Path:   &MeshHTTPPathMatch{Type: match.Path.Type, Value: match.Path.Value},
+				Method: match.Method,
+			}
+			for _, header := range match.Headers {
+				convertedMatch.Headers = append(convertedMatch.Headers, MeshHTTPHeaderMatch(header))
+			}
+			for _, query := range match.QueryParams {
+				convertedMatch.QueryParams = append(convertedMatch.QueryParams, MeshHTTPQueryParamMatch(query))
+			}
+			converted.Matches = append(converted.Matches, convertedMatch)
+		}
+		group.Routes.HTTP = append(group.Routes.HTTP, converted)
+	}
+	if route := declaration.Routes.TLSPassthrough; route != nil {
+		group.Routes.TLSPassthrough = &MeshTLSRoute{Hostnames: route.Hostnames}
+	}
+	group.ApplyDefaults()
+	if err := group.Validate("group"); err != nil {
+		return "", 0, work, err
+	}
+	if len(group.OriginTLS.ExtraCACertificates) > 0 && (!group.OriginTLS.Enabled || !group.OriginTLS.Verify) {
+		return "", 0, work, errors.New("group.origin_tls.extra_ca_certificates requires enabled and verify")
+	}
+	for _, der := range group.OriginTLS.ExtraCACertificates {
+		if _, err := x509.ParseCertificate(der); err != nil {
+			return "", 0, work, fmt.Errorf("invalid mesh group extra CA: %w", err)
+		}
+	}
+	sort.Slice(group.OriginTLS.ExtraCACertificates, func(i, j int) bool {
+		return bytes.Compare(group.OriginTLS.ExtraCACertificates[i], group.OriginTLS.ExtraCACertificates[j]) < 0
+	})
+	group.OriginTLS.ExtraCACertificates = slices.CompactFunc(group.OriginTLS.ExtraCACertificates, bytes.Equal)
+	group.normalize()
+	canonical, err := marshalMeshGroupCanonicalMeasured(group, tracker)
+	if err != nil {
+		return "", 0, work, fmt.Errorf("canonicalize mesh group declaration: %w", err)
+	}
+	tracker.add(int64(cap(canonical)))
+	defer tracker.release(int64(cap(canonical)))
+	if !bytes.Equal(canonical, data) {
+		return "", 0, work, errors.New("mesh group declaration is not canonical")
+	}
+	return group.GroupID, group.RuleVersion, work, nil
+}
+
 type meshGroupCanonical struct {
 	GroupID              string                 `json:"group_id"`
 	RuleVersion          uint64                 `json:"rule_version"`
@@ -1362,6 +1523,10 @@ type meshOriginTLSCanonical struct {
 }
 
 func marshalMeshGroupCanonical(group MeshGroup) ([]byte, error) {
+	return marshalMeshGroupCanonicalMeasured(group, nil)
+}
+
+func marshalMeshGroupCanonicalMeasured(group MeshGroup, tracker *meshGroupWorkTracker) ([]byte, error) {
 	httpRoutes := make([]meshHTTPRouteCanonical, 0, len(group.Routes.HTTP))
 	for _, route := range group.Routes.HTTP {
 		matches := make([]meshHTTPMatchCanonical, 0, len(route.Matches))
@@ -1386,14 +1551,14 @@ func marshalMeshGroupCanonical(group MeshGroup) ([]byte, error) {
 			})
 		}
 		var err error
-		matches, err = sortedUniqueCanonical(matches)
+		matches, err = sortedUniqueCanonical(matches, tracker)
 		if err != nil {
 			return nil, err
 		}
 		httpRoutes = append(httpRoutes, meshHTTPRouteCanonical{Hostnames: nonNilStrings(route.Hostnames), Matches: matches})
 	}
 	var err error
-	httpRoutes, err = sortedUniqueCanonical(httpRoutes)
+	httpRoutes, err = sortedUniqueCanonical(httpRoutes, tracker)
 	if err != nil {
 		return nil, err
 	}
@@ -1422,16 +1587,25 @@ func marshalMeshGroupCanonical(group MeshGroup) ([]byte, error) {
 	return json.Marshal(projection)
 }
 
-func sortedUniqueCanonical[T any](values []T) ([]T, error) {
+func sortedUniqueCanonical[T any](values []T, tracker *meshGroupWorkTracker) ([]T, error) {
 	type keyedValue struct {
 		value T
 		key   []byte
 	}
 	keyed := make([]keyedValue, 0, len(values))
+	var keyBytes int64
+	if tracker != nil {
+		defer func() { tracker.release(keyBytes) }()
+	}
 	for _, value := range values {
 		key, err := json.Marshal(value)
 		if err != nil {
 			return nil, err
+		}
+		if tracker != nil {
+			capacity := int64(cap(key))
+			tracker.add(capacity)
+			keyBytes += capacity
 		}
 		keyed = append(keyed, keyedValue{value: value, key: key})
 	}

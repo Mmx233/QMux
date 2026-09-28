@@ -18,9 +18,14 @@ func outboundRegistration(
 	conn *quic.Conn,
 	registration protocol.MeshRegister,
 	authConfig config.ClientAuth,
-) (*quic.Stream, error) {
+	declaration []byte,
+	ledger *declarationLedger,
+	paths *pathBudget,
+	limits config.MeshServerLimits,
+	snapshot *peerSnapshot,
+) (*quic.Stream, *stagedState, error) {
 	if err := waitForMeshHandshake(ctx, conn); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	authConfig.ApplyDefaults()
 	expectedScheme := ""
@@ -40,14 +45,14 @@ func outboundRegistration(
 			conn.ConnectionState().TLS,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("compute mesh token proof: %w", err)
+			return nil, nil, fmt.Errorf("compute mesh token proof: %w", err)
 		}
 		registration.Auth = &protocol.RegisterAuth{Scheme: sharedtoken.MeshScheme, Proof: proof}
 	}
 
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
-		return nil, meshRegistrationError(ctx, "open mesh control stream", err)
+		return nil, nil, meshRegistrationError(ctx, "open mesh control stream", err)
 	}
 	stream.SetPriority(0, true)
 	committed := false
@@ -60,7 +65,7 @@ func outboundRegistration(
 	}()
 	if deadline, ok := ctx.Deadline(); ok {
 		if err := stream.SetDeadline(deadline); err != nil {
-			return nil, meshRegistrationError(ctx, "set mesh registration deadline", err)
+			return nil, nil, meshRegistrationError(ctx, "set mesh registration deadline", err)
 		}
 	}
 	cancelUnblocked := make(chan struct{})
@@ -84,11 +89,36 @@ func outboundRegistration(
 	}()
 
 	if err := protocol.WriteMeshRegister(stream, registration); err != nil {
-		return nil, meshRegistrationError(ctx, "write mesh registration", err)
+		return nil, nil, meshRegistrationError(ctx, "write mesh registration", err)
+	}
+	var state *stagedState
+	if registration.Role == protocol.MeshRoleClient {
+		if err := sendClientInitial(stream, declaration); err != nil {
+			return nil, nil, meshRegistrationError(ctx, "write mesh declaration", err)
+		}
+	} else {
+		written := make(chan error, 1)
+		go func() { written <- sendPeerSnapshot(ctx, stream, snapshot) }()
+		var err error
+		state, err = receiveInitial(ctx, stream, ledger, paths, limits, protocol.MeshRolePeer, "")
+		if err != nil {
+			stream.CancelWrite(meshStreamError)
+			<-written
+			return nil, nil, meshRegistrationError(ctx, "read mesh peer initial state", err)
+		}
+		if err := <-written; err != nil {
+			state.close()
+			return nil, nil, meshRegistrationError(ctx, "write mesh peer initial state", err)
+		}
+		if err := protocol.WriteMeshControl(stream, protocol.MeshReady{State: protocol.MeshStateStaged}); err != nil {
+			state.close()
+			return nil, nil, meshRegistrationError(ctx, "write mesh peer Ready", err)
+		}
 	}
 	ack, err := protocol.ReadMeshRegisterAck(stream)
 	if err != nil {
-		return nil, meshRegistrationError(ctx, "read mesh registration acknowledgment", err)
+		state.close()
+		return nil, nil, meshRegistrationError(ctx, "read mesh registration acknowledgment", err)
 	}
 	if err := protocol.ValidateMeshRegisterAck(
 		ack,
@@ -97,16 +127,23 @@ func outboundRegistration(
 		expectedScheme,
 		registration.Capabilities,
 	); err != nil {
-		return nil, err
+		state.close()
+		return nil, nil, err
+	}
+	if ack.State != protocol.MeshStateStaged {
+		state.close()
+		return nil, nil, fmt.Errorf("unexpected mesh initial state result %q", ack.State)
 	}
 	if !stopAndWait() || ctx.Err() != nil {
-		return nil, fmt.Errorf("mesh registration canceled: %w", context.Cause(ctx))
+		state.close()
+		return nil, nil, fmt.Errorf("mesh registration canceled: %w", context.Cause(ctx))
 	}
 	if err := stream.SetDeadline(time.Time{}); err != nil {
-		return nil, fmt.Errorf("clear mesh registration deadline: %w", err)
+		state.close()
+		return nil, nil, fmt.Errorf("clear mesh registration deadline: %w", err)
 	}
 	committed = true
-	return stream, nil
+	return stream, state, nil
 }
 
 func authenticateInbound(
@@ -137,6 +174,7 @@ func writeMeshAck(
 ) error {
 	ack := protocol.MeshRegisterAck{Success: success, Message: message}
 	if success {
+		ack.State = protocol.MeshStateStaged
 		ack.ServerID = serverID
 		ack.Role = role
 		ack.SelectedVersion = protocol.MeshProtocolVersion

@@ -22,7 +22,10 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-const meshRegistrationTimeout = 10 * time.Second
+const (
+	meshRegistrationTimeout = 10 * time.Second
+	meshInitialTimeout      = 30 * time.Second
+)
 
 var (
 	ErrMeshServerAlreadyStarted = errors.New("mesh server is already started")
@@ -32,6 +35,9 @@ var (
 type Server struct {
 	config         config.MeshServer
 	registry       *Registry
+	declarations   *declarationLedger
+	paths          *pathBudget
+	controlState   *controlState
 	tunnelSource   *tcpSource
 	ingressSources []*tcpSource
 	authenticator  auth.Auth
@@ -43,6 +49,7 @@ type Server struct {
 	outboundReloader *tlsreload.Reloader
 
 	registrationTimeout   time.Duration
+	initialTimeout        time.Duration
 	stableGrace           time.Duration
 	reconnectDelay        func(int) time.Duration
 	beforePeerDial        func(string)
@@ -105,9 +112,12 @@ func NewServer(conf *config.MeshServer) (*Server, error) {
 	server := &Server{
 		config:              owned,
 		registry:            NewRegistry(owned.Limits.MaxPendingRegistrations, owned.Limits.MaxClientGenerations, owned.Limits.MaxPeers),
+		declarations:        newDeclarationLedger(owned.Limits),
+		paths:               newPathBudget(owned.Limits),
 		authenticator:       authenticator,
 		logger:              logger,
 		registrationTimeout: meshRegistrationTimeout,
+		initialTimeout:      meshInitialTimeout,
 		stableGrace:         defaultStableGrace(),
 		reconnectDelay:      func(stage int) time.Duration { return outbound.ReconnectDelay(stage, rand.Int64N) },
 		sessions:            make(chan *Session, max(1, owned.Limits.MaxClientGenerations+owned.Limits.MaxPeers)),
@@ -123,6 +133,7 @@ func NewServer(conf *config.MeshServer) (*Server, error) {
 		}
 		server.ingressSources = append(server.ingressSources, newTCPSource(listener.Capacity, requestLimit))
 	}
+	server.controlState = newControlState(server.declarations, owned.Limits)
 	server.inboundReloader, err = newInboundTLSReloader(
 		"mesh-server-inbound",
 		owned.Tunnel.Listen.TLS,
@@ -190,6 +201,7 @@ func (s *Server) Start(ctx context.Context) (runErr error) {
 		if !registryStopped {
 			s.registry.Stop()
 		}
+		s.controlState.close()
 		s.stopTLS()
 		s.readyOnce.Do(func() { close(s.ready) })
 		s.sessionsOnce.Do(func() { close(s.sessions) })
@@ -264,6 +276,7 @@ func (s *Server) Stop() error {
 	s.closeSources()
 	if !started {
 		s.registry.Stop()
+		s.controlState.close()
 		s.stopTLS()
 		s.readyOnce.Do(func() { close(s.ready) })
 		s.sessionsOnce.Do(func() { close(s.sessions) })
@@ -374,6 +387,7 @@ func (s *Server) acceptLoop(ctx context.Context, listener *quic.Listener, fatal 
 			}
 			return
 		}
+		acceptedAt := time.Now()
 		ownerCtx, cancel := context.WithCancel(ctx)
 		owner := outbound.NewOwner(cancel)
 		installConnectionOwner(owner, conn)
@@ -382,7 +396,7 @@ func (s *Server) acceptLoop(ctx context.Context, listener *quic.Listener, fatal 
 			owner.Finish()
 			continue
 		}
-		s.handlerWG.Go(func() { s.handleInbound(ownerCtx, owner, pending, conn) })
+		s.handlerWG.Go(func() { s.handleInbound(ownerCtx, owner, pending, conn, acceptedAt) })
 	}
 }
 
@@ -391,24 +405,31 @@ func (s *Server) handleInbound(
 	owner *outbound.Owner,
 	generation *Generation,
 	conn *quic.Conn,
+	acceptedAt time.Time,
 ) {
 	ownedGeneration := generation
+	var state *stagedState
+	var link *peerLink
 	defer func() {
 		s.registry.BeginRetire(ownedGeneration)
 		owner.Finish()
+		s.controlState.unsubscribe(link)
+		state.close()
 		s.registry.Release(ownedGeneration)
 	}()
-	registrationCtx, cancel := context.WithTimeout(ctx, s.registrationTimeout)
+	headerCtx, cancelHeader := context.WithDeadline(ctx, acceptedAt.Add(s.registrationTimeout))
+	defer cancelHeader()
+	registrationCtx, cancel := context.WithDeadline(ctx, acceptedAt.Add(s.initialTimeout))
 	defer cancel()
-	if err := waitForMeshHandshake(registrationCtx, conn); err != nil {
+	if err := waitForMeshHandshake(headerCtx, conn); err != nil {
 		return
 	}
-	stream, err := conn.AcceptStream(registrationCtx)
+	stream, err := conn.AcceptStream(headerCtx)
 	if err != nil {
 		return
 	}
 	stream.SetPriority(0, true)
-	if deadline, ok := registrationCtx.Deadline(); ok {
+	if deadline, ok := headerCtx.Deadline(); ok {
 		if err := stream.SetDeadline(deadline); err != nil {
 			return
 		}
@@ -421,16 +442,30 @@ func (s *Server) handleInbound(
 	if err := authenticateInbound(s.authenticator, conn, registration); err != nil {
 		return
 	}
+	if headerCtx.Err() != nil {
+		return
+	}
+	cancelHeader()
+	if deadline, ok := registrationCtx.Deadline(); ok {
+		if err := stream.SetDeadline(deadline); err != nil {
+			return
+		}
+	}
 	reject := func(err error) {
 		if s.beforeReject != nil {
 			s.beforeReject(registration, err)
 		}
-		if writeMeshAck(stream, false, err.Error(), "", "", "") != nil || stream.Close() != nil {
+		deadline := time.Now().Add(time.Second)
+		if total, ok := registrationCtx.Deadline(); ok && total.Before(deadline) {
+			deadline = total
+		}
+		if stream.SetWriteDeadline(deadline) != nil || writeMeshAck(stream, false, err.Error(), "", "", "") != nil || stream.Close() != nil {
 			return
 		}
 		select {
 		case <-registrationCtx.Done():
 		case <-conn.Context().Done():
+		case <-time.After(max(0, time.Until(deadline))):
 		}
 	}
 	if err := protocol.ValidateMeshRegistration(registration.Version, registration.Capabilities); err != nil {
@@ -449,6 +484,43 @@ func (s *Server) handleInbound(
 		generation, err = s.prepareInboundPeer(registrationCtx, generation, registration.PeerServerID)
 	default:
 		err = fmt.Errorf("unsupported mesh role %q", registration.Role)
+	}
+	if err != nil {
+		reject(err)
+		return
+	}
+	if registration.Role == protocol.MeshRoleClient {
+		state, err = receiveInitial(registrationCtx, stream, s.declarations, s.paths, s.config.Limits, registration.Role, registration.GroupID)
+	} else {
+		snapshot := s.controlState.subscribe(func() { _ = conn.CloseWithError(meshApplicationError, "mesh control queue full") })
+		link = snapshot.link
+		written := make(chan error, 1)
+		go func() { written <- sendPeerSnapshot(registrationCtx, stream, snapshot) }()
+		state, err = receiveInitial(registrationCtx, stream, s.declarations, s.paths, s.config.Limits, registration.Role, "")
+		if err != nil {
+			select {
+			case <-written:
+			default:
+				stream.CancelWrite(meshStreamError)
+				<-written
+				return
+			}
+			reject(err)
+			return
+		}
+		writeErr := <-written
+		if err == nil {
+			err = writeErr
+		}
+		if err == nil {
+			var ready any
+			ready, err = protocol.ReadMeshControl(stream)
+			if err == nil {
+				if result, ok := ready.(protocol.MeshReady); !ok || result.State != protocol.MeshStateStaged {
+					err = fmt.Errorf("mesh peer Ready is not staged: %v", ready)
+				}
+			}
+		}
 	}
 	if err != nil {
 		reject(err)
@@ -480,6 +552,9 @@ func (s *Server) handleInbound(
 		s.registry.BeginRetire(generation)
 		return
 	}
+	if generation.role == RoleClient {
+		s.registry.PublishForwarding(generation, ForwardingEligibility{SessionReady: true})
+	}
 	cancel()
 	if err := stream.SetDeadline(time.Time{}); err != nil {
 		return
@@ -496,6 +571,9 @@ func (s *Server) handleInbound(
 		stream,
 		s.stableGrace,
 	)
+	if link != nil {
+		session.configurePeerControl(link.queue, state, s.declarations, s.paths, s.config.Limits)
+	}
 	installSessionOwner(owner, session)
 	if s.beforeInboundDelivery != nil {
 		s.beforeInboundDelivery(session)
@@ -599,10 +677,14 @@ func (s *Server) runOutboundPeerAttempt(
 	attemptDone chan struct{},
 ) (stable bool, resultErr error) {
 	var session *Session
+	var initialState *stagedState
+	var link *peerLink
 	defer func() {
 		stable = s.registry.IsCurrent(generation) && session != nil && session.ReconnectStable()
 		s.registry.BeginRetire(generation)
 		owner.Finish()
+		s.controlState.unsubscribe(link)
+		initialState.close()
 		s.registry.Release(generation)
 		close(attemptDone)
 	}()
@@ -629,7 +711,10 @@ func (s *Server) runOutboundPeerAttempt(
 		TargetServerID: peer.ServerID,
 		PeerServerID:   s.config.ServerID,
 	}
-	stream, err := outboundRegistration(attemptCtx, conn, registration, s.config.Tunnel.Peering.Auth)
+	snapshot := s.controlState.subscribe(func() { _ = conn.CloseWithError(meshApplicationError, "mesh control queue full") })
+	link = snapshot.link
+	defer snapshot.release()
+	stream, initialState, err := outboundRegistration(attemptCtx, conn, registration, s.config.Tunnel.Peering.Auth, nil, s.declarations, s.paths, s.config.Limits, snapshot)
 	if err != nil {
 		return false, err
 	}
@@ -651,6 +736,7 @@ func (s *Server) runOutboundPeerAttempt(
 		stream,
 		s.stableGrace,
 	)
+	session.configurePeerControl(link.queue, initialState, s.declarations, s.paths, s.config.Limits)
 	installSessionOwner(owner, session)
 	if !outbound.DeliverThenStart(workerCtx, conn.Context(), s.sessions, session, func() {
 		resultErr = session.run(s.config.Tunnel.HeartbeatInterval, s.config.Tunnel.HealthTimeout)

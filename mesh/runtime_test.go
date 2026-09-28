@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -794,6 +795,21 @@ func rawMeshRegisterOpen(
 	registration protocol.MeshRegister,
 	badProof bool,
 	onDial func(*quic.Conn),
+	beforeInitial ...func(*quic.Stream),
+) (*quic.Conn, *quic.Stream, protocol.MeshRegisterAck, error) {
+	return rawMeshRegisterOpenWithInitial(t, address, files, registration, badProof, onDial, nil, nil, beforeInitial...)
+}
+
+func rawMeshRegisterOpenWithInitial(
+	t *testing.T,
+	address string,
+	files meshTestFiles,
+	registration protocol.MeshRegister,
+	badProof bool,
+	onDial func(*quic.Conn),
+	quicConfig *quic.Config,
+	initial func(*quic.Stream) error,
+	beforeInitial ...func(*quic.Stream),
 ) (*quic.Conn, *quic.Stream, protocol.MeshRegisterAck, error) {
 	t.Helper()
 	roots := x509.NewCertPool()
@@ -802,10 +818,13 @@ func rawMeshRegisterOpen(
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
+	if quicConfig == nil {
+		quicConfig = config.Quic{}.GetConfig()
+	}
 	conn, err := quic.DialAddr(ctx, address, &tls.Config{
 		RootCAs: roots, ServerName: "localhost", MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS13,
 		NextProtos: []string{meshALPN},
-	}, config.Quic{}.GetConfig())
+	}, quicConfig)
 	if err != nil {
 		return nil, nil, protocol.MeshRegisterAck{}, err
 	}
@@ -837,6 +856,64 @@ func rawMeshRegisterOpen(
 	}
 	if err := protocol.WriteMeshRegister(stream, registration); err != nil {
 		return conn, stream, protocol.MeshRegisterAck{}, err
+	}
+	if len(beforeInitial) > 0 {
+		beforeInitial[0](stream)
+	}
+	if !badProof {
+		if initial != nil {
+			if err := initial(stream); err != nil {
+				return conn, stream, protocol.MeshRegisterAck{}, err
+			}
+		} else if registration.Role == protocol.MeshRoleClient {
+			clientConfig := testMeshClientConfig(registration.InstanceID, registration.GroupID, config.ClientAuthMethodToken, files,
+				[]config.MeshServerEndpoint{{ServerID: registration.TargetServerID, Address: address, ServerName: "localhost"}})
+			if err := config.FinalizeMeshClientConfig(clientConfig); err != nil {
+				return conn, stream, protocol.MeshRegisterAck{}, err
+			}
+			if err := sendClientInitial(stream, clientConfig.Group.CanonicalBytes()); err != nil {
+				return conn, stream, protocol.MeshRegisterAck{}, err
+			}
+		} else if registration.Role == protocol.MeshRolePeer {
+			if err := sendPeerInitial(stream); err != nil {
+				return conn, stream, protocol.MeshRegisterAck{}, err
+			}
+		}
+		if registration.Role == protocol.MeshRolePeer {
+			kind, payload, err := protocol.ReadMessageLimited(stream, protocol.MaxControlPayloadSize)
+			if err != nil {
+				return conn, stream, protocol.MeshRegisterAck{}, err
+			}
+			if kind == protocol.MsgTypeMeshRegisterAck {
+				var ack protocol.MeshRegisterAck
+				err := protocol.DecodeMessage(payload, &ack)
+				return conn, stream, ack, err
+			}
+			begin, err := protocol.DecodeMeshControl(kind, payload)
+			if err != nil {
+				return conn, stream, protocol.MeshRegisterAck{}, err
+			}
+			if _, ok := begin.(protocol.MeshBegin); !ok {
+				return conn, stream, protocol.MeshRegisterAck{}, fmt.Errorf("peer initial message = %T", begin)
+			}
+		peerInitial:
+			for {
+				message, err := protocol.ReadMeshControl(stream)
+				if err != nil {
+					return conn, stream, protocol.MeshRegisterAck{}, err
+				}
+				switch message.(type) {
+				case protocol.MeshChunk, protocol.MeshPath:
+				case protocol.MeshEnd:
+					break peerInitial
+				default:
+					return conn, stream, protocol.MeshRegisterAck{}, fmt.Errorf("peer initial message = %T", message)
+				}
+			}
+			if err := protocol.WriteMeshControl(stream, protocol.MeshReady{State: protocol.MeshStateStaged}); err != nil {
+				return conn, stream, protocol.MeshRegisterAck{}, err
+			}
+		}
 	}
 	ack, err := protocol.ReadMeshRegisterAck(stream)
 	return conn, stream, ack, err
@@ -1036,6 +1113,7 @@ func TestMeshPeerArbitrationTimeoutReturnsToBackoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	server.registrationTimeout = 50 * time.Millisecond
+	server.initialTimeout = 50 * time.Millisecond
 	loserPrepared := make(chan struct{})
 	releaseLoser := make(chan struct{})
 	releaseLoserFn := sync.OnceFunc(func() { close(releaseLoser) })

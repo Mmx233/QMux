@@ -17,6 +17,12 @@ const (
 	MsgTypeNewConnAck      = 0x08 // Client confirms its backend connection is ready
 	MsgTypeMeshRegister    = 0x09 // Mesh client or peer registration
 	MsgTypeMeshRegisterAck = 0x0A // Mesh registration acknowledgment
+	MsgTypeMeshBegin       = 0x0B // Initial state snapshot boundary
+	MsgTypeMeshChunk       = 0x0C // Public group declaration chunk
+	MsgTypeMeshPath        = 0x0D // Candidate path record
+	MsgTypeMeshWithdraw    = 0x0E // Candidate path withdrawal
+	MsgTypeMeshEnd         = 0x0F // Initial state completion boundary
+	MsgTypeMeshReady       = 0x10 // Dialer's staged/accepted result
 	MsgTypeError           = 0xFF // Error message
 )
 
@@ -48,6 +54,8 @@ const (
 	CapabilityMeshSessionV1 = "mesh-session-v1"
 	MeshRoleClient          = "client"
 	MeshRolePeer            = "peer"
+	MeshStateStaged         = "staged"
+	MeshStateAccepted       = "accepted"
 )
 
 // MeshRegister is the mesh-only registration header. Initial group and route
@@ -67,6 +75,7 @@ type MeshRegister struct {
 type MeshRegisterAck struct {
 	Success              bool
 	Message              string   `json:",omitempty"`
+	State                string   `json:",omitempty"`
 	ServerID             string   `json:",omitempty"`
 	Role                 string   `json:",omitempty"`
 	SelectedVersion      string   `json:",omitempty"`
@@ -225,6 +234,9 @@ func ValidateMeshRegisterAck(
 	if ack.SelectedAuthScheme != expectedAuthScheme {
 		return fmt.Errorf("invalid mesh registration acknowledgment: selected auth scheme got %q, require %q", ack.SelectedAuthScheme, expectedAuthScheme)
 	}
+	if ack.State != MeshStateStaged && ack.State != MeshStateAccepted {
+		return fmt.Errorf("invalid mesh registration acknowledgment: state %q", ack.State)
+	}
 	if err := validateCapabilities(requestedCapabilities); err != nil {
 		return fmt.Errorf("invalid requested capabilities: %w", err)
 	}
@@ -276,6 +288,9 @@ func validateMeshRegisterAckShape(ack MeshRegisterAck) error {
 	}
 	if ack.ServerID == "" || ack.SelectedVersion == "" {
 		return fmt.Errorf("successful mesh registration acknowledgment requires server_id and selected version")
+	}
+	if ack.State != MeshStateStaged && ack.State != MeshStateAccepted {
+		return fmt.Errorf("invalid mesh registration acknowledgment state %q", ack.State)
 	}
 	if ack.Role != MeshRoleClient && ack.Role != MeshRolePeer {
 		return fmt.Errorf("invalid mesh registration acknowledgment role %q", ack.Role)
