@@ -58,11 +58,12 @@ func (b *pathBudget) release(backing int64) {
 }
 
 type stagedState struct {
-	ledger   *declarationLedger
-	paths    *pathBudget
-	groups   []*groupRecord
-	items    []stagedPath
-	revision uint64
+	ledger       *declarationLedger
+	paths        *pathBudget
+	groups       []*groupRecord
+	groupUpdates []groupKey
+	items        []stagedPath
+	revision     uint64
 }
 
 func (s *stagedState) close() {
@@ -76,6 +77,7 @@ func (s *stagedState) close() {
 		s.paths.release(path.backing)
 	}
 	s.groups = nil
+	s.groupUpdates = nil
 	s.items = nil
 }
 

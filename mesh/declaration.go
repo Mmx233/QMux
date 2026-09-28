@@ -24,6 +24,7 @@ type groupKey struct {
 
 type groupRecord struct {
 	key    groupKey
+	policy string
 	digest [32]byte
 	bytes  []byte
 	refs   int
@@ -158,6 +159,12 @@ func (l *declarationLedger) release(record *groupRecord) {
 	l.mu.Unlock()
 }
 
+func (l *declarationLedger) retain(record *groupRecord) {
+	l.mu.Lock()
+	record.refs++
+	l.mu.Unlock()
+}
+
 func (claim *declarationClaim) close() {
 	if claim == nil || claim.ledger == nil {
 		return
@@ -187,7 +194,7 @@ func (claim *declarationClaim) finish(ctx context.Context, input []byte, expecte
 		<-meshValidationSlot
 		return nil, context.Cause(ctx)
 	}
-	groupID, version, work, err := config.ParseMeshGroupCanonicalMeasured(input, claim.ledger.changeWork)
+	groupID, version, policy, work, err := config.ParseMeshGroupCanonicalPolicyMeasured(input, claim.ledger.changeWork)
 	<-meshValidationSlot
 	claim.ledger.mu.Lock()
 	claim.ledger.parsePeak = max(claim.ledger.parsePeak, work.PeakBytes)
@@ -245,7 +252,7 @@ func (claim *declarationClaim) finish(ctx context.Context, input []byte, expecte
 		l.workBytes -= normalizedBytes
 		return nil, errMeshGroupCapacity
 	}
-	record := &groupRecord{key: key, digest: sha256.Sum256(input), bytes: input, refs: 1}
+	record := &groupRecord{key: key, policy: policy, digest: sha256.Sum256(input), bytes: input, refs: 1}
 	l.records[key] = record
 	l.byDigest[record.digest] = append(l.byDigest[record.digest], record)
 	l.groups++

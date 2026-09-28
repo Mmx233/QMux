@@ -110,6 +110,10 @@ func outboundRegistration(
 			state.close()
 			return nil, nil, meshRegistrationError(ctx, "write mesh peer initial state", err)
 		}
+		if err := snapshot.owner.stagePeerGroups(state); err != nil {
+			state.close()
+			return nil, nil, meshRegistrationError(ctx, "stage mesh peer groups", err)
+		}
 		if err := protocol.WriteMeshControl(stream, protocol.MeshReady{State: protocol.MeshStateStaged}); err != nil {
 			state.close()
 			return nil, nil, meshRegistrationError(ctx, "write mesh peer Ready", err)
@@ -130,7 +134,11 @@ func outboundRegistration(
 		state.close()
 		return nil, nil, err
 	}
-	if ack.State != protocol.MeshStateStaged {
+	wantState := protocol.MeshStateStaged
+	if registration.Role == protocol.MeshRoleClient {
+		wantState = protocol.MeshStateAccepted
+	}
+	if ack.State != wantState {
 		state.close()
 		return nil, nil, fmt.Errorf("unexpected mesh initial state result %q", ack.State)
 	}
@@ -175,6 +183,9 @@ func writeMeshAck(
 	ack := protocol.MeshRegisterAck{Success: success, Message: message}
 	if success {
 		ack.State = protocol.MeshStateStaged
+		if role == protocol.MeshRoleClient {
+			ack.State = protocol.MeshStateAccepted
+		}
 		ack.ServerID = serverID
 		ack.Role = role
 		ack.SelectedVersion = protocol.MeshProtocolVersion

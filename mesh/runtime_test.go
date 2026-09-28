@@ -1,6 +1,7 @@
 package mesh
 
 import (
+	"bytes"
 	"context"
 	"crypto/rsa"
 	"crypto/tls"
@@ -1497,6 +1498,25 @@ func TestMeshReceiverSuccessAckCancelAndStopBarriers(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			declaration := testDeclaration(t, "group-a", 1, 0)
+			checkGroup := func(event string, wantRevision uint64, wantPublished bool, wantGroups int) {
+				t.Helper()
+				server.controlState.mu.Lock()
+				current := server.controlState.groups["group-a"]
+				revision := server.controlState.revision
+				server.controlState.mu.Unlock()
+				groups, size := server.declarations.snapshot()
+				wantBytes := int64(0)
+				if wantGroups != 0 {
+					wantBytes = int64(len(declaration))
+				}
+				if revision != wantRevision || (current != nil) != wantPublished || groups != wantGroups || size != wantBytes {
+					t.Fatalf("%s: revision %d, published %t, ledger %d/%d", event, revision, current != nil, groups, size)
+				}
+				if current != nil && !bytes.Equal(current.bytes, declaration) {
+					t.Fatalf("%s: published declaration changed", event)
+				}
+			}
 			reached := make(chan *quic.Conn, 1)
 			releaseAck := make(chan struct{})
 			release := sync.OnceFunc(func() { close(releaseAck) })
@@ -1540,6 +1560,7 @@ func TestMeshReceiverSuccessAckCancelAndStopBarriers(t *testing.T) {
 			if snapshot := server.Snapshot(); snapshot.Registry.ClientPrepared != 1 || snapshot.Registry.ClientCurrent != 0 || snapshot.Registry.ClientTotal != 1 || snapshot.Registry.ClientBindings != 1 || snapshot.PostAckCommitFailures != 0 {
 				t.Fatalf("held ACK boundary snapshot = %+v", snapshot)
 			}
+			checkGroup("held ACK boundary", 0, false, 1)
 			select {
 			case session := <-server.Sessions():
 				t.Fatalf("prepared session was published before commit: %+v", session)
@@ -1568,6 +1589,7 @@ func TestMeshReceiverSuccessAckCancelAndStopBarriers(t *testing.T) {
 					t.Fatal("receiver did not observe canceled registration")
 				}
 			}
+			checkGroup("canceled ACK boundary", 0, false, 1)
 			release()
 			if !test.after {
 				select {
@@ -1594,8 +1616,22 @@ func TestMeshReceiverSuccessAckCancelAndStopBarriers(t *testing.T) {
 				}
 			} else {
 				awaitMeshRegistryEmpty(t, server, "canceled registration cleanup")
+				wantGroups := 0
+				if test.after {
+					wantGroups = 1
+				}
+				awaitMeshCondition(t, "ACK group ownership settled", func() bool {
+					groups, _ := server.declarations.snapshot()
+					return groups == wantGroups
+				})
+				checkGroup("canceled registration settled", uint64(wantGroups), test.after, wantGroups)
 				stopMeshServer(t, server, serverDone)
 			}
+			wantRevision := uint64(0)
+			if test.after {
+				wantRevision = 1
+			}
+			checkGroup("after Stop", wantRevision, false, 0)
 			if snapshot := server.Snapshot(); snapshot.Registry.Pending != 0 || snapshot.Registry.ClientTotal != 0 || snapshot.Registry.ClientBindings != 0 || snapshot.Registry.ClientPrepared != 0 || snapshot.PostAckCommitFailures != 0 {
 				t.Fatalf("ACK boundary cleanup snapshot = %+v", snapshot)
 			}

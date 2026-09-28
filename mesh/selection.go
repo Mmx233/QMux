@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 
+	"github.com/Mmx233/QMux/config"
 	"github.com/quic-go/quic-go"
 )
 
@@ -20,7 +21,6 @@ var (
 type ForwardingEligibility struct {
 	SessionReady     bool
 	DeclarationReady bool
-	VersionEligible  bool
 	L4Healthy        bool
 }
 
@@ -87,6 +87,20 @@ func (r *Registry) PublishForwarding(g *Generation, eligibility ForwardingEligib
 	return true
 }
 
+func (r *Registry) publishL4Healthy(g *Generation) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.isCurrentLocked(g) || g.role != RoleClient {
+		return false
+	}
+	if !g.forwarding.L4Healthy {
+		g.forwarding.L4Healthy = true
+		r.refreshGroupLocked(g.groupID)
+		r.signalLocked()
+	}
+	return true
+}
+
 func (r *Registry) PublishInstanceL7Health(g *Generation, health InstanceL7Health) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -118,7 +132,15 @@ func (r *Registry) isForwardingReadyLocked(g *Generation) bool {
 		return false
 	}
 	e := g.forwarding
-	return e.SessionReady && e.DeclarationReady && e.VersionEligible && e.L4Healthy
+	if !e.SessionReady || !e.DeclarationReady || !e.L4Healthy {
+		return false
+	}
+	if g.role != RoleClient {
+		return true
+	}
+	rule, ok := r.groupRules[g.groupID]
+	return ok && g.ruleVersion != 0 &&
+		(g.ruleVersion >= rule.version || rule.policy == config.MeshOutdatedClientPolicyApplyLatestRules)
 }
 
 func (r *Registry) refreshGroupLocked(groupID string) {

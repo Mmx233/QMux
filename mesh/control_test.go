@@ -355,7 +355,7 @@ func TestMeshFullCapacityClientAndPeerReconnect(t *testing.T) {
 			}
 			conn, _, ack, err := rawMeshRegisterOpenWithInitial(t, address, files, registration, false, nil, nil,
 				func(stream *quic.Stream) error { return sendClientInitial(stream, declaration) })
-			if err != nil || !ack.Success || ack.State != protocol.MeshStateStaged {
+			if err != nil || !ack.Success || ack.State != protocol.MeshStateAccepted {
 				t.Fatalf("full-capacity client %s ACK = %+v, %v", instanceID, ack, err)
 			}
 			awaitMeshSession(t, server.Sessions(), "full-capacity client")
@@ -385,8 +385,8 @@ func TestMeshFullCapacityClientAndPeerReconnect(t *testing.T) {
 		_ = first.CloseWithError(0, "test complete")
 		_ = second.CloseWithError(0, "test complete")
 		awaitMeshRegistryEmpty(t, server, "client HA release")
-		if groups, size := server.declarations.snapshot(); groups != 0 || size != 0 {
-			t.Fatalf("client HA retained %d/%d", groups, size)
+		if groups, size := server.declarations.snapshot(); groups != 1 || size != limit || server.registry.GroupAvailability("api") {
+			t.Fatalf("client HA highest record/availability = %d/%d, %t", groups, size, server.registry.GroupAvailability("api"))
 		}
 	})
 	t.Run("peer", func(t *testing.T) {
@@ -1059,17 +1059,22 @@ func TestMeshTypedNewClientSendsFrozenDeclaration(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("server did not receive the frozen declaration")
 	}
-	awaitMeshSession(t, server.Sessions(), "server staged typed client")
+	awaitMeshSession(t, server.Sessions(), "server accepted typed client")
+	awaitMeshCondition(t, "typed client initial L4 health", func() bool {
+		return server.registry.GroupAvailability("api")
+	})
 	server.registry.mu.Lock()
 	entry := server.registry.clients["instance-a"]
 	if entry == nil || entry.current.Empty() {
 		server.registry.mu.Unlock()
 		t.Fatal("typed client did not publish a control session")
 	}
-	ready := entry.current.Load().forwarding
+	current := entry.current.Load()
+	ready := current.forwarding
+	version := current.ruleVersion
 	server.registry.mu.Unlock()
-	if !ready.SessionReady || ready.DeclarationReady || ready.VersionEligible || server.registry.GroupAvailability("api") {
-		t.Fatalf("staged declaration activated forwarding: %+v", ready)
+	if !ready.SessionReady || !ready.DeclarationReady || !ready.L4Healthy || version != 1 {
+		t.Fatalf("accepted declaration readiness = %+v, version %d", ready, version)
 	}
 }
 
@@ -1099,7 +1104,7 @@ func TestMeshClientLargeInitialRealQUIC(t *testing.T) {
 	}
 	conn, _, ack, err := rawMeshRegisterOpenWithInitial(t, address, files, registration, false, nil, nil,
 		func(stream *quic.Stream) error { return sendClientInitial(stream, declaration) })
-	if err != nil || !ack.Success || ack.State != protocol.MeshStateStaged {
+	if err != nil || !ack.Success || ack.State != protocol.MeshStateAccepted {
 		t.Fatalf("large client registration ACK = %+v, %v", ack, err)
 	}
 	defer func() { _ = conn.CloseWithError(0, "test complete") }()
@@ -1110,19 +1115,19 @@ func TestMeshClientLargeInitialRealQUIC(t *testing.T) {
 		received = bytes.Clone(record.bytes)
 	}
 	server.declarations.mu.Unlock()
-	if !bytes.Equal(received, declaration) || server.registry.GroupAvailability("api") {
-		t.Fatal("large client declaration changed or became eligible")
+	if !bytes.Equal(received, declaration) {
+		t.Fatal("large client declaration changed")
 	}
 	_ = conn.CloseWithError(0, "test complete")
 	awaitMeshRegistryEmpty(t, server, "large client release")
-	if groups, size := server.declarations.snapshot(); groups != 0 || size != 0 {
+	if groups, size := server.declarations.snapshot(); groups != 1 || size != int64(len(declaration)) || server.registry.GroupAvailability("api") {
 		t.Fatalf("large client retained declarations %d/%d", groups, size)
 	}
 
 	updated := testDeclaration(t, "api", 2, 0)
 	conn, _, ack, err = rawMeshRegisterOpenWithInitial(t, address, files, registration, false, nil, nil,
 		func(stream *quic.Stream) error { return sendClientInitial(stream, updated) })
-	if err != nil || !ack.Success || ack.State != protocol.MeshStateStaged {
+	if err != nil || !ack.Success || ack.State != protocol.MeshStateAccepted {
 		t.Fatalf("same-group new rule_version ACK = %+v, %v", ack, err)
 	}
 	defer func() { _ = conn.CloseWithError(0, "test complete") }()
@@ -1145,7 +1150,7 @@ func TestMeshACKRetainsCanonicalWithoutValidationWork(t *testing.T) {
 		TargetServerID: "edge-a", InstanceID: "instance-a", GroupID: "api",
 	}
 	conn, _, ack, err := rawMeshRegisterOpen(t, address, files, registration, false, nil)
-	if err != nil || !ack.Success || ack.State != protocol.MeshStateStaged {
+	if err != nil || !ack.Success || ack.State != protocol.MeshStateAccepted {
 		t.Fatalf("canonical registration ACK = %+v, %v", ack, err)
 	}
 	defer func() { _ = conn.CloseWithError(0, "test complete") }()
@@ -1161,7 +1166,7 @@ func TestMeshACKRetainsCanonicalWithoutValidationWork(t *testing.T) {
 	}
 	_ = conn.CloseWithError(0, "test complete")
 	awaitMeshRegistryEmpty(t, server, "ACK retention release")
-	if groups, retained := server.declarations.snapshot(); groups != 0 || retained != 0 {
+	if groups, retained := server.declarations.snapshot(); groups != 1 || retained != int64(len(testDeclaration(t, "api", 1, 0))) || server.registry.GroupAvailability("api") {
 		t.Fatalf("retired ACK retained %d/%d", groups, retained)
 	}
 }
@@ -1229,7 +1234,7 @@ func TestMeshInboundHeaderAndInitialDeadlines(t *testing.T) {
 				defer func() { _ = conn.CloseWithError(0, "test complete") }()
 			}
 			if test.wantAccept {
-				if registerErr != nil || !ack.Success || ack.State != protocol.MeshStateStaged {
+				if registerErr != nil || !ack.Success || ack.State != protocol.MeshStateAccepted {
 					t.Fatalf("authenticated initial after header deadline = %+v, %v", ack, registerErr)
 				}
 				awaitMeshSession(t, server.Sessions(), "client after header deadline")
@@ -1304,7 +1309,7 @@ func TestMeshInboundSuccessClearsRegistrationDeadline(t *testing.T) {
 		TargetServerID: "edge-a", InstanceID: "instance-a", GroupID: "api",
 	}
 	conn, _, ack, err := rawMeshRegisterOpen(t, address, files, registration, false, nil)
-	if err != nil || !ack.Success || ack.State != protocol.MeshStateStaged {
+	if err != nil || !ack.Success || ack.State != protocol.MeshStateAccepted {
 		t.Fatalf("inbound registration ACK = %+v, %v", ack, err)
 	}
 	defer func() { _ = conn.CloseWithError(0, "test complete") }()

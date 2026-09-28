@@ -55,19 +55,20 @@ type Owner struct {
 }
 
 type Generation struct {
-	registry   *Registry
-	id         uint64
-	role       Role
-	direction  Direction
-	phase      Phase
-	instanceID string
-	groupID    string
-	peerID     string
-	owner      Owner
-	forwarding ForwardingEligibility
-	l7Health   InstanceL7Health
-	inflight   int
-	traffic    map[*tcpSource]*generationTraffic
+	registry    *Registry
+	id          uint64
+	role        Role
+	direction   Direction
+	phase       Phase
+	instanceID  string
+	groupID     string
+	peerID      string
+	owner       Owner
+	ruleVersion uint64
+	forwarding  ForwardingEligibility
+	l7Health    InstanceL7Health
+	inflight    int
+	traffic     map[*tcpSource]*generationTraffic
 }
 
 func (g *Generation) ID() uint64 { return g.id }
@@ -131,6 +132,11 @@ type peerEntry struct {
 	retiring map[uint64]*Generation
 }
 
+type groupRule struct {
+	version uint64
+	policy  string
+}
+
 type Arbitration struct {
 	registry      *Registry
 	id            uint64
@@ -166,6 +172,7 @@ type Registry struct {
 	peers          map[string]*peerEntry
 	arbitrations   map[string]*Arbitration
 	groupAvailable map[string]bool
+	groupRules     map[string]groupRule
 	groupChanged   chan struct{}
 	roundRobin     map[string]uint64
 }
@@ -204,6 +211,7 @@ func NewRegistry(maxPending, maxClients, maxPeers int) *Registry {
 		peers:          make(map[string]*peerEntry),
 		arbitrations:   make(map[string]*Arbitration),
 		groupAvailable: make(map[string]bool),
+		groupRules:     make(map[string]groupRule),
 		groupChanged:   make(chan struct{}),
 		roundRobin:     make(map[string]uint64),
 	}

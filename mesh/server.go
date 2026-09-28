@@ -418,8 +418,8 @@ func (s *Server) handleInbound(
 		s.registry.BeginRetire(ownedGeneration)
 		owner.Finish()
 		s.controlState.unsubscribe(link)
-		state.close()
 		s.registry.Release(ownedGeneration)
+		state.close()
 	}()
 	headerCtx, cancelHeader := context.WithDeadline(ctx, acceptedAt.Add(s.registrationTimeout))
 	defer cancelHeader()
@@ -530,6 +530,15 @@ func (s *Server) handleInbound(
 		reject(err)
 		return
 	}
+	if registration.Role == protocol.MeshRoleClient {
+		err = s.controlState.preflightClientGroup(state.groups[0])
+	} else {
+		err = s.controlState.stagePeerGroups(state)
+	}
+	if err != nil {
+		reject(err)
+		return
+	}
 
 	if s.beforeSuccessAck != nil {
 		s.beforeSuccessAck(registration, conn)
@@ -547,7 +556,12 @@ func (s *Server) handleInbound(
 	if s.afterSuccessAck != nil {
 		s.afterSuccessAck(registration, conn)
 	}
-	committed, stop := s.registry.CommitReceiver(generation)
+	var committed, stop bool
+	if generation.role == RoleClient {
+		committed, stop = s.commitClientGroup(generation, state)
+	} else {
+		committed, stop = s.registry.CommitReceiver(generation)
+	}
 	if !committed {
 		s.postAckCommitFailures.Add(1)
 		return
@@ -555,9 +569,6 @@ func (s *Server) handleInbound(
 	if stop {
 		s.registry.BeginRetire(generation)
 		return
-	}
-	if generation.role == RoleClient {
-		s.registry.PublishForwarding(generation, ForwardingEligibility{SessionReady: true})
 	}
 	cancel()
 	if err := stream.SetDeadline(time.Time{}); err != nil {
@@ -583,6 +594,9 @@ func (s *Server) handleInbound(
 		s.beforeInboundDelivery(session)
 	}
 	outbound.DeliverThenStart(ctx, conn.Context(), s.sessions, session, func() {
+		if generation.role == RoleClient {
+			s.registry.publishL4Healthy(generation)
+		}
 		_ = session.run(s.config.Tunnel.HeartbeatInterval, s.config.Tunnel.HealthTimeout)
 	})
 }

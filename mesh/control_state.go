@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/Mmx233/QMux/config"
@@ -279,11 +281,148 @@ func (s *controlState) fence() uint64 {
 	return s.revision
 }
 
+func (s *controlState) preflightClientGroup(record *groupRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrMeshServerStopped
+	}
+	if current := s.groups[record.key.id]; current != nil && current.key.version == record.key.version && !bytes.Equal(current.bytes, record.bytes) {
+		return errMeshGroupConflict
+	}
+	check := func(offset int) error {
+		end := min(len(record.bytes), offset+protocol.MaxMeshChunkDataSize)
+		chunk := protocol.MeshChunk{Sequence: math.MaxUint64, Total: uint32(len(record.bytes)), Offset: uint32(offset), Data: record.bytes[offset:end]}
+		if offset == 0 {
+			chunk.Digest = record.digest[:]
+		}
+		_, err := protocol.MarshalMeshControlFrame(chunk)
+		return err
+	}
+	if err := check(0); err != nil {
+		return err
+	}
+	// Equal-sized ordinary chunks differ only by their offset width. The
+	// last full chunk and final partial chunk cover both maxima.
+	lastFull := max(0, len(record.bytes)/protocol.MaxMeshChunkDataSize-1) * protocol.MaxMeshChunkDataSize
+	if lastFull > 0 {
+		if err := check(lastFull); err != nil {
+			return err
+		}
+	}
+	last := (len(record.bytes) - 1) / protocol.MaxMeshChunkDataSize * protocol.MaxMeshChunkDataSize
+	if last > 0 && last != lastFull {
+		return check(last)
+	}
+	return nil
+}
+
+// Peer group decisions stay provisional until MESH-007 accepts their paths.
+func (s *controlState) stagePeerGroups(state *stagedState) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrMeshServerStopped
+	}
+	updates := state.groupUpdates[:0]
+	for _, record := range state.groups {
+		current := s.groups[record.key.id]
+		if current != nil {
+			if record.key.version < current.key.version {
+				continue
+			}
+			if record.key.version == current.key.version {
+				if !bytes.Equal(record.bytes, current.bytes) {
+					return errMeshGroupConflict
+				}
+				continue
+			}
+		}
+		updates = append(updates, groupKey{id: strings.Clone(record.key.id), version: record.key.version})
+	}
+	state.groupUpdates = updates
+	return nil
+}
+
+func (s *Server) commitClientGroup(g *Generation, state *stagedState) (committed, stop bool) {
+	record := state.groups[0]
+	control := s.controlState
+	control.mu.Lock()
+	r := s.registry
+	r.mu.Lock()
+	if !r.isExactLocked(g, RoleClient, PhasePrepared) || !r.commitLocked(g) {
+		stop = r.closed
+		r.mu.Unlock()
+		control.mu.Unlock()
+		return false, stop
+	}
+	g.ruleVersion = record.key.version
+	g.forwarding = ForwardingEligibility{SessionReady: true, DeclarationReady: true}
+	previous := control.groups[record.key.id]
+	publish := previous == nil || record.key.version > previous.key.version
+	var sequence uint64
+	if publish {
+		// The staged reference becomes the group owner; the exact session gets
+		// its own reference to the same immutable canonical backing.
+		control.ledger.retain(record)
+		control.groups[record.key.id] = record
+		control.revision++
+		sequence = control.revision
+		r.groupRules[record.key.id] = groupRule{version: record.key.version, policy: record.policy}
+	}
+	r.refreshGroupLocked(record.key.id)
+	stop = r.closed
+	r.mu.Unlock()
+
+	var failed []*peerLink
+	if publish {
+		frames, err := declarationFrames(sequence, record.bytes)
+		if err != nil {
+			// Preflight used these exact immutable chunks with the longest
+			// possible revision. Resync peers if that invariant is violated.
+			s.logger.Error().Err(err).Msg("prevalidated mesh group notification failed")
+			for link := range control.links {
+				failed = append(failed, link)
+			}
+		} else {
+			failed = control.broadcastLocked(frames)
+		}
+	}
+	control.mu.Unlock()
+	if publish && previous != nil {
+		control.ledger.release(previous)
+	}
+	for _, link := range failed {
+		link.close()
+	}
+	return true, stop
+}
+
 func (s *controlState) publishGroup(record *groupRecord) error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
 		return ErrMeshServerStopped
+	}
+	previous := s.groups[record.key.id]
+	if previous != nil {
+		if previous == record {
+			s.mu.Unlock()
+			return nil
+		}
+		if record.key.version < previous.key.version {
+			s.mu.Unlock()
+			s.ledger.release(record)
+			return nil
+		}
+		if record.key.version == previous.key.version {
+			s.mu.Unlock()
+			if !bytes.Equal(record.bytes, previous.bytes) {
+				return errMeshGroupConflict
+			}
+			s.ledger.release(record)
+			return nil
+		}
 	}
 	sequence := s.revision + 1
 	frames, err := declarationFrames(sequence, record.bytes)
@@ -291,7 +430,6 @@ func (s *controlState) publishGroup(record *groupRecord) error {
 		s.mu.Unlock()
 		return err
 	}
-	previous := s.groups[record.key.id]
 	s.groups[record.key.id] = record
 	s.revision = sequence
 	failed := s.broadcastLocked(frames)

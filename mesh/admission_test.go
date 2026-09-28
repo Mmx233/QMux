@@ -11,7 +11,7 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-var readyForwarding = ForwardingEligibility{SessionReady: true, DeclarationReady: true, VersionEligible: true, L4Healthy: true}
+var readyForwarding = ForwardingEligibility{SessionReady: true, DeclarationReady: true, L4Healthy: true}
 
 func currentMeshClient(t *testing.T, r *Registry, instance, group string) *Generation {
 	t.Helper()
@@ -26,6 +26,12 @@ func currentMeshClient(t *testing.T, r *Registry, instance, group string) *Gener
 	if committed, stopped := r.CommitReceiver(g); !committed || stopped {
 		t.Fatalf("commit %s = %t, stopped %t", instance, committed, stopped)
 	}
+	r.mu.Lock()
+	g.ruleVersion = 1
+	if _, ok := r.groupRules[group]; !ok {
+		r.groupRules[group] = groupRule{version: 1, policy: config.MeshOutdatedClientPolicyApplyLatestRules}
+	}
+	r.mu.Unlock()
 	return g
 }
 
@@ -166,15 +172,13 @@ func TestMeshGroupSelectionAndAvailabilityEdges(t *testing.T) {
 		t.Fatalf("unpublished current selectable: %v", err)
 	}
 	partial := readyForwarding
-	for _, missing := range []string{"session", "declaration", "version", "l4"} {
+	for _, missing := range []string{"session", "declaration", "l4"} {
 		partial = readyForwarding
 		switch missing {
 		case "session":
 			partial.SessionReady = false
 		case "declaration":
 			partial.DeclarationReady = false
-		case "version":
-			partial.VersionEligible = false
 		case "l4":
 			partial.L4Healthy = false
 		}
@@ -182,6 +186,19 @@ func TestMeshGroupSelectionAndAvailabilityEdges(t *testing.T) {
 			t.Fatalf("missing %s readiness made group available", missing)
 		}
 	}
+	r.mu.Lock()
+	r.groupRules["api"] = groupRule{version: 2, policy: config.MeshOutdatedClientPolicyPauseNewTraffic}
+	r.mu.Unlock()
+	if !r.PublishForwarding(a, readyForwarding) || r.GroupAvailability("api") {
+		t.Fatal("older v1 client qualified under v2 pause policy")
+	}
+	if _, err := r.beginClientSelection("api", setup, "round-robin").next(); !errors.Is(err, ErrNoMeshCandidate) {
+		t.Fatalf("older v1 client admitted under v2 pause policy: %v", err)
+	}
+	r.PublishForwarding(a, ForwardingEligibility{})
+	r.mu.Lock()
+	r.groupRules["api"] = groupRule{version: 1, policy: config.MeshOutdatedClientPolicyApplyLatestRules}
+	r.mu.Unlock()
 	changed := r.GroupChanges()
 	if !r.PublishForwarding(a, readyForwarding) || !r.GroupAvailability("api") {
 		t.Fatal("first qualified instance missing")

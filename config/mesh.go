@@ -1381,6 +1381,13 @@ func (w *meshGroupWorkTracker) release(size int64) {
 }
 
 func ParseMeshGroupCanonicalMeasured(data []byte, change ...func(int64)) (_ string, _ uint64, work MeshGroupValidationWork, err error) {
+	groupID, version, _, work, err := ParseMeshGroupCanonicalPolicyMeasured(data, change...)
+	return groupID, version, work, err
+}
+
+// ParseMeshGroupCanonicalPolicyMeasured returns the normalized policy while
+// the validated declaration is still parsed, without retaining route objects.
+func ParseMeshGroupCanonicalPolicyMeasured(data []byte, change ...func(int64)) (_ string, _ uint64, _ string, work MeshGroupValidationWork, err error) {
 	tracker := &meshGroupWorkTracker{}
 	if len(change) > 0 {
 		tracker.change = change[0]
@@ -1395,7 +1402,7 @@ func ParseMeshGroupCanonicalMeasured(data []byte, change ...func(int64)) (_ stri
 	tracker.add(certificateBytes)
 	defer tracker.release(certificateBytes)
 	if decodeErr != nil {
-		return "", 0, work, fmt.Errorf("decode mesh group declaration: %w", decodeErr)
+		return "", 0, "", work, fmt.Errorf("decode mesh group declaration: %w", decodeErr)
 	}
 	group := MeshGroup{
 		GroupID:              declaration.GroupID,
@@ -1435,14 +1442,14 @@ func ParseMeshGroupCanonicalMeasured(data []byte, change ...func(int64)) (_ stri
 	}
 	group.ApplyDefaults()
 	if err := group.Validate("group"); err != nil {
-		return "", 0, work, err
+		return "", 0, "", work, err
 	}
 	if len(group.OriginTLS.ExtraCACertificates) > 0 && (!group.OriginTLS.Enabled || !group.OriginTLS.Verify) {
-		return "", 0, work, errors.New("group.origin_tls.extra_ca_certificates requires enabled and verify")
+		return "", 0, "", work, errors.New("group.origin_tls.extra_ca_certificates requires enabled and verify")
 	}
 	for _, der := range group.OriginTLS.ExtraCACertificates {
 		if _, err := x509.ParseCertificate(der); err != nil {
-			return "", 0, work, fmt.Errorf("invalid mesh group extra CA: %w", err)
+			return "", 0, "", work, fmt.Errorf("invalid mesh group extra CA: %w", err)
 		}
 	}
 	sort.Slice(group.OriginTLS.ExtraCACertificates, func(i, j int) bool {
@@ -1452,14 +1459,14 @@ func ParseMeshGroupCanonicalMeasured(data []byte, change ...func(int64)) (_ stri
 	group.normalize()
 	canonical, err := marshalMeshGroupCanonicalMeasured(group, tracker)
 	if err != nil {
-		return "", 0, work, fmt.Errorf("canonicalize mesh group declaration: %w", err)
+		return "", 0, "", work, fmt.Errorf("canonicalize mesh group declaration: %w", err)
 	}
 	tracker.add(int64(cap(canonical)))
 	defer tracker.release(int64(cap(canonical)))
 	if !bytes.Equal(canonical, data) {
-		return "", 0, work, errors.New("mesh group declaration is not canonical")
+		return "", 0, "", work, errors.New("mesh group declaration is not canonical")
 	}
-	return group.GroupID, group.RuleVersion, work, nil
+	return group.GroupID, group.RuleVersion, group.OutdatedClientPolicy, work, nil
 }
 
 type meshGroupCanonical struct {

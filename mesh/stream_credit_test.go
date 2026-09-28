@@ -53,6 +53,9 @@ func TestMeshRealQUICDefaultStreamCreditAcrossSources(t *testing.T) {
 	if !server.registry.PublishForwarding(a, readyForwarding) {
 		t.Fatal("publish A")
 	}
+	if !server.registry.PublishForwarding(b, ForwardingEligibility{}) {
+		t.Fatal("hold B until the stream-credit fallback")
+	}
 	serverSessionA, serverSessionB := serverSessions["a"], serverSessions["b"]
 	if serverSessionA == nil || serverSessionB == nil {
 		t.Fatalf("server sessions = %v", serverSessions)
